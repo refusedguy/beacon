@@ -79,22 +79,22 @@ func decodeDispatchBody(r *http.Request) map[string]any {
 // parentModel mirrors the composition root's session lookup. The model comes
 // from the parent session over HTTP, not from BEACON_MODEL or config.
 func parentModel(endpoint, token string) app.ModelResolver {
-	return func(parent string) map[string]string {
+	return func(parent string) core.ModelRef {
 		if parent == "" {
-			return nil
+			return core.ModelRef{}
 		}
 		req, err := http.NewRequest(http.MethodGet, endpoint+"/api/session/"+url.PathEscape(parent), nil)
 		if err != nil {
-			return nil
+			return core.ModelRef{}
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return nil
+			return core.ModelRef{}
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 300 {
-			return nil
+			return core.ModelRef{}
 		}
 		var info struct {
 			Data struct {
@@ -106,13 +106,13 @@ func parentModel(endpoint, token string) app.ModelResolver {
 			} `json:"data"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.Data.Model.ID == "" {
-			return nil
+			return core.ModelRef{}
 		}
-		ref := map[string]string{"id": info.Data.Model.ID, "providerID": info.Data.Model.ProviderID}
-		if info.Data.Model.Variant != "" {
-			ref["variant"] = info.Data.Model.Variant
+		return core.ModelRef{
+			ID:         info.Data.Model.ID,
+			ProviderID: info.Data.Model.ProviderID,
+			Variant:    info.Data.Model.Variant,
 		}
-		return ref
 	}
 }
 

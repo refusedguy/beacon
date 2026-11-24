@@ -381,9 +381,9 @@ func TestSpawnUsesDispatchModelRef(t *testing.T) {
 
 	want := map[string]any{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
 	h := New(srv.URL, "paid-startup", "worker", "ses_parent")
-	h.ModelRef = map[string]string{"id": "paid-startup", "providerID": "opencode"}
+	h.ModelRef = core.ModelRef{ID: "paid-startup", ProviderID: "opencode"}
 	req := testSpawnRequest()
-	req.ModelRef = map[string]string{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
+	req.ModelRef = core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode", Variant: "default"}
 	sess, err := h.Spawn(context.Background(), req)
 	if err != nil || sess.ID != "ses_worker" {
 		t.Fatalf("Spawn = %q, %v", sess.ID, err)
@@ -405,6 +405,37 @@ func TestSpawnUsesDispatchModelRef(t *testing.T) {
 	}
 	if _, ok := prompts[0]["model"]; ok {
 		t.Errorf("prompt must not carry a model: %v", prompts[0])
+	}
+}
+
+func TestSpawnModelRefOmitsEmptyVariantOnWire(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			rec.addSession(decodeBody(r))
+			_, _ = io.WriteString(w, `{"id":"ses_novariant"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/model"):
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(srv.URL, "", "worker", "")
+	h.ModelRef = core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode"}
+	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if len(rec.sessions) != 1 {
+		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
+	}
+	want := map[string]any{"id": "hy4-flash-free", "providerID": "opencode"}
+	if got := rec.sessions[0]["model"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("session model = %v, want %v", got, want)
 	}
 }
 
@@ -450,7 +481,7 @@ func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
 
 	ref := map[string]any{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
 	h := New(srv.URL, "", "worker", "ses_parent")
-	h.ModelRef = map[string]string{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
+	h.ModelRef = core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode", Variant: "default"}
 	sess, err := h.Spawn(context.Background(), testSpawnRequest())
 	if err != nil || sess.ID != "ses_worker" {
 		t.Fatalf("Spawn = %q, %v", sess.ID, err)

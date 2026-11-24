@@ -15,8 +15,8 @@ import {
   cleanErrorMessage, createStatusSource, readCard, str, tuiLocation,
 } from "./ui_model.js"
 import {
-  DETAIL_OPEN, SIDEBAR_OPEN, detailCommand, detailModel, discardStoredEpicOpen,
-  metricsLine, sidebarModel,
+  DETAIL_OPEN, SIDEBAR_OPEN, blockedOpenFrom, detailCommand, detailModel, discardStoredEpicOpen,
+  metricsLine, sidebarModel, toggleAllBlockedGroups, toggleBlockedGroup,
 } from "./ui_view.js"
 import { compactReason } from "./ui_alerts.js"
 import { sessionIdentity } from "./session_identity.js"
@@ -131,7 +131,7 @@ async function setup(ctx, deps = {}) {
   function applySlot(key) {
     const slot = slots[key]
     if (!slot || slot.node.isDestroyed) return
-    if (key === "sidebar") slot.apply(sidebarModel(m(), error(), timers.now(), sidebarOpen, epic.open), error())
+    if (key === "sidebar") slot.apply(sidebarModel(m(), error(), timers.now(), sidebarOpen, epic.open, blockedOpenFrom(epic.open)), error())
     else if (key === "footer") slot.apply([metricsLine(m())])
     else if (key === "card") slot.apply(cardModel(currentCard, m().queue, epic.open))
     else slot.apply(detailModel(selectedRun(), m().metrics, timers.now(), detailSections), selectedRun())
@@ -214,6 +214,8 @@ async function setup(ctx, deps = {}) {
   const handleSidebarItem = (item) => {
     if (item.sectionKey) toggleSection("sidebar", item.sectionKey)
     else if (item.action === "dispatch") void runAction("dispatch")
+    else if (item.action === "blocked-toggle") toggleAllBlockedGroups(epic, m().queue)
+    else if (item.blockedKey) toggleBlockedGroup(epic, item.blockedKey)
     else if (item.epicKey) epic.toggle(item.epicKey)
     else select(item.runID)
   }

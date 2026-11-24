@@ -56,6 +56,60 @@ func TestEvaluatePendingCheckReturnsWait(t *testing.T) {
 	}
 }
 
+func TestEvaluateWorkflowSkippedDocsOnlyWithNoChecksMerges(t *testing.T) {
+	cfg := Config{RequiredChecks: []string{"build", "vet", "test", "lint"}}
+	obs := core.Observation{PRState: "open", WorkflowSkipped: true}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictMerge {
+		t.Fatalf("verdict = %s, want %s (reason %q)", got.Verdict, core.VerdictMerge, got.Reason)
+	}
+}
+
+func TestEvaluateWorkflowSkippedWithFailureBlocks(t *testing.T) {
+	cfg := Config{RequiredChecks: []string{"build"}}
+	obs := core.Observation{
+		PRState:         "open",
+		WorkflowSkipped: true,
+		Checks:          []core.CheckResult{{Name: "manual", State: core.CheckFailure}},
+	}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictNeedsAgentFix {
+		t.Fatalf("verdict = %s, want %s", got.Verdict, core.VerdictNeedsAgentFix)
+	}
+	if got.Criterion != "invariant" {
+		t.Fatalf("criterion = %q, want invariant", got.Criterion)
+	}
+	if verdict, _ := (ChecksRule{Names: cfg.RequiredChecks}).Evaluate(obs); verdict == core.VerdictNoop {
+		t.Fatal("ChecksRule returned noop for a reported failure")
+	}
+}
+
+func TestEvaluateMissingChecksWithoutSkipWaitsWithCriterion(t *testing.T) {
+	cfg := Config{RequiredChecks: []string{"build", "lint"}}
+	obs := core.Observation{PRState: "open"}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictWait {
+		t.Fatalf("verdict = %s, want %s", got.Verdict, core.VerdictWait)
+	}
+	if got.Criterion != "required_checks" {
+		t.Fatalf("criterion = %q, want required_checks", got.Criterion)
+	}
+	for _, want := range []string{"build", "lint", "missing"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Fatalf("reason = %q, want it to contain %q", got.Reason, want)
+		}
+	}
+}
+
+func TestEvaluateWorkflowSkippedStillAppliesOtherCriteria(t *testing.T) {
+	cfg := Config{RequiredChecks: []string{"build"}, Labels: []string{"ready"}}
+	obs := core.Observation{PRState: "open", WorkflowSkipped: true}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictWait || got.Criterion != "labels" {
+		t.Fatalf("decision = %+v, want wait/labels", got)
+	}
+}
+
 func TestEvaluateFailedCheckReturnsNeedsAgentFix(t *testing.T) {
 	cfg := Config{RequiredChecks: []string{"ci"}}
 	obs := core.Observation{

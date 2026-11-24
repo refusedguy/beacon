@@ -67,6 +67,10 @@ type Observation struct {
 	Conflict          bool
 	FailureExcerpt    string
 	UnresolvedThreads []string
+	// WorkflowSkipped reports that the provider ran no checks because the CI
+	// workflow skipped this diff. Adapters set it only for changes whose paths
+	// the workflow ignores. It is never inferred from an empty check list.
+	WorkflowSkipped bool
 }
 
 func (o Observation) Failure() (CheckResult, bool) {

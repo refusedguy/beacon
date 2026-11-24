@@ -15,7 +15,7 @@ import (
 // ModelResolver resolves a worker model from its parent session. The
 // composition root supplies the OpenCode session lookup. A nil resolver keeps
 // the harness default.
-type ModelResolver func(parentSession string) map[string]string
+type ModelResolver func(parentSession string) core.ModelRef
 
 type Dispatcher struct {
 	Source             core.TaskSource
@@ -283,9 +283,9 @@ func firstNonEmptyLocal(values ...string) string {
 // modelRef resolves the worker model from the run's parent session. The MCP
 // daemon has no BEACON_PARENT_SESSION, so the parent arrives per dispatch in
 // the request metadata and must be resolved here, not at process start.
-func (d *Dispatcher) modelRef(parent string) map[string]string {
+func (d *Dispatcher) modelRef(parent string) core.ModelRef {
 	if d.ResolveModel == nil || parent == "" {
-		return nil
+		return core.ModelRef{}
 	}
 	return d.ResolveModel(parent)
 }

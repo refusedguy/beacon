@@ -5,7 +5,7 @@ import {
   normalizeSnapshot, str,
 } from "./ui_model.js"
 import {
-  baseIncidentItem, checkRow, checksSummary, compactReason, daemonAlertItem,
+  baseIncidentItem, blockedGroupKeys, checkRow, checksSummary, compactReason, daemonAlertItem,
   dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, timelineText, truncate,
 } from "./ui_alerts.js"
 export { shortTaskID }
@@ -187,7 +187,50 @@ export function discardStoredEpicOpen(epic) {
   return epic
 }
 
-export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null) {
+const BLOCKED_PREFIX = "blocked:"
+const blockedStateKey = (depID) => `${BLOCKED_PREFIX}${depID}`
+
+// Blocked groups live in the same persisted map as epics, under a prefixed key
+// so a blocker that is also a card cannot collide with an epic toggle. The
+// startup discard above clears both, so every group begins collapsed.
+export function blockedOpenFrom(epicOpen) {
+  const out = Object.create(null)
+  for (const [key, value] of Object.entries(epicOpen ?? {})) {
+    if (key.startsWith(BLOCKED_PREFIX) && value === true) {
+      out[key.slice(BLOCKED_PREFIX.length)] = true
+    }
+  }
+  return out
+}
+
+export function blockedToggleItem(queue = [], blockedOpen = null) {
+  const keys = blockedGroupKeys(queue)
+  if (!keys.length) return null
+  const expanded = keys.every((key) => blockedOpen?.[key] === true)
+  return {
+    marker: expanded ? "▼" : "▶",
+    name: expanded ? "Collapse all blocked" : "Expand all blocked",
+    status: "", color: "action", nameColor: "action",
+    kind: "queue-blocked-toggle", action: "blocked-toggle",
+  }
+}
+
+export function toggleBlockedGroup(epic, depID) {
+  if (depID) epic.toggle(blockedStateKey(depID))
+}
+
+export function toggleAllBlockedGroups(epic, queue = []) {
+  const keys = blockedGroupKeys(queue)
+  const expanded = keys.length > 0 && keys.every((key) => epic.open[blockedStateKey(key)] === true)
+  const target = !expanded
+  for (const key of keys) {
+    const storageKey = blockedStateKey(key)
+    if ((epic.open[storageKey] === true) !== target) epic.toggle(storageKey)
+  }
+  return keys
+}
+
+export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null, blockedOpen = null) {
   const view = normalizeSnapshot(snapshot)
   const bar = stateBarItem(view)
   const active = activeRuns(view)
@@ -214,7 +257,9 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   }
   listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
   if (open.queue === true) {
-    listItems.push(...queueRows(view.queue, epicOpen))
+    const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen) : null
+    if (toggle) listItems.push(toggle)
+    listItems.push(...queueRows(view.queue, epicOpen, blockedOpen))
     listItems.push(spacerItem())
   }
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
