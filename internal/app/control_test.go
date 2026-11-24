@@ -2,11 +2,131 @@ package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// busyStore injects SQLite write-lock conflicts into the fake store's saves.
+type busyStore struct {
+	*fakeStore
+	mu       sync.Mutex
+	failures map[core.RunID]int
+	saves    map[core.RunID]int
+}
+
+func newBusyStore() *busyStore {
+	return &busyStore{
+		fakeStore: newFakeStore(),
+		failures:  map[core.RunID]int{},
+		saves:     map[core.RunID]int{},
+	}
+}
+
+func (s *busyStore) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
+	run, err := s.fakeStore.Get(ctx, id)
+	if err != nil || run == nil {
+		return run, err
+	}
+	copy := *run
+	return &copy, nil
+}
+
+func (s *busyStore) Save(ctx context.Context, r *core.Run) error {
+	s.mu.Lock()
+	s.saves[r.ID]++
+	failures := s.failures[r.ID]
+	if failures > 0 {
+		s.failures[r.ID]--
+	}
+	s.mu.Unlock()
+	if failures > 0 {
+		return errors.New("database is locked (5) (SQLITE_BUSY)")
+	}
+	return s.fakeStore.Save(ctx, r)
+}
+
+func TestCancelRetriesTransientBusy(t *testing.T) {
+	ctx := context.Background()
+	store := newBusyStore()
+	if err := store.fakeStore.Save(ctx, core.NewRun("r-busy", "T-1", time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	store.failures["r-busy"] = 1
+
+	c := &Control{Store: store}
+	if err := c.Cancel(ctx, "r-busy"); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.runs["r-busy"]; got.State != core.RunClosed {
+		t.Fatalf("state = %s, want %s", got.State, core.RunClosed)
+	}
+	if store.saves["r-busy"] != 2 {
+		t.Fatalf("saves = %d, want 2", store.saves["r-busy"])
+	}
+}
+
+func TestCancelReturnsPersistentBusyAfterBoundedRetries(t *testing.T) {
+	ctx := context.Background()
+	store := newBusyStore()
+	if err := store.fakeStore.Save(ctx, core.NewRun("r-busy", "T-1", time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	store.failures["r-busy"] = 100
+
+	c := &Control{Store: store}
+	err := c.Cancel(ctx, "r-busy")
+	if err == nil || !strings.Contains(err.Error(), "SQLITE_BUSY") {
+		t.Fatalf("error = %v, want SQLITE_BUSY", err)
+	}
+	if store.saves["r-busy"] != controlWriteAttempts {
+		t.Fatalf("saves = %d, want %d", store.saves["r-busy"], controlWriteAttempts)
+	}
+	if got := store.runs["r-busy"]; got.State != core.RunPending {
+		t.Fatalf("state = %s, want %s", got.State, core.RunPending)
+	}
+}
+
+func TestParallelCancelsAllSucceed(t *testing.T) {
+	ctx := context.Background()
+	store := newBusyStore()
+	const n = 8
+	for i := 0; i < n; i++ {
+		id := core.RunID(fmt.Sprintf("r-%d", i))
+		if err := store.fakeStore.Save(ctx, core.NewRun(id, "T-1", time.Now())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &Control{Store: store}
+
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- c.Cancel(ctx, core.RunID(fmt.Sprintf("r-%d", i)))
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < n; i++ {
+		got := store.runs[core.RunID(fmt.Sprintf("r-%d", i))]
+		if got == nil || got.State != core.RunClosed {
+			t.Fatalf("run %d = %+v, want closed", i, got)
+		}
+	}
+}
 
 func TestRetrySignalsReconciler(t *testing.T) {
 	ctx := context.Background()
