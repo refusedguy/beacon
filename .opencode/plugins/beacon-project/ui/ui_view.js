@@ -5,8 +5,8 @@ import {
   normalizeSnapshot, str,
 } from "./ui_model.js"
 import {
-  baseIncidentItem, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, timelineText, truncate,
+  baseIncidentItem, blockedGroupKeys, checkRow, checksSummary, compactReason, daemonAlertItem,
+  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, timelineText, truncate,
 } from "./ui_alerts.js"
 export { shortTaskID }
 
@@ -187,7 +187,50 @@ export function discardStoredEpicOpen(epic) {
   return epic
 }
 
-export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null) {
+const BLOCKED_PREFIX = "blocked:"
+const blockedStateKey = (depID) => `${BLOCKED_PREFIX}${depID}`
+
+// Blocked groups live in the same persisted map as epics, under a prefixed key
+// so a blocker that is also a card cannot collide with an epic toggle. The
+// startup discard above clears both, so every group begins collapsed.
+export function blockedOpenFrom(epicOpen) {
+  const out = Object.create(null)
+  for (const [key, value] of Object.entries(epicOpen ?? {})) {
+    if (key.startsWith(BLOCKED_PREFIX) && value === true) {
+      out[key.slice(BLOCKED_PREFIX.length)] = true
+    }
+  }
+  return out
+}
+
+export function blockedToggleItem(queue = [], blockedOpen = null) {
+  const keys = blockedGroupKeys(queue)
+  if (!keys.length) return null
+  const expanded = keys.every((key) => blockedOpen?.[key] === true)
+  return {
+    marker: expanded ? "▼" : "▶",
+    name: expanded ? "Collapse all blocked" : "Expand all blocked",
+    status: "", color: "action", nameColor: "action",
+    kind: "queue-blocked-toggle", action: "blocked-toggle",
+  }
+}
+
+export function toggleBlockedGroup(epic, depID) {
+  if (depID) epic.toggle(blockedStateKey(depID))
+}
+
+export function toggleAllBlockedGroups(epic, queue = []) {
+  const keys = blockedGroupKeys(queue)
+  const expanded = keys.length > 0 && keys.every((key) => epic.open[blockedStateKey(key)] === true)
+  const target = !expanded
+  for (const key of keys) {
+    const storageKey = blockedStateKey(key)
+    if ((epic.open[storageKey] === true) !== target) epic.toggle(storageKey)
+  }
+  return keys
+}
+
+export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null, blockedOpen = null) {
   const view = normalizeSnapshot(snapshot)
   const bar = stateBarItem(view)
   const active = activeRuns(view)
@@ -213,7 +256,12 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
     }
   }
   listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
-  if (open.queue === true) listItems.push(...queueRows(view.queue, epicOpen))
+  if (open.queue === true) {
+    const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen) : null
+    if (toggle) listItems.push(toggle)
+    listItems.push(...queueRows(view.queue, epicOpen, blockedOpen))
+    listItems.push(spacerItem())
+  }
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
   if (open.recent !== false) {
     if (!recent.length) listItems.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
@@ -224,9 +272,17 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
 export const snapshotLineItems = (snapshot, error, now) => sidebarModel(snapshot, error, now).items
 export const renderSnapshotLines = (snapshot, error, now) => snapshotLineItems(snapshot, error, now)
   .map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))
+const launchOf = (run) => str(run?.launchSource ?? run?.launch_source).toLowerCase()
+export const launchSourceText = (metrics = {}) => {
+  const raw = metrics?.launch_sources ?? metrics?.launchSources
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return ""
+  return Object.entries(raw).filter(([, n]) => Number.isFinite(Number(n)) && Number(n) > 0)
+    .map(([k, n]) => `${str(k).toLowerCase()}:${Number(n)}`).join(" ")
+}
 export const metricsLine = (snapshot = EMPTY_SNAPSHOT) => {
   const item = stateBarItem(snapshot)
-  return { marker: "", name: `Beacon ${item.summary}`, status: item.legend, color: "muted" }
+  const launch = launchSourceText(snapshot?.metrics)
+  return { marker: "", name: `Beacon ${item.summary}`, status: [item.legend, launch].filter(Boolean).join(" · "), color: "muted" }
 }
 
 const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
@@ -289,6 +345,8 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
   if (isOpen("technical")) {
     row({ marker: key("Run ID"), name: run.id || "-", status: "", color: "base", kind: "tech" })
     row({ marker: key("Session"), name: run.sessionID || "-", status: "", color: "base", kind: "tech" })
+    const launch = launchOf(run)
+    if (launch) row({ marker: key("Launch"), name: [launch, str(run.agentIdentity ?? run.agent_identity)].filter(Boolean).join(" · "), status: "", color: "base", kind: "tech" })
     row({ marker: key("Head SHA"), name: run.sha || "-", status: "", color: "base", kind: "tech" })
     const attempts = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
     row({ marker: key("Attempts"), name: attempts, status: "", color: "base", kind: "tech" })

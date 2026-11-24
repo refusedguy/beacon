@@ -22,7 +22,7 @@ import {
   statusPanelEnabled,
   watcherEnabled,
 } from "./index.js"
-import { noopMcpRegistration, registeredBeaconConfig } from "./mcp.js"
+import { noopMcpRegistration, registeredBeaconConfig } from "./mcp/mcp.js"
 
 function fakeCtx() {
   let handler = null

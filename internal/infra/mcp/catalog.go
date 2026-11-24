@@ -11,8 +11,5 @@ var toolRegistrations = []func(*msdk.Server, Services){
 	registerRecent,
 	registerWait,
 	registerControl,
-	registerTaskCreate,
-	registerTaskDelete,
-	registerTaskUpdate,
 	registerReconcile,
 }

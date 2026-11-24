@@ -44,7 +44,7 @@ type Harness struct {
 	Endpoint        string
 	Repo            string
 	Model           string
-	ModelRef        map[string]string
+	ModelRef        core.ModelRef
 	Agent           string
 	Token           string
 	ParentSessionID string
@@ -71,29 +71,17 @@ type Config struct {
 	Client          *http.Client
 }
 
-func New(endpoint string, rest ...string) *Harness {
-	h := &Harness{Endpoint: strings.TrimRight(endpoint, "/"), HTTP: &http.Client{Timeout: requestTimeout}}
-	if len(rest) > 0 {
-		h.Model = rest[0]
+// New builds a Harness from cfg. A nil Client gets a default client with the
+// request timeout.
+func New(cfg Config) *Harness {
+	h := &Harness{
+		Endpoint:        strings.TrimRight(cfg.Endpoint, "/"),
+		Model:           cfg.Model,
+		Agent:           cfg.Agent,
+		Token:           cfg.Token,
+		ParentSessionID: cfg.ParentSessionID,
+		HTTP:            &http.Client{Timeout: requestTimeout},
 	}
-	if len(rest) > 1 {
-		h.Agent = rest[1]
-	}
-	if len(rest) > 2 {
-		h.Token = rest[2]
-	}
-	if len(rest) > 3 {
-		h.ParentSessionID = rest[3]
-	}
-	return h
-}
-
-func NewOpenCode(endpoint, model, token string) *Harness {
-	return New(endpoint, model, "", token)
-}
-
-func NewFromConfig(cfg Config) *Harness {
-	h := New(cfg.Endpoint, cfg.Model, cfg.Agent, cfg.Token, cfg.ParentSessionID)
 	if cfg.Client != nil {
 		h.HTTP = cfg.Client
 	}
@@ -156,17 +144,17 @@ func firstNonEmpty(a, b string) string {
 // dispatch from the parent session wins over the startup fallback. OpenCode
 // child sessions do not inherit the parent model, so the ref is sent both when
 // the session is created and when it is configured. A bare id is not a ref.
-func (h *Harness) modelRef(req core.SpawnRequest) map[string]string {
-	if len(req.ModelRef) > 0 {
+func (h *Harness) modelRef(req core.SpawnRequest) core.ModelRef {
+	if !req.ModelRef.IsZero() {
 		return req.ModelRef
 	}
-	if len(h.ModelRef) > 0 {
+	if !h.ModelRef.IsZero() {
 		return h.ModelRef
 	}
 	if h.Model != "" {
-		return map[string]string{"providerID": "opencode", "id": h.Model}
+		return core.ModelRef{ProviderID: "opencode", ID: h.Model}
 	}
-	return nil
+	return core.ModelRef{}
 }
 
 // SetRepo implements core.RepoSetter. The repo roots RefreshWorktrees to this
@@ -365,7 +353,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	if agent := firstNonEmpty(strings.TrimSpace(req.Task.WorkerAgent), h.Agent); agent != "" {
 		body["agent"] = agent
 	}
-	if ref := h.modelRef(req); ref != nil {
+	if ref := h.modelRef(req); !ref.IsZero() {
 		body["model"] = ref
 	}
 	data, _, err := h.do(ctx, http.MethodPost, "/api/session", body)

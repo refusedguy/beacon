@@ -1,9 +1,11 @@
 // Run: node --test .opencode/plugins/beacon-project/ui_plugin_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
 import { solidModule, themeStub, signalStub } from "./ui_test_helpers.js"
-import { PANEL_NAME, beaconStatusDefinition, createCliStatusSource, createRowMount } from "./ui.js"
+import {
+  DETAIL_LINES, FOOTER_ROWS, PANEL_NAME, beaconStatusDefinition,
+  createCliStatusSource, createDetailMount, createRowMount,
+} from "./ui.js"
 
 test("CLI source forwards snapshot limits as flags", async () => {
   const calls = []
@@ -75,12 +77,13 @@ test("row mount accepts a per-slot row budget", () => {
     mount({ children: [] }, () => [], limit)
     return created.length
   }
-  const footer = makeMount(1)
-  const detail = makeMount(120)
+  const footer = makeMount(FOOTER_ROWS)
+  const detail = makeMount(DETAIL_LINES)
   assert.ok(footer > 0 && footer < 20, `footer allocated ${footer} nodes`)
   assert.ok(detail > footer, `detail allocated ${detail} nodes`)
-  const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
-  assert.ok(src.includes("maxLines: FOOTER_ROWS"), "the footer has a one-line budget")
-  assert.ok(src.includes("createDetailMount(ui,"), "the detail slot owns its own node budget")
-  assert.ok(readFileSync(new URL("./ui_detail_view.js", import.meta.url), "utf8").includes("DETAIL_LINES"))
+  assert.equal(FOOTER_ROWS, 1, "the footer has a one-line budget")
+  assert.ok(DETAIL_LINES > FOOTER_ROWS, "the detail slot has its own larger node budget")
+  const detailCreated = []
+  const detailMount = createDetailMount(solidModule(detailCreated), { color })
+  assert.equal(detailMount.body.node.length, DETAIL_LINES, "the detail slot owns its own node budget")
 })

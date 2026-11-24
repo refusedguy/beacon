@@ -183,4 +183,4 @@ The lint job checks `gofmt -l cmd internal pkg harnesses ui arch_test.go` and ru
 
 ## Notes and decisions
 
-Some Beacon behavior is surprising until you know the reason. `docs/decisions/` records those cases, what caused them, and the options that were considered. Start with [parent session notification delivery](docs/decisions/0001-parent-notify-delivery.md) if a merge notice reaches the chat late.
+Some Beacon behavior is surprising until you know the reason. `docs/decisions/` records those cases, what caused them, and the options that were considered. Start with [parent session notification delivery](docs/decisions/0001-parent-notify-delivery.md) if a merge notice reaches the chat late. Read [the first-render empty queue](docs/decisions/0003-plugin-first-render.md) if the sidebar shows no cards right after an OpenCode restart. See [second harness support](docs/decisions/0002-second-harness.md) for the capability ports and the ACP adapter that made a second harness possible.

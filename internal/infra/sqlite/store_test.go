@@ -440,8 +440,7 @@ func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	app.SetDecisionSink(store)
-	t.Cleanup(func() { app.SetDecisionSink(nil) })
+	logger := app.DecisionLogger{Sink: store}
 
 	first := core.NewRun("r1", "T-1", time.Now().UTC().Add(-2*time.Minute))
 	first.State = core.RunWaitingCI
@@ -452,15 +451,15 @@ func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	app.RecordDecision(ctx, app.Decision{
+	logger.Record(ctx, app.Decision{
 		Kind: "dispatch.skip", RunID: "r1", TaskID: "T-1",
 		Verdict: "scope_overlap", Reason: "scope overlaps T-9",
 		Fields: map[string]any{"blocked_by": "T-9"},
 	})
-	app.RecordDecision(ctx, app.Decision{
+	logger.Record(ctx, app.Decision{
 		Kind: "transition.merge", RunID: "r2", PRNumber: 42, Action: "merged",
 	})
-	app.RecordDecision(ctx, app.Decision{Kind: "dispatch.candidates"})
+	logger.Record(ctx, app.Decision{Kind: "dispatch.candidates"})
 
 	decisions, err := store.ListDecisions(ctx, []string{"r1", "r2"}, 0, 0)
 	if err != nil || len(decisions) != 3 {
@@ -502,8 +501,7 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	app.SetDecisionSink(store)
-	t.Cleanup(func() { app.SetDecisionSink(nil) })
+	logger := app.DecisionLogger{Sink: store}
 
 	run := core.NewRun("r1", "T-1", time.Now().UTC())
 	if err := store.Save(ctx, run); err != nil {
@@ -511,13 +509,13 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 	}
 	base := time.Now().UTC().Add(-time.Hour)
 	for i := 0; i < 5; i++ {
-		app.RecordDecision(ctx, app.Decision{
+		logger.Record(ctx, app.Decision{
 			Kind: "dispatch.skip", RunID: "r1", Verdict: "overlap",
 			At: base.Add(time.Duration(i) * time.Second),
 		})
 	}
 	for i := 0; i < 7; i++ {
-		app.RecordDecision(ctx, app.Decision{
+		logger.Record(ctx, app.Decision{
 			Kind: "dispatch.candidates", At: base.Add(time.Duration(i) * time.Second),
 		})
 	}

@@ -3,17 +3,19 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"testing"
 
 	"github.com/refusedguy/beacon/harnesses/acp"
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/internal/infra/sqlite"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -49,22 +51,6 @@ func TestSetHarnessRepoUsesPort(t *testing.T) {
 		t.Fatalf("repo = %q, want /workspace/repo", h.repo)
 	}
 	setHarnessRepo(bareHarness{}, "/workspace/repo")
-}
-
-func TestModelResolverFromUsesPort(t *testing.T) {
-	if got := modelResolverFrom(bareHarness{}); got != nil {
-		t.Fatalf("resolver for a plain harness = %v, want nil", got)
-	}
-	h := &portHarness{models: map[string]string{"id": "free"}}
-	resolver := modelResolverFrom(h)
-	if resolver == nil {
-		t.Fatal("no resolver for a capable harness")
-	}
-	got := resolver("ses_parent")
-	want := map[string]string{"parent": "ses_parent", "id": "free"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("resolved model = %v, want %v", got, want)
-	}
 }
 
 func TestProjectRootPrefersEnvironment(t *testing.T) {
@@ -155,12 +141,61 @@ func TestNewHarnessACPRequiresCommand(t *testing.T) {
 }
 
 func TestResolveModelUsesConfiguredHarness(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
 	acpCfg := config.Config{Harness: config.Harness{Provider: "acp", Command: "fake-agent"}}
-	if got := resolveModel(acpCfg, "", "ses_parent"); got != nil {
-		t.Fatalf("model for acp = %v, want nil", got)
+	if got := resolveModel(acpCfg, "", "ses_parent"); !got.IsZero() {
+		t.Fatalf("model for acp = %+v, want zero value", got)
 	}
-	if got := resolveModel(config.Config{Harness: config.Harness{Provider: "acp"}}, "", ""); got != nil {
-		t.Fatalf("model for invalid config = %v, want nil", got)
+	if got := resolveModel(config.Config{Harness: config.Harness{Provider: "acp"}}, "", ""); !got.IsZero() {
+		t.Fatalf("model for invalid config = %+v, want zero value", got)
+	}
+}
+
+func TestResolveModelPrefersEnvironmentOverConfig(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "env-model")
+	cfg := config.Config{}
+	cfg.Harness.Model = "config-model"
+	got := resolveModel(cfg, "", "")
+	want := core.ModelRef{ProviderID: "opencode", ID: "env-model"}
+	if got != want {
+		t.Fatalf("resolveModel() = %+v, want %+v", got, want)
+	}
+}
+
+func TestResolveModelUsesConfiguredModel(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	cfg := config.Config{}
+	cfg.Harness.Model = "config-model"
+	got := resolveModel(cfg, "", "")
+	want := core.ModelRef{ProviderID: "opencode", ID: "config-model"}
+	if got != want {
+		t.Fatalf("resolveModel() = %+v, want %+v", got, want)
+	}
+}
+
+func TestResolveModelIsZeroWithoutSource(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	if got := resolveModel(config.Config{}, "", ""); !got.IsZero() {
+		t.Fatalf("resolveModel() = %+v, want zero value", got)
+	}
+}
+
+func TestResolveModelReadsParentSession(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/session/ses_parent" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"model":{"id":"hy4-flash-free","providerID":"opencode","variant":"default"}}}`)
+	}))
+	defer srv.Close()
+	cfg := config.Config{}
+	cfg.Harness.Endpoint = srv.URL
+	got := resolveModel(cfg, "token", "ses_parent")
+	want := core.ModelRef{ProviderID: "opencode", ID: "hy4-flash-free", Variant: "default"}
+	if got != want {
+		t.Fatalf("resolveModel() = %+v, want %+v", got, want)
 	}
 }
 
@@ -217,6 +252,26 @@ func TestWireInfraDoesNotRefreshWorktreesAtStartup(t *testing.T) {
 	}
 	if reloads != 0 {
 		t.Fatalf("startup location reloads = %d, want 0", reloads)
+	}
+}
+
+func TestWireServicesInjectsDecisionSink(t *testing.T) {
+	cfg := config.Config{BaseBranch: "main"}
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	infra := &wiredInfra{
+		store: store, changes: make(chan int, 1),
+		decisions: app.DecisionLogger{Sink: store},
+	}
+	w := wireServices(cfg, t.TempDir(), "", infra)
+	if w.dispatcher.Decisions.Sink != store {
+		t.Error("dispatcher is missing the decision sink")
+	}
+	if w.recon.Decisions.Sink != store {
+		t.Error("reconciler is missing the decision sink")
 	}
 }
 

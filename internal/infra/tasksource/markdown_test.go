@@ -235,6 +235,57 @@ func TestMarkdownMarkInWorkspace(t *testing.T) {
 	}
 }
 
+func TestCardStorePatchStatus(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "odd-name.md")
+	if err := os.WriteFile(legacy, []byte("# T-PATCH. Legacy\nBody line.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fm := filepath.Join(dir, "also-odd.md")
+	if err := os.WriteFile(fm, []byte("---\nid: T-FM\ntitle: Front\n---\n# T-FM. Wrong\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := CardStore{Dir: dir}
+
+	// Lookup follows the parsed ID, not the filename, and a missing status
+	// line is inserted in the card's own format.
+	if err := store.PatchStatus(context.Background(), "T-PATCH", "in_progress"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "Статус: in_progress") {
+		t.Fatalf("legacy status not written: %s", b)
+	}
+	if err := store.PatchStatus(context.Background(), "T-FM", "done"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(fm)
+	if !strings.Contains(string(b), "status: done") {
+		t.Fatalf("frontmatter status not written: %s", b)
+	}
+
+	// A second patch updates the existing line in place rather than adding one.
+	if err := store.PatchStatus(context.Background(), "T-FM", "in_progress"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(fm)
+	if strings.Count(string(b), "status:") != 1 || !strings.Contains(string(b), "status: in_progress") {
+		t.Fatalf("frontmatter status not replaced: %s", b)
+	}
+
+	if err := store.PatchStatus(context.Background(), "T-MISSING", "done"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing card error = %v, want os.ErrNotExist", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.PatchStatus(ctx, "T-FM", "done"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled patch error = %v, want context.Canceled", err)
+	}
+}
+
 func TestNormalizeStatus(t *testing.T) {
 	cases := []struct {
 		raw  string

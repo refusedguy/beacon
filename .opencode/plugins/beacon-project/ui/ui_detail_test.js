@@ -115,15 +115,19 @@ test("setup without injected deps keeps the TUI imports literal", async () => {
   })
 })
 
-test("plugin rendering uses theme tokens and native text styling only", () => {
+test("plugin rendering uses theme tokens and native text styling only", async () => {
   const files = ["ui.js", "ui_nodes.js", "ui_sidebar.js", "ui_detail_view.js", "ui_actions.js"]
   const src = files.map((file) => readFileSync(new URL(`./${file}`, import.meta.url), "utf8")).join("\n")
   assert.equal(/#[0-9a-fA-F]{3,8}\b/.test(src), false, "no hardcoded hex colors")
   assert.equal(/ascii_font/.test(src), false)
   assert.equal(/setProp\([^,]+,\s*"(font|size|width|height)"/.test(src), false)
-  assert.equal(/@opentui\/core/.test(readFileSync(new URL("./ui_view.js", import.meta.url), "utf8")), false)
-  assert.equal(/@opentui\/core/.test(readFileSync(new URL("./ui_model.js", import.meta.url), "utf8")), false)
-  assert.equal(/@opentui\/core/.test(readFileSync(new URL("./ui_bridge.js", import.meta.url), "utf8")), false)
+  // The view, model and bridge modules must load without the TUI peer. The
+  // ui.js import at the top succeeds while @opentui/core is unavailable, so
+  // these exported functions prove none of the three modules imports it.
+  await assert.rejects(import("@opentui/core"), /ERR_MODULE_NOT_FOUND|Cannot find package|Cannot find module/)
+  for (const name of ["detailModel", "normalizeRun", "createRunChangeBridge"]) {
+    assert.equal(typeof ui[name], "function", `${name} loads without @opentui/core`)
+  }
   for (const token of [
     "theme.text.base", "theme.text.muted", "theme.text.action.primary.base",
     "theme.text.feedback", "theme.background.raised.high",

@@ -1,7 +1,7 @@
 // Live subscriptions miss events while the client is disconnected. A failed
 // subscription is dropped and retried with exponential backoff; the poll in
 // setup keeps the panel fresh until the subscription recovers.
-import { locationInfo } from "./location.js"
+import { locationInfo } from "../state/location.js"
 import {
   RESUBSCRIBE_MAX_MS, RESUBSCRIBE_MIN_MS, RUN_CHANGED_EVENT,
   eventKey, eventMatchesLocation,
