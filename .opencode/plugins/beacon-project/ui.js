@@ -7,13 +7,15 @@ export * from "./ui_nodes.js"
 export * from "./ui_sidebar.js"
 export * from "./ui_detail_view.js"
 export * from "./ui_actions.js"
+export * from "./ui_alerts.js"
 
 import {
   EVENT_IDLE_MS, PANEL_NAME, BeaconStatusRpc, EMPTY_SNAPSHOT,
-  createStatusSource, errorMessage, tuiLocation,
+  createStatusSource, errorMessage, str, tuiLocation,
 } from "./ui_model.js"
 import {
-  DETAIL_OPEN, SIDEBAR_OPEN, detailCommand, detailModel, metricsLine, sidebarModel,
+  DETAIL_OPEN, SIDEBAR_OPEN, compactReason, detailCommand, detailModel,
+  metricsLine, sidebarModel,
 } from "./ui_view.js"
 import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
@@ -32,6 +34,28 @@ export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg, maxRows })
     apply()
     return apply
   }
+}
+
+// One notification per run that reaches a terminal or blocked state. The
+// caller owns the state map so each setup keeps its own first-render baseline.
+export function collectTransitionToasts(previous, snapshot) {
+  const runs = new Map()
+  for (const run of [...(snapshot?.active ?? []), ...(snapshot?.recent ?? [])]) {
+    if (run?.id && !runs.has(run.id)) runs.set(run.id, run)
+  }
+  const toasts = []
+  for (const [id, run] of runs) {
+    const state = str(run.state).toLowerCase()
+    const before = previous.get(id)
+    previous.set(id, state)
+    if (before === undefined || before === state) continue
+    if (state === "merged") {
+      toasts.push({ message: `✔ Merged #${run.pr || "?"}: ${str(run.title) || str(run.taskID)}`, variant: "success" })
+    } else if (state === "blocked" || state === "closed") {
+      toasts.push({ message: `▲ ${str(run.taskID) || id}: ${compactReason(run.reason)}`, variant: state === "blocked" ? "error" : "warning" })
+    }
+  }
+  return toasts
 }
 
 async function setup(ctx, deps = {}) {
@@ -165,6 +189,12 @@ async function setup(ctx, deps = {}) {
   }
 
   let pending = false
+  const lastSeenState = new Map()
+  const notify = (snapshot) => {
+    for (const toast of collectTransitionToasts(lastSeenState, snapshot)) {
+      ctx.ui?.toast?.show?.(toast)
+    }
+  }
   const refresh = async () => {
     if (stopped) return
     if (inFlight) { pending = true; return }
@@ -172,7 +202,9 @@ async function setup(ctx, deps = {}) {
     try {
       const next = await source.snapshot()
       if (stopped) return
-      setSnapshot(next ?? EMPTY_SNAPSHOT)
+      const snap = next ?? EMPTY_SNAPSHOT
+      notify(snap)
+      setSnapshot(snap)
       setError(null)
     } catch (cause) { if (!stopped) setError(errorMessage(cause)) }
     finally { inFlight = false }

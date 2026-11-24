@@ -91,7 +91,7 @@ test("row mount reuses nodes across refreshes and keeps the click handler", () =
   })
   const container = { children: [], tag: "box" }
   let items = snapshotLineItems({ active: [makeRun({ title: "First" })], recent: [] }, null, NOW)
-  const apply = mount(container, () => items)
+  const apply = mount(container, () => items, 12)
   const afterFirst = created.length
   const row = container.children.find((box) => box.item?.runID === "run-1")
   const handler = row.props.onMouseDown

@@ -68,7 +68,7 @@ test("detail hero wraps the full title and reasons, and exposes fixed action but
     badge: "▲ BLK · 2s", badgeColor: "error", pr: "No PR yet", branch: "beacon/T-1",
     title: "Working collapsible sections and honest close hint in detail panel".repeat(2),
     task: "T-1", phase: "Run run-1 · Coding 0s · CI 0s · Blocked 2s",
-    actions: ["retry", "approve", "cancel", "copy"],
+    actions: ["retry", "approve", "cancel", "pr", "help", "copy"],
     rows: [
       { marker: "▼", name: "Why / Blocker", status: "", color: "action", bold: true, sectionKey: "why" },
       { marker: "↳", name: "workspace: conflict: refusing to remove dirty worktree at /tmp/wt", status: "", color: "error" },

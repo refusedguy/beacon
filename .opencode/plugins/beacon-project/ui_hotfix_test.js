@@ -60,10 +60,10 @@ test("2. Copy ID is visible from mount and follows state for the other actions",
     mount.apply(detailModel(run, {}, NOW), run)
     return Object.fromEntries(ACTION_NAMES.map((name) => [name, mount.buttons[name].props.visible]))
   }
-  assert.deepEqual(applyFor("merged"), { retry: false, approve: false, cancel: false, copy: true })
-  assert.deepEqual(applyFor("blocked"), { retry: true, approve: false, cancel: false, copy: true })
-  assert.deepEqual(applyFor("waiting_ci"), { retry: false, approve: true, cancel: true, copy: true })
-  assert.deepEqual(applyFor("running"), { retry: false, approve: true, cancel: true, copy: true })
+  assert.deepEqual(applyFor("merged"), { retry: false, approve: false, cancel: false, pr: false, help: false, copy: true })
+  assert.deepEqual(applyFor("blocked"), { retry: true, approve: false, cancel: false, pr: false, help: false, copy: true })
+  assert.deepEqual(applyFor("waiting_ci"), { retry: false, approve: true, cancel: true, pr: false, help: true, copy: true })
+  assert.deepEqual(applyFor("running"), { retry: false, approve: true, cancel: true, pr: false, help: true, copy: true })
 })
 
 test("3. stale storage cannot reopen the Technical section", async () => {

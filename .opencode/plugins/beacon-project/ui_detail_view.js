@@ -6,7 +6,8 @@ import { createBox, createLineMount, createText } from "./ui_nodes.js"
 
 export const DETAIL_LINES = 80
 const ACTION_LABEL = Object.freeze({
-  retry: "↻ Retry", approve: "✔ Approve", cancel: "✖ Cancel", copy: "⧉ Copy ID",
+  retry: "↻ Retry", approve: "✔ Approve", cancel: "✖ Cancel",
+  pr: "⧉ PR URL", help: "💬 Help", copy: "⧉ Copy ID",
 })
 const fieldKey = (text) => text.padEnd(8, " ")
 
@@ -40,7 +41,9 @@ export function createDetailMount(ui, deps) {
   const badge = createText(ui, { content: "", fg: color("base"), bold: true })
   set(badge, "attributes", BOLD)
   const pr = createText(ui, { content: "", fg: color("info") })
-  insert(badgeRow, badge); insert(badgeRow, pr)
+  const fixer = createText(ui, { content: "", fg: color("warning"), bold: true })
+  set(fixer, "attributes", BOLD)
+  insert(badgeRow, badge); insert(badgeRow, pr); insert(badgeRow, fixer)
   insert(heroCard, badgeRow)
 
   // A non-growing wrapped text node keeps its own height inside the column
@@ -63,6 +66,9 @@ export function createDetailMount(ui, deps) {
   const branchValue = kvRow("Branch")
   const phaseValue = kvRow("Phase")
   insert(heroCard, fields)
+
+  const nextStep = createText(ui, { content: "", fg: color("warning"), wrap: true })
+  insert(heroCard, nextStep)
 
   // Each action is a padded box. Copy ID stays mounted and visible so merged
   // and closed runs can still be copied. Cancel shows an inline confirmation.
@@ -137,6 +143,9 @@ export function createDetailMount(ui, deps) {
     set(badge, "content", model.badge ?? "")
     set(badge, "fg", color(model.badgeColor ?? "base"))
     set(pr, "content", model.pr ?? "")
+    set(fixer, "content", model.fixer ?? "")
+    set(nextStep, "content", model.nextStep ?? "")
+    set(nextStep, "visible", Boolean(model.nextStep))
     set(branchValue, "content", model.branch ?? "")
     set(heroTitle, "content", model.title ?? "")
     set(taskValue, "content", model.task ?? "")
@@ -157,6 +166,6 @@ export function createDetailMount(ui, deps) {
   }
   return {
     node: container, apply, buttons, buttonBoxes, heroCard, confirmBox, body,
-    open: DETAIL_OPEN,
+    fixer, nextStep, open: DETAIL_OPEN,
   }
 }

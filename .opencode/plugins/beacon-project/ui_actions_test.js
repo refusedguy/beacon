@@ -98,6 +98,64 @@ test("Copy ID uses OSC52 and reports honestly when unavailable", async () => {
   assert.equal(missing.toasts[0].message, "Clipboard unavailable in this TUI")
 })
 
+test("Retry works on a closed run", async () => {
+  const h = harness()
+  const closed = normalizeRun(makeRun({ ID: "run-9", State: "closed" }))
+  await h.invoke("retry", closed)
+  assert.deepEqual(h.controls, [{ action: "retry", runID: "run-9", sha: "abcdef1234567890" }])
+  assert.equal(h.toasts[0].variant, "success")
+  assert.equal(h.refreshes, 1)
+})
+
+test("Help opens a nudge prompt and sends the entered guidance", async () => {
+  const h = harness()
+  const prompts = []
+  h.ctx.ui.dialog = { prompt: async (options) => { prompts.push(options); return "check the base branch" } }
+  const active = normalizeRun(makeRun({ State: "running" }))
+  await h.invoke("help", active)
+  assert.deepEqual(prompts, [{
+    title: "Nudge worker",
+    description: "Send guidance to the running worker",
+    placeholder: "...",
+  }])
+  assert.deepEqual(h.controls, [{
+    action: "nudge", runID: "run-1", sha: "abcdef1234567890", message: "check the base branch",
+  }])
+  assert.match(h.toasts.at(-1).message, /nudge accepted/)
+  assert.equal(h.refreshes, 1)
+})
+
+test("an empty or missing nudge prompt sends nothing", async () => {
+  const blank = harness()
+  blank.ctx.ui.dialog = { prompt: async () => "   " }
+  await blank.invoke("help", normalizeRun(makeRun({ State: "running" })))
+  assert.equal(blank.controls.length, 0)
+  assert.equal(blank.toasts[0].message, "No guidance sent")
+
+  const missing = harness()
+  await missing.invoke("help", normalizeRun(makeRun({ State: "running" })))
+  assert.equal(missing.controls.length, 0)
+  assert.match(missing.toasts[0].message, /unavailable/)
+})
+
+test("Copy PR URL uses OSC52 and reports honestly when absent or refused", async () => {
+  const url = "https://github.com/o/r/pull/42"
+  const copied = []
+  const ok = harness({ renderer: { copyToClipboardOSC52: (text) => { copied.push(text); return true } } })
+  await ok.invoke("pr", normalizeRun(makeRun({ PRURL: url })))
+  assert.deepEqual(copied, [url])
+  assert.equal(ok.toasts[0].variant, "success")
+
+  const refused = harness({ renderer: { copyToClipboardOSC52: () => false } })
+  await refused.invoke("pr", normalizeRun(makeRun({ PRURL: url })))
+  assert.equal(refused.toasts[0].variant, "warning")
+
+  const absent = harness({ renderer: { copyToClipboardOSC52: () => true } })
+  await absent.invoke("pr", run())
+  assert.equal(absent.toasts[0].message, "No PR URL for this run")
+  assert.equal(absent.toasts[0].variant, "warning")
+})
+
 test("Dispatch starts one task, toasts the result and refreshes", async () => {
   const h = harness()
   await h.invoke("dispatch")
@@ -114,7 +172,10 @@ test("panel buttons and the Dispatch row call the RPC through the real setup", a
   const dispatches = []
   let snapshots = 0
   const rpc = {
-    snapshot: async () => { snapshots++; return { active: [makeRun({ State: "blocked" })], recent: [] } },
+    snapshot: async () => { snapshots++; return {
+      active: [makeRun({ State: "blocked" })], recent: [],
+      queue: [{ id: "T-2", title: "Queued task", status: "ready", priority: 1 }],
+    } },
     control: async (input) => { controls.push(input); return { ok: true } },
     dispatch: async (input) => { dispatches.push(input); return { started: 1 } },
     events: { on: () => () => {} },
