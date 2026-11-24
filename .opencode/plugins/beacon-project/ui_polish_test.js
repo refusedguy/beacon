@@ -280,3 +280,22 @@ test("polished mounts never allocate nodes on refresh without box.children", () 
   assert.equal(created.length, before)
   assert.equal(SIDEBAR_OPEN.queue, false, "the queue still starts collapsed")
 })
+
+test("narrow detail rows wrap and keep the hero controls clickable", () => {
+  const mount = createDetailMount(solidModule([]), detailDeps())
+  const run = normalizeRun(makeRun({ State: "running", PRURL: "https://github.com/o/r/pull/42" }))
+  mount.apply(detailModel(run, {}, NOW), run)
+  const [badgeRow, heroTitle, fields, nextStep, actions, confirmBox] = mount.heroCard.children
+  assert.deepEqual(mount.heroCard.children, [badgeRow, heroTitle, fields, nextStep, actions, confirmBox])
+  for (const node of [badgeRow, actions]) {
+    assert.equal(node.props.flexWrap, "wrap", "the row wraps at a narrow width")
+    assert.equal(node.props.rowGap, 1, "wrapped rows keep a gutter")
+    assert.equal(node.props.flexShrink, 0, "the row keeps its height")
+  }
+  assert.ok(actions.children.every((box) => box.props.flexShrink === 0), "buttons never clip")
+  assert.equal(mount.heroCard.props.overflow, "hidden")
+  assert.equal(mount.node.children.at(-1).props.minHeight, 0, "the scrollbox shrinks")
+  assert.ok(findText(mount.node, "ctrl+g"), "the toggle hint is unchanged")
+  assert.ok(findText(mount.node, "✕"), "the close button is unchanged")
+  assert.ok(findText(mount.node, " "), "the explicit spacer is unchanged")
+})

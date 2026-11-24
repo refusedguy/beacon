@@ -275,7 +275,7 @@ const familyFiles = {
   readFileSync: (path) => path.endsWith("T-EPIC-01.md") ? CHILD_CARD : EPIC_CARD,
 }
 
-test("an epic lists its children and a child links back to its parent epic", async () => {
+test("an epic collapses its children, expands on click and links back from the child", async () => {
   const h = await setup({
     queue: [
       { id: "T-EPIC", title: "Harness epic", status: "ready", priority: 9 },
@@ -284,12 +284,19 @@ test("an epic lists its children and a child links back to its parent epic", asy
     files: familyFiles,
   })
   const sidebar = h.renderers["sidebar.content"]()
-  findItem(sidebar, (item) => item.action === "card:T-EPIC" && item.kind === "queue-title").props.onMouseDown()
+  findItem(sidebar, (item) => item.action === "card:T-EPIC" && item.kind === "queue-status").props.onMouseDown()
   const panel = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
-  const epicTexts = texts(panel)
+  assert.ok(texts(panel).includes("Children (1)"), "the child count stays visible")
+  assert.equal(findItem(panel, (item) => item.kind === "card-child"), null, "children start collapsed")
+  assert.equal(findItem(panel, (item) => item.kind === "card-dep" && item.name === "T-EPIC-01"), null,
+    "the dependency ID is not drawn twice")
+  const toggle = findItem(panel, (item) => item.kind === "card-section" && item.epicKey === "T-EPIC")
+  assert.equal(toggle.children[0].props.content, "▶", "the children row carries a chevron")
+  toggle.props.onMouseDown()
   for (const expected of ["Children (1)", "T-EPIC-01 · Child card", "available"]) {
-    assert.ok(epicTexts.includes(expected), `epic card missing ${expected}`)
+    assert.ok(texts(panel).includes(expected), `epic card missing ${expected}`)
   }
+  assert.equal(toggle.children[0].props.content, "▼", "clicking expands the children")
   const kindRow = findItem(panel, (item) => item.kind === "card-meta" && item.marker.trim() === "Kind")
   assert.equal(kindRow?.children[1].props.content, "epic")
   const child = findItem(panel, (item) => item.kind === "card-child")

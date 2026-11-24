@@ -24,7 +24,7 @@ import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
 import { createDetailMount } from "./ui_detail_view.js"
 import { clipboardCopier, createActionRunner } from "./ui_actions.js"
-import { CARD_PANEL_NAME, cardBackCommand, cardModel, cardRelativePath, createCardMount, fixPrompt } from "./ui_card_view.js"
+import { CARD_PANEL_NAME, cardBackCommand, cardModel, cardRelativePath, createCardMount, createEpicState, fixPrompt } from "./ui_card_view.js"
 import { createRunChangeBridge } from "./ui_bridge.js"
 import { projectRoot } from "./location.js"
 import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
@@ -66,9 +66,8 @@ export function collectTransitionToasts(previous, snapshot) {
 async function setup(ctx, deps = {}) {
   const options = deps.options ?? pluginOptions(ctx)
   if (!statusPanelEnabled(options)) return () => {}
-  // Keep the imports literal so the OpenCode runtime plugin can rewrite them.
-  // A computed import(specifier) is invisible to its rewriter, and this
-  // directory has no node_modules for Bun to resolve the TUI peers.
+  // Keep imports literal: the OpenCode rewriter cannot see computed specifiers,
+  // and this directory has no node_modules for Bun to resolve TUI peers.
   const defaultImport = (specifier) => {
     if (specifier === "@opentui/solid") return import("@opentui/solid")
     if (specifier === "solid-js") return import("solid-js")
@@ -102,6 +101,7 @@ async function setup(ctx, deps = {}) {
     ? ctx.storage.store("beacon-sidebar-sections", { initial: { ...SIDEBAR_OPEN } }) : [{ ...SIDEBAR_OPEN }, () => {}]
   const detailStore = typeof ctx.storage?.store === "function"
     ? ctx.storage.store("beacon-detail-sections", { initial: { ...DETAIL_OPEN } }) : [{ ...DETAIL_OPEN }, () => {}]
+  const epic = createEpicState(ctx, () => applyAll())
   const [selectedID, setSelectedID] = createSignal(store[0].id || "")
   const sidebarOpen = { ...SIDEBAR_OPEN, ...(sidebarStore[0] ?? {}) }
   // A stale stored object must never reopen Technical on load. The other
@@ -131,9 +131,9 @@ async function setup(ctx, deps = {}) {
   function applySlot(key) {
     const slot = slots[key]
     if (!slot || slot.node.isDestroyed) return
-    if (key === "sidebar") slot.apply(sidebarModel(m(), error(), timers.now(), sidebarOpen), error())
+    if (key === "sidebar") slot.apply(sidebarModel(m(), error(), timers.now(), sidebarOpen, epic.open), error())
     else if (key === "footer") slot.apply([metricsLine(m())])
-    else if (key === "card") slot.apply(cardModel(currentCard, m().queue))
+    else if (key === "card") slot.apply(cardModel(currentCard, m().queue, epic.open))
     else slot.apply(detailModel(selectedRun(), m().metrics, timers.now(), detailSections), selectedRun())
   }
   function applyAll() { for (const key of SLOT_KEYS) applySlot(key) }
@@ -188,7 +188,8 @@ async function setup(ctx, deps = {}) {
   }
   const handleCardItem = (item) => {
     const action = str(item?.action ?? "")
-    if (action.startsWith("card:")) showCard(action.slice("card:".length), { push: true })
+    if (action.startsWith("epic:")) epic.toggle(action.slice(5))
+    else if (action.startsWith("card:")) showCard(action.slice("card:".length), { push: true })
   }
   const copyCard = (kind) => {
     const card = currentCard
@@ -212,12 +213,12 @@ async function setup(ctx, deps = {}) {
   const handleSidebarItem = (item) => {
     if (item.sectionKey) toggleSection("sidebar", item.sectionKey)
     else if (item.action === "dispatch") void runAction("dispatch")
+    else if (item.epicKey) epic.toggle(item.epicKey)
     else select(item.runID)
   }
 
-  // Every node is allocated on the first render callback for its slot. OpenCode
-  // unmounts slot trees when a panel opens, so each slot rebuilds only when its
-  // own node reports isDestroyed.
+  // Slots allocate nodes on the first render and rebuild only when OpenCode
+  // unmounts and destroys their tree.
   const slots = Object.create(null)
   const SLOT_KEYS = ["sidebar", "footer", "detail", "card"]
   function ensureSlot(key) {

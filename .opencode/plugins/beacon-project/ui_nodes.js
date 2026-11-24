@@ -2,16 +2,17 @@
 // changes props; it never calls createElement or insert, so refresh() stays
 // safe outside a renderer context. No TUI imports: the caller injects them.
 export function createLineMount(ui, {
-  color, BOLD = 0, onItem, hoverBg, maxLines, wrap = false,
+  color, BOLD = 0, onItem, hoverBg, maxLines, wrap = false, shrinkStatus = false,
 }) {
   const { createElement, insert, setProp } = ui
-  const cell = (grow = false) => {
+  const cell = (grow = false, shrinkable = false) => {
     const node = createElement("text")
     setProp(node, "wrapMode", wrap && grow ? "word" : "none")
     setProp(node, "selectable", false)
     setProp(node, "truncate", !(wrap && grow))
-    setProp(node, "flexShrink", grow ? 1 : 0)
-    if (grow) { setProp(node, "flexGrow", 1); setProp(node, "minWidth", 0) }
+    setProp(node, "flexShrink", grow || shrinkable ? 1 : 0)
+    if (grow || shrinkable) setProp(node, "minWidth", 0)
+    if (grow) setProp(node, "flexGrow", 1)
     return node
   }
   const lines = []
@@ -23,7 +24,7 @@ export function createLineMount(ui, {
     setProp(box, "minWidth", 0)
     const marker = cell()
     const name = cell(true)
-    const status = cell()
+    const status = cell(false, shrinkStatus)
     insert(box, marker); insert(box, name); insert(box, status)
     cellsByLine.push([marker, name, status])
     if (onItem) {

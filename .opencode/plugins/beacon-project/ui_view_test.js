@@ -239,3 +239,60 @@ test("truncate keeps short text unchanged and clips long text", () => {
   assert.equal(truncate("short", 10), "short")
   assert.equal(truncate("abcdefghijklmnopqrstuvwxyz0123456789", 10), "abcdefghi…")
 })
+
+test("queue epics collapse by default and expand through the stored map", () => {
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      { id: "T-EPIC", title: "Harness epic", status: "ready", priority: 9, kind: "epic" },
+      { id: "T-EPIC-01", title: "Child one", status: "available", priority: 8 },
+      { id: "T-EPIC-02", title: "Child two", status: "waiting_deps", priority: 8 },
+    ],
+  }
+  const open = { active: true, queue: true, recent: true }
+  const closed = ui.sidebarModel(snap, null, NOW, open, {}).listItems
+  const epic = closed.find((i) => i.kind === "queue-title" && i.cardID === "T-EPIC")
+  assert.deepEqual([epic.marker, epic.status, epic.action], ["▶", "2", "epic:T-EPIC"])
+  assert.equal(closed.some((i) => i.cardID === "T-EPIC-01"), false)
+  assert.equal(closed.some((i) => i.cardID === "T-EPIC-02"), false)
+  const expanded = ui.sidebarModel(snap, null, NOW, open, { "T-EPIC": true }).listItems
+  assert.equal(expanded.find((i) => i.kind === "queue-title" && i.cardID === "T-EPIC").marker, "▼")
+  assert.ok(expanded.some((i) => i.cardID === "T-EPIC-01"))
+  assert.ok(expanded.some((i) => i.cardID === "T-EPIC-02"))
+  assert.equal(ui.sidebarModel(snap, null, NOW, open).listItems.some((i) => i.cardID === "T-EPIC-01"), true,
+    "callers without a map keep the flat legacy list")
+})
+
+test("card children collapse by default and a child ID is drawn once", () => {
+  const card = {
+    id: "T-EPIC", title: "Epic", status: "ready", priority: 9, kind: "epic", depends: "T-EPIC-01",
+  }
+  const queue = [{ id: "T-EPIC-01", title: "Child", status: "available" }]
+  const closed = ui.cardModel(card, queue, {}).rows
+  const toggle = closed.find((r) => r.kind === "card-section" && r.epicKey === "T-EPIC")
+  assert.deepEqual([toggle.marker, toggle.name, toggle.action], ["▶", "Children (1)", "epic:T-EPIC"])
+  assert.equal(closed.some((r) => r.kind === "card-child"), false)
+  assert.equal(closed.some((r) => r.kind === "card-dep" && r.name === "T-EPIC-01"), false)
+  const expanded = ui.cardModel(card, queue, { "T-EPIC": true }).rows
+  assert.equal(expanded.find((r) => r.kind === "card-section" && r.epicKey === "T-EPIC").marker, "▼")
+  assert.ok(expanded.some((r) => r.kind === "card-child" && r.name === "T-EPIC-01 · Child"))
+})
+
+test("epic state reads only true IDs from storage and persists toggles", () => {
+  const saved = []
+  const value = { "T-EPIC": true, stale: "yes" }
+  const ctx = { storage: { store: (name) => {
+    assert.equal(name, "beacon-epic-sections")
+    return [value, async (fn) => { fn(value); saved.push({ ...value }) }]
+  } } }
+  let changes = 0
+  const epic = ui.createEpicState(ctx, () => { changes += 1 })
+  assert.equal(epic.open["T-EPIC"], true)
+  assert.equal(epic.open.stale, undefined, "a malformed stored value is ignored")
+  epic.toggle("T-NEW")
+  assert.equal(saved.at(-1)["T-NEW"], true)
+  epic.toggle("T-NEW")
+  assert.equal(saved.at(-1)["T-NEW"], false)
+  epic.toggle()
+  assert.equal(changes, 2, "an empty ID does not toggle")
+})
