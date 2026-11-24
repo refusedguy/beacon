@@ -15,7 +15,7 @@ import (
 // DefaultWorkerInstructions is prepended to worker spawn prompts when the
 // operator does not configure harness.worker_instructions. It keeps heavy
 // verification off the operator's machine.
-const DefaultWorkerInstructions = "Worker environment: weak PC. Run targeted tests only for the files or packages you changed; leave full test suites, full builds and full repo linters to CI."
+const DefaultWorkerInstructions = "Worker environment: weak PC. Run targeted tests only for the files or packages you changed; leave full test suites, full builds and full repo linters to CI. Use the beacon_* MCP tools only. Never locate, build or execute the beacon binary or cmd/beacon source from a shell."
 
 type Config struct {
 	StateDB      string      `yaml:"state_db"`

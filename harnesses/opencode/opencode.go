@@ -148,10 +148,14 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-// modelRef returns the resolved model as a Model.Ref object. OpenCode child
-// sessions do not inherit the parent session's model, so the model must be
-// supplied when the session is created. A bare model id is not a valid ref.
-func (h *Harness) modelRef() map[string]string {
+// modelRef returns the model to use as a Model.Ref object. A model resolved at
+// dispatch from the parent session wins over the startup fallback. OpenCode
+// child sessions do not inherit the parent model, so the ref is sent both when
+// the session is created and when it is configured. A bare id is not a ref.
+func (h *Harness) modelRef(req core.SpawnRequest) map[string]string {
+	if len(req.ModelRef) > 0 {
+		return req.ModelRef
+	}
 	if len(h.ModelRef) > 0 {
 		return h.ModelRef
 	}
@@ -302,7 +306,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	if agent := firstNonEmpty(strings.TrimSpace(req.Task.WorkerAgent), h.Agent); agent != "" {
 		body["agent"] = agent
 	}
-	if ref := h.modelRef(); ref != nil {
+	if ref := h.modelRef(req); ref != nil {
 		body["model"] = ref
 	}
 	data, _, err := h.do(ctx, http.MethodPost, "/api/session", body)

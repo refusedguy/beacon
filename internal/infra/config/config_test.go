@@ -106,6 +106,13 @@ func TestLoadDefaultWorkerInstructions(t *testing.T) {
 	}
 }
 
+func TestDefaultWorkerInstructionsForbidCLIFallback(t *testing.T) {
+	want := "Use the beacon_* MCP tools only. Never locate, build or execute the beacon binary or cmd/beacon source from a shell."
+	if !strings.Contains(DefaultWorkerInstructions, want) {
+		t.Fatalf("default lacks the MCP-only rule: %q", DefaultWorkerInstructions)
+	}
+}
+
 func TestLoadWorkerInstructionsOverride(t *testing.T) {
 	const custom = "Use targeted tests. Full builds run in CI."
 	c, err := Load(writeConfig(t, "harness:\n  worker_instructions: "+strconv.Quote(custom)+"\n"))
