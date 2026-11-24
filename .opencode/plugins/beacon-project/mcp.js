@@ -18,6 +18,12 @@ const defaultDeps = {
   execFileSync: defaultExecFileSync,
 }
 
+// Partial dependency objects are useful at call sites that only override one
+// probe. Merge them with the real defaults before any command resolution.
+function normalizeDeps(deps) {
+  return { ...defaultDeps, ...(deps && typeof deps === "object" ? deps : {}) }
+}
+
 // One registration per canonical project root. The operator attaches the MCP
 // server manually. Registration here only records the config for that attach.
 // It never starts, reloads or restarts a daemon.
@@ -95,6 +101,7 @@ function rebuildLocalIfStale(root, local, deps) {
 }
 
 export function beaconCommand(root, deps = defaultDeps) {
+  deps = normalizeDeps(deps)
   const explicit = deps.env.BEACON_BIN
   if (explicit && deps.existsSync(explicit)) return [explicit, "mcp"]
 
@@ -120,9 +127,11 @@ export function beaconServerConfig(root, deps = defaultDeps) {
   if (typeof root !== "string" || root.trim() === "") {
     throw new Error("beacon MCP: project root is required")
   }
+  deps = normalizeDeps(deps)
+  const resolveCommand = typeof deps.beaconCommand === "function" ? deps.beaconCommand : beaconCommand
   return Object.freeze({
     type: "local",
-    command: beaconCommand(root, deps),
+    command: resolveCommand(root, deps),
     cwd: root,
     environment: Object.freeze({ [BEACON_PROJECT_ROOT_ENV]: root }),
     disabled: false,
@@ -133,11 +142,25 @@ export function registeredBeaconConfig(root) {
   return registrations.get(root)?.config ?? null
 }
 
+// A worker session inherits the pooled daemon from its parent. This stands in
+// for a real registration so the plugin's cleanup path stays uniform without
+// resolving a command or touching the registration cache.
+export function noopMcpRegistration() {
+  let disposed = false
+  return Object.freeze({
+    server: BEACON_SERVER,
+    config: null,
+    get disposed() { return disposed },
+    async dispose() { disposed = true },
+  })
+}
+
 // ctx keeps the plugin setup signature. The function does not call ctx.mcp.
 export async function registerBeaconMcp(ctx, root, deps = defaultDeps) {
   if (typeof root !== "string" || root.trim() === "") {
     throw new Error("beacon MCP: project root is required")
   }
+  deps = normalizeDeps(deps)
   const existing = registrations.get(root)
   if (existing) return existing
 

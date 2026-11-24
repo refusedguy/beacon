@@ -5,19 +5,24 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   SHELL_GUARD_RULES,
+  beaconProject,
   buildShellGuardRules,
   commandFromToolInput,
+  createRunChangeWatcher,
+  currentSessionAgent,
   findShellGuardHit,
   guardedAgents,
   guardMode,
+  isWorkerAgent,
   pluginOptions,
   pollIntervalMs,
   registerShellGuard,
+  resolveMcpRegistration,
   snapshotLimits,
   statusPanelEnabled,
   watcherEnabled,
-  createRunChangeWatcher,
 } from "./index.js"
+import { noopMcpRegistration, registeredBeaconConfig } from "./mcp.js"
 
 function fakeCtx() {
   let handler = null
@@ -241,4 +246,111 @@ test("run change watcher honours a custom interval and can be stopped", async ()
   assert.equal(watcher.running, true)
   watcher.stop()
   assert.equal(watcher.running, false)
+})
+
+function beaconCommandSpy(calls) {
+  return (root) => { calls.push(root); return ["/bin/beacon", "mcp"] }
+}
+
+function setupCtx(agent, options = {}, root = "/setup-project") {
+  return {
+    location: { project: { canonical: root } },
+    agent,
+    options,
+    session: {
+      hook: async () => ({ dispose() {} }),
+      list: async () => [],
+    },
+    tool: { hook: async () => ({ dispose() {} }) },
+  }
+}
+
+test("worker agent names are recognised by substring", () => {
+  assert.equal(isWorkerAgent("worker"), true)
+  assert.equal(isWorkerAgent("beacon-worker"), true)
+  assert.equal(isWorkerAgent("Worker"), true)
+  assert.equal(isWorkerAgent("build"), false)
+  assert.equal(isWorkerAgent("orchestrator"), false)
+  assert.equal(isWorkerAgent(null), false)
+})
+
+test("currentSessionAgent resolves an explicit session and the newest session", async () => {
+  const named = {
+    sessionID: "s1",
+    session: { get: async ({ sessionID }) => ({ agent: sessionID === "s1" ? "worker" : "build" }) },
+  }
+  assert.equal(await currentSessionAgent(named), "worker")
+
+  const newest = { session: { list: async () => [{ id: "s2", agent: "beacon-worker" }] } }
+  assert.equal(await currentSessionAgent(newest), "beacon-worker")
+  assert.equal(isWorkerAgent(await currentSessionAgent(newest)), true)
+})
+
+test("a worker skips MCP config registration and command resolution", async (t) => {
+  const root = "/worker-no-mcp"
+  const calls = []
+  const ctx = {
+    agent: "beacon-worker",
+    options: { mcpDeps: { beaconCommand: beaconCommandSpy(calls) } },
+  }
+  const registration = await resolveMcpRegistration(ctx, root)
+  t.after(() => registration.dispose())
+
+  assert.deepEqual(calls, [])
+  assert.equal(registeredBeaconConfig(root), null)
+  assert.equal(registration.config, null)
+  assert.equal(typeof registration.dispose, "function")
+})
+
+test("build and orchestrator agents still register config and resolve the command", async (t) => {
+  for (const agent of ["build", "orchestrator"]) {
+    const root = `/keep-mcp-${agent}`
+    const calls = []
+    const ctx = {
+      agent,
+      options: { mcpDeps: { beaconCommand: beaconCommandSpy(calls) } },
+    }
+    const registration = await resolveMcpRegistration(ctx, root)
+    t.after(() => registration.dispose())
+
+    assert.deepEqual(calls, [root])
+    assert.equal(registeredBeaconConfig(root), registration.config)
+    assert.deepEqual(registration.config.command, ["/bin/beacon", "mcp"])
+  }
+})
+
+test("worker setup skips the status panel and disposes the no-op on cleanup", async () => {
+  let noop = null
+  let panelRegistrations = 0
+  const ctx = setupCtx("worker", {
+    noopMcpRegistration: () => (noop = noopMcpRegistration()),
+  }, "/worker-cleanup")
+  ctx.rpc = { register: async () => { panelRegistrations += 1; return { dispose() {} } } }
+
+  const dispose = await beaconProject.setup(ctx)
+  assert.ok(noop)
+  assert.equal(noop.disposed, false)
+  assert.equal(panelRegistrations, 0)
+
+  await dispose()
+  assert.equal(noop.disposed, true)
+})
+
+test("build setup keeps the status panel RPC for the operator TUI", async () => {
+  let panelRegistrations = 0
+  const ctx = setupCtx("build", {
+    statusPollMs: 0,
+    watcherEnabled: false,
+    mcpDeps: { beaconCommand: () => ["/bin/beacon", "mcp"] },
+  }, "/build-panel")
+  ctx.rpc = {
+    register: async () => {
+      panelRegistrations += 1
+      return { events: { emit() {} }, dispose() {} }
+    },
+  }
+
+  const dispose = await beaconProject.setup(ctx)
+  await dispose()
+  assert.equal(panelRegistrations, 1)
 })
