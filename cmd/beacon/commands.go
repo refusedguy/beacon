@@ -82,7 +82,11 @@ func newStatusCommand(configPath *string) *cobra.Command {
 			defer store.Close()
 			snapshot, _ := cmd.Flags().GetBool("snapshot")
 			if snapshot {
-				result, err := (app.SnapshotService{Store: store}).Snapshot(cmd.Context())
+				recentLimit, _ := cmd.Flags().GetInt("recent-limit")
+				decisionsLimit, _ := cmd.Flags().GetInt("decisions-limit")
+				result, err := (app.SnapshotService{
+					Store: store, RecentLimit: recentLimit, DecisionsLimit: decisionsLimit,
+				}).Snapshot(cmd.Context())
 				if err != nil {
 					return err
 				}
@@ -105,6 +109,8 @@ func newStatusCommand(configPath *string) *cobra.Command {
 	}
 	cmd.Flags().Bool("recent", false, "print recently finished runs instead of active ones")
 	cmd.Flags().Bool("snapshot", false, "print one batched snapshot with runs, history and metrics")
+	cmd.Flags().Int("recent-limit", 0, "cap finished runs in a snapshot (0 uses the default)")
+	cmd.Flags().Int("decisions-limit", 0, "cap decisions per run and run-less decisions in a snapshot (0 uses the default)")
 	cmd.Flags().Bool("daemon", false, "print daemon liveness and heartbeat age instead of runs")
 	return cmd
 }

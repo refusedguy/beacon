@@ -7,9 +7,13 @@ try {
   Plugin = { define: (definition) => definition }
 }
 
-import { locationInfo, projectRoot } from "./location.js"
+import { projectRoot } from "./location.js"
 import { registerBeaconMcp } from "./mcp.js"
 import { installProjectContext } from "./context.js"
+import {
+  pluginOptions, pollIntervalMs, snapshotLimits,
+  statusPanelEnabled, watcherEnabled,
+} from "./options.js"
 import {
   BeaconStatusRpc, REFRESH_MS, RUN_CHANGED_EVENT, changedRuns,
   createCliStatusSource, normalizeSnapshot,
@@ -213,32 +217,36 @@ export const beaconProject = Plugin.define({
     if (!root) return
 
     // Config values may arrive under options or the full config object.
-    const guardConfig = {
-      ...(ctx?.options && typeof ctx.options === "object" ? ctx.options : {}),
-      ...(ctx?.config && typeof ctx.config === "object" ? ctx.config : {}),
-    }
+    const options = pluginOptions(ctx)
 
     // Record the server config for the operator's manual attach. This does not
     // register an MCP server with OpenCode, so no daemon starts per session.
     const mcp = await registerBeaconMcp(ctx, root)
-    const context = await installProjectContext(ctx, root, locationInfo(ctx))
-    const guard = await registerShellGuard(ctx, guardConfig)
+    const context = await installProjectContext(ctx, root, options)
+    const guard = await registerShellGuard(ctx, options)
 
     // One CLI snapshot feeds every panel. The handler normalizes the same
     // shape the TUI source uses, so old fields stay available to both.
-    const statusSource = createCliStatusSource({ root })
+    const limits = snapshotLimits(options)
+    const statusSource = createCliStatusSource({ root, limits })
+    const panelEnabled = statusPanelEnabled(options)
     let statusRpc = null
-    try {
-      statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
-        snapshot: async () => normalizeSnapshot(await statusSource.snapshot()),
-      })
-    } catch (error) {
-      console.warn(`beacon status panel: RPC registration failed: ${error.message}`)
+    if (panelEnabled && typeof ctx.rpc?.register === "function") {
+      try {
+        statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
+          snapshot: async (input) => normalizeSnapshot(await statusSource.snapshot(input ?? limits)),
+        })
+      } catch (error) {
+        console.warn(`beacon status panel: RPC registration failed: ${error.message}`)
+      }
     }
 
-    const watcher = statusRpc ? createRunChangeWatcher(statusSource, {
-      emit: (change) => statusRpc.events?.emit?.(RUN_CHANGED_EVENT, change),
-    }) : null
+    const pollMs = pollIntervalMs(options.statusPollMs)
+    const watcher = statusRpc && watcherEnabled(options) && pollMs > 0
+      ? createRunChangeWatcher(statusSource, {
+        emit: (change) => statusRpc.events?.emit?.(RUN_CHANGED_EVENT, change),
+        deps: { intervalMs: pollMs },
+      }) : null
     watcher?.start()
 
     return async () => {
@@ -251,4 +259,5 @@ export const beaconProject = Plugin.define({
   },
 })
 
+export { pluginOptions, pollIntervalMs, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
 export default beaconProject

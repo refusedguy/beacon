@@ -12,6 +12,21 @@ type StatusService struct{ Store RunStore }
 // DefaultRecentLimit is the number of finished runs returned when no limit is set.
 const DefaultRecentLimit = 20
 
+// DefaultDecisionsLimit caps the decisions attached to one run in a snapshot.
+const DefaultDecisionsLimit = 20
+
+// DefaultOrphanDecisionsLimit caps run-less decisions, which otherwise grow
+// without bound as dispatch cycles accumulate.
+const DefaultOrphanDecisionsLimit = 100
+
+// DecisionCount is a compact aggregate returned by the store for a snapshot.
+type DecisionCount struct {
+	Kind    string
+	Verdict string
+	Action  string
+	Count   int
+}
+
 func (s StatusService) Active(ctx context.Context) ([]*core.Run, error) {
 	return s.Store.ListActive(ctx)
 }
@@ -124,12 +139,15 @@ type SnapshotStore interface {
 	ListActive(ctx context.Context) ([]*core.Run, error)
 	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
 	ListRunEvents(ctx context.Context, runIDs []string) ([]RunEvent, error)
-	ListDecisions(ctx context.Context, runIDs []string) ([]Decision, error)
+	ListDecisions(ctx context.Context, runIDs []string, limit, orphanLimit int) ([]Decision, error)
+	DecisionCounts(ctx context.Context, runIDs []string) ([]DecisionCount, error)
 }
 
 type SnapshotService struct {
-	Store       SnapshotStore
-	RecentLimit int
+	Store                SnapshotStore
+	RecentLimit          int
+	DecisionsLimit       int
+	OrphanDecisionsLimit int
 }
 
 // Snapshot returns active and recent runs with their timelines, decisions and
@@ -152,7 +170,19 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	decisions, err := s.Store.ListDecisions(ctx, ids)
+	decisionLimit := s.DecisionsLimit
+	if decisionLimit <= 0 {
+		decisionLimit = DefaultDecisionsLimit
+	}
+	orphanLimit := s.OrphanDecisionsLimit
+	if orphanLimit <= 0 {
+		orphanLimit = DefaultOrphanDecisionsLimit
+	}
+	decisions, err := s.Store.ListDecisions(ctx, ids, decisionLimit, orphanLimit)
+	if err != nil {
+		return nil, err
+	}
+	counts, err := s.Store.DecisionCounts(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +191,7 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 		GeneratedAt: time.Now().UTC(),
 		Active:      make([]RunSnapshot, 0, len(active)),
 		Recent:      make([]RunSnapshot, 0, len(recent)),
-		Metrics:     makeMetrics(active, recent, timeline, histories),
+		Metrics:     makeMetrics(active, recent, timeline, histories, counts),
 	}
 	for _, run := range active {
 		out.Active = append(out.Active, makeRunSnapshot(run, timeline, histories))
@@ -247,7 +277,12 @@ func addDuration(out *Durations, state core.RunState, seconds int64) {
 	}
 }
 
-func makeMetrics(active, recent []*core.Run, timeline map[string][]RunEvent, histories map[string][]Decision) Metrics {
+func makeMetrics(
+	active, recent []*core.Run,
+	timeline map[string][]RunEvent,
+	histories map[string][]Decision,
+	counts []DecisionCount,
+) Metrics {
 	m := Metrics{Skips: map[string]int{}, Blocked: map[string]int{}}
 	merged := make(map[string]bool)
 	blocked := make(map[string]bool)
@@ -260,8 +295,31 @@ func makeMetrics(active, recent []*core.Run, timeline map[string][]RunEvent, his
 		}
 	}
 	addDecisionMetrics(&m, histories, merged, blocked)
+	addCountMetrics(&m, counts)
 	m.MergeCount = len(merged)
 	return m
+}
+
+func addCountMetrics(m *Metrics, counts []DecisionCount) {
+	for _, c := range counts {
+		switch c.Kind {
+		case "dispatch.candidates":
+			m.DispatchCycles += c.Count
+		case "dispatch.skip":
+			m.SkipCount += c.Count
+			m.Skips[c.Verdict] += c.Count
+		case "transition.spawn":
+			m.DispatchCount += c.Count
+		case "transition.rebase":
+			if c.Action == "rebased" {
+				m.RebaseCount += c.Count
+			}
+		case "transition.wake":
+			if c.Action == "woke" {
+				m.FixCount += c.Count
+			}
+		}
+	}
 }
 
 func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][]RunEvent, merged, blocked map[string]bool) {
@@ -287,21 +345,6 @@ func addDecisionMetrics(m *Metrics, histories map[string][]Decision, merged, blo
 	for _, decisions := range histories {
 		for _, decision := range decisions {
 			switch decision.Kind {
-			case "dispatch.candidates":
-				m.DispatchCycles++
-			case "dispatch.skip":
-				m.SkipCount++
-				m.Skips[decision.Verdict]++
-			case "transition.spawn":
-				m.DispatchCount++
-			case "transition.rebase":
-				if decision.Action == "rebased" {
-					m.RebaseCount++
-				}
-			case "transition.wake":
-				if decision.Action == "woke" {
-					m.FixCount++
-				}
 			case "transition.merge":
 				merged[decision.RunID] = true
 			case "reconcile.decision":

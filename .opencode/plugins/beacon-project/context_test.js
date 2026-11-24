@@ -2,7 +2,10 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { SURVIVAL_KEY, SURVIVAL_RULES, ensureSurvivalRules, installProjectContext } from "./context.js"
+import {
+  ORCHESTRATOR_KEY, ORCHESTRATOR_RULES, SURVIVAL_KEY, SURVIVAL_RULES,
+  ensureSurvivalRules, installProjectContext, sessionInstructions,
+} from "./context.js"
 
 const SESSION = "ses_current"
 
@@ -66,4 +69,38 @@ test("installProjectContext writes rules only for the current session", async ()
 
   assert.equal(ctx.puts.length, 1)
   assert.equal(event.system[0].text, "beacon project root=/project")
+})
+
+test("worker rules list the real Beacon tools", async () => {
+  for (const name of [
+    "beacon_dispatch", "beacon_watch_pr", "beacon_status", "beacon_recent",
+    "beacon_wait", "beacon_control", "beacon_task_create", "beacon_task_delete",
+    "beacon_task_update",
+  ]) {
+    assert.ok(SURVIVAL_RULES.includes(name), `worker rules missing ${name}`)
+  }
+  assert.ok(!SURVIVAL_RULES.includes("The sixth tool"))
+})
+
+test("orchestrator sessions get orchestrator rules instead of worker rules", async () => {
+  const ctx = fakeCtx()
+  const wanted = await sessionInstructions(ctx, { sessionID: SESSION, agent: "orchestrator" })
+  assert.equal(wanted.key, ORCHESTRATOR_KEY)
+  assert.equal(wanted.value, ORCHESTRATOR_RULES)
+  assert.ok(wanted.value.includes("Scope:"))
+})
+
+test("session.get fallback resolves the agent when the event omits it", async () => {
+  const ctx = fakeCtx()
+  ctx.session.get = async () => ({ data: { agent: "worker" } })
+  const wanted = await sessionInstructions(ctx, { sessionID: SESSION })
+  assert.equal(wanted.key, SURVIVAL_KEY)
+  assert.equal(wanted.value, SURVIVAL_RULES)
+})
+
+test("survivalRulesEnabled false disables role instruction injection", async () => {
+  const ctx = fakeCtx()
+  ctx.session.get = async () => ({ data: { agent: "orchestrator" } })
+  const wanted = await sessionInstructions(ctx, { sessionID: SESSION }, { survivalRulesEnabled: false })
+  assert.equal(wanted, null)
 })
