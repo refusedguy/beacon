@@ -71,7 +71,9 @@ async function setup(ctx, deps = {}) {
     ? ctx.storage.store("beacon-detail-sections", { initial: { ...DETAIL_OPEN } }) : [{ ...DETAIL_OPEN }, () => {}]
   const [selectedID, setSelectedID] = createSignal(store[0].id || "")
   const sidebarOpen = { ...SIDEBAR_OPEN, ...(sidebarStore[0] ?? {}) }
-  const detailSections = { ...DETAIL_OPEN, ...(detailStore[0] ?? {}) }
+  // A stale stored object must never reopen Technical on load. The other
+  // sections keep their stored value, defaulting to open via DETAIL_OPEN.
+  const detailSections = { ...DETAIL_OPEN, ...(detailStore[0] ?? {}), technical: false }
   const color = (key) => key === "base" ? theme.text.base
     : key === "muted" ? theme.text.muted
       : key === "action" ? theme.text.action.primary.base

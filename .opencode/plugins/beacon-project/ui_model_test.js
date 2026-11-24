@@ -242,6 +242,6 @@ test("errorMessage handles Error, plain object and string", () => {
 
 test("empty snapshot renders both sections with a dispatch button", () => {
   assert.deepEqual(renderSnapshotLines(EMPTY_SNAPSHOT), [
-    "Beacon no runs", "R0 C0 B0 M0", "▼ Active 0", "No active runs", "▶ Dispatch", "▼ Recent 0", "No recent runs",
+    "Beacon 0 active", "R0 C0 B0 M0", "▼ Active 0", "No active runs", "▶ Dispatch", "▼ Recent 0", "No recent runs",
   ])
 })

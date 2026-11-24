@@ -43,7 +43,9 @@ export function createLineMount(ui, {
       if (!item) { setProp(box, "visible", false); return }
       const [marker, name, status] = cellsByLine[i]
       const fg = color(item.color ?? "base")
-      setProp(marker, "content", item.marker ?? "")
+      // The host does not apply the box gap between text cells. Run markers
+      // carry markerSpace so "✔" never runs into the title as "✔Hotfix".
+      setProp(marker, "content", item.markerSpace && item.marker ? `${item.marker} ` : item.marker ?? "")
       setProp(marker, "fg", fg)
       setProp(name, "content", item.text ?? item.name ?? "")
       setProp(name, "fg", fg)

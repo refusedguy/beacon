@@ -16,7 +16,7 @@ export function createDetailMount(ui, deps) {
   const set = setProp ?? ((node, key, value) => { node.props[key] = value })
   const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
   const header = createBox(ui, { flexDirection: "row", justifyContent: "space-between", minWidth: 0 })
-  const title = createText(ui, { content: "Beacon · Run & Control", fg: color("base"), bold: true })
+  const title = createText(ui, { content: "Beacon", fg: color("base"), bold: true })
   set(title, "attributes", BOLD)
   insert(header, title)
   const controls = createBox(ui, { flexDirection: "row", gap: 1, minWidth: 0 })
@@ -27,14 +27,16 @@ export function createDetailMount(ui, deps) {
   insert(container, header)
 
   const card = createBox(ui, { border: true, borderStyle: "single", borderColor: color("action"), flexDirection: "column", minWidth: 0 })
-  const badgeRow = createBox(ui, { flexDirection: "row", gap: 1, minWidth: 0 })
+  const badgeRow = createBox(ui, { flexDirection: "row", justifyContent: "space-between", gap: 1, minWidth: 0 })
   const badge = createText(ui, { content: "", fg: color("base"), bold: true })
   set(badge, "attributes", BOLD)
   const pr = createText(ui, { content: "", fg: color("info") })
-  const branch = createText(ui, { content: "", fg: color("muted") })
-  insert(badgeRow, badge); insert(badgeRow, pr); insert(badgeRow, branch)
+  insert(badgeRow, badge); insert(badgeRow, pr)
   insert(card, badgeRow)
-  const heroTitle = createText(ui, { content: "", fg: color("base"), wrap: true, grow: true })
+  // A non-growing wrapped text node keeps its own height inside the column
+  // card. A growing one collapsed to zero height in the real host.
+  const heroTitle = createText(ui, { content: "", fg: color("base"), wrap: true })
+  set(heroTitle, "attributes", BOLD)
   insert(card, heroTitle)
   const kvRow = (name) => {
     const row = createBox(ui, { flexDirection: "row", gap: 1, minWidth: 0 })
@@ -45,6 +47,7 @@ export function createDetailMount(ui, deps) {
     return value
   }
   const taskValue = kvRow("Task")
+  const branchValue = kvRow("Branch")
   const phaseValue = kvRow("Phase")
   const actions = createBox(ui, { flexDirection: "row", gap: 1, minWidth: 0 })
   const buttons = Object.create(null)
@@ -53,7 +56,9 @@ export function createDetailMount(ui, deps) {
       content: ACTION_LABEL[name], fg: color(name === "cancel" ? "error" : "action"),
       name: `beacon-action-${name}`, onMouseUp: () => onAction(name),
     })
-    set(node, "visible", false)
+    // Copy ID must be visible from the first mount. The host does not reveal a
+    // button that was created with visible=false on a merged run.
+    set(node, "visible", name === "copy")
     buttons[name] = node
     insert(actions, node)
   }
@@ -69,12 +74,15 @@ export function createDetailMount(ui, deps) {
     set(badge, "content", model.badge ?? "")
     set(badge, "fg", color(model.badgeColor ?? "base"))
     set(pr, "content", model.pr ?? "")
-    set(branch, "content", model.branch ?? "")
+    set(branchValue, "content", model.branch ?? "")
     set(heroTitle, "content", model.title ?? "")
     set(taskValue, "content", model.task ?? "")
     set(phaseValue, "content", model.phase ?? "")
     const available = new Set(model.actions ?? [])
-    for (const name of ACTION_NAMES) set(buttons[name], "visible", available.has(name) && Boolean(run))
+    set(actions, "visible", Boolean(run))
+    for (const name of ACTION_NAMES) {
+      set(buttons[name], "visible", Boolean(run) && (name === "copy" || available.has(name)))
+    }
     body.apply(model.rows ?? [])
   }
   return { node: container, apply, buttons, open: DETAIL_OPEN }

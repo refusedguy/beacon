@@ -110,8 +110,10 @@ export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
 
 export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
   const view = normalizeSnapshot(snapshot)
+  const active = activeRuns(view)
+  const recent = recentRuns(view)
   const counts = { running: 0, waiting_ci: 0, blocked: 0, merged: 0 }
-  for (const run of [...view.active, ...view.recent]) {
+  for (const run of [...active, ...recent]) {
     const state = str(run.state).toLowerCase()
     if (Object.hasOwn(counts, state)) counts[state] += 1
   }
@@ -129,13 +131,11 @@ export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
   const mergeTotal = view.metrics?.mergeCount ?? counts.merged
   const legend = STATE_BAR_KEYS.map((key) => `${STATE_BAR_LETTER[key]}${key === "merged" ? mergeTotal : counts[key]}`).join(" ")
   const parts = []
+  if (!active.length) parts.push("0 active")
   if (counts.running) parts.push(`${counts.running} running`)
   if (counts.waiting_ci) parts.push(`${counts.waiting_ci} in CI`)
   if (counts.blocked) parts.push(`${counts.blocked} blocked`)
-  const fixing = str(view.metrics?.rebaseCount) && Number(view.metrics.rebaseCount) + Number(view.metrics.fixCount) > 0
-    ? Number(view.metrics.rebaseCount) + Number(view.metrics.fixCount) : 0
-  if (fixing) parts.push(`${fixing} needs work`)
-  if (mergeTotal) parts.push(`${mergeTotal} done`)
+  if (counts.merged) parts.push(`${counts.merged} done`)
   const summary = parts.length ? parts.join(" · ") : "no runs"
   return {
     segments, bar, counts, mergeTotal, total, filled, legend, summary,
@@ -154,8 +154,8 @@ export function runLineItems(run, now = Date.now(), recent = false) {
   const duration = recent ? tookOf(run) : phaseLabel(run, now)
   const reason = state === "merged" ? "" : compactReason(run.reason)
   return [
-    { marker: v.marker, name: title, status: v.label, color: v.color, bold: true, runID: run.id },
-    { marker: ref, name: duration, status: reason, color: "muted", runID: run.id },
+    { marker: v.marker, markerSpace: true, name: title, status: v.label, color: v.color, bold: true, runID: run.id },
+    { marker: ref, markerSpace: true, name: duration, status: reason, color: "muted", runID: run.id },
   ]
 }
 const sectionItem = (label, count, key, open) => ({
@@ -255,9 +255,9 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     else decisions.forEach((d) => row(`${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd()))
   }
   return {
-    badge: `${v.marker} ${v.label} · ${ageOf(run, now)}`,
+    badge: `${v.marker} ${v.label}`,
     badgeColor: v.color,
-    pr: run.pr ? `PR #${run.pr}` : "No PR yet",
+    pr: run.pr ? `#${run.pr}` : "No PR",
     branch: run.branch || "-",
     title: str(run.title) || str(run.taskID) || "-",
     task: run.taskID || "-",

@@ -25,7 +25,7 @@ test("state bar builds proportional colored segments and a human summary", () =>
       makeRun({ ID: "a", State: "running" }), makeRun({ ID: "b", State: "running" }),
       makeRun({ ID: "c", State: "waiting_ci" }), makeRun({ ID: "d", State: "blocked" }),
     ],
-    recent: [makeRun({ ID: "e", State: "merged" })],
+    recent: [makeRun({ ID: "e", TaskID: "T-E", State: "merged" })],
     metrics: { merge_count: 51, rebase_count: 2, fix_count: 1 },
   })
   assert.deepEqual(item.counts, { running: 2, waiting_ci: 1, blocked: 1, merged: 1 })
@@ -34,7 +34,7 @@ test("state bar builds proportional colored segments and a human summary", () =>
   assert.equal(item.segments.reduce((n, s) => n + s.text.length, 0), STATE_BAR_WIDTH)
   assert.deepEqual(item.segments.map((s) => s.color), ["success", "info", "error", "success", "muted"])
   assert.equal(item.legend, "R2 C1 B1 M51")
-  assert.equal(item.summary, "2 running · 1 in CI · 1 blocked · 3 needs work · 51 done")
+  assert.equal(item.summary, "2 running · 1 in CI · 1 blocked · 1 done")
   assert.equal(item.fg, "error", "a blocked run colors the bar with the error tone")
   const big = stateBarItem({ active: Array.from({ length: 20 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })), recent: [] })
   assert.equal(big.filled, STATE_BAR_WIDTH)
@@ -70,10 +70,10 @@ test("run rows keep the full title and put PR, duration and cause on line two", 
   const title = "Make worktree registration refresh reliable at every exit"
   const [first, second] = runLineItems(normalizeRun(makeRun({ State: "blocked", title })), NOW)
   assert.deepEqual(first, {
-    marker: "▲", name: title, status: "BLK", color: "error", bold: true, runID: "run-1",
+    marker: "▲", markerSpace: true, name: title, status: "BLK", color: "error", bold: true, runID: "run-1",
   })
   assert.deepEqual(second, {
-    marker: "#42", name: "3m", status: "waiting CI", color: "muted", runID: "run-1",
+    marker: "#42", markerSpace: true, name: "3m", status: "waiting CI", color: "muted", runID: "run-1",
   })
 })
 
@@ -137,8 +137,8 @@ test("detail model uses four sections with full wrapping text", () => {
   const metrics = { dispatchCount: 25, rebaseCount: 2, fixCount: 1, mergeCount: 3 }
   const model = detailModel(run, metrics, NOW, { ...DETAIL_OPEN, technical: true })
   assert.equal(model.title, longTitle, "the hero uses the full title")
-  assert.equal(model.badge, "▲ BLK · 3m")
-  assert.equal(model.pr, "PR #42")
+  assert.equal(model.badge, "▲ BLK")
+  assert.equal(model.pr, "#42")
   assert.equal(model.branch, "beacon/T-1")
   assert.equal(model.task, "T-1")
   assert.ok(model.phase.includes("Coding 5s") && model.phase.includes("CI 1m"))
