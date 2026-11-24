@@ -162,14 +162,13 @@ func TestDuplicateReconcileDecisionsAreSkipped(t *testing.T) {
 	ctx := context.Background()
 	logs := captureDecisions(t)
 	sink := &memoryDecisionSink{}
-	SetDecisionSink(sink)
-	t.Cleanup(func() { SetDecisionSink(nil) })
+	logger := DecisionLogger{Sink: sink}
 
 	run := makeRun("r-decision", 42, core.RunWaitingCI)
 	obs := core.Observation{HeadSHA: "sha42", PRNumber: 42}
 	decision := core.MergeDecision{Verdict: core.VerdictWait, Reason: "checks pending"}
-	logReconcileDecision(ctx, 42, run, obs, decision, "wait")
-	logReconcileDecision(ctx, 42, run, obs, decision, "wait")
+	logger.logReconcileDecision(ctx, 42, run, obs, decision, "wait")
+	logger.logReconcileDecision(ctx, 42, run, obs, decision, "wait")
 	if len(sink.decisions) != 1 {
 		t.Fatalf("stored decisions = %d, want 1", len(sink.decisions))
 	}
@@ -184,7 +183,7 @@ func TestDuplicateReconcileDecisionsAreSkipped(t *testing.T) {
 	}
 
 	obs.HeadSHA = "sha43"
-	logReconcileDecision(ctx, 42, run, obs, decision, "wait")
+	logger.logReconcileDecision(ctx, 42, run, obs, decision, "wait")
 	if len(sink.decisions) != 2 {
 		t.Fatalf("stored decisions = %d, want 2 after head change", len(sink.decisions))
 	}

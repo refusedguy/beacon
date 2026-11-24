@@ -29,6 +29,7 @@ type Dispatcher struct {
 	ParentSessionID    string
 	WorkerInstructions string
 	ResolveModel       ModelResolver
+	Decisions          DecisionLogger
 }
 
 var _ core.AgentSlots = (*Dispatcher)(nil)
@@ -74,7 +75,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 		limit = free
 	}
 	budget := d.Available(ctx)
-	logDispatchCandidates(ctx, len(ready), len(active), limit, budget)
+	d.Decisions.logDispatchCandidates(ctx, len(ready), len(active), limit, budget)
 	if limit <= 0 {
 		return out, nil
 	}
@@ -84,7 +85,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	}
 	out.Skipped = skipped
 	for _, s := range skipped {
-		logDispatchSkip(ctx, s)
+		d.Decisions.logDispatchSkip(ctx, s)
 	}
 	for _, task := range chosen {
 		if existing, err := d.Store.FindActiveByTask(ctx, task.ID); err != nil {
@@ -98,7 +99,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 				Reason:       "already has an active run",
 			}
 			out.Skipped = append(out.Skipped, skip)
-			logDispatchSkip(ctx, skip)
+			d.Decisions.logDispatchSkip(ctx, skip)
 			continue
 		}
 		run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
@@ -192,7 +193,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	run.SessionID = session.ID
 	if session.PR != 0 {
 		run.PRNumber = session.PR
-		logTransitionWatchPR(ctx, run.ID, session.PR)
+		d.Decisions.logTransitionWatchPR(ctx, run.ID, session.PR)
 	}
 	if err := run.Apply(core.Event{Kind: core.EvStart}); err != nil {
 		return err
@@ -200,7 +201,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	if err := d.Store.Save(ctx, run); err != nil {
 		return fmt.Errorf("save: %w", err)
 	}
-	logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
+	d.Decisions.logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
 	// MarkInWorkspace already sets in_progress inside the worker branch, and
 	// FindActiveByTask blocks a second run. Claiming through the root source
 	// would only rewrite the card on the operator's main checkout, leaving it

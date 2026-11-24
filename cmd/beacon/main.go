@@ -62,6 +62,7 @@ type wiredInfra struct {
 	scm          core.ScmGateway
 	changes      chan int
 	resolveModel app.ModelResolver
+	decisions    app.DecisionLogger
 }
 
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
@@ -184,7 +185,8 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 		wt.Refresher = refresher
 	}
 	infra := &wiredInfra{store: store, source: source, harness: h,
-		workspace: wt, scm: scmGW, changes: make(chan int, 64)}
+		workspace: wt, scm: scmGW, changes: make(chan int, 64),
+		decisions: app.DecisionLogger{Sink: store}}
 	// resolveModel closes over the wired endpoint and token so a dispatch can
 	// look up the parent session's model even when no parent was known at start.
 	infra.resolveModel = func(parent string) core.ModelRef {
@@ -216,6 +218,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		ParentSessionID:    firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
 		WorkerInstructions: cfg.Harness.WorkerInstructions,
 		ResolveModel:       infra.resolveModel,
+		Decisions:          infra.decisions,
 	}
 	ctrl := &app.Control{Store: infra.store, Harness: infra.harness, Workspace: infra.workspace, OnChange: func(pr int) {
 		select {
@@ -226,6 +229,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 	recon := newReconciler(cfg, infra.store, infra.scm, infra.harness,
 		infra.source, infra.workspace, disp, infra.changes,
 		firstNonEmpty(parentSession, cfg.Harness.ParentSessionID))
+	recon.Decisions = infra.decisions
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: infra.harness,
 		workspace: infra.workspace, scm: infra.scm, policy: recon.Policy,

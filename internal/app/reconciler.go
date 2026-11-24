@@ -34,6 +34,7 @@ type Reconciler struct {
 	OrphanTimeout   time.Duration
 	Events          <-chan core.HarnessEvent
 	AutoRebase      bool
+	Decisions       DecisionLogger
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.MergeDecision, err error) {
@@ -54,7 +55,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	if err := r.Store.Save(ctx, run); err != nil {
 		return core.MergeDecision{}, err
 	}
-	defer logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
+	defer r.Decisions.logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
 	if closed := closedPRVerdict(obs.PRState); closed != nil {
 		return *closed, r.finalizeExternal(ctx, run, obs)
 	}
@@ -105,17 +106,17 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 		}
 	}
 	key := fmt.Sprintf("merge:%d:%s", obs.PRNumber, obs.HeadSHA)
-	logTransitionMerge(ctx, run.ID, obs.PRNumber, "attempt")
+	r.Decisions.logTransitionMerge(ctx, run.ID, obs.PRNumber, "attempt")
 	if err := r.SCM.Merge(ctx, obs.PRNumber, obs.HeadSHA, string(run.TaskID)); err != nil {
 		return err
 	}
 	if ok, err := r.Store.ClaimDelivery(ctx, key); err != nil {
 		return err
 	} else if !ok {
-		logTransitionDeliveryClaim(ctx, run.ID, obs.PRNumber, false)
+		r.Decisions.logTransitionDeliveryClaim(ctx, run.ID, obs.PRNumber, false)
 		return nil
 	}
-	logTransitionDeliveryClaim(ctx, run.ID, obs.PRNumber, true)
+	r.Decisions.logTransitionDeliveryClaim(ctx, run.ID, obs.PRNumber, true)
 	if err := run.Apply(core.Event{
 		Kind: core.EvMerged, HeadSHA: obs.HeadSHA,
 		Reason: fmt.Sprintf("merged PR #%d via squash", obs.PRNumber),
@@ -170,7 +171,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	}
 	newSHA, err := r.SCM.UpdateBranch(ctx, obs.PRNumber, obs.HeadSHA)
 	if err != nil {
-		logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts+1, "", "failed")
+		r.Decisions.logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts+1, "", "failed")
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}, obs); err != nil {
 			return err
 		}
@@ -179,7 +180,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}, core.Observation{HeadSHA: newSHA, BaseSHA: obs.BaseSHA}); err != nil {
 		return err
 	}
-	logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts, newSHA, "rebased")
+	r.Decisions.logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts, newSHA, "rebased")
 	return nil
 }
 
@@ -205,7 +206,7 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 	if err := r.Harness.Wake(ctx, run.SessionID, w); err != nil {
 		return fmt.Errorf("wake: %w", err)
 	}
-	logTransitionWake(ctx, run.ID, obs.PRNumber, "woke")
+	r.Decisions.logTransitionWake(ctx, run.ID, obs.PRNumber, "woke")
 	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed, Reason: reason}, obs)
 }
 
