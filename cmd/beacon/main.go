@@ -54,12 +54,7 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
-	scmToken := firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token)
-	sourceToken := os.Getenv(cfg.TaskSource.TokenEnv)
-	if sourceToken == "" {
-		sourceToken = scmToken
-	}
-	harnessToken := firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token)
+	scmToken, sourceToken, harnessToken := loadTokens(cfg)
 	store, err := sqlite.Open(cfg.StateDB)
 	if err != nil {
 		return nil, err
@@ -131,6 +126,16 @@ func wire(path, parentSession string) (*wiring, error) {
 		wait:        app.WaitService{Store: store, Interval: time.Second},
 		taskCreator: taskCreator, recon: recon,
 	}, nil
+}
+
+func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) {
+	scmToken = firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token)
+	sourceToken = os.Getenv(cfg.TaskSource.TokenEnv)
+	if sourceToken == "" {
+		sourceToken = scmToken
+	}
+	harnessToken = firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token)
+	return
 }
 
 func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, error) {
