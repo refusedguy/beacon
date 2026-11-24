@@ -13,6 +13,7 @@ const {
   PANEL_NAME,
   RECENT_LIMIT,
   REASON_WIDTH,
+  STATE_BAR_WIDTH,
   TITLE_WIDTH,
   beaconStatusDefinition,
   createCliStatusSource,
@@ -31,9 +32,73 @@ const {
   renderSnapshotLines,
   runLineItems,
   snapshotLineItems,
+  stateBarItem,
   truncate,
   default: beaconStatus,
 } = ui
+
+test("state bar builds a proportional one-row visualization", () => {
+  const item = stateBarItem({
+    active: [
+      makeRun({ ID: "a", State: "running" }), makeRun({ ID: "b", State: "running" }),
+      makeRun({ ID: "c", State: "waiting_ci" }), makeRun({ ID: "d", State: "blocked" }),
+    ],
+    recent: [makeRun({ ID: "e", State: "merged" })],
+  })
+  assert.deepEqual(item.counts, { running: 2, waiting_ci: 1, blocked: 1, merged: 1 })
+  assert.equal(item.filled, 5)
+  assert.equal((item.bar.match(/█/g) ?? []).length, 5)
+  assert.equal((item.bar.match(/░/g) ?? []).length, STATE_BAR_WIDTH - 5)
+  assert.ok(item.content.startsWith("states ") && item.content.includes("R2 C1 B1 M1"))
+  assert.equal(item.fg, "error", "a blocked run colors the bar with the error tone")
+  const big = stateBarItem({ active: Array.from({ length: 20 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })), recent: [] })
+  assert.equal(big.filled, STATE_BAR_WIDTH)
+  assert.equal((big.bar.match(/█/g) ?? []).length, STATE_BAR_WIDTH)
+  assert.equal((big.bar.match(/░/g) ?? []).length, 0)
+  assert.ok(big.content.includes("R20"))
+  const empty = stateBarItem(EMPTY_SNAPSHOT)
+  assert.equal(empty.bar, "░".repeat(STATE_BAR_WIDTH))
+  assert.ok(empty.content.includes("R0 C0 B0 M0"))
+})
+
+test("sidebar bar updates on refresh without allocating nodes", async () => {
+  let current = { active: [makeRun({ ID: "r-1", State: "running" })], recent: [] }
+  const created = []
+  const renderers = Object.create(null)
+  let tick = null
+  const ctx = {
+    theme: themeStub(),
+    client: { rpc: () => ({ snapshot: async () => current }) },
+    storage: { store: () => [{ id: "" }, async () => {}] },
+    ui: { slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }, panel: { open: () => {} } },
+    keymap: { layer: () => () => {} },
+  }
+  const modules = {
+    "@opentui/solid": solidModule(created),
+    "solid-js": { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } },
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+  const deps = {
+    options: { statusPollMs: 1000, watcherEnabled: false },
+    import: (specifier) => modules[specifier],
+    setInterval: (fn) => { tick = fn; return 1 }, clearInterval: () => {},
+    setTimeout: () => 1, clearTimeout: () => {},
+  }
+  const dispose = await beaconStatusDefinition.setup(ctx, deps)
+  await new Promise((resolve) => setImmediate(resolve))
+  const sidebar = renderers["sidebar.content"]()
+  const bar = sidebar.children[0]
+  assert.ok(bar.props.content.startsWith("states ") && bar.props.content.includes("R1"))
+  const before = created.length
+  current = { active: [makeRun({ ID: "r-1", State: "blocked" })], recent: [] }
+  tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(created.length, before, "refresh must not create nodes")
+  assert.equal(sidebar.children[0], bar, "the bar node is reused")
+  assert.ok(bar.props.content.includes("B1"), "refresh updates the bar content")
+  assert.equal(bar.props.fg, "error", "refresh updates the bar color")
+  dispose()
+})
 
 test("row mount reuses nodes across refreshes and keeps the click handler", () => {
   let nextNode = 0
