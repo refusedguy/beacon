@@ -2,16 +2,70 @@ package workspace
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+type refreshRecorder struct {
+	mu        sync.Mutex
+	refreshes []map[string]any
+	status    int
+}
+
+func (r *refreshRecorder) snapshot() []map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]map[string]any(nil), r.refreshes...)
+}
+
+func newRefreshServer(t *testing.T, canonical string, status int) (*httptest.Server, *refreshRecorder) {
+	t.Helper()
+	rec := &refreshRecorder{status: status}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/project":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]string{{"id": "prj_beacon", "canonical": canonical}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/worktree/refresh":
+			body := map[string]any{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rec.mu.Lock()
+			rec.refreshes = append(rec.refreshes, body)
+			rec.mu.Unlock()
+			if rec.status != 0 {
+				w.WriteHeader(rec.status)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, rec
+}
+
+func worktreeWithRefresher(t *testing.T, status int) (*GitWorktree, *refreshRecorder) {
+	t.Helper()
+	wt, repo := newTestGitWorktree(t)
+	srv, rec := newRefreshServer(t, repo, status)
+	h := opencode.New(srv.URL)
+	h.Repo = repo
+	wt.Refresher = h
+	return wt, rec
+}
 
 func gitCmd(t *testing.T, dir string, args ...string) string {
 	t.Helper()
@@ -361,5 +415,75 @@ func TestGitWorktreeHasChanges(t *testing.T) {
 	}
 	if changed, err := wt.HasChanges(ctx, ws, "main"); err != nil || !changed {
 		t.Fatalf("HasChanges() with commit-only change = %v, %v; want true, nil", changed, err)
+	}
+}
+
+func TestWorktreeRemoveRefreshesOpenCode(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, 0)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-REFRESH"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Remove(ctx, ws); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	refreshes := rec.snapshot()
+	if len(refreshes) != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1", len(refreshes))
+	}
+	if got := refreshes[0]["projectID"]; got != "prj_beacon" {
+		t.Fatalf("refresh projectID = %v, want prj_beacon", got)
+	}
+}
+
+func TestWorktreeRemoveRefreshesAfterOutOfBandDelete(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, 0)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-STALE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(ws.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Remove(ctx, ws); err != nil {
+		t.Fatalf("Remove() after out-of-band delete = %v, want nil", err)
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1", got)
+	}
+}
+
+func TestWorktreeRemoveIgnoresRefreshFailure(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, http.StatusInternalServerError)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-REFRESH-FAIL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Remove(ctx, ws); err != nil {
+		t.Fatalf("Remove() with failing refresh = %v, want nil", err)
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1", got)
+	}
+}
+
+func TestForceRemoveRefreshesOpenCode(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, 0)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-FORCE-REFRESH"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.Path, "WIP.txt"), []byte("agent work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.ForceRemove(ctx, ws); err != nil {
+		t.Fatalf("ForceRemove() error = %v", err)
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1", got)
 	}
 }

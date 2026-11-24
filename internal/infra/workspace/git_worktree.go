@@ -4,6 +4,7 @@ package workspace
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,11 +18,12 @@ import (
 )
 
 type GitWorktree struct {
-	Repo    string
-	Root    string
-	Base    string
-	Dir     string
-	Timeout time.Duration
+	Repo      string
+	Root      string
+	Base      string
+	Dir       string
+	Timeout   time.Duration
+	Refresher core.WorktreeRefresher
 }
 
 func New(repo, base, dir string) (*GitWorktree, error) {
@@ -132,9 +134,9 @@ func (g *GitWorktree) Clean(ctx context.Context, ws core.Workspace) (bool, error
 }
 
 // RebaseBase fetches origin/<base> and rebases the workspace's local branch on
-// it. Publishing a card calls this before committing so a stale local base does
-// not make the push fail as non-fast-forward. A failed rebase is aborted so the
-// workspace is not left mid-rebase on a retry.
+// it. The ref may be the configured base branch before a card is published, or
+// the workspace's own branch after a push was rejected as non-fast-forward.
+// A failed rebase is aborted so the workspace is not left mid-rebase on a retry.
 func (g *GitWorktree) RebaseBase(ctx context.Context, ws core.Workspace, base string) error {
 	if err := checkPath(ws.Path); err != nil {
 		return err
@@ -214,20 +216,38 @@ func (g *GitWorktree) HasChanges(ctx context.Context, ws core.Workspace, base st
 	return n > 0, nil
 }
 
+func (g *GitWorktree) refresh(ctx context.Context) {
+	if g.Refresher == nil {
+		return
+	}
+	if err := g.Refresher.RefreshWorktrees(ctx); err != nil {
+		slog.Warn("worktree refresh failed", "error", err)
+	}
+}
+
 func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	if ws.Path == "" {
 		return nil
 	}
-	clean, err := g.Clean(ctx, ws)
-	if err != nil || !clean {
-		if err == nil {
-			return fmt.Errorf("refusing to remove dirty worktree %s", ws.Path)
+	// A directory removed outside this method is not dirty. It still needs the
+	// editor registration refreshed, so skip the clean check but keep going.
+	clean := true
+	if _, err := os.Stat(ws.Path); err == nil {
+		var checkErr error
+		clean, checkErr = g.Clean(ctx, ws)
+		if checkErr != nil {
+			return checkErr
 		}
+	} else if !os.IsNotExist(err) {
 		return err
+	}
+	if !clean {
+		return fmt.Errorf("refusing to remove dirty worktree %s", ws.Path)
 	}
 	if _, err := g.run(ctx, "worktree", "remove", ws.Path); err != nil {
 		return err
 	}
+	g.refresh(ctx)
 	if ws.Branch != "" {
 		_, _ = g.run(ctx, "branch", "-d", ws.Branch)
 	}
@@ -236,8 +256,11 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 
 func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error {
 	_, err := g.run(ctx, "worktree", "remove", "--force", ws.Path)
-	if err == nil && ws.Branch != "" {
-		_, _ = g.run(ctx, "branch", "-D", ws.Branch)
+	if err == nil {
+		g.refresh(ctx)
+		if ws.Branch != "" {
+			_, _ = g.run(ctx, "branch", "-D", ws.Branch)
+		}
 	}
 	return err
 }

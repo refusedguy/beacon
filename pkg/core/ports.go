@@ -74,6 +74,12 @@ type AgentHarness interface {
 	Events() <-chan HarnessEvent
 }
 
+// WorktreeRefresher reconciles an editor's worktree registry after a worktree
+// directory is removed. Harnesses without a worktree registry can omit it.
+type WorktreeRefresher interface {
+	RefreshWorktrees(ctx context.Context) error
+}
+
 type ScmGateway interface {
 	Observe(ctx context.Context, pr int) (Observation, error)
 	UpdateBranch(ctx context.Context, pr int, expectedSHA string) (string, error)

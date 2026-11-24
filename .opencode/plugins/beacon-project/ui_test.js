@@ -7,6 +7,7 @@ import beaconStatus, {
   BEACON_STATUS_RPC_ID,
   BeaconStatusRpc,
   CliStatusSource,
+  DECISION_LIMIT,
   EMPTY_SNAPSHOT,
   PANEL_NAME,
   RECENT_LIMIT,
@@ -187,6 +188,26 @@ test("detail lines show identity, metrics, durations, attempts and history sorte
   assert.equal(detail[0].bold, true)
 })
 
+test("detail caps decisions to the most recent 20 and marks the rest", () => {
+  const decisions = Array.from({ length: 25 }, (_, i) => ({
+    at: `2026-11-23T10:${String(i).padStart(2, "0")}:00Z`,
+    kind: "reconcile.decision",
+    verdict: `verdict-${i}`,
+  }))
+  const text = detailLines(normalizeRun(makeRun({ Decisions: decisions })), {}, NOW).map((item) => item.text)
+  const rendered = text.filter((line) => line.includes("reconcile.decision"))
+  assert.equal(rendered.length, DECISION_LIMIT)
+  assert.ok(rendered[0].includes("verdict-5"), "drops the oldest five")
+  assert.ok(rendered.at(-1).includes("verdict-24"), "keeps the newest decision")
+  const marker = "  ... 5 earlier decisions"
+  assert.ok(text.includes(marker), "marker carries the hidden count")
+  assert.ok(text.indexOf(marker) < text.indexOf(rendered[0]), "marker precedes the shown decisions")
+
+  const twenty = detailLines(normalizeRun(makeRun({ Decisions: decisions.slice(0, 20) })), {}, NOW).map((item) => item.text)
+  assert.equal(twenty.filter((line) => line.includes("reconcile.decision")).length, 20)
+  assert.equal(twenty.some((line) => line.includes("earlier decisions")), false)
+})
+
 test("detail with no run is explicit", () => {
   assert.deepEqual(detailLines(null), [{ text: "No run selected", color: "muted" }])
 })
@@ -252,6 +273,22 @@ test("CLI source makes one batched call and keeps numeric metrics", async () => 
   assert.equal(snapshot.metrics.ciWaitSeconds, 90)
   assert.equal(snapshot.generatedAt, "2026-11-23T10:00:00Z")
   assert.deepEqual(calls, [["/bin/beacon", "status", "--snapshot"]])
+})
+
+test("CLI source raises maxBuffer so multi-megabyte snapshots fit", async () => {
+  let options
+  const execFile = async (program, args, opts) => {
+    options = opts
+    return { stdout: JSON.stringify({ active: [], recent: [] }) }
+  }
+  const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
+  await source.snapshot()
+  assert.ok(options, "execFile receives an options object")
+  assert.ok(Number.isFinite(options.maxBuffer), "maxBuffer is set to a finite number")
+  assert.ok(options.maxBuffer >= 4 * 1024 * 1024,
+    `maxBuffer ${options.maxBuffer} must hold a multi-megabyte snapshot`)
+  assert.equal(options.cwd, "/p")
+  assert.equal(options.encoding, "utf8")
 })
 
 test("status source uses the RPC when it works and falls back when it throws", async () => {
@@ -419,6 +456,23 @@ test("setup defers every createElement to a slot render callback", async () => {
 
   dispose()
   assert.equal(Object.keys(renderers).length, 0, "dispose removes every slot")
+})
+
+test("setup without injected deps keeps the TUI imports literal", async () => {
+  const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
+  for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {
+    assert.ok(src.includes(`import("${specifier}")`), `literal import("${specifier}") is present`)
+  }
+  assert.ok(src.includes('import("@opencode/plugin/tui")'), "the TUI plugin import stays literal")
+
+  // With no injected deps, setup must reach the runtime imports rather than
+  // the guard. The TUI peers are absent under node --test, so a module
+  // resolution failure is the only acceptable rejection.
+  await assert.rejects(beaconStatusDefinition.setup({}), (error) => {
+    assert.equal(/unexpected import/.test(error.message), false)
+    assert.match(error.message, /Cannot find package|ERR_MODULE_NOT_FOUND|Cannot find module/)
+    return true
+  })
 })
 
 test("ui.js uses theme tokens and native text styling only", () => {

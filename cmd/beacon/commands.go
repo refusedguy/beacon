@@ -67,6 +67,14 @@ func newStatusCommand(configPath *string) *cobra.Command {
 		Use:   "status",
 		Short: "Print active runs",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			daemon, _ := cmd.Flags().GetBool("daemon")
+			if daemon {
+				cfg, err := config.Load(*configPath)
+				if err != nil {
+					return err
+				}
+				return printJSON(readDaemonStatus(filepath.Dir(cfg.StateDB)))
+			}
 			_, store, _, err := wireReadOnly(*configPath)
 			if err != nil {
 				return err
@@ -97,6 +105,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 	}
 	cmd.Flags().Bool("recent", false, "print recently finished runs instead of active ones")
 	cmd.Flags().Bool("snapshot", false, "print one batched snapshot with runs, history and metrics")
+	cmd.Flags().Bool("daemon", false, "print daemon liveness and heartbeat age instead of runs")
 	return cmd
 }
 
