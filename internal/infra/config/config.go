@@ -55,6 +55,10 @@ type SCM struct {
 	BaseURL  string `yaml:"base_url"`
 }
 
+// Harness holds the shared settings any harness may read. The config package
+// does not name a provider or supply provider-specific values. Each harness
+// adapter interprets the fields it needs, and the composition root maps an
+// empty Provider to its default harness.
 type Harness struct {
 	Provider           string `yaml:"provider"`
 	Endpoint           string `yaml:"endpoint"`
@@ -183,7 +187,7 @@ func defaults() Config {
 		Concurrency:  Concurrency{MaxInFlight: 20, MaxActiveAgents: 4},
 		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
 		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
-		Harness:      Harness{Provider: "opencode", Endpoint: "http://127.0.0.1:4096", WorkerInstructions: DefaultWorkerInstructions},
+		Harness:      Harness{WorkerInstructions: DefaultWorkerInstructions},
 		Merge:        Merge{MaxAttempts: 12, AutoRebase: true},
 		OnBaseRed:    OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}

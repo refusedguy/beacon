@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,11 +12,46 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+type bareHarness struct{}
+
+func (bareHarness) Spawn(context.Context, core.SpawnRequest) (core.Session, error) {
+	return core.Session{}, nil
+}
+func (bareHarness) Wake(context.Context, string, core.WakeContext) error { return nil }
+func (bareHarness) Stop(context.Context, string) error                   { return nil }
+func (bareHarness) IsAlive(context.Context, string) (bool, error)        { return false, nil }
+func (bareHarness) NotifyParent(context.Context, string, string) error   { return nil }
+func (bareHarness) Events() <-chan core.HarnessEvent                     { return nil }
+
+type portHarness struct {
+	bareHarness
+	repo   string
+	models map[string]string
+}
+
+func (h *portHarness) SetRepo(root string) { h.repo = root }
+
+func (h *portHarness) ResolveModel(parent string) map[string]string {
+	return map[string]string{"parent": parent, "id": h.models["id"]}
+}
+
+func (h *portHarness) WatchIdle(context.Context) {}
+
+func TestSetHarnessRepoUsesPort(t *testing.T) {
+	h := &portHarness{}
+	setHarnessRepo(h, "/workspace/repo")
+	if h.repo != "/workspace/repo" {
+		t.Fatalf("repo = %q, want /workspace/repo", h.repo)
+	}
+	setHarnessRepo(bareHarness{}, "/workspace/repo")
+}
 
 func TestProjectRootPrefersEnvironment(t *testing.T) {
 	want := t.TempDir()
@@ -74,6 +110,44 @@ func TestLoadConfigPinsRelativePathsToProjectRoot(t *testing.T) {
 		if got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
+	}
+}
+
+func TestNewHarnessBuildsACPProvider(t *testing.T) {
+	cfg := config.Config{Harness: config.Harness{
+		Provider: "ACP", Command: "fake-agent --acp", Model: "sonnet",
+	}}
+	h, err := newHarness(cfg, "", "ses_parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ah, ok := h.(*acp.Harness)
+	if !ok {
+		t.Fatalf("harness for acp provider = %T, want *acp.Harness", h)
+	}
+	if ah.Command != "fake-agent --acp" || ah.Model != "sonnet" || ah.ParentSessionID != "ses_parent" {
+		t.Fatalf("acp harness = %+v, want command, model and parent from config", ah)
+	}
+	if _, ok := h.(core.ModelResolver); ok {
+		t.Error("acp harness must not claim the model resolver port")
+	}
+}
+
+func TestNewHarnessACPRequiresCommand(t *testing.T) {
+	cfg := config.Config{Harness: config.Harness{Provider: "acp"}}
+	if _, err := newHarness(cfg, "", ""); err == nil {
+		t.Fatal("acp harness without a command should fail")
+	}
+}
+
+func TestResolveModelUsesConfiguredHarness(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	acpCfg := config.Config{Harness: config.Harness{Provider: "acp", Command: "fake-agent"}}
+	if got := resolveModel(acpCfg, "", "ses_parent"); !got.IsZero() {
+		t.Fatalf("model for acp = %+v, want zero value", got)
+	}
+	if got := resolveModel(config.Config{Harness: config.Harness{Provider: "acp"}}, "", ""); !got.IsZero() {
+		t.Fatalf("model for invalid config = %+v, want zero value", got)
 	}
 }
 

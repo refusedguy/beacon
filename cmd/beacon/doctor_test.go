@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/internal/infra/shared"
 )
 
 func TestDoctorExitCode(t *testing.T) {
@@ -258,8 +258,8 @@ func TestDoctorHTTPCheckAuth(t *testing.T) {
 		wantPass   string
 		wantBearer string
 	}{
-		{"opencode user password", "opencode:deadbeef", opencode.ApplyAuth, "opencode", "deadbeef", ""},
-		{"opencode plain", "plain-token", opencode.ApplyAuth, "", "", "plain-token"},
+		{"user password", "opencode:deadbeef", shared.ApplyAuth, "opencode", "deadbeef", ""},
+		{"plain token", "plain-token", shared.ApplyAuth, "", "", "plain-token"},
 		{"scm bearer", "ghp_secret", bearerAuth, "", "", "ghp_secret"},
 	}
 	for _, tc := range cases {

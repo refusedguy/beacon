@@ -17,6 +17,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
@@ -174,9 +175,7 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 	if err != nil {
 		return nil, err
 	}
-	if oc, ok := h.(*opencode.Harness); ok {
-		oc.Repo = root
-	}
+	setHarnessRepo(h, root)
 	wt, err := workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
 	if err != nil {
 		return nil, err
@@ -283,7 +282,7 @@ func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) 
 
 func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, error) {
 	parent = firstNonEmpty(parent, cfg.Harness.ParentSessionID)
-	switch cfg.Harness.Provider {
+	switch strings.ToLower(cfg.Harness.Provider) {
 	case "opencode", "":
 		h := opencode.New(opencode.Config{
 			Endpoint:        cfg.Harness.Endpoint,
@@ -294,6 +293,11 @@ func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, err
 		})
 		h.ModelRef = resolveModel(cfg, token, parent)
 		return h, nil
+	case "acp":
+		if strings.TrimSpace(cfg.Harness.Command) == "" {
+			return nil, fmt.Errorf("acp harness requires command")
+		}
+		return acp.New(cfg.Harness.Command, cfg.Harness.Model, parent), nil
 	default:
 		return harness.New(harness.Config{
 			Provider: cfg.Harness.Provider, Command: cfg.Harness.Command,
@@ -349,6 +353,13 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 		ProviderID: info.Data.Model.ProviderID,
 		ID:         info.Data.Model.ID,
 		Variant:    info.Data.Model.Variant,
+	}
+}
+
+// setHarnessRepo points a harness that keeps a project registry at this repo.
+func setHarnessRepo(h core.AgentHarness, root string) {
+	if setter, ok := h.(core.RepoSetter); ok {
+		setter.SetRepo(root)
 	}
 }
 

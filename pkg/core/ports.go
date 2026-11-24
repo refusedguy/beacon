@@ -98,6 +98,26 @@ type WorktreeRefresher interface {
 	RefreshWorktrees(ctx context.Context) error
 }
 
+// RepoSetter tells a harness which repository it serves. A harness that keeps
+// a per-repository registry implements this port so the composition root does
+// not have to assert a concrete harness type.
+type RepoSetter interface {
+	SetRepo(root string)
+}
+
+// ModelResolver resolves the model reference for a worker from its parent
+// session. A harness that can look up its own model implements this port, so
+// the composition root does not need harness-specific session requests.
+type ModelResolver interface {
+	ResolveModel(parentSessionID string) map[string]string
+}
+
+// IdleWatcher watches a harness's sessions for idle workers and reports them
+// through Events. A harness without an idle signal can omit this port.
+type IdleWatcher interface {
+	WatchIdle(ctx context.Context)
+}
+
 type ScmGateway interface {
 	Observe(ctx context.Context, pr int) (Observation, error)
 	UpdateBranch(ctx context.Context, pr int, expectedSHA string) (string, error)

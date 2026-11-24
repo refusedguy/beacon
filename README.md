@@ -51,6 +51,7 @@ internal/infra           config, sqlite, planner, task sources, workspaces,
                          SCM adapters, policies, MCP server, notifications
 cmd/beacon               composition root and cobra CLI
 harnesses/opencode       separate AgentHarness module for OpenCode HTTP/SSE
+harnesses/acp            separate AgentHarness module for ACP over stdio
 ui/tui                   separate Bubble Tea monitor over loopback HTTP/SSE
 ```
 
@@ -112,9 +113,22 @@ Legacy Russian fields such as `Статус:`, `Владелец файлов:` 
 
 ## Worker model
 
-The OpenCode harness talks to the running OpenCode background server. Set `harness.endpoint` in `.beacon/config.yaml`. Authentication uses either a bearer token or `user:password` in `harness.token`, or the variable named by `harness.token_env`. The model resolves in this order: `BEACON_MODEL`, `harness.model`, then the model of the orchestrator session named in `harness.parent_session_id`. Nothing is hardcoded in the binary.
+The `harness` block in `.beacon/config.yaml` is provider neutral. `harness.provider` selects the adapter: `opencode`, `acp`, or a CLI provider such as `cli`, `claude`, `codex` and `exec`. The config loader stores the values and adds no provider name or endpoint of its own. An empty provider lets the composition root choose its default harness. Each adapter reads the fields it understands.
 
-`beacon init` always writes `harness.command: worker`. The OpenCode harness passes that value as the session agent, so workers inherit the global deny rules for the four orchestrator-only tools. A worker must never create, delete or update task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
+| Field | Used by |
+| --- | --- |
+| `provider` | Every adapter, to select one. |
+| `command` | ACP and CLI adapters; the OpenCode adapter uses it as the session agent. |
+| `endpoint` | HTTP adapters such as OpenCode. |
+| `model` | Adapters that choose a worker model. |
+| `token`, `token_env` | Adapters that authenticate to a service. |
+| `parent_session_id` | Adapters that notify an orchestrator session. |
+| `prompt_template` | CLI adapters. |
+| `worker_instructions` | Every worker prompt, as a prefix added by the dispatcher. |
+
+The OpenCode adapter talks to the running OpenCode background server. Set `harness.endpoint` for it. Authentication uses either a bearer token or `user:password` in `harness.token`, or the variable named by `harness.token_env`. The model resolves in this order: `BEACON_MODEL`, `harness.model`, then the model of the orchestrator session named in `harness.parent_session_id`. The ACP adapter launches the executable in `harness.command` over stdio and ignores `harness.endpoint`.
+
+`beacon init` writes `harness.provider: opencode` and `harness.command: worker`. The OpenCode harness passes the command as the session agent, so workers inherit the global deny rules for the four orchestrator-only tools. A worker must never create, delete or update task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
 
 The default worker instructions are language agnostic: "Worker environment: weak PC. Run targeted tests only for the files or packages you changed; leave full test suites, full builds and full repo linters to CI." `beacon init` replaces this default with stack-specific instructions when it detects a supported stack. Set `harness.worker_instructions` to override both. With `--weak-pc=false`, `beacon init` writes instructions that run the full suite, the full build, and the repository linters.
 
@@ -169,4 +183,4 @@ The lint job checks `gofmt -l cmd internal pkg harnesses ui arch_test.go` and ru
 
 ## Notes and decisions
 
-Some Beacon behavior is surprising until you know the reason. `docs/decisions/` records those cases, what caused them, and the options that were considered. Start with [parent session notification delivery](docs/decisions/0001-parent-notify-delivery.md) if a merge notice reaches the chat late. Read [the first-render empty queue](docs/decisions/0003-plugin-first-render.md) if the sidebar shows no cards right after an OpenCode restart.
+Some Beacon behavior is surprising until you know the reason. `docs/decisions/` records those cases, what caused them, and the options that were considered. Start with [parent session notification delivery](docs/decisions/0001-parent-notify-delivery.md) if a merge notice reaches the chat late. Read [the first-render empty queue](docs/decisions/0003-plugin-first-render.md) if the sidebar shows no cards right after an OpenCode restart. See [second harness support](docs/decisions/0002-second-harness.md) for the capability ports and the ACP adapter that made a second harness possible.
