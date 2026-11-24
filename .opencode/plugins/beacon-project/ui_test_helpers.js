@@ -36,6 +36,21 @@ export function solidModule(created = []) {
   }
 }
 
+// Mirrors the real @opentui/solid host: nodes carry props, but insert() does
+// not expose a JavaScript `children` array on the parent. Stubs built with
+// solidModule() hide code that wrongly reads box.children; this one does not.
+export function hostModule(created = []) {
+  return {
+    createElement: (tag) => {
+      const node = { tag, props: {} }
+      created.push(node)
+      return node
+    },
+    insert: () => {},
+    setProp: (node, name, value) => { node.props[name] = value },
+  }
+}
+
 export function themeStub() {
   return {
     text: {

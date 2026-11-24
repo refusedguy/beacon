@@ -15,6 +15,7 @@ export function createLineMount(ui, {
     return node
   }
   const lines = []
+  const cellsByLine = []
   for (let i = 0; i < maxLines; i++) {
     const box = createElement("box")
     setProp(box, "flexDirection", "row")
@@ -24,6 +25,7 @@ export function createLineMount(ui, {
     const name = cell(true)
     const status = cell()
     insert(box, marker); insert(box, name); insert(box, status)
+    cellsByLine.push([marker, name, status])
     if (onItem) {
       setProp(box, "onMouseDown", () => {
         if (box.item?.runID || box.item?.sectionKey || box.item?.action) onItem(box.item)
@@ -39,7 +41,7 @@ export function createLineMount(ui, {
       const item = items[i]
       box.item = item
       if (!item) { setProp(box, "visible", false); return }
-      const [marker, name, status] = box.children
+      const [marker, name, status] = cellsByLine[i]
       const fg = color(item.color ?? "base")
       setProp(marker, "content", item.marker ?? "")
       setProp(marker, "fg", fg)
