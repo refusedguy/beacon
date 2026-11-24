@@ -41,7 +41,7 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 | `beacon_recent` | List the most recently finished runs. | worker |
 | `beacon_wait` | Wait for a run to reach a verdict or a terminal state. | worker |
 | `beacon_control` | Approve, unblock, cancel or retry a run. | worker |
-| `beacon_task_create` | Create a task card and publish it for dispatch. | orchestrator only |
+| `beacon_task_create` | `{"title": "...", ...}` creates one card; `{"tasks": [{"title": "...", "depends": ["@1"], ...}, ...]}` creates several and returns `{"created": [{"id", "path"}], "pushed": true}`. `@N` in `depends` means the Nth card in the batch (1-based) and must name an earlier card. | orchestrator only |
 | `beacon_task_delete` | `{"ids": ["T-...", ...]}` deletes several task cards in one commit and push. | orchestrator only |
 | `beacon_task_update` | `{"updates": [{"id": "T-...", "title": "...", ...}]}` edits several task cards in one commit and push. Omitted fields stay unchanged and `status` is ignored. | orchestrator only |
 | `beacon_reconcile` | `{"pr": 42}` forces one reconciler tick and returns `{"pr", "decision": {"verdict", "reason", "criterion"}, "state", "error"}`. Errors and panics are captured in the result, so the daemon loop keeps running. | orchestrator only |

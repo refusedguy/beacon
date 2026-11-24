@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +72,18 @@ type CreatedTask struct {
 	Children []CreatedTask `json:"children,omitempty"`
 }
 
+// CreatedCard is one entry in a batch create response.
+type CreatedCard struct {
+	ID   string `json:"id"`
+	Path string `json:"path"`
+}
+
+// CreateBatchResult is the response for a batch task creation.
+type CreateBatchResult struct {
+	Created []CreatedCard `json:"created"`
+	Pushed  bool          `json:"pushed"`
+}
+
 // TaskCreator writes cards through the source, then commits and pushes them.
 // An epic with a plan expands into deterministic child cards before the epic.
 type TaskCreator struct {
@@ -80,6 +94,7 @@ type TaskCreator struct {
 
 	mu      sync.Mutex
 	created map[string][]core.Task
+	batch   map[core.TaskID]CreatedTask
 }
 
 func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTask, error) {
@@ -147,6 +162,170 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		c.mu.Unlock()
 	}
 	return c.result(created), nil
+}
+
+// CreateBatch writes the given cards in order and returns one result per input.
+// IDs are derived from the batch contents, so repeating a call returns the
+// same cards instead of creating duplicates. A depends entry of the form @N
+// resolves to the ID of the Nth card in this batch (1-based) and must name an
+// earlier card. If any step fails, every card written by this batch is removed.
+func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput) ([]CreatedTask, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	ids := c.batchIDs(inputs)
+	resolved := make([]CreateTaskInput, len(inputs))
+	for i, in := range inputs {
+		in.ID = string(ids[i])
+		deps := make([]string, 0, len(in.Depends))
+		for _, dep := range in.Depends {
+			dep = strings.TrimSpace(dep)
+			if n, ok := localRefIndex(dep); ok {
+				if n < 1 || n > i {
+					return nil, core.Errorf(core.CodeInvalidInput,
+						"depends %q in task %d must refer to an earlier task in this batch", dep, i+1)
+				}
+				dep = string(ids[n-1])
+			}
+			deps = append(deps, dep)
+		}
+		in.Depends = deps
+		resolved[i] = in
+	}
+
+	created := make([]CreatedTask, 0, len(inputs))
+	written := make([]core.Task, 0, len(inputs))
+	for i, in := range resolved {
+		if existing, ok := c.existingCard(ctx, ids[i]); ok {
+			created = append(created, existing)
+			continue
+		}
+		out, err := c.Create(ctx, in)
+		if err != nil {
+			c.rollback(ctx, written)
+			return nil, err
+		}
+		if len(out.IDs) == 0 {
+			written = append(written, core.Task{ID: core.TaskID(out.ID), SourceRef: out.Path})
+		}
+		for _, id := range out.IDs {
+			written = append(written, core.Task{ID: core.TaskID(id), SourceRef: "docs/tasks/" + id + ".md"})
+		}
+		created = append(created, out)
+	}
+	c.rememberBatch(ids, created)
+	return created, nil
+}
+
+// batchIDs assigns a stable ID to each input. An explicit ID wins. An epic
+// without one keeps the derivation Create uses, so an epic made alone or in a
+// batch gets the same ID.
+func (c *TaskCreator) batchIDs(inputs []CreateTaskInput) []core.TaskID {
+	seed := batchSeed(inputs)
+	out := make([]core.TaskID, len(inputs))
+	for i, in := range inputs {
+		if id := strings.TrimSpace(in.ID); id != "" {
+			out[i] = core.TaskID(id)
+			continue
+		}
+		if normalizeKind(in.Kind) == core.TaskKindEpic {
+			out[i] = epicTaskID(in.Title, in.Plan)
+			continue
+		}
+		out[i] = batchTaskID(seed, i)
+	}
+	return out
+}
+
+func batchSeed(inputs []CreateTaskInput) string {
+	var b strings.Builder
+	for _, in := range inputs {
+		b.WriteString(in.Title)
+		b.WriteByte('\x00')
+		b.WriteString(in.Body)
+		b.WriteByte('\x00')
+		for _, scope := range in.Scope {
+			b.WriteString(scope)
+			b.WriteByte('\x1f')
+		}
+		b.WriteByte('\x00')
+		for _, dep := range in.Depends {
+			b.WriteString(dep)
+			b.WriteByte('\x1f')
+		}
+		b.WriteByte('\x00')
+		b.WriteString(strconv.Itoa(in.Priority))
+		b.WriteByte('\x00')
+		b.WriteString(string(in.Kind))
+		b.WriteByte('\x00')
+		b.WriteString(in.BaseBranch)
+		b.WriteByte('\x00')
+		b.WriteString(string(in.RequireReview))
+		b.WriteByte('\x00')
+		for _, child := range in.Plan {
+			b.WriteString(child.Title)
+			b.WriteByte('\x1f')
+		}
+		b.WriteByte('\x1e')
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func batchTaskID(seed string, index int) core.TaskID {
+	sum := sha256.Sum256([]byte(seed + "\x00" + strconv.Itoa(index)))
+	return core.TaskID("T-" + time.Now().UTC().Format("20060102") + "-" + hex.EncodeToString(sum[:4]))
+}
+
+var localRefPattern = regexp.MustCompile(`^@([1-9][0-9]*)$`)
+
+func localRefIndex(value string) (int, bool) {
+	match := localRefPattern.FindStringSubmatch(value)
+	if match == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func (c *TaskCreator) existingCard(ctx context.Context, id core.TaskID) (CreatedTask, bool) {
+	c.mu.Lock()
+	out, ok := c.batch[id]
+	c.mu.Unlock()
+	if ok {
+		return out, true
+	}
+	available, err := c.Source.ListAvailable(ctx)
+	if err != nil {
+		return CreatedTask{}, false
+	}
+	for _, task := range available {
+		if task.ID == id {
+			path := task.SourceRef
+			if path == "" {
+				path = "docs/tasks/" + string(id) + ".md"
+			}
+			return CreatedTask{ID: string(id), Path: path, Pushed: true}, true
+		}
+	}
+	return CreatedTask{}, false
+}
+
+func (c *TaskCreator) rememberBatch(ids []core.TaskID, created []CreatedTask) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.batch == nil {
+		c.batch = make(map[core.TaskID]CreatedTask)
+	}
+	for i, out := range created {
+		if i >= len(ids) {
+			break
+		}
+		c.batch[ids[i]] = out
+	}
 }
 
 func (c *TaskCreator) publish(ctx context.Context, id core.TaskID) error {

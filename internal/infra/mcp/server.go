@@ -29,22 +29,29 @@ func NewServer(sv Services) *msdk.Server {
 		if sv.TaskCreator == nil {
 			return nil, nil, core.Errorf(core.CodeUnavailable, "task creator is not configured")
 		}
-		plan := make([]core.ChildSpec, 0, len(a.Plan))
-		for _, spec := range a.Plan {
-			plan = append(plan, core.ChildSpec{
-				Title: spec.Title, Scope: specScopes(spec.Scope),
-				Depends: specDeps(spec.Depends), Priority: spec.Priority,
-			})
+		inputs := []app.CreateTaskInput{createInput(a)}
+		batch := len(a.Tasks) > 0
+		if batch {
+			inputs = inputs[:0]
+			for _, item := range a.Tasks {
+				inputs = append(inputs, batchInput(item))
+			}
 		}
-		created, err := sv.TaskCreator.Create(ctx, app.CreateTaskInput{
-			Title: a.Title, Body: a.Body, Scope: a.Scope, Depends: a.Depends, Priority: a.Priority,
-			ID: a.ID, Kind: core.TaskKind(a.Kind), BaseBranch: a.BaseBranch,
-			RequireReview: core.ReviewMode(a.RequireReview), Plan: plan,
-		})
+		created, err := sv.TaskCreator.CreateBatch(ctx, inputs)
 		if err != nil {
 			return nil, nil, err
 		}
-		return jsonResult(created), nil, nil
+		if !batch {
+			return jsonResult(created[0]), nil, nil
+		}
+		out := app.CreateBatchResult{
+			Created: make([]app.CreatedCard, 0, len(created)),
+			Pushed:  true,
+		}
+		for _, item := range created {
+			out.Created = append(out.Created, app.CreatedCard{ID: item.ID, Path: item.Path})
+		}
+		return jsonResult(out), nil, nil
 	})
 	return s
 }
@@ -52,7 +59,22 @@ func NewServer(sv Services) *msdk.Server {
 // epicCreateArgs is the input schema of beacon_task_create. It extends the
 // basic create arguments with the fields an epic card needs.
 type epicCreateArgs struct {
-	Title         string         `json:"title"`
+	Title         string          `json:"title,omitempty"`
+	Body          string          `json:"body,omitempty"`
+	Scope         []string        `json:"scope,omitempty"`
+	Depends       []string        `json:"depends,omitempty"`
+	Priority      int             `json:"priority,omitempty"`
+	ID            string          `json:"id,omitempty"`
+	Kind          string          `json:"kind,omitempty"`
+	BaseBranch    string          `json:"base_branch,omitempty"`
+	RequireReview string          `json:"require_review,omitempty"`
+	Plan          []epicChildArg  `json:"plan,omitempty"`
+	Tasks         []batchTaskArgs `json:"tasks,omitempty"`
+}
+
+// batchTaskArgs is one entry of the optional tasks array in beacon_task_create.
+type batchTaskArgs struct {
+	Title         string         `json:"title,omitempty"`
 	Body          string         `json:"body,omitempty"`
 	Scope         []string       `json:"scope,omitempty"`
 	Depends       []string       `json:"depends,omitempty"`
@@ -69,6 +91,32 @@ type epicChildArg struct {
 	Scope    []string `json:"scope,omitempty"`
 	Depends  []string `json:"depends,omitempty"`
 	Priority int      `json:"priority,omitempty"`
+}
+
+func createInput(a epicCreateArgs) app.CreateTaskInput {
+	return buildCreateInput(a.Title, a.Body, a.Scope, a.Depends, a.Priority,
+		a.ID, a.Kind, a.BaseBranch, a.RequireReview, a.Plan)
+}
+
+func batchInput(a batchTaskArgs) app.CreateTaskInput {
+	return buildCreateInput(a.Title, a.Body, a.Scope, a.Depends, a.Priority,
+		a.ID, a.Kind, a.BaseBranch, a.RequireReview, a.Plan)
+}
+
+func buildCreateInput(title, body string, scope, depends []string, priority int,
+	id, kind, baseBranch, review string, plan []epicChildArg) app.CreateTaskInput {
+	children := make([]core.ChildSpec, 0, len(plan))
+	for _, spec := range plan {
+		children = append(children, core.ChildSpec{
+			Title: spec.Title, Scope: specScopes(spec.Scope),
+			Depends: specDeps(spec.Depends), Priority: spec.Priority,
+		})
+	}
+	return app.CreateTaskInput{
+		Title: title, Body: body, Scope: scope, Depends: depends, Priority: priority,
+		ID: id, Kind: core.TaskKind(kind), BaseBranch: baseBranch,
+		RequireReview: core.ReviewMode(review), Plan: children,
+	}
 }
 
 // updateTaskArgs is the input schema of beacon_task_update. A nil field is

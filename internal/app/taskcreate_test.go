@@ -395,3 +395,125 @@ func TestTaskCreatorDerivesStableEpicID(t *testing.T) {
 		t.Fatalf("first = %q, second = %q", first.ID, second.ID)
 	}
 }
+
+func TestTaskCreatorCreateBatch(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	got, err := creator.CreateBatch(context.Background(), []CreateTaskInput{
+		{Title: "First", Body: "One", Scope: []string{"a.go"}, Priority: 3},
+		{Title: "Second", Depends: []string{"@1", "EXT-9"}},
+		{Title: "Third", Depends: []string{"@1", "@2"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("results = %d, want 3", len(got))
+	}
+	if len(src.created) != 3 || len(ws.commits) != 3 {
+		t.Fatalf("created = %d, commits = %d", len(src.created), len(ws.commits))
+	}
+	for i, item := range got {
+		if !regexp.MustCompile(`^T-[0-9]{8}-[0-9a-f]{8}$`).MatchString(item.ID) ||
+			item.Path != "docs/tasks/"+item.ID+".md" || !item.Pushed {
+			t.Fatalf("result %d = %+v", i, item)
+		}
+		if string(src.created[i].ID) != item.ID {
+			t.Fatalf("created %d = %q, result = %q", i, src.created[i].ID, item.ID)
+		}
+	}
+	if !src.created[1].DependsOnID(core.TaskID(got[0].ID)) ||
+		!src.created[1].DependsOnID("EXT-9") {
+		t.Fatalf("second depends = %v", src.created[1].DependsOn)
+	}
+	if !src.created[2].DependsOnID(core.TaskID(got[0].ID)) ||
+		!src.created[2].DependsOnID(core.TaskID(got[1].ID)) {
+		t.Fatalf("third depends = %v", src.created[2].DependsOn)
+	}
+}
+
+func TestTaskCreatorCreateBatchIsIdempotent(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+	in := []CreateTaskInput{
+		{Title: "Alpha", Body: "One"},
+		{Title: "Beta", Depends: []string{"@1"}},
+		{Title: "Gamma"},
+	}
+
+	first, err := creator.CreateBatch(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := creator.CreateBatch(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != len(first) {
+		t.Fatalf("second = %d cards, first = %d", len(second), len(first))
+	}
+	for i := range first {
+		if second[i].ID != first[i].ID || second[i].Path != first[i].Path {
+			t.Fatalf("card %d changed: %+v vs %+v", i, first[i], second[i])
+		}
+	}
+	if len(src.created) != 3 || len(src.log.items) != 3 || len(ws.commits) != 3 {
+		t.Fatalf("repeated batch wrote cards = %d, creates = %d, commits = %d",
+			len(src.created), len(src.log.items), len(ws.commits))
+	}
+}
+
+func TestTaskCreatorCreateBatchRejectsForwardPlaceholder(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	_, err := creator.CreateBatch(context.Background(), []CreateTaskInput{
+		{Title: "First", Depends: []string{"@2"}},
+		{Title: "Second"},
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v", err)
+	}
+	if len(src.log.items) != 0 || len(ws.commits) != 0 {
+		t.Fatal("invalid placeholder still wrote a card or committed")
+	}
+}
+
+type failOnIDSource struct {
+	*fakeSource
+	failID core.TaskID
+}
+
+func (f *failOnIDSource) Create(ctx context.Context, task core.Task) (core.Task, error) {
+	if task.ID == f.failID {
+		return core.Task{}, errors.New("write failed")
+	}
+	return f.fakeSource.Create(ctx, task)
+}
+
+func TestTaskCreatorCreateBatchRollsBackOnFailure(t *testing.T) {
+	src := &failOnIDSource{fakeSource: &fakeSource{log: &callLog{}}, failID: "T-BATCH-B"}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	_, err := creator.CreateBatch(context.Background(), []CreateTaskInput{
+		{ID: "T-BATCH-A", Title: "A"},
+		{ID: "T-BATCH-B", Title: "B"},
+		{ID: "T-BATCH-C", Title: "C"},
+	})
+	if err == nil {
+		t.Fatal("write failure did not surface")
+	}
+	if len(src.removed) != 1 || src.removed[0] != "T-BATCH-A" {
+		t.Fatalf("removed = %v, want the card written before the failure", src.removed)
+	}
+	// The first card publishes before the later card fails, so one commit is
+	// expected. Rollback removes its file but cannot undo that commit.
+	if len(ws.commits) != 1 {
+		t.Fatalf("commits = %d, want the first card's publish only", len(ws.commits))
+	}
+}
