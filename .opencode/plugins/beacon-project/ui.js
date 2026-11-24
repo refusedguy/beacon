@@ -114,6 +114,10 @@ async function setup(ctx, deps = {}) {
   let stopped = false
   let pollTimer
   let inFlight = false
+  // The detail header ✕ releases the panel. Swallow one row click after that
+  // so the same pointer gesture cannot reopen it immediately.
+  let suppressNextRowClick = false
+  let panelClose = null
   const pollMs = pollIntervalMs(options.statusPollMs)
   const color = (key) => key === "base" ? theme.text.base
     : key === "muted" ? theme.text.muted
@@ -128,7 +132,13 @@ async function setup(ctx, deps = {}) {
     if (!id) return
     setSelectedID(id)
     void store[1]((draft) => { draft.id = id }).catch(() => {})
+    if (suppressNextRowClick) { suppressNextRowClick = false; return }
     ctx.ui.panel.open(PANEL_NAME)
+  }
+  function closeDetail() {
+    suppressNextRowClick = true
+    if (typeof panelClose === "function") panelClose()
+    else if (typeof ctx.ui.panel?.close === "function") ctx.ui.panel.close()
   }
   function sync() {
     const snap = snapshot()
@@ -148,13 +158,30 @@ async function setup(ctx, deps = {}) {
       setProp(box, "flexDirection", "column")
       return box
     }
+    const text = (content, fg, onMouseUp, grow = false) => {
+      const node = createElement("text")
+      setProp(node, "content", content)
+      setProp(node, "fg", fg)
+      setProp(node, "wrapMode", "none")
+      setProp(node, "selectable", false)
+      if (onMouseUp) setProp(node, "onMouseUp", onMouseUp)
+      if (grow) { setProp(node, "flexGrow", 1); setProp(node, "minWidth", 0) }
+      return node
+    }
     const sidebar = listBox()
     const footer = listBox()
-    const detail = createElement("box")
-    setProp(detail, "flexDirection", "column")
-    setProp(detail, "flexGrow", 1)
+    const detailBox = listBox()
+    setProp(detailBox, "flexGrow", 1)
+    const header = createElement("box")
+    setProp(header, "flexDirection", "row")
+    setProp(header, "justifyContent", "space-between")
+    insert(header, text("Beacon run detail", color("base"), null, true))
+    insert(header, text("✕", color("muted"), closeDetail))
+    const detail = listBox()
+    insert(detailBox, header)
+    insert(detailBox, detail)
     nodes = {
-      sidebar, footer, detail,
+      sidebar, footer, detail: detailBox,
       applySidebar: mount(sidebar, rows, MAX_ROWS),
       applyFooter: mount(footer, footerItems, FOOTER_ROWS),
       applyDetail: mount(detail, detailItems, DETAIL_ROWS),
@@ -202,13 +229,17 @@ async function setup(ctx, deps = {}) {
     }, pollMs)
   }
   const removeKeymap = typeof ctx.keymap?.layer === "function"
-    ? ctx.keymap.layer(() => ({ mode: "global", commands: [detailCommand((name) => ctx.ui.panel.open(name))] }))
+    ? ctx.keymap.layer(() => ({ mode: "global", commands: [detailCommand((name) => {
+      suppressNextRowClick = false
+      ctx.ui.panel.open(name)
+    })] }))
     : null
   const disposers = [
     ctx.ui.slot({ append: "sidebar.content", render: () => ensureNodes().sidebar }),
     ctx.ui.slot({ append: "home.footer.status", render: () => ensureNodes().footer }),
     ctx.ui.slot({ append: "session.panel", render: (input) => {
       if (input.name !== PANEL_NAME) return null
+      if (typeof input?.close === "function") panelClose = input.close
       const n = ensureNodes()
       sync()
       n.applyDetail()
