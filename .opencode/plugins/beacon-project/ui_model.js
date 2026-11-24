@@ -40,7 +40,7 @@ const list = (v, fn) => (Array.isArray(v) ? v : []).map(fn)
 const normalize = (value, spec) => {
   const s = value && typeof value === "object" ? value : {}
   const out = {}
-  for (const [key, names, coerce] of spec) out[key] = (coerce ?? str)(pick(s, names))
+  for (const [key, names, coerce] of spec) out[key] = (coerce ?? str)(pick(s, names), s)
   return out
 }
 const EVENT_SPEC = [
@@ -95,7 +95,8 @@ const RUN_SPEC = [
   ["durations", ["Durations", "durations"], (v) => normalize(v, DURATION_SPEC)],
   ["timeline", ["Timeline", "timeline"], (v) => list(v, (e) => normalize(e, EVENT_SPEC))],
   ["decisions", ["Decisions", "decisions"], (v) => list(v, (d) => normalize(d, DECISION_SPEC))],
-  ["checks", ["Checks", "checks"], (v) => list(v, (c) => normalize(c, CHECK_SPEC))],
+  ["checks", ["Checks", "checks"], (v, s) => Object.defineProperty(list(v, (c) => normalize(c, CHECK_SPEC)), "ciWallSeconds", { value: num(pick(s, ["ci_wall_seconds", "ciWallSeconds"]) ?? pick(v, ["ciWallSeconds"])), writable: true, configurable: true })],
+  ["ciWallSeconds", ["ci_wall_seconds", "ciWallSeconds"], num],
   ["sessionID", ["SessionID", "session_id", "sessionID"]],
   ["isFixer", ["IsFixer", "is_fixer", "isFixer"], bool],
   ["blockedIncidentID", ["BlockedIncidentID", "blocked_incident_id", "blockedIncidentID"]],

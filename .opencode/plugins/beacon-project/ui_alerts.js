@@ -185,14 +185,32 @@ export function checkRow(check) {
   }
 }
 
-export function checksSummary(checks = []) {
+const CHECK_BUCKETS = Object.freeze(Object.assign(Object.create(null), {
+  failure: "failed", failed: "failed", error: "failed",
+  skipped: "skipped", neutral: "skipped",
+  pending: "pending", in_progress: "pending", queued: "pending",
+}))
+export function checksSummary(checks = [], ciWallSeconds) {
   const list = Array.isArray(checks) ? checks : []
   if (!list.length) return ""
-  const passed = list.filter((c) => str(c?.state).toLowerCase() === "success").length
-  const failed = list.length - passed
-  // GitHub runs required checks in parallel. Their durations overlap, so the
-  // longest job, not their sum, is the honest CI time to show in the header.
-  const longest = list.reduce((max, c) => Math.max(max, Number(c?.durationSeconds) || 0), 0)
-  const duration = longest > 0 ? ` · longest ${clockDuration(longest)}` : ""
-  return failed ? `${failed} failed · ${passed}/${list.length}` : `${passed}/${list.length}${duration}`
+  const buckets = { success: 0, failed: 0, skipped: 0, pending: 0 }
+  for (const check of list) {
+    const state = str(check?.state).toLowerCase()
+    const bucket = state === "success" ? "success" : CHECK_BUCKETS[state] ?? "pending"
+    buckets[bucket] += 1
+  }
+  // An unrecognised state is a wait, not a failure. Go sends only the four
+  // canonical states, but older snapshots and third-party sources may differ.
+  const parts = []
+  if (buckets.failed) parts.push(`${buckets.failed} failed`)
+  parts.push(`${buckets.success}/${list.length}`)
+  if (buckets.skipped) parts.push(`${buckets.skipped} skipped`)
+  if (buckets.pending) parts.push(`${buckets.pending} pending`)
+  // GitHub runs required checks in parallel, so their durations overlap. The
+  // Go side measures the real span; the longest job is only a fallback.
+  const longest = list.reduce((max, check) => Math.max(max, Number(check?.durationSeconds) || 0), 0)
+  const wall = Number(ciWallSeconds !== undefined ? ciWallSeconds : list.ciWallSeconds)
+  if (Number.isFinite(wall) && wall > 0) parts.push(clockDuration(wall))
+  else if (longest > 0) parts.push(`longest ${clockDuration(longest)}`)
+  return parts.join(" · ")
 }
