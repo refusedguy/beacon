@@ -3,6 +3,7 @@ package core
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeCriterion struct {
@@ -129,6 +130,35 @@ func TestAllRequiredPass(t *testing.T) {
 			obs := Observation{Checks: tc.checks}
 			if got := obs.AllRequiredPass(tc.names); got != tc.want {
 				t.Fatalf("AllRequiredPass(%v) = %t, want %t", tc.names, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCIWallSeconds(t *testing.T) {
+	base := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	at := func(seconds int) time.Time { return base.Add(time.Duration(seconds) * time.Second) }
+	check := func(name string, start, end int) CheckResult {
+		return CheckResult{Name: name, StartedAt: at(start), CompletedAt: at(end)}
+	}
+	cases := []struct {
+		name   string
+		checks []CheckResult
+		want   int64
+	}{
+		{"empty", nil, 0},
+		{"no timestamps", []CheckResult{{Name: "ci", State: CheckPending}}, 0},
+		{"parallel", []CheckResult{check("lint", 0, 25), check("build", 0, 40)}, 40},
+		{"sequential", []CheckResult{check("build", 0, 30), check("test", 30, 55)}, 55},
+		{"staggered starts", []CheckResult{check("lint", 0, 20), check("test", 15, 60)}, 60},
+		{"missing endpoint", []CheckResult{check("build", 0, 40), {Name: "lint", StartedAt: at(0)}}, 40},
+		{"reversed endpoints", []CheckResult{check("build", 0, 40), check("bad", 30, 10)}, 40},
+		{"single check", []CheckResult{check("build", 5, 35)}, 30},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CIWallSeconds(tc.checks); got != tc.want {
+				t.Fatalf("CIWallSeconds = %d, want %d", got, tc.want)
 			}
 		})
 	}
