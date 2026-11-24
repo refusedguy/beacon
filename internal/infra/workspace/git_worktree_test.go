@@ -21,6 +21,7 @@ import (
 type refreshRecorder struct {
 	mu        sync.Mutex
 	refreshes []map[string]any
+	reloads   int
 	status    int
 }
 
@@ -28,6 +29,12 @@ func (r *refreshRecorder) snapshot() []map[string]any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]map[string]any(nil), r.refreshes...)
+}
+
+func (r *refreshRecorder) reloadCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reloads
 }
 
 func newRefreshServer(t *testing.T, canonical string, status int) (*httptest.Server, *refreshRecorder) {
@@ -48,6 +55,11 @@ func newRefreshServer(t *testing.T, canonical string, status int) (*httptest.Ser
 				w.WriteHeader(rec.status)
 				return
 			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/location/reload":
+			rec.mu.Lock()
+			rec.reloads++
+			rec.mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -485,5 +497,103 @@ func TestForceRemoveRefreshesOpenCode(t *testing.T) {
 	}
 	if got := len(rec.snapshot()); got != 1 {
 		t.Fatalf("worktree refresh calls = %d, want 1", got)
+	}
+}
+
+// breakGitAdmin removes the worktree's administrative directory. Git then
+// refuses both status and worktree remove for that path.
+func breakGitAdmin(t *testing.T, wt *GitWorktree, ws core.Workspace) {
+	t.Helper()
+	admin := filepath.Join(wt.Root, ".git", "worktrees", filepath.Base(ws.Path))
+	if err := os.RemoveAll(admin); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorktreeRemoveRefreshesWhenGitCannotRemove(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, 0)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-BROKEN-ADMIN"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	breakGitAdmin(t, wt, ws)
+	if err := wt.Remove(ctx, ws); err == nil {
+		t.Fatal("Remove() error = nil, want an error when git metadata is missing")
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1 after failed removal", got)
+	}
+}
+
+func TestForceRemoveRefreshesWhenGitCannotRemove(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, 0)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-FORCE-BROKEN"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	breakGitAdmin(t, wt, ws)
+	if err := wt.ForceRemove(ctx, ws); err == nil {
+		t.Fatal("ForceRemove() error = nil, want an error when git metadata is missing")
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1 after failed force removal", got)
+	}
+}
+
+func TestWorktreeCreateRefreshesAfterStaleCleanup(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, 0)
+	ctx := context.Background()
+	task := core.Task{ID: "T-CREATE-STALE"}
+	if _, err := wt.Create(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	// A retry finds the previous worktree still on disk. Create removes it as
+	// stale, so the editor's registration must be refreshed again.
+	if _, err := wt.Create(ctx, task); err != nil {
+		t.Fatalf("Create() retry error = %v", err)
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1 after stale cleanup", got)
+	}
+	if got := rec.reloadCount(); got != 1 {
+		t.Fatalf("location reloads = %d, want 1 after stale cleanup", got)
+	}
+}
+
+func TestWorktreeRemovalReloadsLiveEditorLocations(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, 0)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-RELOAD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Remove(ctx, ws); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1", got)
+	}
+	if got := rec.reloadCount(); got != 1 {
+		t.Fatalf("location reloads = %d, want 1 after a successful refresh", got)
+	}
+}
+
+func TestWorktreeRefreshFailureSkipsLocationReload(t *testing.T) {
+	wt, rec := worktreeWithRefresher(t, http.StatusInternalServerError)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-NO-RELOAD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Remove(ctx, ws); err != nil {
+		t.Fatalf("Remove() with failing refresh = %v, want nil", err)
+	}
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("worktree refresh calls = %d, want 1", got)
+	}
+	if got := rec.reloadCount(); got != 0 {
+		t.Fatalf("location reloads = %d, want 0 when refresh failed", got)
 	}
 }

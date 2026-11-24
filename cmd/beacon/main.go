@@ -121,6 +121,9 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 	}
 	if refresher, ok := h.(core.WorktreeRefresher); ok {
 		wt.Refresher = refresher
+		if err := refresher.RefreshWorktrees(context.Background()); err != nil {
+			slog.Warn("startup worktree refresh failed", "error", err)
+		}
 	}
 	return &wiredInfra{store: store, source: source, harness: h,
 		workspace: wt, scm: scmGW, changes: make(chan int, 64)}, nil

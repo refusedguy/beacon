@@ -1,7 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/infra/config"
@@ -31,6 +36,62 @@ func TestProjectRootFallsBackToWorkingDirectory(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("projectRoot() = %q, want %q", got, want)
+	}
+}
+
+func TestWireInfraRefreshesWorktreesAtStartup(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	root := t.TempDir()
+	cmd := exec.Command("git", "-C", root, "init", "--initial-branch=main")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+
+	var mu sync.Mutex
+	refreshes, reloads := 0, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/project":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]string{{"id": "prj_startup", "canonical": root}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/worktree/refresh":
+			mu.Lock()
+			refreshes++
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/location/reload":
+			mu.Lock()
+			reloads++
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	cfg := config.Config{
+		StateDB:      filepath.Join(tmp, "state.db"),
+		WorkspaceDir: filepath.Join(tmp, "worktrees"),
+		BaseBranch:   "main",
+		TaskSource:   config.TaskSource{Provider: "markdown", Dir: tmp},
+		SCM:          config.SCM{Provider: "github", Owner: "owner", Repo: "repo"},
+		Harness:      config.Harness{Provider: "opencode", Endpoint: srv.URL},
+	}
+	infra, err := wireInfra(cfg, root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer infra.store.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if refreshes != 1 {
+		t.Fatalf("startup worktree refresh calls = %d, want 1", refreshes)
+	}
+	if reloads != 1 {
+		t.Fatalf("startup location reloads = %d, want 1", reloads)
 	}
 }
 
