@@ -81,9 +81,15 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
+	if oc, ok := h.(*opencode.Harness); ok {
+		oc.Repo = root
+	}
 	wt, err := workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
 	if err != nil {
 		return nil, err
+	}
+	if refresher, ok := h.(core.WorktreeRefresher); ok {
+		wt.Refresher = refresher
 	}
 	changes := make(chan int, 64)
 	taskCreator := &app.TaskCreator{
