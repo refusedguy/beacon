@@ -20,6 +20,7 @@ export const TITLE_WIDTH = 18
 export const REASON_WIDTH = 20
 export const RECENT_LIMIT = 5
 export const MAX_ROWS = 64
+export const DECISION_LIMIT = 20
 export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [] })
 
 const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v))
@@ -392,7 +393,10 @@ export function detailLines(run, metrics, now = Date.now()) {
   const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
   timeline.length ? timeline.forEach((e) => out.push(line(`  ${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`, "muted"))) : out.push(line("  (none)", "muted"))
   out.push(line("Decisions", "base", true))
-  const decisions = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
+  const allDecisions = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
+  const decisions = allDecisions.slice(-DECISION_LIMIT)
+  const earlier = allDecisions.length - decisions.length
+  if (earlier > 0) out.push(line(`  ... ${earlier} earlier decisions`, "muted"))
   decisions.length ? decisions.forEach((d) => out.push(line(`  ${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd(), "muted"))) : out.push(line("  (none)", "muted"))
   return out
 }

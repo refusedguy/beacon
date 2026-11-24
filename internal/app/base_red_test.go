@@ -87,6 +87,91 @@ func TestRedBaseSpawnsOneFixerAndRecovers(t *testing.T) {
 	}
 }
 
+func TestRedBaseDefaultSpawnsFixer(t *testing.T) {
+	r, store, _, _, _ := redReconciler(t)
+	r.BaseRedMode = "" // unset config resolves to spawn_fixer
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	if store.runs["r1"].State != core.RunBlocked {
+		t.Fatalf("run not blocked: %s", store.runs["r1"].State)
+	}
+	fixers := 0
+	for _, run := range store.runs {
+		if run.IsFixer {
+			fixers++
+		}
+	}
+	if fixers != 1 {
+		t.Fatalf("spawned %d fixers, want 1", fixers)
+	}
+	incidents, err := store.ListOpenIncidents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 1 || incidents[0].FixerRunID == "" {
+		t.Fatalf("incident missing fixer run ID: %+v", incidents)
+	}
+}
+
+func assertBaseRedParentNotified(t *testing.T, h *fakeHarness) {
+	t.Helper()
+	if len(h.notifications) != 1 {
+		t.Fatalf("parent notifications = %d, want 1", len(h.notifications))
+	}
+	got := h.notifications[0]
+	if got.sessionID != "ses_parent" {
+		t.Fatalf("notification session = %q, want ses_parent", got.sessionID)
+	}
+	if !strings.Contains(got.text, "base_red") {
+		t.Fatalf("notification text %q missing base_red", got.text)
+	}
+}
+
+func TestRedBaseNotifyOrchestratorNotifiesAndDoesNotSpawn(t *testing.T) {
+	r, store, _, h, _ := redReconciler(t)
+	r.BaseRedMode = "notify_orchestrator"
+	n := &fakeNotifier{}
+	r.Notifier = n
+	store.runs["r1"].ParentSessionID = "ses_parent"
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 {
+		t.Fatalf("notifier calls = %d, want 1", n.count)
+	}
+	if store.runs["r1"].State != core.RunBlocked {
+		t.Fatalf("run not blocked: %s", store.runs["r1"].State)
+	}
+	fixers := 0
+	for _, run := range store.runs {
+		if run.IsFixer {
+			fixers++
+		}
+	}
+	if fixers != 0 {
+		t.Fatalf("spawned %d fixers, want 0", fixers)
+	}
+	assertBaseRedParentNotified(t, h)
+}
+
+func TestRedBaseNoNotifierStillNotifiesParent(t *testing.T) {
+	r, store, _, h, _ := redReconciler(t)
+	r.BaseRedMode = "notify_orchestrator"
+	store.runs["r1"].ParentSessionID = "ses_parent"
+	if r.Notifier != nil {
+		t.Fatal("expected no notifier")
+	}
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if store.runs["r1"].State != core.RunBlocked {
+		t.Fatalf("run not blocked: %s", store.runs["r1"].State)
+	}
+	assertBaseRedParentNotified(t, h)
+}
+
 func TestRedEpicBranchBlocksChildrenAndSpawnsFixer(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()

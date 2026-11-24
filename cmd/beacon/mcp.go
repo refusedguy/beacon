@@ -35,22 +35,32 @@ func newMCPCommand(configPath *string) *cobra.Command {
 				Dispatcher: w.dispatcher, Control: w.control, Status: w.status,
 				Wait: w.wait, TaskCreator: w.taskCreator,
 			}
-			info, connErr := readConnection(filepath.Dir(w.cfg.StateDB))
+			dir := filepath.Dir(w.cfg.StateDB)
+			info, connErr := readConnection(dir)
 			if connErr == nil && daemonAlive(w.cfg.StateDB) {
 				client := &remoteClient{info: info, http: &http.Client{Timeout: 5 * time.Second}}
 				services.Remote = client.call
-			} else if lock, err := acquireLock(filepath.Dir(w.cfg.StateDB)); err != nil {
+			} else if lock, err := acquireLock(dir); err != nil {
 				slog.Error("acquire daemon lock", "error", err)
+				writeDaemonError(dir, "lock", err)
 			} else {
 				ctx, cancel := context.WithCancel(cmd.Context())
 				defer lock.Close()
 				defer cancel()
+				tracker, stateErr := startDaemonState(dir)
+				if stateErr != nil {
+					slog.Error("write daemon state", "error", stateErr)
+					writeDaemonError(dir, "state", stateErr)
+				} else {
+					defer tracker.Close()
+				}
 				if watcher, ok := w.harness.(idleWatcher); ok {
 					go watcher.WatchIdle(ctx)
 				}
 				go func() {
 					if err := w.recon.Run(ctx, w.changes); err != nil && !errors.Is(err, context.Canceled) {
 						slog.Error("reconciler loop stopped", "error", err)
+						writeDaemonError(dir, "reconciler", err)
 					}
 				}()
 			}

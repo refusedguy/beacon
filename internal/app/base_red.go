@@ -90,7 +90,11 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 		}
 	}
 	if strings.EqualFold(r.BaseRedMode, "notify_orchestrator") {
-		return r.notify(run, "base_red", "base branch is red: "+reason)
+		if err := r.notify(run, "base_red", "base branch is red: "+reason); err != nil {
+			return err
+		}
+		r.notifyParent(ctx, run, run.PRNumber, "blocked: base_red")
+		return nil
 	}
 	return r.ensureFixer(ctx, in, base, run)
 }

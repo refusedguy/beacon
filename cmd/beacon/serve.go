@@ -26,20 +26,26 @@ func newServeCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer w.close()
-			lock, err := acquireLock(filepath.Dir(w.cfg.StateDB))
+			dir := filepath.Dir(w.cfg.StateDB)
+			lock, err := acquireLock(dir)
 			if err != nil {
 				return err
 			}
 			defer lock.Close()
+			tracker, err := startDaemonState(dir)
+			if err != nil {
+				return err
+			}
+			defer tracker.Close()
 			addr := os.Getenv("BEACON_API_ADDR")
 			if addr == "" {
 				addr = "127.0.0.1:7432"
 			}
-			token, err := writeConnection(filepath.Dir(w.cfg.StateDB), "http://"+addr)
+			token, err := writeConnection(dir, "http://"+addr)
 			if err != nil {
 				return err
 			}
-			defer removeConnection(filepath.Dir(w.cfg.StateDB))
+			defer removeConnection(dir)
 
 			ctx, stop := signalContext(cmd.Context())
 			defer stop()
@@ -80,6 +86,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 				if err == http.ErrServerClosed || err == context.Canceled {
 					return nil
 				}
+				writeDaemonError(dir, "serve", err)
 				return err
 			}
 		},

@@ -23,5 +23,6 @@ func ToolCatalog() []ToolSpec {
 		{Name: "beacon_control", Description: "Control a run: approve, unblock, cancel, retry or bind a PR."},
 		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true},
 		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
+		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
 	}
 }

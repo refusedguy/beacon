@@ -7,6 +7,7 @@ import beaconStatus, {
   BEACON_STATUS_RPC_ID,
   BeaconStatusRpc,
   CliStatusSource,
+  DECISION_LIMIT,
   EMPTY_SNAPSHOT,
   PANEL_NAME,
   RECENT_LIMIT,
@@ -185,6 +186,26 @@ test("detail lines show identity, metrics, durations, attempts and history sorte
   assert.deepEqual(timeline, ["  10:01:00 created → running", "  10:06:00 merge_checks → waiting_ci"])
   assert.ok(text.includes("  10:06:00 reconcile.decision merge"))
   assert.equal(detail[0].bold, true)
+})
+
+test("detail caps decisions to the most recent 20 and marks the rest", () => {
+  const decisions = Array.from({ length: 25 }, (_, i) => ({
+    at: `2026-11-23T10:${String(i).padStart(2, "0")}:00Z`,
+    kind: "reconcile.decision",
+    verdict: `verdict-${i}`,
+  }))
+  const text = detailLines(normalizeRun(makeRun({ Decisions: decisions })), {}, NOW).map((item) => item.text)
+  const rendered = text.filter((line) => line.includes("reconcile.decision"))
+  assert.equal(rendered.length, DECISION_LIMIT)
+  assert.ok(rendered[0].includes("verdict-5"), "drops the oldest five")
+  assert.ok(rendered.at(-1).includes("verdict-24"), "keeps the newest decision")
+  const marker = "  ... 5 earlier decisions"
+  assert.ok(text.includes(marker), "marker carries the hidden count")
+  assert.ok(text.indexOf(marker) < text.indexOf(rendered[0]), "marker precedes the shown decisions")
+
+  const twenty = detailLines(normalizeRun(makeRun({ Decisions: decisions.slice(0, 20) })), {}, NOW).map((item) => item.text)
+  assert.equal(twenty.filter((line) => line.includes("reconcile.decision")).length, 20)
+  assert.equal(twenty.some((line) => line.includes("earlier decisions")), false)
 })
 
 test("detail with no run is explicit", () => {
