@@ -167,7 +167,7 @@ export function queueRows(queue = [], epicOpen = null) {
     }
     if (at > 0) summaries.push({ at, item: {
       marker: "", name: `+${children.length - QUEUE_CHILD_LIMIT} more`, status: "",
-      color: "muted", kind: "queue-more", epicKey: id,
+      color: "muted", kind: "queue-more",
     } })
   }
   for (const { at, item } of summaries.sort((a, b) => b.at - a.at)) visible.splice(at, 0, item)
