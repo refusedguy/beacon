@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -486,6 +487,49 @@ func TestDispatchWithoutWorkerInstructionsKeepsStockPrompt(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "Implement the task, open a pull request, then call beacon_watch_pr") {
 		t.Fatalf("stock prompt content lost: %q", prompt)
+	}
+}
+
+func TestDispatchResolvesModelFromParentSession(t *testing.T) {
+	ref := map[string]string{"id": "hy4-flash-free", "providerID": "opencode"}
+	var parents []string
+	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	d := newInstructionDispatcher(h, "")
+	d.ParentSessionID = "ses_fallback"
+	d.ResolveModel = func(parent string) map[string]string {
+		parents = append(parents, parent)
+		return ref
+	}
+	ctx := WithParentSession(context.Background(), "ses_parent")
+	if _, err := d.Dispatch(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(parents) != 1 || parents[0] != "ses_parent" {
+		t.Fatalf("resolved parents = %v, want [ses_parent]", parents)
+	}
+	if len(h.requests) != 1 {
+		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
+	}
+	req := h.requests[0]
+	if !reflect.DeepEqual(req.ModelRef, ref) {
+		t.Fatalf("spawn model = %v, want %v", req.ModelRef, ref)
+	}
+	if req.ParentSessionID != "ses_parent" {
+		t.Fatalf("spawn parent = %q, want ses_parent", req.ParentSessionID)
+	}
+}
+
+func TestDispatchWithoutResolverLeavesHarnessDefault(t *testing.T) {
+	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	d := newInstructionDispatcher(h, "")
+	if _, err := d.Dispatch(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.requests) != 1 {
+		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
+	}
+	if h.requests[0].ModelRef != nil {
+		t.Fatalf("spawn model = %v, want nil without a resolver", h.requests[0].ModelRef)
 	}
 }
 

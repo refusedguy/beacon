@@ -33,12 +33,16 @@ type WorkspaceManager interface {
 }
 
 type SpawnRequest struct {
-	Task            Task
-	Workspace       Workspace
-	RunID           RunID
-	Prompt          string
+	Task      Task
+	Workspace Workspace
+	RunID     RunID
+	Prompt    string
+	// ParentSessionID keeps the orchestrator session that owns the run.
 	ParentSessionID string
-	IsFixer         bool
+	// ModelRef is the model resolved for this dispatch from the parent
+	// session. It overrides the harness default when set.
+	ModelRef map[string]string
+	IsFixer  bool
 }
 
 type Session struct {
