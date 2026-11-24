@@ -2,16 +2,20 @@
 // lazily in setup so `node --test` can load this module without TUI peers.
 import { execFile as nodeExecFile } from "node:child_process"
 import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { beaconCommand } from "./mcp.js"
-import { projectRoot } from "./location.js"
+import { locationInfo, projectRoot } from "./location.js"
 
 const execFileAsync = promisify(nodeExecFile)
 export const REFRESH_MS = 5000
 export const RPC_TIMEOUT_MS = 10000
 export const BEACON_STATUS_RPC_ID = "beacon.project.status"
 export const PANEL_NAME = "beacon.detail"
+export const RUN_CHANGED_EVENT = "runChanged"
+export const EVENT_IDLE_MS = 30000
+export const RESUBSCRIBE_MIN_MS = 1000
+export const RESUBSCRIBE_MAX_MS = 30000
 export const TITLE_WIDTH = 18
 export const REASON_WIDTH = 20
 export const RECENT_LIMIT = 5
@@ -90,6 +94,40 @@ export function parseSnapshot(text) {
   if (text == null || String(text).trim() === "") return {}
   try { const v = JSON.parse(String(text)); return v && typeof v === "object" && !Array.isArray(v) ? v : {} } catch { return {} }
 }
+// Identity includes the SHA and state, since a run often changes state without
+// receiving a new commit. The key dedupes repeated emissions of the same state.
+export const runSignature = (run) => [str(run.id), str(run.sha), str(run.state), str(run.updatedAt)].join("|")
+export const runChangedPayload = (run) => Object.freeze({
+  id: str(run.id), sha: str(run.sha), state: str(run.state), at: str(run.updatedAt), key: runSignature(run),
+})
+export function changedRuns(previous, next) {
+  const before = new Map()
+  const identity = (run) => run
+  for (const run of [...list(previous?.active, identity), ...list(previous?.recent, identity)]) if (run.id) before.set(run.id, runSignature(run))
+  const seen = new Set()
+  const out = []
+  for (const run of [...list(next?.active, identity), ...list(next?.recent, identity)]) {
+    if (!run.id || seen.has(run.id)) continue
+    seen.add(run.id)
+    const key = runSignature(run)
+    if (before.get(run.id) === key) continue
+    before.set(run.id, key)
+    out.push(runChangedPayload(run))
+  }
+  return out
+}
+export const eventKey = (data) => str(data?.key) || [str(data?.id), str(data?.sha), str(data?.state), str(data?.at)].join("|")
+export function eventMatchesLocation(eventLocation, ownLocation) {
+  const event = locationInfo({ location: eventLocation })
+  const own = locationInfo({ location: ownLocation })
+  if (!event || !own) return false
+  if (event.workspaceID && own.workspaceID && event.workspaceID !== own.workspaceID) return false
+  if (event.projectID && own.projectID && event.projectID !== own.projectID) return false
+  const left = event.canonical || event.projectDirectory || event.directory
+  const right = own.canonical || own.projectDirectory || own.directory
+  return Boolean(left && right && resolve(left) === resolve(right))
+}
+export const tuiLocation = (ctx) => ctx?.location ?? ctx?.data?.location?.default?.() ?? null
 export function readTitle(root, taskID, deps = {}) {
   const id = str(taskID)
   if (!id) return ""
@@ -138,8 +176,16 @@ const schema = (check) => ({ "~standard": { version: 1, vendor: "beacon", valida
   const issue = check(v)
   return issue ? { issues: [{ message: issue }] } : { value: v }
 } } })
+export const RunChangedEvent = Object.freeze({
+  schema: schema((v) => {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return "event must be an object"
+    if (typeof v.id !== "string" || !v.id) return "event.id must be a non-empty string"
+    return null
+  }),
+})
 export const BeaconStatusRpc = Object.freeze({
-  id: BEACON_STATUS_RPC_ID, events: Object.freeze({}),
+  id: BEACON_STATUS_RPC_ID,
+  events: Object.freeze({ [RUN_CHANGED_EVENT]: RunChangedEvent }),
   methods: Object.freeze({ snapshot: Object.freeze({
     input: schema(() => null),
     output: schema((v) => {
@@ -157,7 +203,7 @@ export class RpcStatusSource {
   constructor(ctx, { timeout = RPC_TIMEOUT_MS } = {}) { this.ctx = ctx; this.timeout = timeout }
   async snapshot() {
     const rpc = this.ctx.client.rpc(BeaconStatusRpc)
-    const location = this.ctx.location ?? this.ctx.data?.location?.default?.()
+    const location = tuiLocation(this.ctx)
     return normalizeSnapshot(await rpc.snapshot({}, { location, signal: AbortSignal.timeout(this.timeout) }))
   }
 }
@@ -170,6 +216,70 @@ export function createStatusSource(ctx, { root, deps = {} } = {}) {
   } }
 }
 export const errorMessage = (error) => (error && typeof error.message === "string" ? error.message : String(error))
+
+// Live subscriptions miss events while the client is disconnected. A failed
+// subscription is dropped and retried with exponential backoff; the poll in
+// setup keeps the panel fresh until the subscription recovers.
+export function createRunChangeBridge(rpc, ownLocation, onEvent, deps = {}) {
+  const now = deps.now ?? (() => Date.now())
+  const setTimer = deps.setTimeout ?? globalThis.setTimeout.bind(globalThis)
+  const clearTimer = deps.clearTimeout ?? globalThis.clearTimeout.bind(globalThis)
+  let off = null
+  let retry = null
+  let attempts = 0
+  let lastEventAt = 0
+  let stopped = false
+  let keys = new Set()
+  const teardown = () => {
+    const current = off
+    off = null
+    try { current?.() } catch {}
+  }
+  const scheduleRetry = () => {
+    if (stopped || retry) return
+    const delay = Math.min(RESUBSCRIBE_MIN_MS * 2 ** attempts, RESUBSCRIBE_MAX_MS)
+    attempts += 1
+    retry = setTimer(() => { retry = null; subscribe() }, delay)
+  }
+  const subscribe = () => {
+    if (stopped) return
+    try {
+      const unsubscribe = rpc.events.on(RUN_CHANGED_EVENT, (event) => {
+        if (stopped) return
+        try {
+          if (!eventMatchesLocation(event?.location, ownLocation)) return
+          const key = eventKey(event?.data)
+          if (key && keys.has(key)) return
+          if (key) { keys.add(key); if (keys.size > 128) keys = new Set([...keys].slice(-64)) }
+          lastEventAt = now()
+          onEvent(event)
+        } catch {
+          teardown()
+          scheduleRetry()
+        }
+      })
+      if (typeof unsubscribe !== "function") throw new Error("events.on did not return an unsubscribe function")
+      off = unsubscribe
+      attempts = 0
+    } catch {
+      teardown()
+      scheduleRetry()
+    }
+  }
+  subscribe()
+  return {
+    get active() { return typeof off === "function" },
+    get lastEventAt() { return lastEventAt },
+    get pendingRetry() { return retry != null },
+    stop() {
+      stopped = true
+      if (retry) clearTimer(retry)
+      retry = null
+      teardown()
+      keys.clear()
+    },
+  }
+}
 
 const STATE_VIEW = Object.freeze({
   pending: { marker: "○", color: "muted", label: "PEND" },
@@ -246,6 +356,17 @@ export function snapshotLineItems(snapshot = EMPTY_SNAPSHOT, error = null, now =
 }
 export function renderSnapshotLines(snapshot, error, now) {
   return snapshotLineItems(snapshot, error, now).map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))
+}
+export function metricsLine(snapshot = EMPTY_SNAPSHOT) {
+  const view = normalizeSnapshot(snapshot)
+  const m = view.metrics ?? {}
+  const blocked = m.blockedCount ?? view.active.filter((r) => r.state === "blocked").length
+  const stamps = [...view.active, ...view.recent].map((r) => timeOf(r.updatedAt)).filter(Boolean)
+  const at = timeOf(view.generatedAt) || Math.max(0, ...stamps)
+  const date = at ? new Date(at) : null
+  const clock = date && Number.isFinite(date.getTime()) ? date.toISOString().slice(11, 19) : "--:--:--"
+  const name = `Beacon active ${view.active.length} · blocked ${blocked} · rebase ${m.rebaseCount ?? 0} · fix ${m.fixCount ?? 0} · updated ${clock}`
+  return { marker: "", name, status: "", color: "muted" }
 }
 export function detailLines(run, metrics, now = Date.now()) {
   if (!run) return [{ text: "No run selected", color: "muted" }]
@@ -346,14 +467,22 @@ async function setup(ctx, deps = {}) {
   try { ({ TextAttributes: { BOLD } } = await load("@opentui/core")) } catch {}
   const source = createStatusSource(ctx)
   const theme = ctx.theme
+  const timers = {
+    now: deps.now ?? (() => Date.now()),
+    setTimeout: deps.setTimeout ?? globalThis.setTimeout.bind(globalThis),
+    clearTimeout: deps.clearTimeout ?? globalThis.clearTimeout.bind(globalThis),
+    setInterval: deps.setInterval ?? globalThis.setInterval.bind(globalThis),
+    clearInterval: deps.clearInterval ?? globalThis.clearInterval.bind(globalThis),
+  }
   const [snapshot, setSnapshot] = createSignal(EMPTY_SNAPSHOT)
   const [error, setError] = createSignal(null)
   const [detailItems, setDetailItems] = createSignal(detailLines(null))
+  const [footerItems, setFooterItems] = createSignal([metricsLine(EMPTY_SNAPSHOT)])
   const store = typeof ctx.storage?.store === "function"
     ? ctx.storage.store("beacon-selected-run", { initial: { id: "" } }) : [{ id: "" }, () => {}]
   const [selectedID, setSelectedID] = createSignal(store[0].id || "")
   let stopped = false
-  let timer
+  let pollTimer
   const color = (key) => key === "base" ? theme.text.base
     : key === "muted" ? theme.text.muted
     : key === "action" ? theme.text.action.primary.base
@@ -369,10 +498,11 @@ async function setup(ctx, deps = {}) {
     void store[1]((draft) => { draft.id = id }).catch(() => {})
     ctx.ui.panel.open(PANEL_NAME)
   }
-  function syncDetail() {
+  function sync() {
     const snap = snapshot()
+    setFooterItems([metricsLine(snap)])
     const run = [...snap.active, ...snap.recent].find((r) => r.id === selectedID())
-    setDetailItems(detailLines(run, snap.metrics, Date.now()))
+    setDetailItems(detailLines(run, snap.metrics, timers.now()))
   }
 
   // The reconciler's renderer is only active inside a slot render callback.
@@ -394,12 +524,12 @@ async function setup(ctx, deps = {}) {
     nodes = {
       sidebar, footer, detail,
       applySidebar: mount(sidebar, rows),
-      applyFooter: mount(footer, rows),
+      applyFooter: mount(footer, footerItems),
       applyDetail: mount(detail, detailItems),
     }
     nodes.applySidebar()
     nodes.applyFooter()
-    syncDetail()
+    sync()
     nodes.applyDetail()
     return nodes
   }
@@ -413,20 +543,27 @@ async function setup(ctx, deps = {}) {
       setError(null)
     } catch (cause) { if (!stopped) setError(errorMessage(cause)) }
     if (!nodes) return
+    sync()
     nodes.applySidebar()
     nodes.applyFooter()
-    syncDetail()
     nodes.applyDetail()
   }
+  let rpc = null
+  try { rpc = typeof ctx?.client?.rpc === "function" ? ctx.client.rpc(BeaconStatusRpc) : null } catch {}
+  const bridge = rpc?.events ? createRunChangeBridge(rpc, tuiLocation(ctx), () => void refresh(), timers) : null
   void refresh()
-  timer = setInterval(() => void refresh(), REFRESH_MS)
+  pollTimer = timers.setInterval(() => {
+    if (stopped) return
+    if (bridge?.active && timers.now() - bridge.lastEventAt < EVENT_IDLE_MS) return
+    void refresh()
+  }, REFRESH_MS)
   const disposers = [
     ctx.ui.slot({ append: "sidebar.content", render: () => ensureNodes().sidebar }),
     ctx.ui.slot({ append: "home.footer.status", render: () => ensureNodes().footer }),
     ctx.ui.slot({ append: "session.panel", render: (input) => {
       if (input.name !== PANEL_NAME) return null
       const n = ensureNodes()
-      syncDetail()
+      sync()
       n.applyDetail()
       return n.detail
     } }),
@@ -437,7 +574,8 @@ async function setup(ctx, deps = {}) {
   ]
   return () => {
     stopped = true
-    clearInterval(timer)
+    timers.clearInterval(pollTimer)
+    bridge?.stop()
     disposers.forEach((d) => d?.())
   }
 }
