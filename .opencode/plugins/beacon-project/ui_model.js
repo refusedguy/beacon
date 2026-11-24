@@ -18,7 +18,10 @@ export const RESUBSCRIBE_MIN_MS = 1000
 export const RESUBSCRIBE_MAX_MS = 30000
 export const TITLE_WIDTH = 18
 export const REASON_WIDTH = 20
+export const VALUE_WIDTH = 22
 export const RECENT_LIMIT = 5
+// Detail sections share one dim rule so groups read as blocks, not a wall.
+export const RULE = "─".repeat(30)
 export const MAX_ROWS = 64
 export const DECISION_LIMIT = 20
 export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [] })

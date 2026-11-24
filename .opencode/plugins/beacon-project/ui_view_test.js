@@ -13,6 +13,7 @@ const {
   PANEL_NAME,
   RECENT_LIMIT,
   REASON_WIDTH,
+  RULE,
   TITLE_WIDTH,
   beaconStatusDefinition,
   createCliStatusSource,
@@ -61,11 +62,13 @@ test("a stale transport error keeps the snapshot and clips the marker", () => {
   assert.ok(items.find((item) => item.name.startsWith("[stale]")).name.length <= 9 + REASON_WIDTH)
 })
 
-test("empty snapshot still renders both sections", () => {
-  assert.deepEqual(lines(EMPTY_SNAPSHOT), ["Beacon", "▼ Active 0", "No active runs", "▼ Recent 0", "No recent runs"])
+test("empty snapshot still renders both sections behind a counted header", () => {
+  assert.deepEqual(lines(EMPTY_SNAPSHOT), [
+    "Beacon A0 B0 R0 F0 --:--:--", "▼ Active 0", "No active runs", "▼ Recent 0", "No recent runs",
+  ])
 })
 
-test("detail lines show identity, metrics, durations, attempts and history sorted by time", () => {
+test("detail groups fields into six sections with dim separators", () => {
   const run = normalizeRun(makeRun({
     title: "Fix TUI plugin shape",
     Timeline: [
@@ -75,22 +78,29 @@ test("detail lines show identity, metrics, durations, attempts and history sorte
   }))
   const metrics = { dispatchCount: 25, rebaseCount: 2, fixCount: 1, mergeCount: 3, ciWaitSeconds: 90 }
   const detail = detailLines(run, metrics, NOW)
-  const text = detail.map((item) => item.text)
-  assert.equal(text[0], "Run detail")
-  assert.equal(text[1], "Metrics dispatch 25 · rebase 2 · fix 1 · merge 3 · ci_wait 1m")
-  assert.ok(text[2].includes("ID run-1 · task T-1"))
-  assert.ok(text[3].includes("● Fix TUI plugin shape"))
-  assert.ok(text.some((line) => line.includes("PR #42")))
-  assert.ok(text.some((line) => line.includes("Branch beacon/T-1")))
-  assert.ok(text.some((line) => line.includes("SHA abcdef12345…")))
-  assert.ok(text.some((line) => line.includes("Created 10:00:00 · Updated 10:07:00 · 3m")))
-  assert.ok(text.some((line) => line.includes("wait_ci 1m · running 5s · blocked 0s")))
-  assert.ok(text.some((line) => line.includes("Attempts 2/3 rebase · 1/3 fix")))
-  assert.ok(text.some((line) => line.includes("Reason waiting CI")))
-  const timeline = text.filter((line) => line.startsWith("  ") && line.includes("→"))
-  assert.deepEqual(timeline, ["  10:01:00 created → running", "  10:06:00 merge_checks → waiting_ci"])
-  assert.ok(text.includes("  10:06:00 reconcile.decision merge"))
-  assert.equal(detail[0].bold, true)
+  const name = (item) => item.name ?? item.text
+  assert.deepEqual(detail.filter((i) => i.bold && i.marker === "▼").map(name),
+    ["Identity", "Timing", "Attempts", "Reason", "Timeline", "Decisions"])
+  assert.equal(detail.filter((i) => i.name === RULE).length, 5)
+  const field = (label) => detail.find((i) => i.name === label)?.status
+  assert.equal(field("State"), "● running · RUN")
+  assert.equal(field("PR"), "#42")
+  assert.equal(field("Branch"), "beacon/T-1")
+  assert.equal(field("SHA"), "abcdef12345…")
+  assert.equal(field("Created"), "10:00:00")
+  assert.equal(field("Updated"), "10:07:00")
+  assert.equal(field("Age"), "3m")
+  assert.equal(field("Wait CI"), "1m")
+  assert.equal(field("Running"), "5s")
+  assert.equal(field("Rebase"), "2/3")
+  assert.equal(field("Fix"), "1/3")
+  assert.equal(field("Dispatch"), "25")
+  assert.equal(field("Merges"), "3")
+  const notes = detail.filter((i) => i.name && i.name !== RULE && !i.status && i.color === "muted").map(name)
+  assert.deepEqual(notes.filter((n) => n.includes("→")), [
+    "10:01:00 created → running", "10:06:00 merge_checks → waiting_ci",
+  ])
+  assert.ok(notes.includes("10:06:00 reconcile.decision merge"))
 })
 
 test("detail caps decisions to the most recent 20 and marks the rest", () => {
@@ -99,16 +109,16 @@ test("detail caps decisions to the most recent 20 and marks the rest", () => {
     kind: "reconcile.decision",
     verdict: `verdict-${i}`,
   }))
-  const text = detailLines(normalizeRun(makeRun({ Decisions: decisions })), {}, NOW).map((item) => item.text)
-  const rendered = text.filter((line) => line.includes("reconcile.decision"))
+  const names = detailLines(normalizeRun(makeRun({ Decisions: decisions })), {}, NOW).map((i) => i.name ?? i.text)
+  const rendered = names.filter((line) => line.includes("reconcile.decision"))
   assert.equal(rendered.length, DECISION_LIMIT)
   assert.ok(rendered[0].includes("verdict-5"), "drops the oldest five")
   assert.ok(rendered.at(-1).includes("verdict-24"), "keeps the newest decision")
-  const marker = "  ... 5 earlier decisions"
-  assert.ok(text.includes(marker), "marker carries the hidden count")
-  assert.ok(text.indexOf(marker) < text.indexOf(rendered[0]), "marker precedes the shown decisions")
+  const marker = "... 5 earlier decisions"
+  assert.ok(names.includes(marker), "marker carries the hidden count")
+  assert.ok(names.indexOf(marker) < names.indexOf(rendered[0]), "marker precedes the shown decisions")
 
-  const twenty = detailLines(normalizeRun(makeRun({ Decisions: decisions.slice(0, 20) })), {}, NOW).map((item) => item.text)
+  const twenty = detailLines(normalizeRun(makeRun({ Decisions: decisions.slice(0, 20) })), {}, NOW).map((i) => i.name ?? i.text)
   assert.equal(twenty.filter((line) => line.includes("reconcile.decision")).length, 20)
   assert.equal(twenty.some((line) => line.includes("earlier decisions")), false)
 })
