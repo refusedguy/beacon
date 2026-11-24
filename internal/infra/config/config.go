@@ -94,6 +94,19 @@ type Notify struct {
 	ChatID           string `yaml:"chat_id"`
 }
 
+// Complete reports whether the config has enough settings to keep the daemon
+// running. A hot reload rejects configs that fail this check so a truncated or
+// empty file cannot replace the last good config.
+func (c Config) Complete() bool {
+	if c.StateDB == "" || c.WorkspaceDir == "" || c.BaseBranch == "" || c.Concurrency.MaxInFlight <= 0 {
+		return false
+	}
+	if c.TaskSource.Provider == "" && c.TaskSource.Dir == "" {
+		return false
+	}
+	return c.SCM.Provider != "" || c.SCM.Owner != "" || c.SCM.Repo != ""
+}
+
 func (c Config) Interval() time.Duration {
 	if c.PollInterval == "" {
 		return 30 * time.Second

@@ -133,3 +133,40 @@ func TestLoadEmptyWorkerInstructionsUsesDefault(t *testing.T) {
 		t.Fatalf("worker instructions = %q, want default", c.Harness.WorkerInstructions)
 	}
 }
+
+const completeConfig = "state_db: .beacon/state.db\n" +
+	"workspace_dir: .beacon/worktrees\n" +
+	"base_branch: main\n" +
+	"task_source:\n  provider: markdown\n  dir: docs/tasks\n" +
+	"scm:\n  provider: github\n  owner: owner\n  repo: repo\n" +
+	"harness:\n  provider: opencode\n  model: model-a\n"
+
+func TestCompleteAcceptsFullConfig(t *testing.T) {
+	c, err := Load(writeConfig(t, completeConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Complete() {
+		t.Fatal("complete config was rejected")
+	}
+}
+
+func TestCompleteRejectsEmptyConfig(t *testing.T) {
+	c, err := Load(writeConfig(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Complete() {
+		t.Fatal("empty config was accepted")
+	}
+}
+
+func TestCompleteRejectsPartialConfig(t *testing.T) {
+	c, err := Load(writeConfig(t, "harness:\n  model: model-a\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Complete() {
+		t.Fatal("partial config was accepted")
+	}
+}
