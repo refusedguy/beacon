@@ -256,8 +256,10 @@ func sessionIDFromJSON(data []byte) string {
 	return envelope.Data.ID
 }
 
-// ApplyAuth sets the Authorization header for an OpenCode request. Tokens of
-// the form user:pass use HTTP Basic; any other token uses a Bearer header.
+// ApplyAuth sets the Authorization header on a request. Tokens of the form
+// user:pass use HTTP Basic; any other token uses a Bearer header. The harness
+// module cannot import packages under internal, so this copy must stay in sync
+// with shared.ApplyAuth.
 func ApplyAuth(req *http.Request, token string) {
 	if user, pass, ok := strings.Cut(token, ":"); ok {
 		req.SetBasicAuth(user, pass)
