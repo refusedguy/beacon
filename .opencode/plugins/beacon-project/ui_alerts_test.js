@@ -4,8 +4,8 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   PANEL_NAME, beaconStatusDefinition, collectTransitionToasts,
-  createDetailMount, createSidebarMount, detailModel, normalizeRun,
-  shortTaskID, sidebarModel,
+  createDetailMount, createSidebarMount, detailModel, launchSourceText,
+  metricsLine, normalizeRun, shortTaskID, sidebarModel,
 } from "./ui.js"
 import { NOW, hostModule, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -109,70 +109,84 @@ test("a base incident banner is clickable and opens its fixer run", async () => 
   h.dispose()
 })
 
-test("queue shows a full title, a compact state line and short clickable dependencies", () => {
-  const snap = {
-    active: [], recent: [],
-    queue: [
-      { id: "T-2", title: "Ready task", priority: 9, status: "ready" },
-      { id: "T-3", title: "Blocked task", priority: 2, status: "waiting_deps", depends_on: ["T-2"] },
-    ],
-  }
-  const open = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true })
-  const lines = open.listItems.map((i) => [i.marker, i.name, i.status].filter(Boolean).join(" "))
-  assert.ok(lines.includes("▼ Queue 2"))
-  assert.ok(lines.includes("○ Ready task"), "line one keeps the title")
-  assert.ok(lines.includes("ready · P9 · 0 deps"), "line two carries state, priority and count")
-  assert.ok(lines.includes("◌ Blocked task"), "a blocked card still shows its title")
-  assert.ok(lines.includes("blocked · P2 · 1 dep"))
-  assert.ok(lines.includes("↳ T-2"), "the dependency is short and on its own clickable row")
-  assert.equal(lines.some((line) => line.includes("blocked by")), false)
-  const dep = open.listItems.find((i) => i.kind === "queue-dep")
-  assert.equal(dep.action, "card:T-2")
-  assert.ok(lines.includes("▶ Dispatch (1 ready)"))
-  assert.equal(open.ready, 1)
-
-  const collapsed = sidebarModel(snap, null, NOW, { active: true, queue: false, recent: true })
-  assert.equal(collapsed.listItems.some((i) => i.name === "Ready task"), false, "the queue starts collapsed")
-  assert.equal(collapsed.listItems.some((i) => i.action === "dispatch"), true, "Dispatch stays available")
+test("three tasks sharing a blocker get one header and three title rows", () => {
+  const blocker = "T-20261124-19651f36-01"
+  const queue = ["A", "B", "C"].map((suffix, i) => ({
+    id: `T-${suffix}`, title: `Task ${suffix}`, priority: 9 - i,
+    status: "waiting_deps", depends_on: [blocker],
+  }))
+  const snap = { active: [], recent: [makeRun({ ID: "r1", TaskID: "T-RECENT", State: "merged" })], queue }
+  const open = { active: true, queue: true, recent: true }
+  const items = sidebarModel(snap, null, NOW, open).listItems
+  const headers = items.filter((i) => i.kind === "queue-blocker")
+  assert.equal(headers.length, 1)
+  assert.deepEqual([headers[0].name, headers[0].depID, headers[0].action],
+    ["blocked by 19651f36-01 · 3 tasks", blocker, `card:${blocker}`])
+  assert.deepEqual(items.filter((i) => i.kind === "queue-title").map((i) => i.name), ["Task A", "Task B", "Task C"])
+  assert.equal(items.some((i) => i.kind === "queue-dep"), false, "dependencies are headers, not repeated rows")
+  assert.equal(items.filter((i) => i.kind === "queue-title").every((i) => !i.name.includes("19651f36")), true)
+  const recentAt = items.findIndex((i) => i.sectionKey === "recent")
+  assert.equal(items[recentAt - 1].kind, "spacer", "Recent is separated from the queue")
+  assert.ok(items.some((i) => i.recent === true && i.runID === "r1"), "Recent stays clickable")
+  assert.ok(items.some((i) => i.name === "Idle · no ready tasks"), "an all-blocked queue stays honest")
+  const collapsed = sidebarModel(snap, null, NOW, { active: true, queue: false, recent: true }).listItems
+  assert.equal(collapsed.some((i) => i.kind === "queue-blocker"), false)
 })
 
-test("epic and child queue rows carry distinct markers and keep their link", () => {
+test("different blockers get separate headers and priority sits in the right column", () => {
   const snap = {
     active: [], recent: [],
     queue: [
-      { id: "T-EPIC", title: "Harness epic", priority: 9, status: "ready", kind: "epic", depends_on: ["T-EPIC-01"] },
-      { id: "T-EPIC-01", title: "Child card", priority: 8, status: "waiting_deps", depends_on: ["T-BLOCK"] },
+      { id: "T-A", title: "Task A", priority: 5, status: "waiting_deps", depends_on: ["BLOCK-1", "EXTRA"] },
+      { id: "T-B", title: "Task B", priority: 4, status: "waiting_deps", depends_on: ["BLOCK-2"] },
+      { id: "T-C", title: "Task C", priority: 3, status: "ready" },
     ],
   }
-  const open = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true })
-  const epic = open.listItems.find((i) => i.kind === "queue-title" && i.cardID === "T-EPIC")
-  const child = open.listItems.find((i) => i.kind === "queue-title" && i.cardID === "T-EPIC-01")
-  assert.equal(epic.marker, "◆")
-  assert.equal(epic.name, "Harness epic")
-  assert.equal(epic.status, "EPIC")
-  assert.equal(child.marker, "└")
-  assert.equal(child.name, "Child card")
-  assert.ok(open.listItems.some((i) => i.name === "child · blocked · P8 · 1 dep"))
-  assert.equal(open.listItems.find((i) => i.kind === "queue-dep" && i.name === "T-BLOCK").depID, "T-BLOCK")
+  const items = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true }).listItems
+  assert.deepEqual(items.filter((i) => i.kind === "queue-blocker").map((i) => i.name), [
+    "blocked by BLOCK-1 · 1 task", "blocked by BLOCK-2 · 1 task",
+  ])
+  assert.deepEqual(items.filter((i) => i.kind === "queue-title").map((i) => [i.marker, i.name, i.status]), [
+    ["◌", "Task A", "P5 · 2 deps"], ["◌", "Task B", "P4 · 1 dep"], ["○", "Task C", "P3"],
+  ])
+  assert.equal(items.filter((i) => i.kind === "spacer").length, 3, "groups and Recent get air")
 })
 
-test("child dependencies are not repeated and long IDs keep the readable suffix", () => {
+test("an expanded epic keeps its children under one blocker header and Recent visible", () => {
+  const epicID = "T-EPIC"
+  const snap = {
+    active: [], recent: [makeRun({ ID: "r1", TaskID: "T-RECENT", State: "merged" })],
+    queue: [
+      { id: epicID, title: "Harness epic", priority: 9, status: "ready", kind: "epic",
+        depends_on: [`${epicID}-01`, `${epicID}-02`, "T-BLOCK"] },
+      { id: `${epicID}-01`, title: "Child one", priority: 8, status: "waiting_deps" },
+      { id: `${epicID}-02`, title: "Child two", priority: 7, status: "waiting_deps" },
+    ],
+  }
+  const open = { active: true, queue: true, recent: true }
+  const closed = sidebarModel(snap, null, NOW, open, {}).listItems
+  assert.deepEqual(closed.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 1 task"])
+  assert.equal(closed.find((i) => i.kind === "queue-status" && i.cardID === epicID).name, "epic · 2 children")
+  const expanded = sidebarModel(snap, null, NOW, open, { [epicID]: true }).listItems
+  assert.deepEqual(expanded.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 3 tasks"])
+  assert.deepEqual(expanded.filter((i) => i.kind === "queue-title").map((i) => i.name),
+    ["Harness epic", "Child one", "Child two"])
+  assert.ok(expanded.some((i) => i.recent === true && i.runID === "r1"), "Recent stays clickable")
+})
+
+test("long blocker IDs are short in the header and child deps are not repeated", () => {
   const snap = {
     active: [], recent: [],
     queue: [
-      {
-        id: "T-20261124-51f36", title: "Harness epic", status: "ready", priority: 9, kind: "epic",
-        depends_on: ["T-20261124-51f36-01", "T-20261124-51f36-02", "T-BLOCK"],
-      },
+      { id: "T-20261124-51f36", title: "Harness epic", status: "ready", priority: 9, kind: "epic",
+        depends_on: ["T-20261124-51f36-01", "T-20261124-51f36-02", "T-BLOCK"] },
       { id: "T-20261124-51f36-01", title: "Child one", status: "available", priority: 8 },
       { id: "T-20261124-51f36-02", title: "Child two", status: "available", priority: 8 },
     ],
   }
-  const open = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true })
-  const deps = open.listItems.filter((i) => i.kind === "queue-dep")
-  assert.equal(deps.length, 1, "a child that is also a dependency is drawn once")
-  assert.equal(deps[0].depID, "T-BLOCK")
-  assert.equal(deps[0].name, "T-BLOCK")
+  const items = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true }).listItems
+  assert.equal(items.some((i) => i.kind === "queue-dep"), false, "child IDs in depends are not drawn twice")
+  assert.deepEqual(items.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 3 tasks"])
   assert.equal(shortTaskID("T-20261124-51f36-01"), "51f36-01", "the date prefix is dropped, not the ID middle cut")
   assert.equal(shortTaskID("T-2"), "T-2")
   assert.equal(shortTaskID(""), "-")
@@ -276,4 +290,14 @@ test("alert, queue and detail rows work on a host without box children", () => {
     detail.apply(detailModel(merged, {}, NOW), merged)
   })
   assert.equal(created.length, before, "refresh changes props only")
+})
+
+test("launch source shows in the metrics line and the technical line", () => {
+  const line = metricsLine({ active: [], recent: [], metrics: { launch_sources: { mcp: 2, cli: 1 } } })
+  assert.deepEqual([line.marker, line.status], ["", "R0 C0 B0 M0 · mcp:2 cli:1"])
+  assert.equal(launchSourceText({ launchSources: { ui: 3 } }), "ui:3")
+  const run = Object.assign(normalizeRun(makeRun()), { launchSource: "mcp", agentIdentity: "operator" })
+  const names = detailModel(run, {}, NOW, { technical: true }).rows.map((i) => i.name)
+  assert.ok(names.includes("mcp · operator"))
+  assert.equal(detailModel(normalizeRun(makeRun()), {}, NOW, { technical: true }).rows.some((i) => i.name === "mcp · operator"), false)
 })

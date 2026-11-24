@@ -6,7 +6,7 @@ import {
 } from "./ui_model.js"
 import {
   baseIncidentItem, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, timelineText, truncate,
+  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, timelineText, truncate,
 } from "./ui_alerts.js"
 export { shortTaskID }
 
@@ -213,7 +213,10 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
     }
   }
   listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
-  if (open.queue === true) listItems.push(...queueRows(view.queue, epicOpen))
+  if (open.queue === true) {
+    listItems.push(...queueRows(view.queue, epicOpen))
+    listItems.push(spacerItem())
+  }
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
   if (open.recent !== false) {
     if (!recent.length) listItems.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
