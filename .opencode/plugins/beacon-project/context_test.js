@@ -126,6 +126,12 @@ test("orchestrator rules warn against duplicate cards and dispatch loops", () =>
   }
 })
 
+test("orchestrator rules ask for status checks before acting on a complaint", () => {
+  for (const text of ["beacon_status", "beacon status --daemon", "git status --short", "no ready tasks"]) {
+    assert.ok(ORCHESTRATOR_RULES.includes(text), `orchestrator rules missing ${text}`)
+  }
+})
+
 test("survivalRulesEnabled false disables role instruction injection", async () => {
   const ctx = fakeCtx()
   ctx.session.get = async () => ({ data: { agent: "orchestrator" } })

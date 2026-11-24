@@ -13,8 +13,8 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
       label: { confirm: "Cancel run", cancel: "Keep run" },
     })
   })
-  const copyID = (run) => {
-    const text = [str(run.id), str(run.branch)].filter(Boolean).join(" · ")
+  const copyText = (text) => {
+    if (!text) return false
     const method = ctx.renderer?.copyToClipboardOSC52
     if (typeof method !== "function") {
       show("Clipboard unavailable in this TUI", "warning")
@@ -25,9 +25,17 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
     show(copied ? `Copied ${text}` : "Clipboard copy was refused", copied ? "success" : "warning")
     return copied
   }
-  const control = async (action, run) => {
+  const copyID = (run) => copyText([str(run.id), str(run.branch)].filter(Boolean).join(" · "))
+  const copyPR = (run) => {
+    const url = str(run.prURL)
+    if (!url) { show("No PR URL for this run", "warning"); return false }
+    return copyText(url)
+  }
+  const control = async (action, run, message) => {
     try {
-      const result = await source.control({ action, runID: str(run.id), sha: str(run.sha) || undefined })
+      const input = { action, runID: str(run.id), sha: str(run.sha) || undefined }
+      if (message) input.message = str(message)
+      const result = await source.control(input)
       if (result?.ok === false) throw new Error(str(result.error || result.reason) || `${action} was refused`)
       show(`${action} accepted for ${str(run.id)}`, "success")
       return result
@@ -35,6 +43,21 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
       show(`${action} failed: ${errorMessage(error)}`, "error")
       return null
     } finally { await refresh() }
+  }
+  const nudge = async (run) => {
+    if (typeof ctx.ui?.dialog?.prompt !== "function") {
+      show("Nudge unavailable in this TUI", "warning")
+      await refresh()
+      return null
+    }
+    const answer = await ctx.ui.dialog.prompt({
+      title: "Nudge worker",
+      description: "Send guidance to the running worker",
+      placeholder: "...",
+    })
+    const message = str(answer).trim()
+    if (!message) { show("No guidance sent", "info"); await refresh(); return null }
+    return control("nudge", run, message)
   }
   const dispatch = async () => {
     try {
@@ -52,6 +75,8 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
     if (name === "dispatch") return dispatch()
     if (!run) return null
     if (name === "copy") return copyID(run)
+    if (name === "pr") return copyPR(run)
+    if (name === "help") return nudge(run)
     if (name === "cancel" && opts.confirmed !== true) {
       if (typeof ctx.ui?.dialog?.confirm !== "function") {
         show("Confirmation unavailable, run kept", "warning")
@@ -65,7 +90,7 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
         return null
       }
     }
-    if (["retry", "approve", "cancel"].includes(name)) return control(name, run)
+    if (["retry", "approve", "cancel", "nudge"].includes(name)) return control(name, run, opts.message)
     return null
   }
 }

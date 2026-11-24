@@ -13,6 +13,7 @@ const modulePaths = [
   "./mcp.js",
   "./context.js",
   "./options.js",
+  "./ui_alerts.js",
 ]
 
 async function importAll() {

@@ -44,9 +44,10 @@ test("sidebar renders a flat header, state bar legend and two lines per run", ()
   assert.equal(result[2], "▼ Active 1")
   assert.equal(result[3], "▲ T-1 BLK")
   assert.equal(result[4], "#42 3m dirty worktree")
-  assert.equal(result[5], "▶ Dispatch")
-  assert.equal(result[6], "▼ Recent 0")
-  assert.equal(result[7], "No recent runs")
+  assert.equal(result[5], "No tasks ready")
+  assert.equal(result[6], "▶ Queue (0)")
+  assert.equal(result[7], "▼ Recent 0")
+  assert.equal(result[8], "No recent runs")
 })
 
 test("a long full title is not cut to a fixed width", () => {
@@ -166,6 +167,57 @@ test("CLI control sends the action, run ID, optional SHA and --json", async () =
   assert.equal(calls[1].includes("--sha"), false)
 })
 
+test("CLI control forwards --message for a nudge", async () => {
+  const calls = []
+  const execFile = async (program, args) => {
+    calls.push([program, ...args])
+    return { stdout: '{"ok":true,"action":"nudge"}' }
+  }
+  const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
+  const result = await source.control({ action: "nudge", runID: "run-1", message: "check the base branch" })
+  assert.deepEqual(calls, [["/bin/beacon", "control", "--action", "nudge", "--run-id", "run-1", "--json", "--message", "check the base branch"]])
+  assert.equal(result.ok, true)
+  await source.control({ action: "retry", runID: "run-2" })
+  assert.equal(calls[1].includes("--message"), false)
+})
+
+test("normalizeSnapshot keeps a non-null queue and reads the new run and incident fields", () => {
+  const old = normalizeSnapshot({ active: [makeRun()], recent: [] })
+  assert.deepEqual(old.queue, [])
+  assert.equal(old.daemon, undefined)
+  assert.equal(old.baseIncident, undefined)
+
+  const snap = normalizeSnapshot({
+    active: [makeRun({
+      SessionID: "ses-1", IsFixer: true, BlockedIncidentID: "inc-1",
+      PRURL: "https://github.com/o/r/pull/42",
+    })],
+    recent: [],
+    queue: [
+      { id: "T-2", title: "Ready task", priority: 9, status: "ready" },
+      { id: "T-3", title: "Blocked task", priority: 2, status: "waiting_deps", depends_on: ["T-2"] },
+    ],
+    base_incident: {
+      id: "inc-1", base_branch: "main", failed_checks: ["ci", "lint"],
+      fixer_run_id: "run-1", attempts: 2,
+    },
+    daemon: { state: "dead", pid: 0, heartbeat_age_seconds: 91, error: "heartbeat lost" },
+  })
+  assert.equal(snap.active[0].sessionID, "ses-1")
+  assert.equal(snap.active[0].isFixer, true)
+  assert.equal(snap.active[0].blockedIncidentID, "inc-1")
+  assert.equal(snap.active[0].prURL, "https://github.com/o/r/pull/42")
+  assert.equal(snap.queue.length, 2)
+  assert.deepEqual(snap.queue[1].dependsOn, ["T-2"])
+  assert.equal(snap.baseIncident.failedChecks, 2)
+  assert.equal(snap.baseIncident.fixerRunID, "run-1")
+  assert.equal(snap.daemon.state, "dead")
+  assert.equal(snap.daemon.heartbeatAgeSeconds, 91)
+  assert.equal(snap.daemon.error, "heartbeat lost")
+  assert.equal(normalizeSnapshot(null).queue.length, 0)
+  assert.equal(normalizeSnapshot({ base_incident: { failed_checks: '["ci","lint"]' } }).baseIncident.failedChecks, 2)
+})
+
 test("CLI dispatch runs beacon dispatch 1 through the same resolver", async () => {
   const calls = []
   const execFile = async (program, args) => {
@@ -217,6 +269,9 @@ test("RPC definition validates snapshot, control and dispatch shapes", () => {
   assert.ok("issues" in control.input["~standard"].validate({ action: "nope", runID: "run-1" }))
   assert.ok("issues" in control.input["~standard"].validate({ action: "retry" }))
   assert.ok("issues" in control.input["~standard"].validate({ action: "retry", runID: "run-1", sha: 4 }))
+  assert.ok(control.input["~standard"].validate({ action: "nudge", runID: "run-1", message: "go" }).value !== undefined)
+  assert.ok("issues" in control.input["~standard"].validate({ action: "nudge", runID: "run-1" }))
+  assert.ok("issues" in control.input["~standard"].validate({ action: "retry", runID: "run-1", message: 4 }))
   assert.ok(control.output["~standard"].validate({ ok: true }).value !== undefined)
   assert.ok(dispatch.input["~standard"].validate({ n: 1 }).value !== undefined)
   assert.ok("issues" in dispatch.input["~standard"].validate({ n: 0 }))
@@ -240,8 +295,9 @@ test("errorMessage handles Error, plain object and string", () => {
   assert.equal(errorMessage("down"), "down")
 })
 
-test("empty snapshot renders both sections with a dispatch button", () => {
+test("empty snapshot renders both sections with an honest dispatch label", () => {
   assert.deepEqual(renderSnapshotLines(EMPTY_SNAPSHOT), [
-    "Beacon 0 active", "R0 C0 B0 M0", "▼ Active 0", "No active runs", "▶ Dispatch", "▼ Recent 0", "No recent runs",
+    "Beacon 0 active", "R0 C0 B0 M0", "▼ Active 0", "No active runs",
+    "No tasks ready", "▶ Queue (0)", "▼ Recent 0", "No recent runs",
   ])
 })

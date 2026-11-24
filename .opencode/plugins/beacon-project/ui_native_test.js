@@ -197,7 +197,10 @@ test("Dispatch and Control still reach the RPC through the real setup", async ()
   const dispatches = []
   const toasts = []
   const rpc = {
-    snapshot: async () => ({ active: [makeRun({ State: "blocked" })], recent: [] }),
+    snapshot: async () => ({
+      active: [makeRun({ State: "blocked" })], recent: [],
+      queue: [{ id: "T-2", title: "Queued task", status: "ready", priority: 1 }],
+    }),
     control: async (input) => { controls.push(input); return { ok: true } },
     dispatch: async (input) => { dispatches.push(input); return { started: 1 } },
     events: { on: () => () => {} },

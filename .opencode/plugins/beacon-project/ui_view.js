@@ -4,6 +4,10 @@ import {
   DECISION_LIMIT, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH, RECENT_LIMIT,
   normalizeSnapshot, str,
 } from "./ui_model.js"
+import {
+  baseIncidentItem, daemonAlertItem, dispatchItem, nextStepLine,
+  queueLineItems, readyCount, timelineText,
+} from "./ui_alerts.js"
 
 export const STATE_BAR_WIDTH = 38
 export const STATE_BAR_KEYS = Object.freeze(["running", "waiting_ci", "blocked", "merged"])
@@ -32,9 +36,9 @@ export function recentBadge(run) {
   return "OK"
 }
 
-export const SIDEBAR_OPEN = Object.freeze({ active: true, recent: true })
+export const SIDEBAR_OPEN = Object.freeze({ active: true, queue: false, recent: true })
 export const DETAIL_OPEN = Object.freeze({ why: true, checks: true, timeline: true, technical: false })
-export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "copy"])
+export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "pr", "help", "copy"])
 
 export function truncate(value, width) {
   const text = str(value)
@@ -98,30 +102,6 @@ export function phaseLabel(run, now = Date.now()) {
   return ageOf(run, now)
 }
 export const mergedReason = (run) => str(run?.reason).trim() || (run?.pr ? `merged PR #${run.pr}` : "merged to main")
-
-const TIMELINE_TEXT = Object.freeze({
-  created: "Run created", admitted: "Run created, task admitted",
-  admitted_task: "Run created, task admitted", spawn: "Worker started",
-  spawned: "Worker started", session: "Worker session started",
-  session_started: "Worker session started", worker_started: "Worker started",
-  watch_pr: "PR opened", pr_opened: "PR opened", pr: "PR opened",
-  checks_pending: "CI checks pending", ci_pending: "CI checks pending",
-  rebase: "Rebased onto main", rebased: "Rebased onto main",
-  merge: "Squash merged to main", merged: "Squash merged to main",
-  delivery_claim: "Squash merged to main", cancel: "Run closed", closed: "Run closed",
-})
-const STATE_NAMES = Object.freeze({
-  waiting_ci: "waiting CI", needs_rebase: "needs rebase", needs_agent_fix: "needs agent fix",
-})
-// Human timeline copy instead of raw event kinds such as "checks_pending".
-export function timelineText(event = {}) {
-  const kind = str(event.kind).toLowerCase()
-  const base = TIMELINE_TEXT[kind]
-    || str(event.kind || "event").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
-  const text = event.pr && /PR opened/.test(base) ? base.replace("PR opened", `PR #${event.pr} opened`) : base
-  return kind === "checks_pending" && event.state
-    ? `${text} · ${STATE_NAMES[str(event.state).toLowerCase()] || str(event.state)}` : text
-}
 
 const BADGE_LABEL = Object.freeze({
   pending: "PEND", running: "RUN", waiting_ci: "CI", needs_rebase: "REBASE",
@@ -232,18 +212,27 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   ]
   if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
   const listItems = []
+  for (const alert of [daemonAlertItem(view.daemon), baseIncidentItem(view.baseIncident)]) {
+    if (alert) listItems.push(alert)
+  }
+  const ready = readyCount(view.queue)
   listItems.push(sectionItem("Active", active.length, "active", open.active !== false))
   if (open.active !== false) {
     if (!active.length) listItems.push({ marker: "", name: "No active runs", status: "", color: "muted" })
     active.forEach((run) => listItems.push(...runLineItems(run, now)))
-    listItems.push({ marker: "▶", name: "Dispatch", status: "", color: "success", bold: true, action: "dispatch" })
+    listItems.push(dispatchItem(ready))
   }
+  listItems.push({
+    ...sectionItem("Queue", view.queue.length, "queue", open.queue === true),
+    name: `Queue (${view.queue.length})`, status: "",
+  })
+  if (open.queue === true) listItems.push(...queueLineItems(view.queue))
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
   if (open.recent !== false) {
     if (!recent.length) listItems.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
     recent.forEach((run) => listItems.push(...runLineItems(run, now, true)))
   }
-  return { ...bar, items: [...items, ...listItems], listItems, active, recent, view }
+  return { ...bar, items: [...items, ...listItems], listItems, active, recent, view, queue: view.queue, ready }
 }
 export const snapshotLineItems = (snapshot, error, now) => sidebarModel(snapshot, error, now).items
 export const renderSnapshotLines = (snapshot, error, now) => snapshotLineItems(snapshot, error, now)
@@ -259,9 +248,11 @@ export function detailActions(run) {
   const state = str(run.state).toLowerCase()
   const active = ["pending", "running", "waiting_ci", "needs_rebase", "needs_agent_fix"].includes(state)
   const actions = []
-  if (state === "blocked") actions.push("retry")
+  if (state === "blocked" || state === "closed") actions.push("retry")
   if (state === "waiting_ci" || (run.pr && active)) actions.push("approve")
   if (active) actions.push("cancel")
+  if (run.prURL) actions.push("pr")
+  if (active) actions.push("help")
   actions.push("copy")
   return actions
 }
@@ -272,7 +263,7 @@ function phaseSummary(run) {
 export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_OPEN) {
   if (!run) return {
     badge: "", pr: "", branch: "", title: "No run selected", task: "", phase: "",
-    actions: [], rows: [{ text: "No run selected", color: "muted" }],
+    nextStep: "", fixer: "", actions: [], rows: [{ text: "No run selected", color: "muted" }],
   }
   const v = stateView(run.state)
   const state = str(run.state).toLowerCase()
@@ -313,6 +304,7 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
   header("Technical", "technical")
   if (isOpen("technical")) {
     row({ marker: key("Run ID"), name: run.id || "-", status: "", color: "base", kind: "tech" })
+    row({ marker: key("Session"), name: run.sessionID || "-", status: "", color: "base", kind: "tech" })
     row({ marker: key("Head SHA"), name: run.sha || "-", status: "", color: "base", kind: "tech" })
     const attempts = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
     row({ marker: key("Attempts"), name: attempts, status: "", color: "base", kind: "tech" })
@@ -333,6 +325,8 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     title: str(run.title) || str(run.taskID) || "-",
     task: run.taskID || "-",
     phase: phaseSummary(run),
+    nextStep: nextStepLine(run),
+    fixer: run.isFixer ? "FIXER" : "",
     actions: detailActions(run),
     rows,
   }

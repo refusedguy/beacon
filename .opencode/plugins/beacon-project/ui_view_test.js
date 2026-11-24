@@ -96,7 +96,10 @@ test("recent shows one terminal run per task and skips tasks active again", () =
 })
 
 test("sidebar sections collapse without losing the dispatcher", () => {
-  const snapshot = { active: [makeRun()], recent: [makeRun({ ID: "r2", State: "closed" })] }
+  const snapshot = {
+    active: [makeRun()], recent: [makeRun({ ID: "r2", State: "closed" })],
+    queue: [{ id: "T-2", title: "Queued", status: "ready", priority: 1 }],
+  }
   const open = sidebarModel(snapshot, null, NOW).items
   assert.ok(open.some((i) => i.action === "dispatch"))
   const closed = sidebarModel(snapshot, null, NOW, { active: false, recent: false }).items
@@ -104,7 +107,7 @@ test("sidebar sections collapse without losing the dispatcher", () => {
   assert.equal(closed.find((i) => i.sectionKey === "active").marker, "▶")
   assert.equal(closed.find((i) => i.sectionKey === "recent").marker, "▶")
   assert.equal(closed.some((i) => i.runID), false)
-  assert.deepEqual(SIDEBAR_OPEN, { active: true, recent: true })
+  assert.deepEqual(SIDEBAR_OPEN, { active: true, queue: false, recent: true })
 })
 
 test("a stale transport error keeps the snapshot and clips the marker", () => {
@@ -119,9 +122,10 @@ test("a stale transport error keeps the snapshot and clips the marker", () => {
 test("empty snapshot still renders both sections behind a counted header", () => {
   const items = sidebarModel(EMPTY_SNAPSHOT, null, NOW).items
   assert.deepEqual(items.map((i) => i.name), [
-    "Beacon", "R0 C0 B0 M0", "Active", "No active runs", "Dispatch", "Recent", "No recent runs",
+    "Beacon", "R0 C0 B0 M0", "Active", "No active runs",
+    "No tasks ready", "Queue (0)", "Recent", "No recent runs",
   ])
-  assert.deepEqual(items.filter((i) => i.sectionKey).map((i) => i.status), ["0", "0"])
+  assert.deepEqual(items.filter((i) => i.sectionKey).map((i) => i.status), ["0", "", "0"])
 })
 
 test("detail model uses four sections with full wrapping text", () => {
@@ -192,10 +196,12 @@ test("detail caps decisions to the most recent 20 and marks the rest", () => {
 })
 
 test("detailActions follows the run state", () => {
-  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "running" }))), ["approve", "cancel", "copy"])
-  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "waiting_ci" }))), ["approve", "cancel", "copy"])
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "running" }))), ["approve", "cancel", "help", "copy"])
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "waiting_ci" }))), ["approve", "cancel", "help", "copy"])
   assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "blocked" }))), ["retry", "copy"])
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "closed" }))), ["retry", "copy"])
   assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "merged" }))), ["copy"])
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "running", PRURL: "https://x/pull/42" }))), ["approve", "cancel", "pr", "help", "copy"])
   assert.deepEqual(detailActions(null), [])
 })
 

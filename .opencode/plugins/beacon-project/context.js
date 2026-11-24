@@ -27,6 +27,7 @@ export const ORCHESTRATOR_RULES = [
   '9) Before beacon_task_create, check git log -n 10 --oneline, beacon_status and beacon_recent. Never duplicate work that is already merged or in flight.',
   '10) Give each card a narrow, disjoint Scope. Never run two cards that touch ui.js, ui_view.js or reconciler.go at the same time.',
   '11) After Go code lands on main, run bash scripts/build-beacon.sh and tell the operator to restart the MCP daemon and the OpenCode TUI.',
+  '12) On any operator complaint or stop, run beacon_status, beacon status --daemon and git status --short before acting. Never dispatch blindly when there are no ready tasks.',
 ].join("\n")
 
 // Plugin options can arrive under options or the full config object.

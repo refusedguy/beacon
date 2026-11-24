@@ -12,6 +12,11 @@ export const SIDEBAR_LINES = 34
 // names are clipped from the end instead of using the host's middle ellipsis.
 export function sidebarPresentation(items = []) {
   return items.map((item) => {
+    if (item.banner) return {
+      ...item,
+      nameColor: item.color, nameBold: true,
+      markerColor: item.color, statusColor: "muted",
+    }
     if (!item.runID) {
       const isDispatch = item.action === "dispatch"
       const isSection = Boolean(item.sectionKey)
@@ -66,14 +71,17 @@ export function createSidebarMount(ui, deps) {
   // The Dispatch line becomes a padded, themed button. Pooled rows reset every
   // apply, so a row that used to be Dispatch never keeps the button styling.
   const decorateRows = () => list.node.forEach((box) => {
-    const dispatch = box.item?.action === "dispatch"
-    set(box, "marginTop", dispatch ? 1 : 0)
-    set(box, "paddingLeft", dispatch ? 1 : 0)
-    set(box, "paddingRight", dispatch ? 1 : 0)
-    set(box, "backgroundColor", dispatch ? raised : undefined)
+    const item = box.item
+    const dispatch = item?.action === "dispatch"
+    const banner = item?.banner === true
+    const baseBg = dispatch || banner ? raised : undefined
+    set(box, "marginTop", dispatch || banner ? 1 : 0)
+    set(box, "paddingLeft", dispatch || banner ? 1 : 0)
+    set(box, "paddingRight", dispatch || banner ? 1 : 0)
+    set(box, "backgroundColor", baseBg)
     set(box, "onMouseUp", dispatch ? () => onItem(box.item) : undefined)
     set(box, "onMouseOver", () => set(box, "backgroundColor", hoverBg))
-    set(box, "onMouseOut", () => set(box, "backgroundColor", dispatch ? raised : undefined))
+    set(box, "onMouseOut", () => set(box, "backgroundColor", baseBg))
   })
 
   const apply = (model, error = null) => {

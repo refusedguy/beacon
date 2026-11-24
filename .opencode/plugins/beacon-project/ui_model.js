@@ -19,9 +19,21 @@ export const RESUBSCRIBE_MAX_MS = 30000
 export const REASON_WIDTH = 40
 export const RECENT_LIMIT = 5
 export const DECISION_LIMIT = 20
-export const SIDEBAR_SECTIONS = Object.freeze(["active", "recent"])
+export const SIDEBAR_SECTIONS = Object.freeze(["active", "queue", "recent"])
 export const DETAIL_SECTIONS = Object.freeze(["why", "checks", "timeline", "technical"])
-export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [] })
+export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [], queue: [] })
+
+const bool = (v) => v === true || v === 1 || v === "true"
+const raw = (v) => (v == null ? "" : v)
+export const failedCheckCount = (v) => {
+  if (Array.isArray(v)) return v.length
+  if (typeof v === "string" && v.trim().startsWith("[")) {
+    try { const parsed = JSON.parse(v); if (Array.isArray(parsed)) return parsed.length } catch {}
+  }
+  if (v == null || v === "") return "?"
+  const n = Number(v)
+  return Number.isFinite(n) ? n : raw(v)
+}
 
 export const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v))
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0 }
@@ -54,6 +66,23 @@ const CHECK_SPEC = [
   ["name", ["Name", "name"]], ["state", ["State", "state"]],
   ["durationSeconds", ["duration_seconds", "durationSeconds"], num],
 ]
+const QUEUE_SPEC = [
+  ["id", ["ID", "id"]], ["title", ["Title", "title"]],
+  ["priority", ["Priority", "priority"], raw],
+  ["status", ["Status", "status"], (v) => str(v) || "ready"],
+  ["dependsOn", ["DependsOn", "depends_on", "dependsOn"], (v) => list(v, str)],
+]
+const BASE_INCIDENT_SPEC = [
+  ["id", ["ID", "id"]], ["baseBranch", ["BaseBranch", "base_branch", "baseBranch"]],
+  ["failedChecks", ["FailedChecks", "failed_checks", "failedChecks"], failedCheckCount],
+  ["fixerRunID", ["FixerRunID", "fixer_run_id", "fixerRunID"]],
+  ["attempts", ["Attempts", "attempts"], num],
+]
+const DAEMON_SPEC = [
+  ["state", ["State", "state"]], ["pid", ["PID", "pid"], num],
+  ["heartbeatAgeSeconds", ["HeartbeatAgeSeconds", "heartbeat_age_seconds", "heartbeatAgeSeconds"], num],
+  ["error", ["Error", "error"]],
+]
 const RUN_SPEC = [
   ["id", ["ID", "id"]], ["taskID", ["TaskID", "task_id", "taskID", "taskId"]],
   ["state", ["State", "state"], (v) => str(v) || "unknown"], ["title", ["title", "Title"]],
@@ -69,6 +98,10 @@ const RUN_SPEC = [
   ["timeline", ["Timeline", "timeline"], (v) => list(v, (e) => normalize(e, EVENT_SPEC))],
   ["decisions", ["Decisions", "decisions"], (v) => list(v, (d) => normalize(d, DECISION_SPEC))],
   ["checks", ["Checks", "checks"], (v) => list(v, (c) => normalize(c, CHECK_SPEC))],
+  ["sessionID", ["SessionID", "session_id", "sessionID"]],
+  ["isFixer", ["IsFixer", "is_fixer", "isFixer"], bool],
+  ["blockedIncidentID", ["BlockedIncidentID", "blocked_incident_id", "blockedIncidentID"]],
+  ["prURL", ["PRURL", "pr_url", "prURL"]],
 ]
 const METRIC_KEYS = {
   dispatchCount: "dispatch_count", dispatchCycles: "dispatch_cycles", skipCount: "skip_count",
@@ -91,7 +124,14 @@ export function normalizeMetrics(v) {
 export const normalizeRun = (v) => normalize(v, RUN_SPEC)
 export function normalizeSnapshot(v) {
   const s = v && typeof v === "object" ? v : {}
-  const out = { active: list(s.active, normalizeRun), recent: list(s.recent, normalizeRun) }
+  const out = {
+    active: list(s.active, normalizeRun), recent: list(s.recent, normalizeRun),
+    queue: list(pick(s, ["queue", "Queue"]), (item) => normalize(item, QUEUE_SPEC)),
+  }
+  const incident = pick(s, ["base_incident", "baseIncident", "BaseIncident"])
+  if (incident != null) out.baseIncident = normalize(incident, BASE_INCIDENT_SPEC)
+  const daemon = pick(s, ["daemon", "Daemon"])
+  if (daemon != null) out.daemon = normalize(daemon, DAEMON_SPEC)
   if (s.metrics !== undefined) out.metrics = normalizeMetrics(s.metrics)
   const generatedAt = pick(s, ["generated_at", "generatedAt"])
   if (generatedAt !== undefined) out.generatedAt = generatedAt
@@ -179,9 +219,10 @@ export class CliStatusSource {
     const snap = normalizeSnapshot(parseSnapshot((await this.#exec(this.#command(), this.#statusArgs(limits))).stdout))
     return { ...snap, active: enrichRuns(this.root, snap.active, this.deps), recent: enrichRuns(this.root, snap.recent, this.deps) }
   }
-  async control({ action, runID, sha } = {}) {
+  async control({ action, runID, sha, message } = {}) {
     const args = ["control", "--action", str(action), "--run-id", str(runID), "--json"]
     if (sha) args.push("--sha", str(sha))
+    if (message) args.push("--message", str(message))
     return parseSnapshot((await this.#exec(this.#command(), args)).stdout)
   }
   async dispatch({ n = 1 } = {}) {
@@ -211,7 +252,7 @@ export const RunChangedEvent = Object.freeze({
     return null
   }),
 })
-export const CONTROL_ACTIONS = Object.freeze(["approve", "unblock", "cancel", "retry"])
+export const CONTROL_ACTIONS = Object.freeze(["approve", "unblock", "cancel", "retry", "nudge"])
 export const BeaconStatusRpc = Object.freeze({
   id: BEACON_STATUS_RPC_ID,
   events: Object.freeze({ [RUN_CHANGED_EVENT]: RunChangedEvent }),
@@ -230,9 +271,11 @@ export const BeaconStatusRpc = Object.freeze({
     }),
     control: Object.freeze({
       input: objectInput((v) => {
-        if (!CONTROL_ACTIONS.includes(str(v.action))) return "action must be approve, unblock, cancel or retry"
+        if (!CONTROL_ACTIONS.includes(str(v.action))) return "action must be approve, unblock, cancel, retry or nudge"
         if (!str(v.runID)) return "runID must be a non-empty string"
         if (v.sha !== undefined && typeof v.sha !== "string") return "sha must be a string"
+        if (v.message !== undefined && typeof v.message !== "string") return "message must be a string"
+        if (str(v.action) === "nudge" && !str(v.message).trim()) return "nudge needs a message"
         return null
       }),
       output: schema((v) => (!v || typeof v !== "object" || Array.isArray(v) ? "output must be an object" : null)),
