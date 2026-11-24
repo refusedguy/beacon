@@ -163,6 +163,36 @@ func TestMakeRunSnapshotMapsChecksWithoutSCM(t *testing.T) {
 	}
 }
 
+func TestRunSnapshotCarriesCIWallSeconds(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	run := core.NewRun("run-wall", "T-WALL", now)
+	run.Checks = []core.CheckResult{
+		{Name: "lint", StartedAt: now, CompletedAt: now.Add(20 * time.Second)},
+		{Name: "test", StartedAt: now.Add(15 * time.Second), CompletedAt: now.Add(time.Minute)},
+	}
+	got := makeRunSnapshot(run, nil, nil, now)
+	if got.CIWallSeconds != 60 {
+		t.Fatalf("ci wall seconds = %d, want 60", got.CIWallSeconds)
+	}
+	if got.Checks[0].DurationSeconds != 20 || got.Checks[1].DurationSeconds != 45 {
+		t.Fatalf("check durations changed: %+v", got.Checks)
+	}
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		CIWallSeconds int64 `json:"ci_wall_seconds"`
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.CIWallSeconds != 60 {
+		t.Fatalf("json ci_wall_seconds = %d, want 60", decoded.CIWallSeconds)
+	}
+}
+
 func TestRunSnapshotCarriesSessionIncidentAndPRURL(t *testing.T) {
 	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
 	run := core.NewRun("run-fields", "T-FIELDS", now)
@@ -318,12 +348,16 @@ func TestRunSnapshotJSONChecksContract(t *testing.T) {
 			State           string `json:"state"`
 			DurationSeconds int64  `json:"duration_seconds"`
 		} `json:"checks"`
+		CIWallSeconds int64 `json:"ci_wall_seconds"`
 	}
 	if err := json.Unmarshal(b, &decoded); err != nil {
 		t.Fatal(err)
 	}
 	if decoded.Checks == nil || len(decoded.Checks) != 0 {
 		t.Fatalf("json checks = %+v, want []", decoded.Checks)
+	}
+	if decoded.CIWallSeconds != 0 {
+		t.Fatalf("json ci_wall_seconds = %d, want 0", decoded.CIWallSeconds)
 	}
 
 	run.Checks = []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
