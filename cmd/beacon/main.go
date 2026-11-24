@@ -112,7 +112,18 @@ func wire(path, parentSession string) (*wiring, error) {
 		default:
 		}
 	}}
-	recon := &app.Reconciler{
+	recon := newReconciler(cfg, store, scmGW, h, source, wt, changes, disp, parentSession)
+	return &wiring{
+		cfg: cfg, store: store, source: source, harness: h, workspace: wt,
+		scm: scmGW, policy: recon.Policy, changes: changes, dispatcher: disp,
+		control: ctrl, status: app.StatusService{Store: store},
+		wait:        app.WaitService{Store: store, Interval: time.Second},
+		taskCreator: taskCreator, recon: recon,
+	}, nil
+}
+
+func newReconciler(cfg config.Config, store *sqlite.Store, scmGW core.ScmGateway, h core.AgentHarness, source core.TaskSource, wt *workspace.GitWorktree, changes chan int, disp *app.Dispatcher, parentSession string) *app.Reconciler {
+	return &app.Reconciler{
 		Store: store, SCM: scmGW, Policy: policy.New(policy.Config{
 			RequiredChecks: cfg.Merge.RequiredChecks, RequiredApprovals: cfg.Merge.RequiredApprovals,
 			Labels: cfg.Merge.Labels, CommandGate: cfg.Merge.CommandGate,
@@ -125,13 +136,6 @@ func wire(path, parentSession string) (*wiring, error) {
 		Interval:   cfg.Interval(),
 		AutoRebase: cfg.Merge.AutoRebase,
 	}
-	return &wiring{
-		cfg: cfg, store: store, source: source, harness: h, workspace: wt,
-		scm: scmGW, policy: recon.Policy, changes: changes, dispatcher: disp,
-		control: ctrl, status: app.StatusService{Store: store},
-		wait:        app.WaitService{Store: store, Interval: time.Second},
-		taskCreator: taskCreator, recon: recon,
-	}, nil
 }
 
 func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) {
