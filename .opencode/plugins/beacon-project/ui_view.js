@@ -5,7 +5,7 @@ import {
   normalizeSnapshot, str,
 } from "./ui_model.js"
 
-export const STATE_BAR_WIDTH = 12
+export const STATE_BAR_WIDTH = 38
 export const STATE_BAR_KEYS = Object.freeze(["running", "waiting_ci", "blocked", "merged"])
 const STATE_BAR_COLOR = Object.freeze({ running: "success", waiting_ci: "info", blocked: "error", merged: "success" })
 const STATE_BAR_LETTER = Object.freeze({ running: "R", waiting_ci: "C", blocked: "B", merged: "M" })
@@ -21,6 +21,17 @@ const STATE_VIEW = Object.freeze({
   closed: { marker: "✖", color: "muted", label: "CLOSED" },
 })
 export const stateView = (state) => STATE_VIEW[str(state).toLowerCase()] ?? { marker: "·", color: "muted", label: "?" }
+
+// Recent rows use three calm verdicts instead of the full active state names.
+export function recentBadge(run) {
+  const state = str(run?.state).toLowerCase()
+  const reason = str(run?.reason)
+  if (/already merged|duplicate/i.test(reason)) return "DUP"
+  if (state === "merged") return "OK"
+  if (state === "closed" || state === "blocked" || state === "needs_agent_fix") return "ERR"
+  return "OK"
+}
+
 export const SIDEBAR_OPEN = Object.freeze({ active: true, recent: true })
 export const DETAIL_OPEN = Object.freeze({ why: true, checks: true, timeline: true, technical: false })
 export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "copy"])
@@ -29,6 +40,10 @@ export function truncate(value, width) {
   const text = str(value)
   return text.length <= width ? text : width <= 1 ? text.slice(0, width) : `${text.slice(0, width - 1)}…`
 }
+// The host truncates from the middle, so sidebar names are clipped here from
+// the end with an explicit ellipsis. Detail text keeps its full width.
+export const SIDEBAR_TITLE_WIDTH = 29
+export const truncateSidebarTitle = (value) => truncate(value, SIDEBAR_TITLE_WIDTH)
 export function shortTaskID(value) {
   const id = str(value)
   return id ? (id.length > 10 ? id.slice(-8) : id) : "-"
@@ -83,6 +98,41 @@ export function phaseLabel(run, now = Date.now()) {
   return ageOf(run, now)
 }
 export const mergedReason = (run) => str(run?.reason).trim() || (run?.pr ? `merged PR #${run.pr}` : "merged to main")
+
+const TIMELINE_TEXT = Object.freeze({
+  created: "Run created", admitted: "Run created, task admitted",
+  admitted_task: "Run created, task admitted", spawn: "Worker started",
+  spawned: "Worker started", session: "Worker session started",
+  session_started: "Worker session started", worker_started: "Worker started",
+  watch_pr: "PR opened", pr_opened: "PR opened", pr: "PR opened",
+  checks_pending: "CI checks pending", ci_pending: "CI checks pending",
+  rebase: "Rebased onto main", rebased: "Rebased onto main",
+  merge: "Squash merged to main", merged: "Squash merged to main",
+  delivery_claim: "Squash merged to main", cancel: "Run closed", closed: "Run closed",
+})
+const STATE_NAMES = Object.freeze({
+  waiting_ci: "waiting CI", needs_rebase: "needs rebase", needs_agent_fix: "needs agent fix",
+})
+// Human timeline copy instead of raw event kinds such as "checks_pending".
+export function timelineText(event = {}) {
+  const kind = str(event.kind).toLowerCase()
+  const base = TIMELINE_TEXT[kind]
+    || str(event.kind || "event").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+  const text = event.pr && /PR opened/.test(base) ? base.replace("PR opened", `PR #${event.pr} opened`) : base
+  return kind === "checks_pending" && event.state
+    ? `${text} · ${STATE_NAMES[str(event.state).toLowerCase()] || str(event.state)}` : text
+}
+
+const BADGE_LABEL = Object.freeze({
+  pending: "PEND", running: "RUN", waiting_ci: "CI", needs_rebase: "REBASE",
+  needs_agent_fix: "FIX", blocked: "BLOCKED", merged: "MERGED", closed: "CLOSED",
+})
+export function heroBadge(run, now = Date.now()) {
+  const v = stateView(run.state)
+  const label = BADGE_LABEL[str(run.state).toLowerCase()] || v.label
+  const duration = phaseLabel(run, now)
+  return `${v.marker} ${label}${duration ? ` · ${duration}` : ""}`
+}
 
 export function activeRuns(snapshot = EMPTY_SNAPSHOT) {
   const seen = new Set()
@@ -153,14 +203,22 @@ export function runLineItems(run, now = Date.now(), recent = false) {
   const ref = run.pr ? `#${run.pr}` : shortTaskID(run.taskID)
   const duration = recent ? tookOf(run) : phaseLabel(run, now)
   const reason = state === "merged" ? "" : compactReason(run.reason)
+  const errorReason = state === "blocked" || state === "closed" || state === "needs_agent_fix"
+  const secondLine = { marker: ref, markerSpace: true, name: duration, status: reason,
+    color: "muted", statusColor: errorReason ? "error" : "muted", runID: run.id }
+  if (recent) return [
+    { marker: v.marker, markerSpace: true, name: title, status: recentBadge(run), color: "muted",
+      bold: false, recent: true, runID: run.id },
+    { ...secondLine, recent: true },
+  ]
   return [
     { marker: v.marker, markerSpace: true, name: title, status: v.label, color: v.color, bold: true, runID: run.id },
-    { marker: ref, markerSpace: true, name: duration, status: reason, color: "muted", runID: run.id },
+    secondLine,
   ]
 }
 const sectionItem = (label, count, key, open) => ({
   marker: open ? "▼" : "▶", name: label, status: String(count),
-  color: "action", bold: true, sectionKey: key,
+  color: "action", bold: true, statusColor: "muted", sectionKey: key,
 })
 
 export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN) {
@@ -222,40 +280,53 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
   const isOpen = (key) => key === "technical" ? open.technical === true : open[key] !== false
   const header = (label, key) => rows.push({
     marker: isOpen(key) ? "▼" : "▶", name: label, status: "",
-    color: "action", bold: true, sectionKey: key,
+    color: "action", bold: true, statusColor: "muted", sectionKey: key, kind: "section",
   })
-  const row = (name, status = "", color = "muted", marker = "") => rows.push({ marker, name, status, color })
+  const row = (item) => rows.push(item)
+  const key = (label) => label.padEnd(10, " ")
   header("Why / Blocker", "why")
   if (isOpen("why")) {
     const reason = state === "merged" ? mergedReason(run) : str(run.reason).trim()
-    row(reason || "No reason recorded", "", state === "blocked" || state === "closed" ? "error" : "base", "↳")
+    row({ marker: "", name: reason || "No reason recorded", status: "", kind: "reason",
+      color: state === "blocked" || state === "closed" || state === "needs_agent_fix" ? "error" : "base" })
   }
   header("CI Checks", "checks")
   if (isOpen("checks")) {
     const checks = run.checks ?? []
-    if (!checks.length) row("(none)")
-    else checks.forEach((c) => row(`${c.name || "check"} ${c.state || "unknown"}`, c.durationSeconds ? elapsed(c.durationSeconds * 1000) : "", c.state === "failure" ? "error" : "muted"))
+    if (!checks.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "check" })
+    else checks.forEach((c) => {
+      const failed = c.state === "failure"
+      row({ marker: failed ? "✖" : c.state === "success" ? "✔" : "◐",
+        name: `${c.name || "check"} ${c.state || "unknown"}`,
+        status: c.durationSeconds ? elapsed(c.durationSeconds * 1000) : "",
+        color: failed ? "error" : "muted", kind: "check" })
+    })
   }
   header("Timeline", "timeline")
   if (isOpen("timeline")) {
     const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
-    if (!timeline.length) row("(none)")
-    else timeline.forEach((e) => row(`${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`))
+    if (!timeline.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "timeline" })
+    else timeline.forEach((e) => row({
+      marker: key(stamp(e.at)), name: timelineText(e), status: "", color: "muted", kind: "timeline",
+    }))
   }
   header("Technical", "technical")
   if (isOpen("technical")) {
-    row(run.id || "-", "", "base", "Run ID")
-    row(run.sha || "-", "", "base", "SHA")
+    row({ marker: key("Run ID"), name: run.id || "-", status: "", color: "base", kind: "tech" })
+    row({ marker: key("Head SHA"), name: run.sha || "-", status: "", color: "base", kind: "tech" })
     const attempts = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
-    row(attempts, "", "base", "Attempts")
+    row({ marker: key("Attempts"), name: attempts, status: "", color: "base", kind: "tech" })
     const all = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
     const decisions = all.slice(-DECISION_LIMIT)
-    if (all.length > decisions.length) row(`... ${all.length - decisions.length} earlier decisions`)
-    if (!decisions.length) row("(none)")
-    else decisions.forEach((d) => row(`${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd()))
+    if (all.length > decisions.length) row({ marker: "", name: `... ${all.length - decisions.length} earlier decisions`, status: "", color: "muted", kind: "decision" })
+    if (!decisions.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "decision" })
+    else decisions.forEach((d) => row({
+      marker: key(stamp(d.at)), name: `${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd(),
+      status: "", color: "muted", kind: "decision",
+    }))
   }
   return {
-    badge: `${v.marker} ${v.label}`,
+    badge: heroBadge(run, now),
     badgeColor: v.color,
     pr: run.pr ? `#${run.pr}` : "No PR",
     branch: run.branch || "-",

@@ -48,11 +48,11 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
       return null
     } finally { await refresh() }
   }
-  return async function runAction(name, run = null) {
+  return async function runAction(name, run = null, opts = {}) {
     if (name === "dispatch") return dispatch()
     if (!run) return null
     if (name === "copy") return copyID(run)
-    if (name === "cancel") {
+    if (name === "cancel" && opts.confirmed !== true) {
       if (typeof ctx.ui?.dialog?.confirm !== "function") {
         show("Confirmation unavailable, run kept", "warning")
         await refresh()

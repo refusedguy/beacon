@@ -322,9 +322,7 @@ test("build and orchestrator agents still register config and resolve the comman
 test("worker setup skips the status panel and disposes the no-op on cleanup", async () => {
   let noop = null
   let panelRegistrations = 0
-  const ctx = setupCtx("worker", {
-    noopMcpRegistration: () => (noop = noopMcpRegistration()),
-  }, "/worker-cleanup")
+  const ctx = setupCtx("worker", { noopMcpRegistration: () => (noop = noopMcpRegistration()) }, "/worker-cleanup")
   ctx.rpc = { register: async () => { panelRegistrations += 1; return { dispose() {} } } }
 
   const dispose = await beaconProject.setup(ctx)
@@ -343,12 +341,7 @@ test("build setup keeps the status panel RPC for the operator TUI", async () => 
     watcherEnabled: false,
     mcpDeps: { beaconCommand: () => ["/bin/beacon", "mcp"] },
   }, "/build-panel")
-  ctx.rpc = {
-    register: async () => {
-      panelRegistrations += 1
-      return { events: { emit() {} }, dispose() {} }
-    },
-  }
+  ctx.rpc = { register: async () => { panelRegistrations += 1; return { events: { emit() {} }, dispose() {} } } }
 
   const dispose = await beaconProject.setup(ctx)
   await dispose()

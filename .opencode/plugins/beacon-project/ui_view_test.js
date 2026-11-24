@@ -36,10 +36,10 @@ test("state bar builds proportional colored segments and a human summary", () =>
   assert.equal(item.legend, "R2 C1 B1 M51")
   assert.equal(item.summary, "2 running · 1 in CI · 1 blocked · 1 done")
   assert.equal(item.fg, "error", "a blocked run colors the bar with the error tone")
-  const big = stateBarItem({ active: Array.from({ length: 20 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })), recent: [] })
+  const big = stateBarItem({ active: Array.from({ length: STATE_BAR_WIDTH + 2 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })), recent: [] })
   assert.equal(big.filled, STATE_BAR_WIDTH)
   assert.equal(big.segments.at(-1).text, "", "a full bar leaves no muted remainder")
-  assert.ok(big.content.includes("R20"))
+  assert.ok(big.content.includes(`R${STATE_BAR_WIDTH + 2}`))
   const empty = stateBarItem(EMPTY_SNAPSHOT)
   assert.equal(empty.segments[0].text, "")
   assert.equal(empty.segments.at(-1).text, "░".repeat(STATE_BAR_WIDTH))
@@ -73,7 +73,8 @@ test("run rows keep the full title and put PR, duration and cause on line two", 
     marker: "▲", markerSpace: true, name: title, status: "BLK", color: "error", bold: true, runID: "run-1",
   })
   assert.deepEqual(second, {
-    marker: "#42", markerSpace: true, name: "3m", status: "waiting CI", color: "muted", runID: "run-1",
+    marker: "#42", markerSpace: true, name: "3m", status: "waiting CI", color: "muted",
+    statusColor: "error", runID: "run-1",
   })
 })
 
@@ -137,7 +138,7 @@ test("detail model uses four sections with full wrapping text", () => {
   const metrics = { dispatchCount: 25, rebaseCount: 2, fixCount: 1, mergeCount: 3 }
   const model = detailModel(run, metrics, NOW, { ...DETAIL_OPEN, technical: true })
   assert.equal(model.title, longTitle, "the hero uses the full title")
-  assert.equal(model.badge, "▲ BLK")
+  assert.equal(model.badge, "▲ BLOCKED · 3m", "the hero badge carries the full state and live duration")
   assert.equal(model.pr, "#42")
   assert.equal(model.branch, "beacon/T-1")
   assert.equal(model.task, "T-1")
@@ -146,7 +147,8 @@ test("detail model uses four sections with full wrapping text", () => {
   const names = model.rows.map((i) => i.name ?? i.text)
   assert.ok(names.includes(longReason), "the reason is not cut to a fixed width")
   assert.ok(names.includes("ci success"), "CI checks come from run.checks")
-  assert.ok(names.some((n) => n.includes("10:01:00 created → running")))
+  assert.ok(names.includes("Run created"), "timeline events use human copy")
+  assert.ok(model.rows.some((i) => i.marker === "10:01:00  "), "the timeline time sits in its own padded column")
   assert.ok(names.some((n) => n.includes("reconcile.decision merge")))
   assert.deepEqual(detailActions(run), ["retry", "copy"])
 })
