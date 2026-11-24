@@ -109,21 +109,12 @@ func sqliteChecks(names []string) string {
 }
 
 func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, base core.BaseStatus, origin *core.Run) error {
-	if in.FixerRunID != "" {
-		live, err := r.Store.Get(ctx, in.FixerRunID)
-		if err != nil {
-			return err
-		}
-		if live != nil && !live.State.Terminal() {
-			return nil
-		}
+	ok, err := r.canStartFixer(ctx, in, origin)
+	if err != nil {
+		return err
 	}
-	max := r.MaxFixTries
-	if max <= 0 {
-		max = 2
-	}
-	if in.Attempts >= max {
-		return r.notify(origin, "fixer exhausted", "base branch fix attempts exhausted")
+	if !ok {
+		return nil
 	}
 	attempt := in.Attempts + 1
 	id := core.RunID(fmt.Sprintf("fix-%s-%d", in.ID, attempt))
@@ -164,6 +155,26 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	in.FixerRunID = run.ID
 	in.Attempts++
 	return r.Store.UpdateIncident(ctx, in)
+}
+
+func (r *Reconciler) canStartFixer(ctx context.Context, in *core.BaseIncident, origin *core.Run) (bool, error) {
+	if in.FixerRunID != "" {
+		live, err := r.Store.Get(ctx, in.FixerRunID)
+		if err != nil {
+			return false, err
+		}
+		if live != nil && !live.State.Terminal() {
+			return false, nil
+		}
+	}
+	max := r.MaxFixTries
+	if max <= 0 {
+		max = 2
+	}
+	if in.Attempts >= max {
+		return false, r.notify(origin, "fixer exhausted", "base branch fix attempts exhausted")
+	}
+	return true, nil
 }
 
 func fixerPrompt(base core.BaseStatus, in *core.BaseIncident, task core.Task) string {
