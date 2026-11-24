@@ -54,12 +54,13 @@ type wiring struct {
 
 // wiredInfra holds the adapters shared by every application service.
 type wiredInfra struct {
-	store     *sqlite.Store
-	source    core.TaskSource
-	harness   core.AgentHarness
-	workspace *workspace.GitWorktree
-	scm       core.ScmGateway
-	changes   chan int
+	store        *sqlite.Store
+	source       core.TaskSource
+	harness      core.AgentHarness
+	workspace    *workspace.GitWorktree
+	scm          core.ScmGateway
+	changes      chan int
+	resolveModel app.ModelResolver
 }
 
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
@@ -150,8 +151,14 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 	if refresher, ok := h.(core.WorktreeRefresher); ok {
 		wt.Refresher = refresher
 	}
-	return &wiredInfra{store: store, source: source, harness: h,
-		workspace: wt, scm: scmGW, changes: make(chan int, 64)}, nil
+	infra := &wiredInfra{store: store, source: source, harness: h,
+		workspace: wt, scm: scmGW, changes: make(chan int, 64)}
+	// resolveModel closes over the wired endpoint and token so a dispatch can
+	// look up the parent session's model even when no parent was known at start.
+	infra.resolveModel = func(parent string) map[string]string {
+		return resolveModel(cfg, harnessToken, parent)
+	}
+	return infra, nil
 }
 
 // wireServices builds the application services on top of the adapters.
@@ -176,6 +183,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		MaxAttempts:        cfg.Merge.MaxAttempts,
 		ParentSessionID:    firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
 		WorkerInstructions: cfg.Harness.WorkerInstructions,
+		ResolveModel:       infra.resolveModel,
 	}
 	ctrl := &app.Control{Store: infra.store, Harness: infra.harness, Workspace: infra.workspace, OnChange: func(pr int) {
 		select {

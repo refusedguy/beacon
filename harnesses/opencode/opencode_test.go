@@ -352,6 +352,62 @@ func TestStopAndIsAlive(t *testing.T) {
 // TestSpawnCreatesOneSessionWithResolvedModel records every session create and
 // model switch. A prompt that carries a model makes the fake server spin up a
 // second, model-less session, the failure observed in the smoke test.
+func TestSpawnUsesDispatchModelRef(t *testing.T) {
+	var mu sync.Mutex
+	var sessions, models, prompts []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			mu.Lock()
+			sessions = append(sessions, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"id":"ses_worker"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/model"):
+			mu.Lock()
+			models = append(models, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			mu.Lock()
+			prompts = append(prompts, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	want := map[string]any{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
+	h := New(srv.URL, "paid-startup", "worker", "ses_parent")
+	h.ModelRef = map[string]string{"id": "paid-startup", "providerID": "opencode"}
+	req := testSpawnRequest()
+	req.ModelRef = map[string]string{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
+	sess, err := h.Spawn(context.Background(), req)
+	if err != nil || sess.ID != "ses_worker" {
+		t.Fatalf("Spawn = %q, %v", sess.ID, err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("session creates = %d, want 1: %v", len(sessions), sessions)
+	}
+	if !reflect.DeepEqual(sessions[0]["model"], want) {
+		t.Errorf("session model = %v, want %v", sessions[0]["model"], want)
+	}
+	if sessions[0]["parentID"] != "ses_parent" {
+		t.Errorf("parentID = %v, want ses_parent", sessions[0]["parentID"])
+	}
+	if len(models) != 1 || !reflect.DeepEqual(models[0]["model"], want) {
+		t.Fatalf("model switches = %v, want one with %v", models, want)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want 1", len(prompts))
+	}
+	if _, ok := prompts[0]["model"]; ok {
+		t.Errorf("prompt must not carry a model: %v", prompts[0])
+	}
+}
+
 func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
 	var mu sync.Mutex
 	var sessions, prompts []map[string]any

@@ -18,7 +18,7 @@ func (h *Harness) configureSession(ctx context.Context, id string, req core.Spaw
 			return err
 		}
 	}
-	if ref := h.modelRef(); ref != nil {
+	if ref := h.modelRef(req); ref != nil {
 		_, status, err := h.do(ctx, http.MethodPost, base+"/model", map[string]any{
 			"model": ref,
 		})

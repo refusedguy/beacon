@@ -12,6 +12,11 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// ModelResolver resolves a worker model from its parent session. The
+// composition root supplies the OpenCode session lookup. A nil resolver keeps
+// the harness default.
+type ModelResolver func(parentSession string) map[string]string
+
 type Dispatcher struct {
 	Source             core.TaskSource
 	Planner            ConflictPlanner
@@ -23,6 +28,7 @@ type Dispatcher struct {
 	MaxAttempts        int
 	ParentSessionID    string
 	WorkerInstructions string
+	ResolveModel       ModelResolver
 }
 
 type DispatchResult struct {
@@ -170,7 +176,8 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	session, err := d.Harness.Spawn(ctx, core.SpawnRequest{
 		Task: task, Workspace: ws, RunID: run.ID,
 		ParentSessionID: run.ParentSessionID, IsFixer: run.IsFixer,
-		Prompt: spawnPrompt(task, run.ID, ws.Path, d.WorkerInstructions),
+		ModelRef: d.modelRef(run.ParentSessionID),
+		Prompt:   spawnPrompt(task, run.ID, ws.Path, d.WorkerInstructions),
 	})
 	if err != nil {
 		return fmt.Errorf("spawn: %w", err)
@@ -266,6 +273,16 @@ func firstNonEmptyLocal(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// modelRef resolves the worker model from the run's parent session. The MCP
+// daemon has no BEACON_PARENT_SESSION, so the parent arrives per dispatch in
+// the request metadata and must be resolved here, not at process start.
+func (d *Dispatcher) modelRef(parent string) map[string]string {
+	if d.ResolveModel == nil || parent == "" {
+		return nil
+	}
+	return d.ResolveModel(parent)
 }
 
 func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
