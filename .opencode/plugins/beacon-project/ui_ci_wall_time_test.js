@@ -35,14 +35,14 @@ test("CI summary reports the longest parallel job, not the summed durations", ()
   assert.doesNotMatch(summary, /1m51s|111s/, "the 111s sum never reaches the header")
 })
 
-test("a failed CI summary keeps its original wording", () => {
+test("a failed CI summary names the failure and keeps the longest-job fallback", () => {
   const checks = [
     { name: "vet", state: "success", durationSeconds: 28 },
     { name: "lint", state: "failure", durationSeconds: 20 },
     { name: "build", state: "success", durationSeconds: 23 },
     { name: "test", state: "success", durationSeconds: 26 },
   ]
-  assert.equal(checksSummary(checks), "1 failed · 3/4")
+  assert.equal(checksSummary(checks), "1 failed · 3/4 · longest 28s")
 })
 
 test("the waiting-ci phase reads as a wait, not CI execution time", () => {
@@ -87,6 +87,66 @@ test("the card header carries ctrl+g and a close button wired to onClose", () =>
   hint.props.onMouseUp()
   close.props.onMouseUp()
   assert.equal(closes, 2, "both header controls call onClose")
+})
+
+test("pending checks are waits, never failures", () => {
+  const states = ["pending", "in_progress", "queued", "unrecognised"]
+  const checks = states.map((state, i) => ({ name: `job-${i}`, state }))
+  const summary = checksSummary(checks)
+  assert.equal(summary, "0/4 · 4 pending")
+  assert.doesNotMatch(summary, /failed/, "an unknown state is not a failed check")
+})
+
+test("skipped checks are counted but never called failed", () => {
+  const checks = [{ name: "a", state: "skipped" }, { name: "b", state: "neutral" }]
+  assert.equal(checksSummary(checks), "0/2 · 2 skipped")
+  assert.equal(checksSummary([]), "", "no checks keep the header empty")
+  assert.equal(checksSummary(null), "")
+})
+
+test("mixed check states separate failures, passes, skips and waits", () => {
+  const checks = [
+    { name: "vet", state: "success" },
+    { name: "unit", state: "success" },
+    { name: "lint", state: "failure" },
+    { name: "e2e", state: "skipped" },
+  ]
+  assert.equal(checksSummary(checks), "1 failed · 2/4 · 1 skipped")
+  const mixed = [
+    { name: "vet", state: "success" },
+    { name: "unit", state: "error" },
+    { name: "lint", state: "queued" },
+    { name: "e2e", state: "neutral" },
+  ]
+  assert.equal(checksSummary(mixed), "1 failed · 1/4 · 1 skipped · 1 pending")
+})
+
+test("the header uses Go wall time when the snapshot provides it", () => {
+  const checks = [
+    { name: "vet", state: "success", durationSeconds: 9 },
+    { name: "unit", state: "success", durationSeconds: 11 },
+  ]
+  const run = normalizeRun(makeRun({ ci_wall_seconds: 31, Checks: checks }))
+  assert.equal(run.ciWallSeconds, 31)
+  assert.equal(checksSummary(run.checks), "2/2 · 31s")
+  assert.equal(checksSummary(checks, 31), "2/2 · 31s")
+  const header = detailModel(run, {}, NOW).rows.find((i) => i.sectionKey === "checks")
+  assert.equal(header.status, "2/2 · 31s", "the wall time reaches the live detail header")
+})
+
+test("a missing or zero wall time falls back to the longest check", () => {
+  const checks = [
+    { name: "vet", state: "success", durationSeconds: 9 },
+    { name: "unit", state: "success", durationSeconds: 11 },
+  ]
+  assert.equal(checksSummary(checks), "2/2 · longest 11s")
+  for (const wall of [undefined, 0]) {
+    const run = normalizeRun(makeRun({ ci_wall_seconds: wall, Checks: checks }))
+    const header = detailModel(run, {}, NOW).rows.find((i) => i.sectionKey === "checks")
+    assert.equal(header.status, "2/2 · longest 11s")
+  }
+  const empty = normalizeRun(makeRun({ ci_wall_seconds: 31 }))
+  assert.equal(detailModel(empty, {}, NOW).rows.find((i) => i.sectionKey === "checks").status, "")
 })
 
 test("the Path row and fix prompt use the path relative to the project root", () => {
