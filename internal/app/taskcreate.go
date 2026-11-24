@@ -465,6 +465,7 @@ func childTasks(epicID core.TaskID, plan []core.ChildSpec) []core.Task {
 	for i, spec := range plan {
 		out = append(out, core.Task{
 			ID: core.ChildTaskID(epicID, i+1), Title: strings.TrimSpace(spec.Title),
+			Body:  strings.TrimSpace(spec.Body),
 			Scope: spec.Scope, DependsOn: append([]core.TaskID(nil), spec.Depends...),
 			Priority: spec.Priority, Status: core.TaskAvailable,
 			Kind: core.TaskKindTask, BaseBranch: branch,

@@ -52,6 +52,7 @@ type yamlFields struct {
 // planSpec is the wire shape of one child in an epic's plan array.
 type planSpec struct {
 	Title    string     `yaml:"title"`
+	Body     string     `yaml:"body,omitempty"`
 	Scope    stringList `yaml:"scope"`
 	Depends  stringList `yaml:"depends"`
 	Priority int        `yaml:"priority"`
@@ -79,7 +80,7 @@ type taskFields struct {
 func childSpecs(specs []planSpec, dir string) []core.ChildSpec {
 	out := make([]core.ChildSpec, 0, len(specs))
 	for _, spec := range specs {
-		child := core.ChildSpec{Title: strings.TrimSpace(spec.Title), Priority: spec.Priority}
+		child := core.ChildSpec{Title: strings.TrimSpace(spec.Title), Body: strings.TrimSpace(spec.Body), Priority: spec.Priority}
 		for _, p := range spec.Scope {
 			child.Scope = append(child.Scope, scopeForPath(p, dir))
 		}
@@ -98,6 +99,7 @@ func planSpecs(specs []core.ChildSpec) []planSpec {
 	for _, spec := range specs {
 		out = append(out, planSpec{
 			Title:    spec.Title,
+			Body:     spec.Body,
 			Scope:    scopeValues(spec.Scope),
 			Depends:  dependencyValues(spec.Depends),
 			Priority: spec.Priority,
@@ -135,6 +137,7 @@ func (PlanParser) Children(epic core.Task) []core.Task {
 		out = append(out, core.Task{
 			ID:        core.ChildTaskID(epic.ID, i+1),
 			Title:     strings.TrimSpace(spec.Title),
+			Body:      strings.TrimSpace(spec.Body),
 			Scope:     spec.Scope,
 			DependsOn: spec.Depends,
 			Priority:  spec.Priority,

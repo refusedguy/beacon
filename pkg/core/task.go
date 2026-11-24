@@ -123,6 +123,7 @@ const (
 // ChildSpec is one child declared in an epic's plan.
 type ChildSpec struct {
 	Title    string
+	Body     string
 	Scope    []ScopePath
 	Depends  []TaskID
 	Priority int
