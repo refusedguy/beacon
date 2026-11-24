@@ -69,6 +69,66 @@ type epicChildArg struct {
 	Priority int      `json:"priority,omitempty"`
 }
 
+// updateTaskArgs is the input schema of beacon_task_update. A nil field is
+// omitted from the call and leaves that card field unchanged.
+type updateTaskArgs struct {
+	Updates []updateOneArgs `json:"updates"`
+}
+
+type updateOneArgs struct {
+	ID            string          `json:"id"`
+	Title         *string         `json:"title,omitempty"`
+	Body          *string         `json:"body,omitempty"`
+	Scope         *[]string       `json:"scope,omitempty"`
+	Depends       *[]string       `json:"depends,omitempty"`
+	Priority      *int            `json:"priority,omitempty"`
+	Kind          *string         `json:"kind,omitempty"`
+	RequireReview *string         `json:"require_review,omitempty"`
+	BaseBranch    *string         `json:"base_branch,omitempty"`
+	Plan          *[]epicChildArg `json:"plan,omitempty"`
+	Status        *string         `json:"status,omitempty"` // accepted but ignored: task flow belongs to Beacon
+}
+
+var taskUpdateTool = &msdk.Tool{
+	Name:        "beacon_task_update",
+	Description: "Update task cards in one commit and push. Orchestrator only.",
+}
+
+func registerTaskUpdate(s *msdk.Server, sv Services) {
+	msdk.AddTool(s, taskUpdateTool, func(ctx context.Context, _ *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
+		if sv.TaskUpdater == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "task updater is not configured")
+		}
+		updates := make([]app.UpdateInput, 0, len(a.Updates))
+		for _, item := range a.Updates {
+			updates = append(updates, updateInput(item))
+		}
+		updated, err := sv.TaskUpdater.Update(ctx, updates)
+		if err != nil {
+			return nil, nil, err
+		}
+		return jsonResult(updated), nil, nil
+	})
+}
+
+func updateInput(a updateOneArgs) app.UpdateInput {
+	out := app.UpdateInput{
+		ID: a.ID, Title: a.Title, Body: a.Body, Scope: a.Scope, Depends: a.Depends,
+		Priority: a.Priority, Kind: a.Kind, RequireReview: a.RequireReview, BaseBranch: a.BaseBranch,
+	}
+	if a.Plan != nil {
+		plan := make([]core.ChildSpec, 0, len(*a.Plan))
+		for _, spec := range *a.Plan {
+			plan = append(plan, core.ChildSpec{
+				Title: spec.Title, Scope: specScopes(spec.Scope),
+				Depends: specDeps(spec.Depends), Priority: spec.Priority,
+			})
+		}
+		out.Plan = &plan
+	}
+	return out
+}
+
 // deleteTaskArgs is the input schema of beacon_task_delete.
 type deleteTaskArgs struct {
 	IDs []string `json:"ids"`
