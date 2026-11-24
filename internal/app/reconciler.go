@@ -23,6 +23,7 @@ type Reconciler struct {
 	Workspace       core.WorkspaceManager
 	Notifier        core.Notifier
 	Dispatcher      *Dispatcher
+	AgentSlots      core.AgentSlots
 	Changes         chan<- int
 	Repo            string
 	BaseBranch      string
@@ -208,15 +209,25 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed, Reason: reason}, obs)
 }
 
+// agentSlots resolves the slot policy through the port. The concrete
+// dispatcher remains wired for promotion and retry settings, and satisfies the
+// port itself, so existing wiring keeps working while tests can inject a fake.
+func (r *Reconciler) agentSlots() core.AgentSlots {
+	if r.AgentSlots != nil {
+		return r.AgentSlots
+	}
+	if r.Dispatcher != nil {
+		return r.Dispatcher
+	}
+	return nil
+}
+
 func (r *Reconciler) hasAgentSlot(ctx context.Context) bool {
-	if r.Dispatcher == nil {
+	slots := r.agentSlots()
+	if slots == nil {
 		return true
 	}
-	active, err := r.Store.ListActive(ctx)
-	if err != nil {
-		return true
-	}
-	return r.Dispatcher.agentBudget(active) > 0
+	return slots.Available(ctx) > 0
 }
 
 // Run drains change events and polls. One failing PR never stops the loop.

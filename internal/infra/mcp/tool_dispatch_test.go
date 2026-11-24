@@ -148,7 +148,7 @@ func TestDispatchToolResolvesParentModel(t *testing.T) {
 	}
 	defer store.Close()
 
-	h := opencode.New(srv.URL, "", "", "test-token")
+	h := opencode.New(opencode.Config{Endpoint: srv.URL, Token: "test-token"})
 	d := &app.Dispatcher{
 		Source: &dispatchSource{tasks: []core.Task{{ID: "T-MCP", Status: core.TaskAvailable,
 			Scope: []core.ScopePath{core.ScopeFile("mcp.go")}}}},

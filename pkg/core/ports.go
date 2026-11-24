@@ -147,3 +147,11 @@ type Concurrency struct {
 	MaxInFlight     int
 	MaxActiveAgents int
 }
+
+// AgentSlots owns the agent-slot budget policy. Available returns the number
+// of free slots; a positive count permits another worker to start. The
+// implementation owns the default limit and fails open when active runs cannot
+// be listed, so dispatch, promotion and wake checks share one policy.
+type AgentSlots interface {
+	Available(ctx context.Context) int
+}

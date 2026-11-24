@@ -73,7 +73,7 @@ func worktreeWithRefresher(t *testing.T, status int) (*GitWorktree, *refreshReco
 	t.Helper()
 	wt, repo := newTestGitWorktree(t)
 	srv, rec := newRefreshServer(t, repo, status)
-	h := opencode.New(srv.URL)
+	h := opencode.New(opencode.Config{Endpoint: srv.URL})
 	h.Repo = repo
 	wt.Refresher = h
 	return wt, rec

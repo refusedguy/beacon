@@ -47,7 +47,7 @@ func TestStreamIdleUsesConfiguredAuth(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			h := New(srv.URL, "model", "agent", tc.token)
+			h := New(Config{Endpoint: srv.URL, Model: "model", Agent: "agent", Token: tc.token})
 			if err := h.streamIdle(context.Background()); err != nil {
 				t.Fatalf("streamIdle: %v", err)
 			}

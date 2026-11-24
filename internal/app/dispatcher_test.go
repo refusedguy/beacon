@@ -611,3 +611,65 @@ func TestDispatchLeavesMainTasksWithoutBranchWork(t *testing.T) {
 		t.Fatalf("branches = %v, creates = %d, want no branch work", ws.branches, ws.creates)
 	}
 }
+
+type listActiveErrorStore struct {
+	*fakeStore
+}
+
+func (s *listActiveErrorStore) ListActive(context.Context) ([]*core.Run, error) {
+	return nil, errors.New("store unavailable")
+}
+
+func TestAgentSlotsAvailableCountsActiveAgents(t *testing.T) {
+	store := newFakeStore()
+	running := core.NewRun("r-run", "T-1", time.Now().UTC())
+	running.State = core.RunRunning
+	pending := core.NewRun("r-pending", "T-2", time.Now().UTC())
+	pending.State = core.RunPending
+	for _, run := range []*core.Run{running, pending} {
+		if err := store.Save(context.Background(), run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := &Dispatcher{Store: store, Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 2}}
+	if got := d.Available(context.Background()); got != 1 {
+		t.Fatalf("Available = %d, want 1 (pending runs do not hold a slot)", got)
+	}
+	second := core.NewRun("r-run-2", "T-3", time.Now().UTC())
+	second.State = core.RunNeedsAgentFix
+	if err := store.Save(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.Available(context.Background()); got != 0 {
+		t.Fatalf("Available = %d, want 0 after two active agents", got)
+	}
+}
+
+func TestAgentSlotsAvailableDefaultsToInFlightLimit(t *testing.T) {
+	empty := newFakeStore()
+	for _, tc := range []struct {
+		name string
+		conf core.Concurrency
+		want int
+	}{
+		{"configured in-flight", core.Concurrency{MaxInFlight: 3}, 3},
+		{"unconfigured", core.Concurrency{}, 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Dispatcher{Store: empty, Concurrency: tc.conf}
+			if got := d.Available(context.Background()); got != tc.want {
+				t.Fatalf("Available = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAgentSlotsAvailableFailsOpen(t *testing.T) {
+	d := &Dispatcher{
+		Store:       &listActiveErrorStore{fakeStore: newFakeStore()},
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	if got := d.Available(context.Background()); got <= 0 {
+		t.Fatalf("Available = %d, want a positive count on a store error", got)
+	}
+}

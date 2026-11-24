@@ -76,7 +76,7 @@ func TestSpawnSessionAndPromptBodies(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL, "model-x", "fixer", "")
+	h := New(Config{Endpoint: srv.URL, Model: "model-x", Agent: "fixer"})
 	sess, err := h.Spawn(context.Background(), testSpawnRequest())
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -133,7 +133,7 @@ func TestPerTaskAgentOverridesGlobalAgent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL, "model-x", "global-agent", "")
+	h := New(Config{Endpoint: srv.URL, Model: "model-x", Agent: "global-agent"})
 	req := testSpawnRequest()
 	req.Task.WorkerAgent = "table-driven-worker"
 	if _, err := h.Spawn(context.Background(), req); err != nil {
@@ -170,7 +170,7 @@ func TestPromptConflictIsAccepted(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL)
+	h := New(Config{Endpoint: srv.URL})
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn with 409 prompt: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestWakeUsesStructuredRedactedPrompt(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL)
+	h := New(Config{Endpoint: srv.URL})
 	secret := "ghp_" + strings.Repeat("a", 30)
 	wake := core.WakeContext{
 		RunID:     "run-7",
@@ -251,7 +251,7 @@ func TestWatchIdleEmitsIdleEvent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL)
+	h := New(Config{Endpoint: srv.URL})
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestNotifyParentUsesQueueDeliveryWithoutResume(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL)
+	h := New(Config{Endpoint: srv.URL})
 	secret := "ghp_" + strings.Repeat("a", 30)
 	if err := h.NotifyParent(context.Background(), "ses_parent", "Beacon: PR #42 run r1 state merged token="+secret); err != nil {
 		t.Fatalf("NotifyParent: %v", err)
@@ -335,7 +335,7 @@ func TestStopAndIsAlive(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL)
+	h := New(Config{Endpoint: srv.URL})
 	alive, err := h.IsAlive(context.Background(), "ses_42")
 	if err != nil || !alive {
 		t.Fatalf("IsAlive = %v, %v", alive, err)
@@ -380,7 +380,7 @@ func TestSpawnUsesDispatchModelRef(t *testing.T) {
 	defer srv.Close()
 
 	want := map[string]any{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
-	h := New(srv.URL, "paid-startup", "worker", "ses_parent")
+	h := New(Config{Endpoint: srv.URL, Model: "paid-startup", Agent: "worker", ParentSessionID: "ses_parent"})
 	h.ModelRef = core.ModelRef{ID: "paid-startup", ProviderID: "opencode"}
 	req := testSpawnRequest()
 	req.ModelRef = core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode", Variant: "default"}
@@ -425,7 +425,7 @@ func TestSpawnModelRefOmitsEmptyVariantOnWire(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := New(srv.URL, "", "worker", "")
+	h := New(Config{Endpoint: srv.URL, Agent: "worker"})
 	h.ModelRef = core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode"}
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -480,7 +480,7 @@ func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
 	defer srv.Close()
 
 	ref := map[string]any{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
-	h := New(srv.URL, "", "worker", "ses_parent")
+	h := New(Config{Endpoint: srv.URL, Agent: "worker", ParentSessionID: "ses_parent"})
 	h.ModelRef = core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode", Variant: "default"}
 	sess, err := h.Spawn(context.Background(), testSpawnRequest())
 	if err != nil || sess.ID != "ses_worker" {
@@ -504,5 +504,31 @@ func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
 	}
 	if len(prompts) != 1 || prompts[0]["model"] != nil {
 		t.Errorf("prompt must not carry a model: %v", prompts)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestNewUsesConfiguredClientAndTrimsEndpoint(t *testing.T) {
+	var gotURL string
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}
+	h := New(Config{Endpoint: "http://example.invalid/", Client: client})
+	if _, err := h.IsAlive(context.Background(), "ses_x"); err != nil {
+		t.Fatalf("IsAlive: %v", err)
+	}
+	if want := "http://example.invalid/api/session/ses_x"; gotURL != want {
+		t.Fatalf("request URL = %q, want %q", gotURL, want)
 	}
 }
