@@ -250,3 +250,45 @@ test("stale waits for two failures, clears on success and skips stale toasts", a
   assert.match(toasts[0].message, /Merged #42/)
   dispose()
 })
+
+test("a late ctx.location fills the queue without a manual reload", async () => {
+  const root = "/work/project"
+  const files = {
+    [`${root}/docs/tasks/T-A.md`]: "---\ntitle: Alpha\nstatus: todo\n---\n",
+    [`${root}/docs/tasks/T-B.md`]: "---\ntitle: Beta\nstatus: todo\n---\n",
+  }
+  const calls = []
+  const execFile = async (program, args, opts) => {
+    calls.push(opts)
+    const queue = opts.cwd === root ? [{ id: "T-A" }, { id: "T-B" }] : []
+    return { stdout: JSON.stringify({ active: [], recent: [], queue }) }
+  }
+  const ctx = ctxFor(null)
+  ctx.client = {}
+  const renderers = Object.create(null)
+  let tick = null
+  ctx.ui.slot = ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    options: { statusPollMs: 1000, watcherEnabled: false },
+    import: (specifier) => modules([])[specifier],
+    cardDeps: {
+      command: () => ["/bin/beacon"], execFile,
+      existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p],
+    },
+    setInterval: (fn) => { tick = fn; return 1 }, clearInterval: () => {},
+    setTimeout: () => 1, clearTimeout: () => {},
+  })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  await flush()
+  const queueCount = () => renderers["sidebar.content"]().children.find((c) => c.item?.sectionKey === "queue")?.item.status
+  assert.equal(queueCount(), "0", "an empty snapshot from a cwd guess is not cached")
+  assert.equal(calls.length, 1, "the CLI still runs with the transient cwd root")
+
+  ctx.location = { project: { canonical: root } }
+  tick()
+  await flush()
+  assert.equal(queueCount(), "2", "the queue appears once the canonical root is known")
+  assert.equal(calls[1].cwd, root)
+  assert.equal(calls[1].env.BEACON_PROJECT_ROOT, root)
+  dispose()
+})

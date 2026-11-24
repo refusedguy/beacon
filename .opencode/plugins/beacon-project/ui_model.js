@@ -127,13 +127,10 @@ export function normalizeSnapshot(v) {
     active: list(s.active, normalizeRun), recent: list(s.recent, normalizeRun),
     queue: list(pick(s, ["queue", "Queue"]), (item) => normalize(item, QUEUE_SPEC)),
   }
-  const incident = pick(s, ["base_incident", "baseIncident", "BaseIncident"])
-  if (incident != null) out.baseIncident = normalize(incident, BASE_INCIDENT_SPEC)
-  const daemon = pick(s, ["daemon", "Daemon"])
-  if (daemon != null) out.daemon = normalize(daemon, DAEMON_SPEC)
+  const incident = pick(s, ["base_incident", "baseIncident", "BaseIncident"]); if (incident != null) out.baseIncident = normalize(incident, BASE_INCIDENT_SPEC)
+  const daemon = pick(s, ["daemon", "Daemon"]); if (daemon != null) out.daemon = normalize(daemon, DAEMON_SPEC)
   if (s.metrics !== undefined) out.metrics = normalizeMetrics(s.metrics)
-  const generatedAt = pick(s, ["generated_at", "generatedAt"])
-  if (generatedAt !== undefined) out.generatedAt = generatedAt
+  const generatedAt = pick(s, ["generated_at", "generatedAt"]); if (generatedAt !== undefined) out.generatedAt = generatedAt
   return out
 }
 export function parseSnapshot(text) {
@@ -261,14 +258,9 @@ export class CliStatusSource {
 }
 export const createCliStatusSource = (opts) => new CliStatusSource(opts)
 const schema = (check) => ({ "~standard": { version: 1, vendor: "beacon", validate: (v) => {
-  const issue = check(v)
-  return issue ? { issues: [{ message: issue }] } : { value: v }
+  const issue = check(v); return issue ? { issues: [{ message: issue }] } : { value: v }
 } } })
-const objectInput = (check) => schema((v) => {
-  if (v == null) return null
-  if (typeof v !== "object" || Array.isArray(v)) return "input must be an object"
-  return check ? check(v) : null
-})
+const objectInput = (check) => schema((v) => v == null ? null : (typeof v !== "object" || Array.isArray(v)) ? "input must be an object" : check ? check(v) : null)
 export const RunChangedEvent = Object.freeze({
   schema: schema((v) => {
     if (!v || typeof v !== "object" || Array.isArray(v)) return "event must be an object"
@@ -328,22 +320,30 @@ export class RpcStatusSource {
   }
 }
 export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionID, model } = {}) {
-  const project = root ?? projectRoot(ctx) ?? process.cwd()
-  const cli = new CliStatusSource({ root: project, deps, limits, sessionID, model })
+  // cwd is a transient fallback, never a verified root; re-resolve per call so
+  // a late location replaces it without a reload and can filter the queue.
+  const explicit = root ?? deps.root ?? null
+  let current = null, cli = null, verified = false
+  const rootOf = () => {
+    const located = explicit ?? projectRoot(ctx); verified = Boolean(located)
+    const next = located ?? process.cwd()
+    if (next !== current || !cli) { current = next; cli = new CliStatusSource({ root: next, deps, limits, sessionID, model }) }
+    return next
+  }
   const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits }) : null
   const fallback = async (name, input) => {
-    let value
-    let usedRPC = false
+    const project = rootOf()
+    let value, usedRPC = false
     if (rpc) { try { value = await rpc[name](input); usedRPC = true } catch {} }
     if (!usedRPC) value = await cli[name](input)
     if (name !== "snapshot") return value
-    const view = normalizeSnapshot(value)
+    const view = normalizeSnapshot(value); if (!verified) return view
     return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
   }
   return {
     snapshot: (input = limits) => fallback("snapshot", input),
     control: (input) => fallback("control", input),
-    dispatch: (input) => fallback("dispatch", input),
+    dispatch: (input) => fallback("dispatch", input), root: rootOf, verified: () => verified,
   }
 }
 export const errorMessage = (error) => (error && typeof error.message === "string" ? error.message : String(error))
