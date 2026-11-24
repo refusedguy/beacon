@@ -180,13 +180,13 @@ func doctorToolChecks(root string, cfg config.Config) []doctorCheck {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return append(checks, doctorCheck{"opencode.json", checkFail, "invalid JSON"})
 	}
-	checks = append(checks, doctorFileShapeCheck(doc))
+	checks = append(checks, doctorFileShapeCheck(doc, root))
 	checks = append(checks, doctorPermissionCheck(doc))
 	checks = append(checks, doctorBinaryCheck(root), doctorDaemonCheck(cfg))
 	return checks
 }
 
-func doctorFileShapeCheck(doc map[string]any) doctorCheck {
+func doctorFileShapeCheck(doc map[string]any, root string) doctorCheck {
 	agents, _ := doc["agents"].(map[string]any)
 	var missing []string
 	for _, role := range []string{"orchestrator", "worker"} {
@@ -194,14 +194,50 @@ func doctorFileShapeCheck(doc map[string]any) doctorCheck {
 			missing = append(missing, role)
 		}
 	}
-	mcpMap, _ := doc["mcp"].(map[string]any)
-	if _, ok := mcpMap["beacon"].(map[string]any); !ok {
+	source := beaconMCPSource(doc)
+	location := ""
+	if source == "" {
+		if parent := readParentOpenCode(root); parent != nil {
+			source = beaconMCPSource(parent)
+			if source != "" {
+				location = " (workspace parent)"
+			}
+		}
+	}
+	if source == "" {
 		missing = append(missing, "mcp.beacon")
 	}
 	if len(missing) > 0 {
 		return doctorCheck{"opencode.json", checkFail, "missing " + strings.Join(missing, ", ")}
 	}
-	return doctorCheck{"opencode.json", checkOK, "agents and mcp.beacon present"}
+	return doctorCheck{"opencode.json", checkOK, "agents and " + source + " present" + location}
+}
+
+// beaconMCPSource reports the key path of a beacon MCP server in one config
+// document, or "" when the document has none.
+func beaconMCPSource(doc map[string]any) string {
+	mcpMap, _ := doc["mcp"].(map[string]any)
+	if _, ok := mcpMap["beacon"].(map[string]any); ok {
+		return "mcp.beacon"
+	}
+	servers, _ := mcpMap["servers"].(map[string]any)
+	if _, ok := servers["beacon"].(map[string]any); ok {
+		return "mcp.servers.beacon"
+	}
+	return ""
+}
+
+func readParentOpenCode(root string) map[string]any {
+	path := filepath.Join(filepath.Dir(root), "opencode.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	return doc
 }
 
 func doctorPermissionCheck(doc map[string]any) doctorCheck {
