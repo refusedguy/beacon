@@ -6,6 +6,7 @@ import { join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { beaconCommand } from "./mcp.js"
 import { locationInfo, projectRoot } from "./location.js"
+import { cliEnv } from "./session_identity.js"
 const execFileAsync = promisify(nodeExecFile)
 export const REFRESH_MS = 5000
 export const RPC_TIMEOUT_MS = 10000
@@ -218,16 +219,15 @@ export function enrichRuns(root, runs, deps = {}) {
 }
 
 export class CliStatusSource {
-  constructor({ root, deps = {}, limits = {} }) {
-    this.root = root
-    this.limits = limits
+  constructor({ root, deps = {}, limits = {}, sessionID, model }) {
+    Object.assign(this, { root, limits, sessionID, model })
     this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, ...deps }
   }
   #exec(base, args) {
     const [program, ...rest] = base
     return this.deps.execFile(program, [...rest, ...args], {
       cwd: this.root, encoding: "utf8", maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, BEACON_PROJECT_ROOT: this.root }, timeout: RPC_TIMEOUT_MS,
+      env: cliEnv(this.root, this), timeout: RPC_TIMEOUT_MS,
     })
   }
   #statusArgs(limits) {
@@ -327,9 +327,9 @@ export class RpcStatusSource {
     return this.#rpc().dispatch(input, { signal: AbortSignal.timeout(this.timeout) })
   }
 }
-export function createStatusSource(ctx, { root, deps = {}, limits = {} } = {}) {
+export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionID, model } = {}) {
   const project = root ?? projectRoot(ctx) ?? process.cwd()
-  const cli = new CliStatusSource({ root: project, deps, limits })
+  const cli = new CliStatusSource({ root: project, deps, limits, sessionID, model })
   const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits }) : null
   const fallback = async (name, input) => {
     let value

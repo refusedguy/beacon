@@ -19,6 +19,7 @@ import {
   metricsLine, sidebarModel,
 } from "./ui_view.js"
 import { compactReason } from "./ui_alerts.js"
+import { sessionIdentity } from "./session_identity.js"
 import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
 import { createDetailMount } from "./ui_detail_view.js"
@@ -81,7 +82,10 @@ async function setup(ctx, deps = {}) {
   let BOLD = 0
   try { ({ TextAttributes: { BOLD } } = await load("@opentui/core")) } catch {}
   const root = deps.root ?? projectRoot(ctx) ?? process.cwd()
-  const source = createStatusSource(ctx, { root, limits: snapshotLimits(options), deps: deps.cardDeps ?? {} })
+  const { sessionID, model } = await sessionIdentity(ctx)
+  const source = createStatusSource(ctx, {
+    root, limits: snapshotLimits(options), deps: deps.cardDeps ?? {}, sessionID, model,
+  })
   const theme = ctx.theme
   const timers = {
     now: deps.now ?? (() => Date.now()),
