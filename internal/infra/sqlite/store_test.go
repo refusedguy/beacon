@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -909,5 +910,34 @@ INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r-old', '
 	got, err = store.Get(ctx, "r-old")
 	if err != nil || got == nil || len(got.Checks) != 1 || got.Checks[0].State != core.CheckFailure {
 		t.Fatalf("write after migration = %+v err=%v", got, err)
+	}
+}
+
+func TestConcurrentSavesDoNotReturnBusy(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	const n = 8
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		id := core.RunID(fmt.Sprintf("r-%d", i))
+		go func() {
+			errs <- store.Save(ctx, core.NewRun(id, "T-1", time.Now()))
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < n; i++ {
+		got, err := store.Get(ctx, core.RunID(fmt.Sprintf("r-%d", i)))
+		if err != nil || got == nil {
+			t.Fatalf("run %d = %+v err=%v", i, got, err)
+		}
 	}
 }

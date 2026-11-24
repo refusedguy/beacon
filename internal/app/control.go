@@ -3,9 +3,15 @@ package app
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
+)
+
+const (
+	controlWriteAttempts = 3
+	controlRetryBase     = 10 * time.Millisecond
 )
 
 type Control struct {
@@ -13,6 +19,38 @@ type Control struct {
 	Harness   AgentHarness
 	Workspace WorkspaceManager
 	OnChange  func(int)
+	writeMu   sync.Mutex
+}
+
+// write serializes control mutations and retries transient SQLite lock
+// conflicts. Read-only services never take this lock.
+func (c *Control) write(ctx context.Context, fn func() error) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	var err error
+	for attempt := 0; attempt < controlWriteAttempts; attempt++ {
+		err = fn()
+		if !isBusy(err) {
+			return err
+		}
+		if attempt+1 < controlWriteAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(controlRetryBase << attempt):
+			}
+		}
+	}
+	return err
+}
+
+// isBusy recognises the write-lock conflicts reported by modernc.org/sqlite.
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "database is locked")
 }
 
 func (c *Control) get(ctx context.Context, id core.RunID) (*core.Run, error) {
@@ -30,6 +68,10 @@ func (c *Control) get(ctx context.Context, id core.RunID) (*core.Run, error) {
 // WatchPR reopens a run closed by workspace cleanup. The reconciler skips
 // terminal runs, so a binding stored on a closed run is never finalized.
 func (c *Control) WatchPR(ctx context.Context, id core.RunID, pr int) error {
+	return c.write(ctx, func() error { return c.watchPR(ctx, id, pr) })
+}
+
+func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 	run, err := c.get(ctx, id)
 	if err != nil {
 		return err
@@ -68,57 +110,69 @@ func (c *Control) WatchPR(ctx context.Context, id core.RunID, pr int) error {
 }
 
 func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
-	run, err := c.get(ctx, id)
+	var saved *core.Run
+	err := c.write(ctx, func() error {
+		run, err := c.get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: "cancelled by operator"}); err != nil {
+			return err
+		}
+		if err := c.Store.Save(ctx, run); err != nil {
+			return err
+		}
+		saved = run
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: "cancelled by operator"}); err != nil {
-		return err
+	if saved.SessionID != "" {
+		_ = c.Harness.Stop(ctx, saved.SessionID)
 	}
-	if err := c.Store.Save(ctx, run); err != nil {
-		return err
-	}
-	if run.SessionID != "" {
-		_ = c.Harness.Stop(ctx, run.SessionID)
-	}
-	if run.WorkspacePath != "" {
-		_ = c.Workspace.Remove(ctx, Workspace{Path: run.WorkspacePath, Branch: run.Branch})
+	if saved.WorkspacePath != "" {
+		_ = c.Workspace.Remove(ctx, Workspace{Path: saved.WorkspacePath, Branch: saved.Branch})
 	}
 	return nil
 }
 
 func (c *Control) Unblock(ctx context.Context, id core.RunID) error {
-	run, err := c.get(ctx, id)
-	if err != nil {
-		return err
-	}
-	if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "unblocked by operator"}); err != nil {
-		return err
-	}
-	if err := c.Store.Save(ctx, run); err != nil {
-		return err
-	}
-	c.signal(run)
-	return nil
+	return c.write(ctx, func() error {
+		run, err := c.get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "unblocked by operator"}); err != nil {
+			return err
+		}
+		if err := c.Store.Save(ctx, run); err != nil {
+			return err
+		}
+		c.signal(run)
+		return nil
+	})
 }
 
 // Approve records a manual approval bound to the observed commit.
 func (c *Control) Approve(ctx context.Context, id core.RunID, sha string) error {
-	run, err := c.get(ctx, id)
-	if err != nil {
-		return err
-	}
-	if sha == "" {
-		sha = run.HeadSHA
-	}
-	if sha == "" {
-		return core.Errorf(core.CodeInvalidInput, "no head SHA for run %s", id)
-	}
-	if err := c.Store.SetApproval(ctx, id, sha); err != nil {
-		return err
-	}
-	c.signal(run)
-	return nil
+	return c.write(ctx, func() error {
+		run, err := c.get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if sha == "" {
+			sha = run.HeadSHA
+		}
+		if sha == "" {
+			return core.Errorf(core.CodeInvalidInput, "no head SHA for run %s", id)
+		}
+		if err := c.Store.SetApproval(ctx, id, sha); err != nil {
+			return err
+		}
+		c.signal(run)
+		return nil
+	})
 }
 
 // Retry re-arms an exhausted run or a closed run that has no replacement.
@@ -126,29 +180,31 @@ func (c *Control) Approve(ctx context.Context, id core.RunID, sha string) error 
 // runs keep their PR when they have one, otherwise they return to pending so
 // the dispatcher can spawn a fresh worker.
 func (c *Control) Retry(ctx context.Context, id core.RunID) error {
-	run, err := c.get(ctx, id)
-	if err != nil {
-		return err
-	}
-	switch run.State {
-	case core.RunBlocked:
-		run.RebaseAttempts = 0
-		run.FixAttempts = 0
-		if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "retried by operator"}); err != nil {
+	return c.write(ctx, func() error {
+		run, err := c.get(ctx, id)
+		if err != nil {
 			return err
 		}
-	case core.RunClosed:
-		if err := c.retryClosed(ctx, run); err != nil {
+		switch run.State {
+		case core.RunBlocked:
+			run.RebaseAttempts = 0
+			run.FixAttempts = 0
+			if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "retried by operator"}); err != nil {
+				return err
+			}
+		case core.RunClosed:
+			if err := c.retryClosed(ctx, run); err != nil {
+				return err
+			}
+		default:
+			return core.Errorf(core.CodeConflict, "run %s is not blocked or closed", id)
+		}
+		if err := c.Store.Save(ctx, run); err != nil {
 			return err
 		}
-	default:
-		return core.Errorf(core.CodeConflict, "run %s is not blocked or closed", id)
-	}
-	if err := c.Store.Save(ctx, run); err != nil {
-		return err
-	}
-	c.signal(run)
-	return nil
+		c.signal(run)
+		return nil
+	})
 }
 
 func (c *Control) retryClosed(ctx context.Context, run *core.Run) error {
