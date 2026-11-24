@@ -57,7 +57,7 @@ test("phaseLabel follows the live phase and merged rows drop the reason", () => 
   const waiting = normalizeRun(makeRun({
     State: "waiting_ci", Durations: { waiting_ci_seconds: 120, running_seconds: 5, blocked_seconds: 0 },
   }))
-  assert.equal(phaseLabel(waiting, NOW), "ci 2m")
+  assert.equal(phaseLabel(waiting, NOW), "CI wait 2m")
   const merged = normalizeRun(makeRun({ State: "merged", Reason: "automatic rebase" }))
   const [, detail] = runLineItems(merged, NOW, true)
   assert.equal(detail.status, "")
@@ -156,12 +156,12 @@ test("detail model uses four sections with full wrapping text", () => {
   assert.equal(model.pr, "#42")
   assert.equal(model.branch, "beacon/T-1")
   assert.equal(model.task, "T-1")
-  assert.ok(model.phase.includes("Coding 5s") && model.phase.includes("CI 1m"))
+  assert.ok(model.phase.includes("Coding 5s") && model.phase.includes("CI wait 1m"))
   assert.deepEqual(model.rows.filter((i) => i.sectionKey).map((i) => i.sectionKey), ["why", "checks", "timeline", "technical"])
   const names = model.rows.map((i) => i.name ?? i.text)
   assert.ok(names.includes(longReason), "the reason is not cut to a fixed width")
   assert.ok(names.includes("ci"), "successful checks hide the word success")
-  assert.equal(model.rows.find((i) => i.sectionKey === "checks").status, "1/1 · 28s")
+  assert.equal(model.rows.find((i) => i.sectionKey === "checks").status, "1/1 · longest 28s")
   assert.ok(names.includes("Run created"), "timeline events use human copy")
   assert.ok(model.rows.some((i) => i.marker === "10:01:00  "), "the timeline time sits in its own padded column")
   assert.ok(names.some((n) => n.includes("reconcile.decision merge")))

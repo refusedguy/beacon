@@ -188,7 +188,7 @@ test("CI checks hide success, keep short failures and carry a right summary", ()
   ]
   const run = normalizeRun(makeRun({ Checks: checks }))
   const model = detailModel(run, {}, NOW)
-  assert.equal(model.rows.find((i) => i.sectionKey === "checks").status, "5/5 · 1m35s")
+  assert.equal(model.rows.find((i) => i.sectionKey === "checks").status, "5/5 · longest 19s")
   assert.ok(model.rows.some((i) => i.kind === "check" && i.name === "vet"))
   assert.equal(model.rows.some((i) => i.name.includes("success")), false)
   const failed = detailModel(normalizeRun(makeRun({

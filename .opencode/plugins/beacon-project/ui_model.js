@@ -2,7 +2,7 @@
 // TUI peers lazily in setup so `node --test` can import this module alone.
 import { execFile as nodeExecFile } from "node:child_process"
 import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { join, relative, resolve } from "node:path"
 import { promisify } from "node:util"
 import { beaconCommand } from "./mcp.js"
 import { locationInfo, projectRoot } from "./location.js"
@@ -202,7 +202,7 @@ export function readCard(root, id, deps = {}) {
   return {
     id: cardID, title: text("title") || cardID, priority: text("priority"),
     status: text("status"), scope: field("scope"), depends: field("depends") || field("depends_on"),
-    path, body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
+    path, relativePath: relative(root, path), body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
   }
 }
 export const readTitle = (root, taskID, deps = {}) => readCard(root, taskID, deps)?.title || str(taskID)
