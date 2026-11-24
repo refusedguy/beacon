@@ -491,12 +491,12 @@ func TestDispatchWithoutWorkerInstructionsKeepsStockPrompt(t *testing.T) {
 }
 
 func TestDispatchResolvesModelFromParentSession(t *testing.T) {
-	ref := map[string]string{"id": "hy4-flash-free", "providerID": "opencode"}
+	ref := core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode"}
 	var parents []string
 	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
 	d := newInstructionDispatcher(h, "")
 	d.ParentSessionID = "ses_fallback"
-	d.ResolveModel = func(parent string) map[string]string {
+	d.ResolveModel = func(parent string) core.ModelRef {
 		parents = append(parents, parent)
 		return ref
 	}
@@ -528,8 +528,8 @@ func TestDispatchWithoutResolverLeavesHarnessDefault(t *testing.T) {
 	if len(h.requests) != 1 {
 		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
 	}
-	if h.requests[0].ModelRef != nil {
-		t.Fatalf("spawn model = %v, want nil without a resolver", h.requests[0].ModelRef)
+	if !h.requests[0].ModelRef.IsZero() {
+		t.Fatalf("spawn model = %v, want no model without a resolver", h.requests[0].ModelRef)
 	}
 }
 

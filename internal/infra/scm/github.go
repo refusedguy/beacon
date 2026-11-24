@@ -78,6 +78,13 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 			break
 		}
 	}
+	if state == "open" && len(checks) == 0 {
+		files, err := g.changedFiles(ctx, pr)
+		if err != nil {
+			return o, err
+		}
+		o.WorkflowSkipped = ignoredPathsOnly(files)
+	}
 
 	approvals, err := g.approvals(ctx, pr)
 	if err != nil {
@@ -140,6 +147,50 @@ func checkState(c *github.CheckRun) core.CheckState {
 	default:
 		return core.CheckFailure
 	}
+}
+
+// changedFiles reads every changed file of a PR. GitHub paginates at 100.
+func (g *GitHub) changedFiles(ctx context.Context, pr int) ([]*github.CommitFile, error) {
+	var all []*github.CommitFile
+	opts := &github.ListOptions{PerPage: 100}
+	for {
+		var (
+			page []*github.CommitFile
+			resp *github.Response
+		)
+		if _, err := g.guarded(func() (any, error) {
+			var err error
+			page, resp, err = g.Client.PullRequests.ListFiles(ctx, g.Owner, g.Repo, pr, opts)
+			return nil, err
+		}); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if resp == nil || resp.NextPage == 0 {
+			return all, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// ignoredPathsOnly reports whether every changed path is one the CI workflow
+// ignores: anything under docs/ or a Markdown file at any depth. An empty set
+// is not a docs-only change, and a rename must have ignored names on both sides.
+func ignoredPathsOnly(files []*github.CommitFile) bool {
+	if len(files) == 0 {
+		return false
+	}
+	for _, f := range files {
+		for _, name := range []string{f.GetFilename(), f.GetPreviousFilename()} {
+			if name == "" {
+				continue
+			}
+			if !strings.HasPrefix(name, "docs/") && !strings.HasSuffix(strings.ToLower(name), ".md") {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (g *GitHub) approvals(ctx context.Context, pr int) (int, error) {

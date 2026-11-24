@@ -40,7 +40,7 @@ type Harness struct {
 	Endpoint        string
 	Repo            string
 	Model           string
-	ModelRef        map[string]string
+	ModelRef        core.ModelRef
 	Agent           string
 	Token           string
 	ParentSessionID string
@@ -152,17 +152,17 @@ func firstNonEmpty(a, b string) string {
 // dispatch from the parent session wins over the startup fallback. OpenCode
 // child sessions do not inherit the parent model, so the ref is sent both when
 // the session is created and when it is configured. A bare id is not a ref.
-func (h *Harness) modelRef(req core.SpawnRequest) map[string]string {
-	if len(req.ModelRef) > 0 {
+func (h *Harness) modelRef(req core.SpawnRequest) core.ModelRef {
+	if !req.ModelRef.IsZero() {
 		return req.ModelRef
 	}
-	if len(h.ModelRef) > 0 {
+	if !h.ModelRef.IsZero() {
 		return h.ModelRef
 	}
 	if h.Model != "" {
-		return map[string]string{"providerID": "opencode", "id": h.Model}
+		return core.ModelRef{ProviderID: "opencode", ID: h.Model}
 	}
-	return nil
+	return core.ModelRef{}
 }
 
 func messageID(prefix string) string {
@@ -306,7 +306,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	if agent := firstNonEmpty(strings.TrimSpace(req.Task.WorkerAgent), h.Agent); agent != "" {
 		body["agent"] = agent
 	}
-	if ref := h.modelRef(req); ref != nil {
+	if ref := h.modelRef(req); !ref.IsZero() {
 		body["model"] = ref
 	}
 	data, _, err := h.do(ctx, http.MethodPost, "/api/session", body)
