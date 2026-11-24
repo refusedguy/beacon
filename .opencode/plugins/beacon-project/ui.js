@@ -12,7 +12,7 @@ export * from "./ui_card_view.js"
 
 import {
   EVENT_IDLE_MS, PANEL_NAME, BeaconStatusRpc, EMPTY_SNAPSHOT,
-  createStatusSource, errorMessage, readCard, str, tuiLocation,
+  cleanErrorMessage, createStatusSource, readCard, str, tuiLocation,
 } from "./ui_model.js"
 import {
   DETAIL_OPEN, SIDEBAR_OPEN, detailCommand, detailModel,
@@ -229,6 +229,8 @@ async function setup(ctx, deps = {}) {
   }
 
   let pending = false
+  let failures = 0
+  let stale = false
   const lastSeenState = new Map()
   const notify = (snapshot) => {
     for (const toast of collectTransitionToasts(lastSeenState, snapshot)) {
@@ -243,10 +245,21 @@ async function setup(ctx, deps = {}) {
       const next = await source.snapshot()
       if (stopped) return
       const snap = next ?? EMPTY_SNAPSHOT
-      notify(snap)
+      // A snapshot taken during an outage may miss transitions. Skip toasts
+      // until a later, confirmed poll reports them.
+      if (!stale) notify(snap)
       setSnapshot(snap)
+      failures = 0
+      stale = false
       setError(null)
-    } catch (cause) { if (!stopped) setError(errorMessage(cause)) }
+    } catch (cause) {
+      if (stopped) return
+      failures += 1
+      if (failures >= 2) {
+        stale = true
+        setError(cleanErrorMessage(cause))
+      }
+    }
     finally { inFlight = false }
     if (!stopped) applyAll()
     if (pending && !stopped) { pending = false; void refresh() }

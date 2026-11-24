@@ -191,3 +191,62 @@ test("a row count change during refresh creates no nodes outside a render callba
   assert.ok(afterVisible > beforeVisible, "the panel shows the new rows")
   dispose()
 })
+
+test("stale waits for two failures, clears on success and skips stale toasts", async () => {
+  const good = (state) => ({ stdout: JSON.stringify({ active: [makeRun({ ID: "r-1", State: state })], recent: [] }) })
+  const outcomes = [
+    () => good("running"),
+    () => { throw new Error("Error: bad flag\nUsage:\n  beacon --help") },
+    () => { throw new Error("Error: bad flag\nUsage:\n  beacon --help") },
+    () => good("blocked"),
+    () => good("merged"),
+  ]
+  let attempt = 0
+  const cliDeps = {
+    command: () => ["/bin/beacon"],
+    existsSync: () => false,
+    execFile: async () => outcomes[Math.min(attempt++, outcomes.length - 1)](),
+  }
+  const toasts = []
+  const renderers = Object.create(null)
+  let tick = null
+  const ctx = ctxFor(null)
+  ctx.ui.toast = { show: (toast) => toasts.push(toast) }
+  ctx.ui.slot = ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    options: { statusPollMs: 1000, watcherEnabled: false },
+    import: (specifier) => modules([])[specifier],
+    cardDeps: cliDeps,
+    setInterval: (fn) => { tick = fn; return 1 }, clearInterval: () => {},
+    setTimeout: () => 1, clearTimeout: () => {},
+  })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  await flush()
+  const sidebar = renderers["sidebar.content"]()
+  const staleLine = () => sidebar.children.find((child) =>
+    child.item?.name?.startsWith("[stale]") && child.props.visible)?.children[1].props.content
+  const runState = () => sidebar.children.find((child) => child.item?.runID === "r-1")?.item.status
+
+  assert.equal(attempt, 1)
+  assert.equal(runState(), "RUN")
+  assert.equal(staleLine(), undefined, "one failure keeps the good snapshot")
+  tick()
+  await flush()
+  assert.equal(runState(), "RUN", "the previous snapshot stays visible")
+  assert.equal(staleLine(), undefined, "one failure shows no stale line")
+  tick()
+  await flush()
+  assert.equal(staleLine(), "[stale] beacon status temporarily unavailable")
+  assert.equal(runState(), "RUN")
+  tick()
+  await flush()
+  assert.equal(runState(), "BLK")
+  assert.equal(staleLine(), undefined, "the first success clears stale")
+  assert.equal(toasts.length, 0, "a snapshot taken while stale fires no toast")
+  tick()
+  await flush()
+  assert.equal(runState(), "MERGED")
+  assert.equal(toasts.length, 1, "toasts resume after recovery")
+  assert.match(toasts[0].message, /Merged #42/)
+  dispose()
+})

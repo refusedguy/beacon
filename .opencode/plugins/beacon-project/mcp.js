@@ -70,13 +70,7 @@ function* sourcePaths(root, deps) {
 
 // A binary is fresh when every build input is older than the binary itself.
 // Any stat failure means we could not prove freshness, so we rebuild.
-function sourceNewerThanBinary(root, local, deps) {
-  let binaryMtime
-  try {
-    binaryMtime = deps.statSync(local).mtimeMs
-  } catch {
-    return true
-  }
+function sourceNewerThanBinary(root, deps, binaryMtime) {
   for (const source of sourcePaths(root, deps)) {
     try {
       if (deps.statSync(source).mtimeMs > binaryMtime) return true
@@ -96,18 +90,31 @@ function runBuild(root, deps) {
   }
 }
 
-function rebuildLocalIfStale(root, local, deps) {
-  if (sourceNewerThanBinary(root, local, deps)) runBuild(root, deps)
+// One rebuild attempt per root and binary mtime. A successful build changes
+// the binary mtime, so a later resolution checks the new build. Until then,
+// repeated resolutions reuse the decision instead of racing with the script.
+const rebuilds = new WeakMap()
+
+function rebuildLocalIfStale(root, local, deps, cacheDeps) {
+  let mtime
+  try { mtime = deps.statSync(local).mtimeMs } catch { mtime = null }
+  let checked = rebuilds.get(cacheDeps)
+  if (!checked) { checked = new Set(); rebuilds.set(cacheDeps, checked) }
+  const key = `${root}\u0000${mtime}`
+  if (checked.has(key)) return
+  checked.add(key)
+  if (mtime === null || sourceNewerThanBinary(root, deps, mtime)) runBuild(root, deps)
 }
 
 export function beaconCommand(root, deps = defaultDeps) {
+  const cacheDeps = deps && typeof deps === "object" ? deps : defaultDeps
   deps = normalizeDeps(deps)
   const explicit = deps.env.BEACON_BIN
   if (explicit && deps.existsSync(explicit)) return [explicit, "mcp"]
 
   const local = join(root, ".opencode", "bin", "beacon")
   if (deps.existsSync(local)) {
-    rebuildLocalIfStale(root, local, deps)
+    rebuildLocalIfStale(root, local, deps, cacheDeps)
     return [local, "mcp"]
   }
 
