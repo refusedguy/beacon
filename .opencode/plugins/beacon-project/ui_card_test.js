@@ -57,7 +57,7 @@ function texts(node, out = []) {
   return out
 }
 
-async function setup({ queue = [], extra = {}, files = cardDeps, copied = [], copyResult = true } = {}) {
+async function setup({ queue = [], extra = {}, files = cardDeps, copied = [], copyResult = true, onLayer } = {}) {
   const created = []
   const renderers = Object.create(null)
   const toasts = []
@@ -84,7 +84,7 @@ async function setup({ queue = [], extra = {}, files = cardDeps, copied = [], co
       slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
       panel: { open: (name) => opened.push(name), close: () => closed.push(true) },
     },
-    keymap: { layer: () => () => {} },
+    keymap: { layer: (fn) => { const value = fn(); onLayer?.(value); return () => {} } },
   }
   const modules = {
     "@opentui/solid": solidModule(created),
@@ -232,5 +232,95 @@ test("the card header offers the detail panel controls and both close the panel"
   findText(panel, "ctrl+g").props.onMouseUp()
   findText(panel, "✕").props.onMouseUp()
   assert.equal(h.closed.length, 2, "both header controls close the panel")
+  h.dispose()
+})
+
+const DEP_CARD = "---\nid: T-40\ntitle: Dependency card\nstatus: available\npriority: 5\n---\nGoal: dependency.\n"
+const twoFiles = {
+  existsSync: (path) => path.endsWith("/docs/tasks/T-42.md") || path.endsWith("/docs/tasks/T-40.md"),
+  readFileSync: (path) => path.endsWith("T-40.md") ? DEP_CARD : CARD,
+}
+
+test("clicking a card dependency opens it and back restores the previous card", async () => {
+  let layer
+  const h = await setup({
+    queue: [{ id: "T-42", title: "Queued task", status: "ready" }],
+    files: twoFiles, onLayer: (value) => { layer = value },
+  })
+  const sidebar = h.renderers["sidebar.content"]()
+  findItem(sidebar, (item) => item.action === "card:T-42" && item.kind === "queue-title").props.onMouseDown()
+  const panel = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  assert.ok(texts(panel).includes("A very long human readable card title"))
+  const dep = findItem(panel, (item) => item.kind === "card-dep" && item.action === "card:T-40")
+  assert.ok(dep, "the dependency row is a navigation link")
+  dep.props.onMouseDown()
+  assert.deepEqual(h.opened, [CARD_PANEL_NAME, CARD_PANEL_NAME])
+  assert.ok(texts(panel).includes("Dependency card"), "the target card opens in the same panel")
+  findText(panel, "← Back").props.onMouseUp()
+  assert.ok(texts(panel).includes("A very long human readable card title"), "back restores the earlier card")
+
+  const backCommand = layer.commands.find((command) => command.id === "beacon.card.back")
+  assert.equal(backCommand.bind, "ctrl+b")
+  findItem(panel, (item) => item.kind === "card-dep" && item.action === "card:T-40").props.onMouseDown()
+  backCommand.run()
+  assert.ok(texts(panel).includes("A very long human readable card title"), "the shortcut goes back too")
+  assert.equal(layer.commands.find((command) => command.id === "beacon.run.detail").bind, "ctrl+g")
+  h.dispose()
+})
+
+const EPIC_CARD = "---\nid: T-EPIC\ntitle: Harness epic\nstatus: available\npriority: 9\nkind: epic\ndepends:\n  - T-EPIC-01\n---\nGoal: epic.\n"
+const CHILD_CARD = "---\nid: T-EPIC-01\ntitle: Child card\nstatus: available\npriority: 8\nkind: task\nbase_branch: beacon/T-EPIC\n---\nGoal: child.\n"
+const familyFiles = {
+  existsSync: (path) => /docs\/tasks\/T-EPIC(-01)?\.md$/.test(path),
+  readFileSync: (path) => path.endsWith("T-EPIC-01.md") ? CHILD_CARD : EPIC_CARD,
+}
+
+test("an epic lists its children and a child links back to its parent epic", async () => {
+  const h = await setup({
+    queue: [
+      { id: "T-EPIC", title: "Harness epic", status: "ready", priority: 9 },
+      { id: "T-EPIC-01", title: "Child card", status: "available", priority: 8 },
+    ],
+    files: familyFiles,
+  })
+  const sidebar = h.renderers["sidebar.content"]()
+  findItem(sidebar, (item) => item.action === "card:T-EPIC" && item.kind === "queue-title").props.onMouseDown()
+  const panel = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  const epicTexts = texts(panel)
+  for (const expected of ["Children (1)", "T-EPIC-01 · Child card", "available"]) {
+    assert.ok(epicTexts.includes(expected), `epic card missing ${expected}`)
+  }
+  const kindRow = findItem(panel, (item) => item.kind === "card-meta" && item.marker.trim() === "Kind")
+  assert.equal(kindRow?.children[1].props.content, "epic")
+  const child = findItem(panel, (item) => item.kind === "card-child")
+  assert.equal(child.item.action, "card:T-EPIC-01")
+  child.props.onMouseDown()
+  const childTexts = texts(panel)
+  assert.ok(childTexts.includes("Child card"), "the child opens in the same panel")
+  const parent = findItem(panel, (item) => item.kind === "card-parent")
+  assert.equal(parent.item.action, "card:T-EPIC")
+  assert.equal(parent.item.status, "Harness epic", "the parent epic carries its queue title")
+  parent.props.onMouseDown()
+  assert.ok(texts(panel).includes("Harness epic"), "the parent epic opens from the child")
+  h.dispose()
+})
+
+test("an empty depends list adds no link and back with no history closes the panel", async () => {
+  const EMPTY_DEPS = "---\nid: T-EMPTY\ntitle: No deps\nstatus: available\ndepends: []\n---\nGoal: none.\n"
+  const files = {
+    existsSync: (path) => path.endsWith("/docs/tasks/T-EMPTY.md"),
+    readFileSync: () => EMPTY_DEPS,
+  }
+  let layer
+  const h = await setup({
+    queue: [{ id: "T-EMPTY", title: "No deps", status: "ready" }],
+    files, onLayer: (value) => { layer = value },
+  })
+  const sidebar = h.renderers["sidebar.content"]()
+  findItem(sidebar, (item) => item.action === "card:T-EMPTY" && item.kind === "queue-title").props.onMouseDown()
+  const panel = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  assert.equal(findItem(panel, (item) => item.kind === "card-dep"), null, "no fake link from an empty list")
+  layer.commands.find((command) => command.id === "beacon.card.back").run()
+  assert.equal(h.closed.length, 1, "back with no history closes the panel")
   h.dispose()
 })

@@ -24,7 +24,7 @@ import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
 import { createDetailMount } from "./ui_detail_view.js"
 import { clipboardCopier, createActionRunner } from "./ui_actions.js"
-import { CARD_PANEL_NAME, cardModel, cardRelativePath, createCardMount, fixPrompt } from "./ui_card_view.js"
+import { CARD_PANEL_NAME, cardBackCommand, cardModel, cardRelativePath, createCardMount, fixPrompt } from "./ui_card_view.js"
 import { createRunChangeBridge } from "./ui_bridge.js"
 import { projectRoot } from "./location.js"
 import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
@@ -117,6 +117,7 @@ async function setup(ctx, deps = {}) {
   let detailOpen = false
   let cardOpen = false
   let currentCard = null
+  const cardHistory = []
   let detailClose = null
   let cardClose = null
   let stopped = false
@@ -132,7 +133,7 @@ async function setup(ctx, deps = {}) {
     if (!slot || slot.node.isDestroyed) return
     if (key === "sidebar") slot.apply(sidebarModel(m(), error(), timers.now(), sidebarOpen), error())
     else if (key === "footer") slot.apply([metricsLine(m())])
-    else if (key === "card") slot.apply(cardModel(currentCard))
+    else if (key === "card") slot.apply(cardModel(currentCard, m().queue))
     else slot.apply(detailModel(selectedRun(), m().metrics, timers.now(), detailSections), selectedRun())
   }
   function applyAll() { for (const key of SLOT_KEYS) applySlot(key) }
@@ -153,6 +154,7 @@ async function setup(ctx, deps = {}) {
   function closePanel() {
     detailOpen = false
     cardOpen = false
+    cardHistory.length = 0
     const close = cardClose ?? detailClose
     if (typeof close === "function") close()
     else if (typeof ctx.ui.panel?.close === "function") ctx.ui.panel.close()
@@ -161,20 +163,32 @@ async function setup(ctx, deps = {}) {
     detailOpen = true
     cardOpen = false
     cardClose = null
+    cardHistory.length = 0
     ctx.ui.panel.open(PANEL_NAME)
   }
-  function showCard(id) {
+  function showCard(id, { push = false } = {}) {
     const card = readCard(root, id, deps.cardDeps ?? {})
     if (!card) {
       ctx.ui?.toast?.show?.({ message: `Card ${id} is not available on disk`, variant: "warning" })
       return
     }
+    if (push && currentCard && currentCard.id !== card.id) cardHistory.push(currentCard)
     currentCard = card
     cardOpen = true
     detailOpen = false
     detailClose = null
     ctx.ui.panel.open(CARD_PANEL_NAME)
     applySlot("card")
+  }
+  function backCard() {
+    if (cardHistory.length) { showCard(cardHistory.pop().id); return }
+    if (!panelIsOpen()) return
+    if (selectedRun()) openDetail()
+    else closePanel()
+  }
+  const handleCardItem = (item) => {
+    const action = str(item?.action ?? "")
+    if (action.startsWith("card:")) showCard(action.slice("card:".length), { push: true })
   }
   const copyCard = (kind) => {
     const card = currentCard
@@ -212,10 +226,14 @@ async function setup(ctx, deps = {}) {
     let entry
     if (key === "sidebar") {
       entry = createSidebarMount(ui, {
-        color, BOLD, onItem: handleSidebarItem, onCard: showCard, hoverBg: theme.background.raised.high,
+        color, BOLD, onItem: handleSidebarItem, onCard: (id) => showCard(id, { push: true }),
+        hoverBg: theme.background.raised.high,
       })
     } else if (key === "card") {
-      entry = createCardMount(ui, { color, BOLD, onCopy: copyCard, onClose: closePanel, setProp })
+      entry = createCardMount(ui, {
+        color, BOLD, onCopy: copyCard, onClose: closePanel, onBack: backCard,
+        onItem: handleCardItem, setProp,
+      })
     } else if (key === "footer") {
       const footer = createBox(ui, { flexDirection: "column", minWidth: 0 })
       const mount = createLineMount(ui, { color, BOLD, maxLines: FOOTER_ROWS })
@@ -285,10 +303,13 @@ async function setup(ctx, deps = {}) {
     }, pollMs)
   }
   const removeKeymap = typeof ctx.keymap?.layer === "function"
-    ? ctx.keymap.layer(() => ({ mode: "global", commands: [detailCommand(() => {
-      if (panelIsOpen()) closePanel()
-      else openDetail()
-    })] }))
+    ? ctx.keymap.layer(() => ({ mode: "global", commands: [
+      detailCommand(() => {
+        if (panelIsOpen()) closePanel()
+        else openDetail()
+      }),
+      cardBackCommand(backCard),
+    ] }))
     : null
   const disposers = [
     ctx.ui.slot({ append: "sidebar.content", render: () => ensureSlot("sidebar").node }),

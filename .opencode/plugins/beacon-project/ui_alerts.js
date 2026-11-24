@@ -59,19 +59,49 @@ export function baseIncidentItem(incident) {
   }
 }
 
+export function shortTaskID(value) {
+  const id = str(value)
+  return id ? (id.length > 10 ? id.slice(-8) : id) : "-"
+}
+
+// A generated child carries its parent's ID as a prefix. Longest match wins
+// when a nested ID happens to contain a shorter epic ID.
+const queueParent = (list, id) => list
+  .map((item) => str(item?.id))
+  .filter((parent) => parent && parent !== id && id.startsWith(`${parent}-`))
+  .sort((a, b) => b.length - a.length)[0] || ""
+
 export function queueLineItems(queue = []) {
-  return (Array.isArray(queue) ? queue : []).map((item) => {
-    const waiting = str(item?.status).toLowerCase() === "waiting_deps"
-    const deps = (Array.isArray(item?.dependsOn) ? item.dependsOn : []).map(str).filter(Boolean).join(", ")
+  const list = Array.isArray(queue) ? queue : []
+  const parents = new Map(list.map((item) => [str(item?.id), queueParent(list, str(item?.id))]))
+  const parentsWithChildren = new Set(parents.values())
+  return list.flatMap((item) => {
     const cardID = str(item?.id)
-    return {
-      marker: waiting ? "◌" : "○",
-      name: str(item?.title) || cardID || "-",
-      status: `${waiting ? `blocked by ${deps || "deps"}` : "ready"} · P${str(item?.priority) || "?"}`,
-      color: "muted",
-      cardID,
-      action: cardID ? `card:${cardID}` : undefined,
-    }
+    const parent = parents.get(cardID) || ""
+    const epic = str(item?.kind).toLowerCase() === "epic" || parentsWithChildren.has(cardID)
+    const waiting = str(item?.status).toLowerCase() === "waiting_deps"
+    const deps = (Array.isArray(item?.dependsOn) ? item.dependsOn : []).map(str).filter(Boolean)
+    const state = waiting ? "blocked" : str(item?.status).replace(/_/g, " ") || "ready"
+    const summary = `${epic ? "epic" : parent ? "child" : ""}${epic || parent ? " · " : ""}${state} · P${str(item?.priority) || "?"} · ${deps.length} dep${deps.length === 1 ? "" : "s"}`
+    const rows = [
+      {
+        marker: epic ? "◆" : parent ? "└" : waiting ? "◌" : "○",
+        markerSpace: parent ? 2 : true,
+        name: str(item?.title) || cardID || "-",
+        status: epic ? "EPIC" : "", statusColor: "muted",
+        color: "base", nameColor: "base", nameBold: epic, cardID, kind: "queue-title",
+        action: cardID ? `card:${cardID}` : undefined,
+      },
+      {
+        marker: "", name: summary, status: "", color: "muted", statusColor: "muted",
+        cardID, kind: "queue-status", action: cardID ? `card:${cardID}` : undefined,
+      },
+    ]
+    for (const dep of deps) rows.push({
+      marker: "↳", name: shortTaskID(dep), status: "", color: "muted", kind: "queue-dep",
+      depID: dep, action: `card:${dep}`,
+    })
+    return rows
   })
 }
 

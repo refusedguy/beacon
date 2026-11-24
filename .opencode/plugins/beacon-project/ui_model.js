@@ -23,8 +23,7 @@ export const SIDEBAR_SECTIONS = Object.freeze(["active", "queue", "recent"])
 export const DETAIL_SECTIONS = Object.freeze(["why", "checks", "timeline", "technical"])
 export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [], queue: [] })
 
-const bool = (v) => v === true || v === 1 || v === "true"
-const raw = (v) => (v == null ? "" : v)
+const bool = (v) => v === true || v === 1 || v === "true", raw = (v) => (v == null ? "" : v)
 export const failedCheckCount = (v) => {
   if (Array.isArray(v)) return v.length
   if (typeof v === "string" && v.trim().startsWith("[")) {
@@ -36,8 +35,7 @@ export const failedCheckCount = (v) => {
 }
 
 export const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v))
-const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0 }
-const pick = (s, names) => { for (const n of names) { const v = s?.[n]; if (v != null) return v } }
+const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0 }, pick = (s, names) => { for (const n of names) { const v = s?.[n]; if (v != null) return v } }
 const list = (v, fn) => (Array.isArray(v) ? v : []).map(fn)
 const normalize = (value, spec) => {
   const s = value && typeof value === "object" ? value : {}
@@ -67,7 +65,7 @@ const CHECK_SPEC = [
   ["durationSeconds", ["duration_seconds", "durationSeconds"], num],
 ]
 const QUEUE_SPEC = [
-  ["id", ["ID", "id"]], ["title", ["Title", "title"]],
+  ["id", ["ID", "id"]], ["title", ["Title", "title"]], ["kind", ["Kind", "kind"]],
   ["priority", ["Priority", "priority"], raw],
   ["status", ["Status", "status"], (v) => str(v) || "ready"],
   ["dependsOn", ["DependsOn", "depends_on", "dependsOn"], (v) => list(v, str)],
@@ -200,8 +198,9 @@ export function readCard(root, id, deps = {}) {
   const rest = match ? body.slice(match[0].length) : body
   const field = (name) => text(name) || new RegExp(`^${name}:\\s*(.+?)\\s*$`, "im").exec(rest)?.[1] || ""
   return {
-    id: cardID, title: text("title") || cardID, priority: text("priority"),
-    status: text("status"), scope: field("scope"), depends: field("depends") || field("depends_on"),
+    id: cardID, title: text("title") || cardID, priority: text("priority"), status: text("status"),
+    kind: text("kind") || "task", scope: field("scope"), depends: field("depends") || field("depends_on"), meta,
+    parent: (field("epic") || (/^beacon\/(.+)$/.exec(field("base_branch"))?.[1] ?? "")).trim(),
     path, relativePath: relative(root, path), body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
   }
 }
