@@ -265,6 +265,31 @@ func TestTaskCreatorExpandsEpic(t *testing.T) {
 	}
 }
 
+func TestTaskCreatorSyncsFullAvailableSet(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{
+		log: &callLog{},
+		tasks: []core.Task{
+			{ID: "T-OLD", Title: "Existing card", Status: core.TaskAvailable},
+		},
+	}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	store := &graphStore{}
+	creator := &TaskCreator{Source: src, Workspace: ws, Store: store,
+		Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	if _, err := creator.Create(context.Background(), CreateTaskInput{Title: "New card"}); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[core.TaskID]bool, len(store.tasks))
+	for _, task := range store.tasks {
+		seen[task.ID] = true
+	}
+	if store.calls != 1 || len(seen) != 2 || !seen["T-OLD"] {
+		t.Fatalf("sync calls = %d, synced = %+v, want the old card plus the new one",
+			store.calls, store.tasks)
+	}
+}
+
 func TestTaskCreatorEpicIsIdempotent(t *testing.T) {
 	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
 	ws := &fakeWorkspace{log: &callLog{}}
