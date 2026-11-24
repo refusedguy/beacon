@@ -80,7 +80,8 @@ const countLabel = (n, one, many) => `${n} ${n === 1 ? one : many}`
 
 // The snapshot carries only unresolved deps. Children of an epic already have
 // their own rows, so they never become blocker headers.
-const queueBlockers = (item, childIDs) => (Array.isArray(item?.dependsOn) ? item.dependsOn : [])
+const queueBlockers = (item, childIDs) => (Array.isArray(item?.dependsOn) ? item.dependsOn
+  : Array.isArray(item?.depends_on) ? item.depends_on : [])
   .map(str).filter((dep) => dep && !childIDs.has(dep))
 
 function taskRows(item, { epic, parent, blockers, children }) {
@@ -106,7 +107,10 @@ function taskRows(item, { epic, parent, blockers, children }) {
   return rows
 }
 
-export function queueLineItems(queue = [], hidden = null) {
+// One group per unresolved blocker. A child with no dep of its own follows its
+// epic's blocker, so an expanded epic keeps a single header. The rendered
+// headers and the global Queue toggle share this grouping.
+export function queueGroups(queue = [], hidden = null) {
   const list = Array.isArray(queue) ? queue : []
   const shown = hidden ? list.filter((item) => !hidden.has(str(item?.id))) : list
   const parents = new Map(list.map((item) => [str(item?.id), queueParent(list, str(item?.id))]))
@@ -115,8 +119,6 @@ export function queueLineItems(queue = [], hidden = null) {
   const childCount = new Map()
   for (const parent of parents.values()) childCount.set(parent, (childCount.get(parent) ?? 0) + 1)
   const blockers = new Map(list.map((item) => [str(item?.id), queueBlockers(item, childIDs)]))
-  // A child with no dep of its own follows its epic's blocker. An expanded epic
-  // then keeps one header instead of growing one per child.
   const groupOf = (item) => {
     const id = str(item?.id)
     const own = blockers.get(id) ?? []
@@ -129,15 +131,35 @@ export function queueLineItems(queue = [], hidden = null) {
     if (!groups.has(key)) { groups.set(key, []); order.push(key) }
     groups.get(key).push(item)
   }
+  return { groups, order, parents, parentsWithChildren, childCount, blockers }
+}
+
+export const blockedGroupKeys = (queue = []) => queueGroups(queue).order.filter(Boolean)
+
+// An expanded epic or blocked group shows at most this many member rows. The
+// rest collapse into a "+N more" line so Recent stays inside the sidebar.
+export const QUEUE_CHILD_LIMIT = 3
+
+// A null blockedOpen keeps the flat legacy rows for pure callers that never
+// drive the toggle. With a map, only groups marked true expand.
+export function queueLineItems(queue = [], hidden = null, blockedOpen = null) {
+  const { groups, order, parents, parentsWithChildren, childCount, blockers } = queueGroups(queue, hidden)
   const rows = []
   for (const key of order) {
     if (rows.length) rows.push(spacerItem())
     const members = groups.get(key)
-    if (key) rows.push({
-      marker: "▲", name: `blocked by ${shortTaskID(key)} · ${countLabel(members.length, "task", "tasks")}`,
-      status: "", color: "muted", kind: "queue-blocker", depID: key, action: `card:${key}`,
-    })
-    for (const item of members) {
+    if (key) {
+      const expanded = blockedOpen == null || blockedOpen[key] === true
+      rows.push({
+        marker: expanded ? "▼" : "▶",
+        name: `blocked by ${shortTaskID(key)} · ${countLabel(members.length, "task", "tasks")}`,
+        status: "", color: "muted", kind: "queue-blocker", depID: key,
+        blockedKey: key, action: `blocked:${key}`,
+      })
+      if (!expanded) continue
+    }
+    const capped = Boolean(key) && blockedOpen != null && members.length > QUEUE_CHILD_LIMIT
+    for (const item of capped ? members.slice(0, QUEUE_CHILD_LIMIT) : members) {
       const id = str(item?.id)
       rows.push(...taskRows(item, {
         epic: str(item?.kind).toLowerCase() === "epic" || parentsWithChildren.has(id),
@@ -145,17 +167,17 @@ export function queueLineItems(queue = [], hidden = null) {
         children: childCount.get(id) ?? 0,
       }))
     }
+    if (capped) rows.push({
+      marker: "", name: `+${members.length - QUEUE_CHILD_LIMIT} more`, status: "",
+      color: "muted", kind: "queue-more",
+    })
   }
   return rows
 }
 
-// An expanded epic shows at most this many children. The rest collapse into a
-// "+N more" line so the queue never pushes Recent out of the sidebar.
-export const QUEUE_CHILD_LIMIT = 3
-
-export function queueRows(queue = [], epicOpen = null) {
+export function queueRows(queue = [], epicOpen = null, blockedOpen = null) {
   const list = Array.isArray(queue) ? queue : []
-  if (!epicOpen) return queueLineItems(list)
+  if (!epicOpen) return queueLineItems(list, null, blockedOpen)
   const ids = list.map((item) => str(item?.id))
   const parentOf = (id) => ids.filter((p) => p && p !== id && id.startsWith(`${p}-`))
     .sort((a, b) => b.length - a.length)[0] || ""
@@ -189,7 +211,7 @@ export function queueRows(queue = [], epicOpen = null) {
       parent = parentOf(parent)
     }
   }
-  const rows = queueLineItems(list, hidden)
+  const rows = queueLineItems(list, hidden, blockedOpen)
   const summaries = []
   for (const id of ids) {
     if (!isEpic(id) || epicOpen[id] !== true) continue
