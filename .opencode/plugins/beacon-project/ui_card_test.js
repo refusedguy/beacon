@@ -1,0 +1,220 @@
+// Behavior tests for the false RED banner, inspectable Queue cards, stale
+// card filtering and the three card clipboard buttons.
+// Run: node --test .opencode/plugins/beacon-project/ui_card_test.js
+
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import {
+  CARD_PANEL_NAME, PANEL_NAME, baseIncidentItem, beaconStatusDefinition,
+  createStatusSource, fixPrompt, readCard, sidebarModel,
+} from "./ui.js"
+import { NOW, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
+
+const CARD = `---
+id: T-42
+title: A very long human readable card title
+status: available
+priority: 7
+scope:
+  - pkg/core/run.go
+  - pkg/core/run_test.go
+depends:
+  - T-40
+---
+Goal: a short goal.
+
+Context: a fact.
+
+Steps: do the work.
+`
+
+const cardDeps = {
+  existsSync: (path) => path.endsWith("/docs/tasks/T-42.md"),
+  readFileSync: () => CARD,
+}
+
+function findItem(node, predicate) {
+  if (node.item && predicate(node.item)) return node
+  for (const child of node.children ?? []) {
+    const found = findItem(child, predicate)
+    if (found) return found
+  }
+  return null
+}
+
+function findText(node, content) {
+  if (node.props?.content === content) return node
+  for (const child of node.children ?? []) {
+    const found = findText(child, content)
+    if (found) return found
+  }
+  return null
+}
+
+function texts(node, out = []) {
+  if (typeof node.props?.content === "string" && node.props.content) out.push(node.props.content)
+  for (const child of node.children ?? []) texts(child, out)
+  return out
+}
+
+async function setup({ queue = [], extra = {}, files = cardDeps, copied = [], copyResult = true } = {}) {
+  const created = []
+  const renderers = Object.create(null)
+  const toasts = []
+  const opened = []
+  const rpc = {
+    snapshot: async () => ({ active: [], recent: [], queue, ...extra }),
+    control: async () => ({ ok: true }),
+    dispatch: async () => ({ started: 1 }),
+    events: { on: () => () => {} },
+  }
+  const ctx = {
+    theme: themeStub(),
+    client: { rpc: () => rpc },
+    storage: {
+      store: (name, init) => [
+        name === "beacon-sidebar-sections" ? { ...init.initial, queue: true } : { ...init.initial },
+        async () => {},
+      ],
+    },
+    renderer: { copyToClipboardOSC52: (text) => { copied.push(text); return copyResult } },
+    ui: {
+      toast: { show: (item) => toasts.push(item) },
+      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
+      panel: { open: (name) => opened.push(name), close: () => {} },
+    },
+    keymap: { layer: () => () => {} },
+  }
+  const modules = {
+    "@opentui/solid": solidModule(created),
+    "solid-js": { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } },
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    root: "/p",
+    options: { statusPollMs: 0, watcherEnabled: false },
+    import: (specifier) => modules[specifier],
+    cardDeps: files,
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  return { renderers, toasts, opened, created, copied, dispose }
+}
+
+test("a stable zero-value base incident raises no banner", () => {
+  const zero = { id: "", base_branch: "", failed_checks: [], fixer_run_id: "", attempts: 0 }
+  assert.equal(baseIncidentItem(zero), null)
+  const view = sidebarModel({ active: [], recent: [], base_incident: zero }, null, NOW)
+  assert.equal(view.listItems.some((item) => item.banner), false)
+})
+
+test("a real incident is still a clickable RED banner", async () => {
+  const h = await setup({
+    extra: {
+      active: [makeRun({ ID: "fixer-1", State: "running" })],
+      base_incident: { id: "inc-1", base_branch: "main", failed_checks: ["ci"], fixer_run_id: "fixer-1" },
+    },
+  })
+  const sidebar = h.renderers["sidebar.content"]()
+  const banner = findItem(sidebar, (item) => item.banner)
+  assert.ok(banner, "the incident banner is rendered")
+  assert.equal(banner.item.runID, "fixer-1")
+  banner.props.onMouseDown()
+  assert.deepEqual(h.opened, [PANEL_NAME])
+  const detail = h.renderers["session.panel"]({ name: PANEL_NAME })
+  assert.ok(texts(detail).includes("T-1"), "the fixer run is selected")
+  h.dispose()
+})
+
+test("clicking a Queue row opens the full read-only card", async () => {
+  const h = await setup({ queue: [{ id: "T-42", title: "Queued task", status: "ready", priority: 7 }] })
+  const sidebar = h.renderers["sidebar.content"]()
+  const row = findItem(sidebar, (item) => item.action === "card:T-42")
+  assert.ok(row, "queue rows carry a card action")
+  row.props.onMouseDown()
+  assert.deepEqual(h.opened, [CARD_PANEL_NAME])
+  const card = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  const content = texts(card)
+  for (const expected of [
+    "A very long human readable card title", "T-42", "7", "available",
+    "T-40", "/p/docs/tasks/T-42.md", "Goal: a short goal.", "Steps: do the work.",
+  ]) {
+    assert.ok(content.includes(expected), `card view missing ${expected}`)
+  }
+  h.dispose()
+
+  const other = await setup({ queue: [{ id: "T-42", status: "ready" }] })
+  assert.equal(other.renderers["session.panel"]({ name: "some.other.panel" }), null)
+  other.dispose()
+})
+
+test("card body lines are word-wrapped, unbounded and capped at 80", async () => {
+  const body = Array.from({ length: 90 }, (_, i) => `body line ${i}`).join("\n")
+  const many = { ...cardDeps, readFileSync: () => CARD.replace("Goal: a short goal.", body) }
+  const card = readCard("/p", "T-42", many)
+  const modelRows = card.body.split(/\r?\n/).filter((line) => line.startsWith("body line"))
+  assert.equal(modelRows.length, 80, "readCard keeps only the first 80 body lines")
+
+  const h = await setup({ queue: [{ id: "T-42", status: "ready" }] })
+  const sidebar = h.renderers["sidebar.content"]()
+  findItem(sidebar, (item) => item.action === "card:T-42").props.onMouseDown()
+  const panel = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  const bodyRow = findItem(panel, (item) => item.kind === "card-body")
+  assert.ok(bodyRow, "the body is rendered as pooled rows")
+  const nameCell = bodyRow.children[1]
+  assert.equal(nameCell.props.wrapMode, "word")
+  assert.equal(nameCell.props.truncate, false)
+  h.dispose()
+})
+
+test("stale, done, dropped, missing and unreadable queue cards are filtered", async () => {
+  const files = {
+    "/p/docs/tasks/T-1.md": "---\nid: T-1\nstatus: available\n---\n",
+    "/p/docs/tasks/T-2.md": "---\nid: T-2\nstatus: done\n---\n",
+    "/p/docs/tasks/T-3.md": "---\nid: T-3\nstatus: dropped\n---\n",
+    "/p/docs/tasks/T-4.md": "---\nid: T-4\nstatus: ready\n---\n",
+  }
+  const deps = {
+    existsSync: (path) => Object.hasOwn(files, path),
+    readFileSync: (path) => {
+      if (path.endsWith("T-4.md")) throw new Error("EACCES")
+      return files[path]
+    },
+  }
+  const ids = ["T-1", "T-2", "T-3", "T-4", "T-9"]
+  const rpc = { snapshot: async () => ({ active: [], recent: [], queue: ids.map((id) => ({ id, title: id })) }) }
+  const source = createStatusSource({ client: { rpc: () => rpc } }, { root: "/p", deps })
+  const snap = await source.snapshot()
+  assert.deepEqual(snap.queue.map((item) => item.id), ["T-1"])
+})
+
+test("card copy buttons write the exact text and report honest results", async () => {
+  const copied = []
+  const h = await setup({ queue: [{ id: "T-42", status: "ready" }], copied })
+  const sidebar = h.renderers["sidebar.content"]()
+  findItem(sidebar, (item) => item.action === "card:T-42").props.onMouseDown()
+  const panel = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  const card = readCard("/p", "T-42", cardDeps)
+
+  findText(panel, "⧉ Copy ID").props.onMouseUp()
+  assert.equal(copied[0], "T-42")
+  assert.equal(h.toasts.at(-1).variant, "success")
+
+  findText(panel, "⧉ Copy path").props.onMouseUp()
+  assert.equal(copied[1], card.path)
+  assert.match(h.toasts.at(-1).message, /^Copied path /)
+
+  findText(panel, "⧉ Copy fix prompt").props.onMouseUp()
+  assert.equal(copied[2], fixPrompt(card))
+  assert.match(copied[2], /^Fix T-42: A very long human readable card title in .*\. Scope: .*\. Depends: T-40\.$/)
+  assert.equal(h.toasts.at(-1).variant, "success")
+
+  const refused = await setup({ queue: [{ id: "T-42", status: "ready" }], copyResult: false })
+  const bar = refused.renderers["sidebar.content"]()
+  findItem(bar, (item) => item.action === "card:T-42").props.onMouseDown()
+  const node = refused.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  findText(node, "⧉ Copy ID").props.onMouseUp()
+  assert.equal(refused.toasts.at(-1).message, "Clipboard copy was refused")
+  assert.equal(refused.toasts.at(-1).variant, "warning")
+  h.dispose()
+  refused.dispose()
+})

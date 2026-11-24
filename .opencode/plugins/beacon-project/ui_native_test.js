@@ -222,6 +222,10 @@ test("Dispatch and Control still reach the RPC through the real setup", async ()
   const dispose = await beaconStatusDefinition.setup(ctx, {
     options: { statusPollMs: 0, watcherEnabled: false },
     import: (specifier) => modules[specifier],
+    cardDeps: {
+      existsSync: (p) => p.endsWith("/docs/tasks/T-2.md"),
+      readFileSync: () => "---\nid: T-2\ntitle: Queued task\nstatus: available\n---\n",
+    },
   })
   await new Promise((resolve) => setImmediate(resolve))
   const detail = renderers["session.panel"]({ name: "beacon.detail" })

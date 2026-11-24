@@ -44,8 +44,17 @@ export function sidebarPresentation(items = []) {
 
 export function createSidebarMount(ui, deps) {
   const { insert, setProp } = ui
-  const { color, BOLD, onItem, hoverBg } = deps
+  const { color, BOLD, onItem, onCard, hoverBg } = deps
   const set = setProp ?? ((node, key, value) => { node.props[key] = value })
+  // Queue rows carry a card action instead of a run ID. Route them to the
+  // card reader and leave every other row with the existing handler.
+  const handle = (item) => {
+    if (typeof item?.action === "string" && item.action.startsWith("card:")) {
+      if (typeof onCard === "function") onCard(item.action.slice("card:".length))
+      return
+    }
+    onItem?.(item)
+  }
   const container = createBox(ui, { flexDirection: "column", minWidth: 0 })
 
   // Standalone header box at column 0, not a cell of the shared line pool.
@@ -69,7 +78,7 @@ export function createSidebarMount(ui, deps) {
   const meta = createLineMount(ui, { ...deps, maxLines: 1 })
   meta.node.forEach((node) => insert(container, node))
 
-  const list = createLineMount(ui, { ...deps, maxLines: SIDEBAR_LINES })
+  const list = createLineMount(ui, { ...deps, onItem: handle, maxLines: SIDEBAR_LINES })
   list.node.forEach((node) => insert(container, node))
 
   const raised = color("raised")
@@ -84,7 +93,7 @@ export function createSidebarMount(ui, deps) {
     set(box, "paddingLeft", dispatch || banner ? 1 : 0)
     set(box, "paddingRight", dispatch || banner ? 1 : 0)
     set(box, "backgroundColor", baseBg)
-    set(box, "onMouseUp", dispatch ? () => onItem(box.item) : undefined)
+    set(box, "onMouseUp", dispatch ? () => handle(box.item) : undefined)
     set(box, "onMouseOver", () => set(box, "backgroundColor", hoverBg))
     set(box, "onMouseOut", () => set(box, "backgroundColor", baseBg))
   })
