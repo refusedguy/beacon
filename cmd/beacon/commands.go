@@ -21,6 +21,22 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// parentSessionFromEnv returns the orchestrator session carried by a CLI
+// process. serve and mcp read the same variable, so dispatch and control must
+// read it too or CLI-launched runs lose their merge notifications.
+func parentSessionFromEnv() string {
+	return os.Getenv("BEACON_PARENT_SESSION")
+}
+
+// cliWire is the wiring entry point shared by the CLI commands. Tests replace
+// it to observe the parent session handed to the wiring layer.
+var cliWire = wire
+
+// wireCLI wires a CLI command with the parent session from the environment.
+func wireCLI(path string) (*wiring, error) {
+	return cliWire(path, parentSessionFromEnv())
+}
+
 func wireReadOnly(path string) (config.Config, *sqlite.Store, *workspace.GitWorktree, error) {
 	cfg, root, err := loadConfig(path)
 	if err != nil {
@@ -63,7 +79,7 @@ func newDispatchCommand(configPath *string) *cobra.Command {
 					return err
 				}
 			}
-			w, err := wire(*configPath, "")
+			w, err := wireCLI(*configPath)
 			if err != nil {
 				return err
 			}
@@ -261,7 +277,7 @@ func dispatchControl(ctx context.Context, configPath, action, runID, sha string,
 	if info, err := readConnection(filepath.Dir(cfg.StateDB)); err == nil && daemonAlive(cfg.StateDB) {
 		return postControl(ctx, info, action, runID, sha, message...)
 	}
-	w, err := wire(configPath, "")
+	w, err := wireCLI(configPath)
 	if err != nil {
 		return err
 	}

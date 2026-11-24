@@ -144,3 +144,30 @@ func TestWireServicesConfiguresTaskWriters(t *testing.T) {
 		t.Error("task writers did not inherit the base branch")
 	}
 }
+
+func TestWireServicesReconcilerUsesConfigParentWhenEnvironmentEmpty(t *testing.T) {
+	cfg := config.Config{
+		BaseBranch: "main",
+		Harness:    config.Harness{ParentSessionID: "ses_from_config"},
+	}
+	infra := &wiredInfra{changes: make(chan int, 1)}
+	w := wireServices(cfg, t.TempDir(), "", infra)
+	if w.recon.ParentSessionID != "ses_from_config" {
+		t.Fatalf("reconciler parent = %q, want ses_from_config", w.recon.ParentSessionID)
+	}
+	if w.dispatcher.ParentSessionID != "ses_from_config" {
+		t.Fatalf("dispatcher parent = %q, want ses_from_config", w.dispatcher.ParentSessionID)
+	}
+}
+
+func TestWireServicesReconcilerPrefersEnvironmentParent(t *testing.T) {
+	cfg := config.Config{
+		BaseBranch: "main",
+		Harness:    config.Harness{ParentSessionID: "ses_from_config"},
+	}
+	infra := &wiredInfra{changes: make(chan int, 1)}
+	w := wireServices(cfg, t.TempDir(), "ses_from_env", infra)
+	if w.recon.ParentSessionID != "ses_from_env" {
+		t.Fatalf("reconciler parent = %q, want ses_from_env", w.recon.ParentSessionID)
+	}
+}
