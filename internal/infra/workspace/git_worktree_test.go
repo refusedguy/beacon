@@ -679,3 +679,61 @@ func TestWorktreeRefreshFailureSkipsLocationReload(t *testing.T) {
 		t.Fatalf("location reloads = %d, want 0 when refresh failed", got)
 	}
 }
+
+func TestGitWorktreeEnsureBranchCreatesBranchChildrenCanFetch(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	origin := filepath.Join(filepath.Dir(repo), "origin.git")
+	baseSHA := strings.TrimSpace(gitCmd(t, origin, "rev-parse", "refs/heads/main"))
+
+	if err := wt.EnsureBranch(ctx, "beacon/T-EPIC", "main"); err != nil {
+		t.Fatalf("EnsureBranch() error = %v", err)
+	}
+	if got := strings.TrimSpace(gitCmd(t, origin, "rev-parse", "refs/heads/beacon/T-EPIC")); got != baseSHA {
+		t.Fatalf("epic branch = %q, want base %q", got, baseSHA)
+	}
+	// This is the fetch a child dispatch performs. It used to fail when the
+	// epic branch had never been published.
+	ws, err := wt.Create(ctx, core.Task{ID: "T-EPIC-01", BaseBranch: "beacon/T-EPIC"})
+	if err != nil {
+		t.Fatalf("Create() for epic child error = %v", err)
+	}
+	if ws.Base != baseSHA {
+		t.Fatalf("child workspace base = %q, want %q", ws.Base, baseSHA)
+	}
+}
+
+func TestGitWorktreeEnsureBranchRepeatsAreNoOps(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	origin := filepath.Join(filepath.Dir(repo), "origin.git")
+	if err := wt.EnsureBranch(ctx, "beacon/T-EPIC", ""); err != nil {
+		t.Fatalf("EnsureBranch() with configured base error = %v", err)
+	}
+	created := strings.TrimSpace(gitCmd(t, origin, "rev-parse", "refs/heads/beacon/T-EPIC"))
+
+	if err := os.WriteFile(filepath.Join(repo, "advance.txt"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo, "add", "advance.txt")
+	gitCmd(t, repo, "commit", "-m", "advance main")
+	gitCmd(t, repo, "push", "origin", "main")
+	if err := wt.EnsureBranch(ctx, "beacon/T-EPIC", "main"); err != nil {
+		t.Fatalf("repeated EnsureBranch() error = %v", err)
+	}
+	if got := strings.TrimSpace(gitCmd(t, origin, "rev-parse", "refs/heads/beacon/T-EPIC")); got != created {
+		t.Fatalf("repeated EnsureBranch moved the epic branch to %q, want %q", got, created)
+	}
+}
+
+func TestGitWorktreeEnsureBranchFailureLeavesNoRemoteBranch(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	origin := filepath.Join(filepath.Dir(repo), "origin.git")
+	if err := wt.EnsureBranch(context.Background(), "beacon/T-EPIC", "missing-base"); err == nil {
+		t.Fatal("EnsureBranch() with a missing base error = nil, want an error")
+	}
+	cmd := exec.Command("git", "-C", origin, "rev-parse", "--verify", "--quiet", "refs/heads/beacon/T-EPIC")
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("failed EnsureBranch still published a branch: %s", out)
+	}
+}

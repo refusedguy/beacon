@@ -59,13 +59,19 @@ func printDoctorChecks(out io.Writer, checks []doctorCheck) {
 	}
 }
 
+const doctorHTTPTimeout = 5 * time.Second
+
+func doctorHTTPClient() *http.Client {
+	return &http.Client{Timeout: doctorHTTPTimeout}
+}
+
 func newDoctorCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "Check a Beacon installation and report problems",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client := &http.Client{Timeout: 2 * time.Second}
+			client := doctorHTTPClient()
 			if code := runDoctor(cmd.OutOrStdout(), *configPath, client); code != 0 {
 				os.Exit(code)
 			}

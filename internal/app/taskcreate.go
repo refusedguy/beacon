@@ -28,6 +28,12 @@ type PathCommitter interface {
 type BaseRebaser interface {
 	RebaseBase(ctx context.Context, ws core.Workspace, base string) error
 }
+
+// BranchEnsurer is an optional workspace capability. GitWorktree implements it
+// so an epic branch exists on origin before any child of that epic dispatches.
+type BranchEnsurer interface {
+	EnsureBranch(ctx context.Context, branch, base string) error
+}
 type TaskGraphStore interface {
 	SyncTasks(ctx context.Context, tasks []core.Task) error
 }
@@ -128,6 +134,11 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	if epic {
 		if existing, ok := c.lookup(ctx, key, id, children); ok {
 			return c.result(existing), nil
+		}
+		// Children fetch this branch before the epic opens a PR, so publish it
+		// before any card is written. A failure leaves no half-created epic.
+		if err := ensureBranch(ctx, c.Workspace, epicBranch(id), publishBase(c.Root)); err != nil {
+			return out, fmt.Errorf("create epic branch: %w", err)
 		}
 	}
 
@@ -506,8 +517,23 @@ func rebaseBase(ctx context.Context, ws PathCommitter, root core.Workspace, base
 	return nil
 }
 
+// ensureBranch publishes an epic base branch when the workspace supports it.
+// Tasks on the configured base need no branch work, and a workspace without the
+// capability keeps its previous behavior.
+func ensureBranch(ctx context.Context, ws any, branch, base string) error {
+	branch = strings.TrimSpace(branch)
+	if !strings.HasPrefix(branch, epicBranchPrefix) {
+		return nil
+	}
+	ensurer, ok := ws.(BranchEnsurer)
+	if !ok {
+		return nil
+	}
+	return ensurer.EnsureBranch(ctx, branch, base)
+}
+
 func childTasks(epicID core.TaskID, plan []core.ChildSpec) []core.Task {
-	branch := "beacon/" + string(epicID)
+	branch := epicBranch(epicID)
 	out := make([]core.Task, 0, len(plan))
 	for i, spec := range plan {
 		out = append(out, core.Task{
