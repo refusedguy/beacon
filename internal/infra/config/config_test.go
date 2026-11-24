@@ -113,6 +113,50 @@ func TestDefaultWorkerInstructionsForbidCLIFallback(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsDoNotNameHarnessProvider(t *testing.T) {
+	c, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Harness.Provider != "" {
+		t.Fatalf("default provider = %q, want empty", c.Harness.Provider)
+	}
+	if c.Harness.Endpoint != "" {
+		t.Fatalf("default endpoint = %q, want empty", c.Harness.Endpoint)
+	}
+	if c.Harness.WorkerInstructions != DefaultWorkerInstructions {
+		t.Fatal("neutral defaults dropped the worker instruction prefix")
+	}
+}
+
+func TestLoadHarnessProviderWithoutEndpoint(t *testing.T) {
+	const content = "harness:\n  provider: acp\n  command: fake-agent\n  model: model-a\n"
+	c, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Harness.Provider != "acp" {
+		t.Fatalf("provider = %q, want acp", c.Harness.Provider)
+	}
+	if c.Harness.Command != "fake-agent" {
+		t.Fatalf("command = %q, want fake-agent", c.Harness.Command)
+	}
+	if c.Harness.Endpoint != "" {
+		t.Fatalf("endpoint = %q, want empty for a non-HTTP provider", c.Harness.Endpoint)
+	}
+}
+
+func TestLoadPreservesExplicitHarnessEndpoint(t *testing.T) {
+	const endpoint = "http://127.0.0.1:9999"
+	c, err := Load(writeConfig(t, "harness:\n  endpoint: "+endpoint+"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Harness.Endpoint != endpoint {
+		t.Fatalf("endpoint = %q, want %q", c.Harness.Endpoint, endpoint)
+	}
+}
+
 func TestLoadWorkerInstructionsOverride(t *testing.T) {
 	const custom = "Use targeted tests. Full builds run in CI."
 	c, err := Load(writeConfig(t, "harness:\n  worker_instructions: "+strconv.Quote(custom)+"\n"))
