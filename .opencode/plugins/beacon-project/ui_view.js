@@ -224,9 +224,17 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
 export const snapshotLineItems = (snapshot, error, now) => sidebarModel(snapshot, error, now).items
 export const renderSnapshotLines = (snapshot, error, now) => snapshotLineItems(snapshot, error, now)
   .map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))
+const launchOf = (run) => str(run?.launchSource ?? run?.launch_source).toLowerCase()
+export const launchSourceText = (metrics = {}) => {
+  const raw = metrics?.launch_sources ?? metrics?.launchSources
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return ""
+  return Object.entries(raw).filter(([, n]) => Number.isFinite(Number(n)) && Number(n) > 0)
+    .map(([k, n]) => `${str(k).toLowerCase()}:${Number(n)}`).join(" ")
+}
 export const metricsLine = (snapshot = EMPTY_SNAPSHOT) => {
   const item = stateBarItem(snapshot)
-  return { marker: "", name: `Beacon ${item.summary}`, status: item.legend, color: "muted" }
+  const launch = launchSourceText(snapshot?.metrics)
+  return { marker: "", name: `Beacon ${item.summary}`, status: [item.legend, launch].filter(Boolean).join(" · "), color: "muted" }
 }
 
 const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
@@ -289,6 +297,8 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
   if (isOpen("technical")) {
     row({ marker: key("Run ID"), name: run.id || "-", status: "", color: "base", kind: "tech" })
     row({ marker: key("Session"), name: run.sessionID || "-", status: "", color: "base", kind: "tech" })
+    const launch = launchOf(run)
+    if (launch) row({ marker: key("Launch"), name: [launch, str(run.agentIdentity ?? run.agent_identity)].filter(Boolean).join(" · "), status: "", color: "base", kind: "tech" })
     row({ marker: key("Head SHA"), name: run.sha || "-", status: "", color: "base", kind: "tech" })
     const attempts = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
     row({ marker: key("Attempts"), name: attempts, status: "", color: "base", kind: "tech" })
