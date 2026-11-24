@@ -33,6 +33,28 @@ func (c CheckResult) DurationSeconds() int64 {
 	return int64(c.CompletedAt.Sub(c.StartedAt).Seconds())
 }
 
+// CIWallSeconds is the span from the earliest check start to the latest check
+// completion. Checks missing either endpoint are ignored. It is zero when no
+// check reports both endpoints.
+func CIWallSeconds(checks []CheckResult) int64 {
+	var start, end time.Time
+	for _, c := range checks {
+		if c.StartedAt.IsZero() || c.CompletedAt.IsZero() || c.CompletedAt.Before(c.StartedAt) {
+			continue
+		}
+		if start.IsZero() || c.StartedAt.Before(start) {
+			start = c.StartedAt
+		}
+		if end.IsZero() || c.CompletedAt.After(end) {
+			end = c.CompletedAt
+		}
+	}
+	if start.IsZero() {
+		return 0
+	}
+	return int64(end.Sub(start).Seconds())
+}
+
 type Observation struct {
 	PRNumber          int
 	HeadSHA           string
