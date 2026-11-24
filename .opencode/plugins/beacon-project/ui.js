@@ -459,7 +459,16 @@ export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg }) {
 }
 
 async function setup(ctx, deps = {}) {
-  const load = deps.import ?? ((specifier) => import(specifier))
+  // Keep the imports literal so the OpenCode runtime plugin can rewrite them.
+  // A computed import(specifier) is invisible to its rewriter, and this
+  // directory has no node_modules for Bun to resolve the TUI peers.
+  const defaultImport = (specifier) => {
+    if (specifier === "@opentui/solid") return import("@opentui/solid")
+    if (specifier === "solid-js") return import("solid-js")
+    if (specifier === "@opentui/core") return import("@opentui/core")
+    throw new Error(`unexpected import: ${specifier}`)
+  }
+  const load = deps.import ?? defaultImport
   const [{ createElement, insert, setProp }, { createSignal }] = await Promise.all([
     load("@opentui/solid"), load("solid-js"),
   ])
