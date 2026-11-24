@@ -10,6 +10,7 @@ try {
 import { projectRoot } from "./location.js"
 import { noopMcpRegistration, registerBeaconMcp } from "./mcp.js"
 import { installProjectContext } from "./context.js"
+import { sessionIdentity } from "./session_identity.js"
 import {
   pluginOptions, pollIntervalMs, snapshotLimits,
   statusPanelEnabled, watcherEnabled,
@@ -286,8 +287,11 @@ export const beaconProject = Plugin.define({
     if (panelEnabled && typeof ctx.rpc?.register === "function") {
       // One CLI snapshot feeds every panel. The handler normalizes the same
       // shape the TUI source uses, so old fields stay available to both.
+      // The CLI has no MCP _meta, so carry the operator session and model in
+      // the child environment. Missing values leave read-only calls intact.
+      const { sessionID, model } = await sessionIdentity(ctx)
       const limits = snapshotLimits(options)
-      const statusSource = createCliStatusSource({ root, limits })
+      const statusSource = createCliStatusSource({ root, limits, sessionID, model })
       try {
         statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
           snapshot: async (input) => normalizeSnapshot(await statusSource.snapshot(input ?? limits)),
