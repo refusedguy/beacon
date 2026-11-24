@@ -647,3 +647,139 @@ func TestReconcileReturnsErrorAsStructuredJSON(t *testing.T) {
 		t.Fatalf("reconcile calls = %d", ticker.calls)
 	}
 }
+
+func createBatchArgs() map[string]any {
+	return map[string]any{
+		"tasks": []any{
+			map[string]any{"id": "T-B1", "title": "First", "scope": []string{"a.go"}},
+			map[string]any{"id": "T-B2", "title": "Second", "depends": []string{"@1"}},
+		},
+	}
+}
+
+func callCreateBatch(t *testing.T, cs *msdk.ClientSession, args map[string]any) (app.CreateBatchResult, *msdk.CallToolResult) {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_task_create", Arguments: args,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Content) == 0 {
+		t.Fatalf("empty tool result: %+v", res)
+	}
+	if res.IsError {
+		return app.CreateBatchResult{}, res
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatalf("unexpected result: %+v", res.Content)
+	}
+	var out app.CreateBatchResult
+	if err := json.Unmarshal([]byte(text.Text), &out); err != nil {
+		t.Fatalf("unmarshal %q: %v", text.Text, err)
+	}
+	return out, res
+}
+
+func TestTaskCreateBatchOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	source := tasksource.NewMarkdown(dir)
+	committer := &stubCommitter{}
+	creator := &app.TaskCreator{
+		Source: source, Workspace: committer,
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	cs := deleteClient(t, Services{TaskCreator: creator})
+
+	got, res := callCreateBatch(t, cs, createBatchArgs())
+	if res.IsError {
+		t.Fatalf("unexpected tool error: %+v", res)
+	}
+	if !got.Pushed || len(got.Created) != 2 {
+		t.Fatalf("result = %+v", got)
+	}
+	for i, id := range []string{"T-B1", "T-B2"} {
+		if got.Created[i].ID != id || got.Created[i].Path == "" {
+			t.Fatalf("created %d = %+v", i, got.Created[i])
+		}
+	}
+	if committer.calls != 2 {
+		t.Fatalf("commit calls = %d, want one per card", committer.calls)
+	}
+	second, err := os.ReadFile(filepath.Join(dir, "T-B2.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(second), "- T-B1") {
+		t.Fatalf("second card does not depend on the first:\n%s", second)
+	}
+}
+
+func TestTaskCreateBatchIsIdempotentOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	committer := &stubCommitter{}
+	creator := &app.TaskCreator{
+		Source: tasksource.NewMarkdown(dir), Workspace: committer,
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	cs := deleteClient(t, Services{TaskCreator: creator})
+
+	first, _ := callCreateBatch(t, cs, createBatchArgs())
+	second, _ := callCreateBatch(t, cs, createBatchArgs())
+	if len(second.Created) != len(first.Created) || !second.Pushed {
+		t.Fatalf("second = %+v, first = %+v", second, first)
+	}
+	for i := range first.Created {
+		if second.Created[i].ID != first.Created[i].ID ||
+			second.Created[i].Path != first.Created[i].Path {
+			t.Fatalf("card %d changed: %+v vs %+v", i, first.Created[i], second.Created[i])
+		}
+	}
+	if committer.calls != 2 {
+		t.Fatalf("repeated batch committed %d times, want 2", committer.calls)
+	}
+}
+
+// removingSource adds the Remove capability the batch rollback needs.
+type removingSource struct {
+	*tasksource.Markdown
+	removed []core.TaskID
+}
+
+func (s *removingSource) Remove(_ context.Context, id core.TaskID) error {
+	s.removed = append(s.removed, id)
+	return os.Remove(filepath.Join(s.Dir, string(id)+".md"))
+}
+
+func TestTaskCreateBatchRollsBackOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	source := &removingSource{Markdown: tasksource.NewMarkdown(dir)}
+	committer := &stubCommitter{}
+	creator := &app.TaskCreator{
+		Source: source, Workspace: committer,
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	cs := deleteClient(t, Services{TaskCreator: creator})
+
+	_, res := callCreateBatch(t, cs, map[string]any{
+		"tasks": []any{
+			map[string]any{"id": "T-B1", "title": "First"},
+			map[string]any{"id": "T-B2", "title": "  "},
+		},
+	})
+	if !res.IsError {
+		t.Fatal("expected a tool error when a batch card fails")
+	}
+	if len(source.removed) != 1 || source.removed[0] != "T-B1" {
+		t.Fatalf("removed = %v, want the card written before the failure", source.removed)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "T-B1.md")); !os.IsNotExist(err) {
+		t.Fatalf("failed batch left the first card on disk: %v", err)
+	}
+	// The first card publishes before the later card fails; rollback removes
+	// its file but cannot undo that commit.
+	if committer.calls != 1 {
+		t.Fatalf("commit calls = %d, want the first card's publish only", committer.calls)
+	}
+}
