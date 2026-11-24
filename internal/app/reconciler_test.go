@@ -706,3 +706,97 @@ func TestNeedsAgentFixWithGreenChecksAdvancesToMerged(t *testing.T) {
 		t.Fatalf("state = %s, want merged", got.State)
 	}
 }
+
+func TestMergeWithEmptyWorkspacePathStillMerges(t *testing.T) {
+	r, store, scm, _, src := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	run := store.runs["r1"]
+	run.WorkspacePath = ""
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	log := &callLog{}
+	scm.log = log
+	src.log = log
+	ws := &fakeWorkspace{log: log}
+	r.Workspace = ws
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunMerged || scm.merges != 1 {
+		t.Fatalf("state=%s merges=%d", got.State, scm.merges)
+	}
+	if len(src.marked) != 0 || len(ws.commits) != 0 {
+		t.Fatalf("empty path marked or committed card: marked=%+v commits=%+v", src.marked, ws.commits)
+	}
+	if len(src.complete) != 1 || src.complete[0] != run.TaskID {
+		t.Fatalf("task not completed after merge: %+v", src.complete)
+	}
+}
+
+func TestMergeRetriesNonFastForwardPushFromRemoteBranch(t *testing.T) {
+	r, store, scm, _, _ := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	run := store.runs["r1"]
+	run.Branch = "beacon/T-1"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	scm.observeSeq = []core.Observation{
+		{PRNumber: 42, HeadSHA: "sha2", PRState: "open"},
+		{PRNumber: 42, HeadSHA: "fresh-sha", PRState: "open"},
+	}
+	log := &callLog{}
+	scm.log = log
+	ws := &fakeWorkspace{log: log, rejectFirst: true}
+	r.Workspace = ws
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunMerged || scm.merges != 1 {
+		t.Fatalf("state=%s merges=%d", got.State, scm.merges)
+	}
+	if ws.pushes != 2 {
+		t.Fatalf("push attempts = %d, want 2", ws.pushes)
+	}
+	if len(ws.rebases) != 1 || ws.rebases[0] != "beacon/T-1" {
+		t.Fatalf("rebases = %v, want one refresh onto the remote branch", ws.rebases)
+	}
+	if scm.mergeSHA != "fresh-sha" {
+		t.Fatalf("merge SHA = %q, want fresh-sha", scm.mergeSHA)
+	}
+}
+
+func TestMergeWithFailedRefreshWarnsAndStillMerges(t *testing.T) {
+	r, store, scm, _, _ := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base1", PRState: "open"})
+	run := store.runs["r1"]
+	run.Branch = "beacon/T-1"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	log := &callLog{}
+	scm.log = log
+	ws := &fakeWorkspace{log: log, rejectFirst: true, rebaseBaseErr: errors.New("fetch failed")}
+	r.Workspace = ws
+	logs := captureDecisions(t)
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunMerged || scm.merges != 1 {
+		t.Fatalf("state=%s merges=%d", got.State, scm.merges)
+	}
+	if ws.pushes != 1 {
+		t.Fatalf("push attempts = %d, want 1 after a failed refresh", ws.pushes)
+	}
+	decisionRecord(t, logs, "card publish failed before merge")
+	if got.ObservedSHA != "sha2" || got.ObservedBaseSHA != "base1" {
+		t.Fatalf("observation not persisted: sha=%q base=%q", got.ObservedSHA, got.ObservedBaseSHA)
+	}
+}

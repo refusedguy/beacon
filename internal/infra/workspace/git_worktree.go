@@ -134,9 +134,9 @@ func (g *GitWorktree) Clean(ctx context.Context, ws core.Workspace) (bool, error
 }
 
 // RebaseBase fetches origin/<base> and rebases the workspace's local branch on
-// it. Publishing a card calls this before committing so a stale local base does
-// not make the push fail as non-fast-forward. A failed rebase is aborted so the
-// workspace is not left mid-rebase on a retry.
+// it. The ref may be the configured base branch before a card is published, or
+// the workspace's own branch after a push was rejected as non-fast-forward.
+// A failed rebase is aborted so the workspace is not left mid-rebase on a retry.
 func (g *GitWorktree) RebaseBase(ctx context.Context, ws core.Workspace, base string) error {
 	if err := checkPath(ws.Path); err != nil {
 		return err

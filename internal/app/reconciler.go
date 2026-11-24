@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -151,20 +152,25 @@ func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Eve
 
 func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
 	_, isEpic := r.epicTask(ctx, run.TaskID)
-	if !run.IsFixer && !isEpic {
+	if !run.IsFixer && !isEpic && run.WorkspacePath != "" {
 		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {
 			return err
 		}
 		ws := core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}
 		message := "beacon: complete task " + string(run.TaskID)
-		if err := r.Workspace.CommitPath(ctx, ws, "docs/tasks", message); err != nil {
-			return err
+		if err := r.commitCard(ctx, ws, "docs/tasks", message); err != nil {
+			slog.Warn("card publish failed before merge", "run", run.ID, "pr", obs.PRNumber, "error", err)
+			recordObservation(run, obs.HeadSHA, obs.BaseSHA)
+			if saveErr := r.Store.Save(ctx, run); saveErr != nil {
+				slog.Error("save observation after card publish failure", "run", run.ID, "error", saveErr)
+			}
+		} else {
+			fresh, err := r.SCM.Observe(ctx, obs.PRNumber)
+			if err != nil {
+				return err
+			}
+			obs.HeadSHA = fresh.HeadSHA
 		}
-		fresh, err := r.SCM.Observe(ctx, obs.PRNumber)
-		if err != nil {
-			return err
-		}
-		obs.HeadSHA = fresh.HeadSHA
 	}
 	key := fmt.Sprintf("merge:%d:%s", obs.PRNumber, obs.HeadSHA)
 	logTransitionMerge(ctx, run.ID, obs.PRNumber, "attempt")
@@ -199,6 +205,22 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 		}
 	}
 	return r.cleanupRun(ctx, run)
+}
+
+// commitCard publishes the card from the run worktree. A push rejected as
+// non-fast-forward gets one refresh from the remote branch and one retry.
+func (r *Reconciler) commitCard(ctx context.Context, ws core.Workspace, pathspec, message string) error {
+	publish := func() error { return r.Workspace.CommitPath(ctx, ws, pathspec, message) }
+	err := publish()
+	var nff *NonFastForwardError
+	rebaser, ok := r.Workspace.(BaseRebaser)
+	if !errors.As(err, &nff) || !ok {
+		return err
+	}
+	if err := rebaser.RebaseBase(ctx, ws, ws.Branch); err != nil {
+		return err
+	}
+	return publish()
 }
 
 func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observation) error {
