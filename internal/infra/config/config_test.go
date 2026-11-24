@@ -95,9 +95,14 @@ func TestLoadDefaultWorkerInstructions(t *testing.T) {
 	if c.Harness.WorkerInstructions != DefaultWorkerInstructions {
 		t.Fatalf("worker instructions = %q, want default %q", c.Harness.WorkerInstructions, DefaultWorkerInstructions)
 	}
-	if !strings.Contains(c.Harness.WorkerInstructions, "go test ./internal/app") ||
+	if !strings.Contains(c.Harness.WorkerInstructions, "weak PC") ||
+		!strings.Contains(c.Harness.WorkerInstructions, "targeted tests") ||
 		!strings.Contains(c.Harness.WorkerInstructions, "CI") {
 		t.Fatalf("default lacks weak-PC rule: %q", c.Harness.WorkerInstructions)
+	}
+	if strings.Contains(c.Harness.WorkerInstructions, "go test") ||
+		strings.Contains(c.Harness.WorkerInstructions, "golangci-lint") {
+		t.Fatalf("default is not language agnostic: %q", c.Harness.WorkerInstructions)
 	}
 }
 
