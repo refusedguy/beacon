@@ -1,0 +1,56 @@
+// Shared fixtures for the Beacon TUI plugin tests.
+export * from "./ui.js"
+import { renderSnapshotLines } from "./ui.js"
+
+export const NOW = Date.parse("2026-11-23T10:10:00Z")
+
+export function makeRun(overrides = {}) {
+  return {
+    ID: "run-1",
+    TaskID: "T-1",
+    State: "running",
+    PRNumber: 42,
+    HeadSHA: "abcdef1234567890",
+    Branch: "beacon/T-1",
+    RebaseAttempts: 2,
+    FixAttempts: 1,
+    MaxAttempts: 3,
+    Reason: "waiting CI",
+    CreatedAt: "2026-11-23T10:00:00Z",
+    UpdatedAt: "2026-11-23T10:07:00Z",
+    Timeline: [{ at: "2026-11-23T10:05:00Z", kind: "checks_pending", state: "waiting_ci" }],
+    Decisions: [{ at: "2026-11-23T10:06:00Z", kind: "reconcile.decision", verdict: "merge" }],
+    Durations: { waiting_ci_seconds: 60, running_seconds: 5, blocked_seconds: 0 },
+    ...overrides,
+  }
+}
+export function solidModule(created = []) {
+  return {
+    createElement: (tag) => {
+      const node = { tag, props: {}, children: [] }
+      created.push(node)
+      return node
+    },
+    insert: (parent, child) => { parent.children.push(child) },
+    setProp: (node, name, value) => { node.props[name] = value },
+  }
+}
+
+export function themeStub() {
+  return {
+    text: {
+      base: "base", muted: "muted", action: { primary: { base: "action" } },
+      feedback: {
+        error: { base: "error" }, warning: { base: "warning" },
+        success: { base: "success" }, info: { base: "info" },
+      },
+    },
+    background: { raised: { high: "hover" } },
+  }
+}
+
+export function signalStub() {
+  return { createSignal: (initial) => [() => initial, () => {}] }
+}
+
+export const lines = (snapshot, error = null, now = NOW) => renderSnapshotLines(snapshot, error, now)

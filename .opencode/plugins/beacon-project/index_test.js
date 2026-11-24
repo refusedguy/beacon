@@ -10,7 +10,13 @@ import {
   findShellGuardHit,
   guardedAgents,
   guardMode,
+  pluginOptions,
+  pollIntervalMs,
   registerShellGuard,
+  snapshotLimits,
+  statusPanelEnabled,
+  watcherEnabled,
+  createRunChangeWatcher,
 } from "./index.js"
 
 function fakeCtx() {
@@ -187,4 +193,52 @@ test("guarded agents are configurable", async () => {
     assert.doesNotThrow(() => ctx.handler(event("go test ./...", "worker")))
     assert.throws(() => ctx.handler(event("go test ./...", "build")), /blocked here/)
   })
+})
+
+test("plugin options merge ctx.options and ctx.config", () => {
+  const ctx = { options: { statusPollMs: 3000, watcherEnabled: false }, config: { statusPanelEnabled: false } }
+  const options = pluginOptions(ctx)
+  assert.equal(options.statusPollMs, 3000)
+  assert.equal(options.watcherEnabled, false)
+  assert.equal(options.statusPanelEnabled, false)
+})
+
+test("panel and watcher options default to on and can be switched off", () => {
+  assert.equal(statusPanelEnabled({}), true)
+  assert.equal(watcherEnabled({}), true)
+  assert.equal(statusPanelEnabled({ statusPanelEnabled: false }), false)
+  assert.equal(watcherEnabled({ watcherEnabled: false }), false)
+})
+
+test("poll interval defaults to 10s and a non-positive value disables polling", () => {
+  assert.equal(pollIntervalMs(undefined), 10000)
+  assert.equal(pollIntervalMs(15000), 15000)
+  assert.equal(pollIntervalMs(0), 0)
+  assert.equal(pollIntervalMs(-1), 0)
+})
+
+test("snapshot limits are configurable with safe defaults", () => {
+  assert.deepEqual(snapshotLimits({}), { recentLimit: 5, decisionsLimit: 20 })
+  assert.deepEqual(snapshotLimits({ snapshotRecentLimit: 2, snapshotDecisionsLimit: 7 }), {
+    recentLimit: 2, decisionsLimit: 7,
+  })
+  assert.deepEqual(snapshotLimits({ snapshotRecentLimit: -3 }), { recentLimit: 5, decisionsLimit: 20 })
+})
+
+test("run change watcher honours a custom interval and can be stopped", async () => {
+  const timers = []
+  const source = { snapshot: async () => ({ active: [], recent: [] }) }
+  const watcher = createRunChangeWatcher(source, {
+    emit: () => {},
+    deps: {
+      intervalMs: 2500,
+      setInterval: (fn, ms) => { timers.push(ms); return 1 },
+      clearInterval: () => {},
+    },
+  })
+  watcher.start()
+  assert.deepEqual(timers, [2500])
+  assert.equal(watcher.running, true)
+  watcher.stop()
+  assert.equal(watcher.running, false)
 })

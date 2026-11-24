@@ -269,16 +269,31 @@ FROM run_events WHERE run_id IN (%s) ORDER BY at, id`, runIDs)
 
 const decisionColumns = `id, at, cycle_id, kind, run_id, task_id, pr_number, verdict, action, reason, fields_json`
 
-// ListDecisions returns the decision history of all given runs in one query.
-// Decisions without a run (dispatch skips, candidate counts) are included so
-// their counts reach the snapshot metrics.
-func (s *Store) ListDecisions(ctx context.Context, runIDs []string) ([]app.Decision, error) {
+// ListDecisions returns a bounded decision history in one query. Each run keeps
+// only its newest decisions; run-less decisions are capped separately so a long
+// dispatch history cannot inflate a snapshot. Totals come from DecisionCounts.
+func (s *Store) ListDecisions(ctx context.Context, runIDs []string, limit, orphanLimit int) ([]app.Decision, error) {
 	out := []app.Decision{}
-	query := `SELECT ` + decisionColumns + ` FROM decisions WHERE run_id = '' ORDER BY at, id`
-	var args []any
+	if limit <= 0 {
+		limit = app.DefaultDecisionsLimit
+	}
+	if orphanLimit <= 0 {
+		orphanLimit = app.DefaultOrphanDecisionsLimit
+	}
+	const orphan = `SELECT ` + decisionColumns + `, ROW_NUMBER() OVER (ORDER BY at DESC, id DESC) AS rn
+FROM decisions WHERE run_id = ''`
+	query := `WITH orphan AS (` + orphan + `)
+SELECT ` + decisionColumns + ` FROM orphan WHERE rn <= ? ORDER BY at, id`
+	args := []any{orphanLimit}
 	if len(runIDs) > 0 {
-		query, args = inQuery(`SELECT `+decisionColumns+` FROM decisions
-WHERE run_id IN (%s) OR run_id = '' ORDER BY at, id`, runIDs)
+		perRun, ids := inQuery(`per_run AS (SELECT `+decisionColumns+`,
+ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY at DESC, id DESC) AS rn
+FROM decisions WHERE run_id IN (%s))`, runIDs)
+		query = `WITH ` + perRun + `, orphan AS (` + orphan + `)
+SELECT ` + decisionColumns + ` FROM per_run WHERE rn <= ?
+UNION ALL SELECT ` + decisionColumns + ` FROM orphan WHERE rn <= ?
+ORDER BY at, id`
+		args = append(ids, limit, orphanLimit)
 	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -298,6 +313,32 @@ WHERE run_id IN (%s) OR run_id = '' ORDER BY at, id`, runIDs)
 			return nil, fmt.Errorf("fields_json: %w", err)
 		}
 		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DecisionCounts aggregates every decision into a handful of rows. It keeps
+// snapshot metrics exact even though ListDecisions returns a bounded sample.
+func (s *Store) DecisionCounts(ctx context.Context, runIDs []string) ([]app.DecisionCount, error) {
+	out := []app.DecisionCount{}
+	query := `SELECT kind, verdict, action, COUNT(*) FROM decisions WHERE run_id = ''
+GROUP BY kind, verdict, action`
+	var args []any
+	if len(runIDs) > 0 {
+		query, args = inQuery(`SELECT kind, verdict, action, COUNT(*) FROM decisions
+WHERE run_id IN (%s) OR run_id = '' GROUP BY kind, verdict, action`, runIDs)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c app.DecisionCount
+		if err := rows.Scan(&c.Kind, &c.Verdict, &c.Action, &c.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }

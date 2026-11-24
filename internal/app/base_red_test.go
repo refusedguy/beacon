@@ -172,6 +172,34 @@ func TestRedBaseNoNotifierStillNotifiesParent(t *testing.T) {
 	assertBaseRedParentNotified(t, h)
 }
 
+func TestRedBaseParentNoticeCarriesReason(t *testing.T) {
+	r, store, _, h, _ := redReconciler(t)
+	r.BaseRedMode = "notify_orchestrator"
+	r.Notifier = &fakeNotifier{}
+	store.runs["r1"].ParentSessionID = "ses_parent"
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	assertBaseRedParentNotified(t, h)
+	if got := h.notifications[0].text; !strings.Contains(got, "ci failed") {
+		t.Fatalf("notification %q missing reason", got)
+	}
+}
+
+func TestFixerInheritsDispatcherMaxAttempts(t *testing.T) {
+	r, store, _, _, _ := redReconciler(t)
+	r.Dispatcher = &Dispatcher{MaxAttempts: 17}
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range store.runs {
+		if run.IsFixer && run.MaxAttempts != 17 {
+			t.Fatalf("fixer max attempts = %d, want 17", run.MaxAttempts)
+		}
+	}
+}
+
 func TestRedEpicBranchBlocksChildrenAndSpawnsFixer(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()

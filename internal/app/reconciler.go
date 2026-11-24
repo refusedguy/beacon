@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -46,9 +45,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	}
 	obs.PRNumber = pr
 	defer logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
-	switch strings.ToLower(obs.PRState) {
-	case "merged", "closed", "locked":
-		return core.MergeDecision{Verdict: core.VerdictWait, Reason: "pull request " + obs.PRState}, r.finalizeExternal(ctx, run, obs)
+	if closed := closedPRVerdict(obs.PRState); closed != nil {
+		return *closed, r.finalizeExternal(ctx, run, obs)
 	}
 	if ok, err := r.Store.Approved(ctx, run.ID, obs.HeadSHA); err != nil {
 		return core.MergeDecision{}, err
@@ -59,85 +57,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	if run.PRNumber == 0 {
 		run.PRNumber = pr
 	}
-
-	switch decision.Verdict {
-	case core.VerdictNoop:
-		return decision, nil
-	case core.VerdictMerge:
-		return r.mergeIfReviewed(ctx, run, obs, decision)
-	case core.VerdictNeedsRebase:
-		if !r.AutoRebase {
-			return core.MergeDecision{Verdict: core.VerdictWait, Reason: "auto_rebase disabled"}, nil
-		}
-		if !obs.Conflict && len(obs.Checks) > 0 && obs.AllRequiredPass(nil) {
-			// Green checks mean the new base commits did not reach the PR scope.
-			if run.State == core.RunNeedsAgentFix {
-				run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
-				return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksPassed, HeadSHA: obs.HeadSHA})
-			}
-			// A behind PR that GitHub still reports mergeable can merge as-is. Re-evaluate
-			// without the behind invariant so approval rules still apply before merging.
-			if run.State == core.RunWaitingCI {
-				mergeable := obs
-				mergeable.Behind = false
-				if merged := r.Policy.Evaluate(mergeable); merged.Verdict == core.VerdictMerge {
-					run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
-					return r.mergeIfReviewed(ctx, run, obs, merged)
-				}
-			}
-			return decision, nil
-		}
-		if sameObservation(run, obs) {
-			return decision, nil
-		}
-		if run.State == core.RunWaitingCI || run.State == core.RunRunning {
-			if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBehind, Reason: decision.Reason}); err != nil {
-				return decision, err
-			}
-		}
-		return decision, r.rebase(ctx, run, obs)
-	case core.VerdictNeedsAgentFix:
-		if sameObservation(run, obs) {
-			return decision, nil
-		}
-		if run.State == core.RunWaitingCI || run.State == core.RunRunning {
-			if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksFailed, Reason: decision.Reason}); err != nil {
-				return decision, err
-			}
-		}
-		if err := r.checkBaseRed(ctx, run, obs, decision.Reason); err != nil {
-			return decision, err
-		}
-		fresh, err := r.Store.Get(ctx, run.ID)
-		if err != nil {
-			return decision, err
-		}
-		if fresh != nil && fresh.State == core.RunBlocked {
-			return decision, nil
-		}
-		if fresh != nil {
-			run = fresh
-		}
-		return decision, r.wake(ctx, run, obs, decision.Reason)
-	case core.VerdictBlocked:
-		if run.State != core.RunBlocked {
-			if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}); err != nil {
-				return decision, err
-			}
-		}
-		return decision, r.notify(run, "blocked", decision.Reason)
-	default:
-		if run.State == core.RunWaitingCI || run.State == core.RunRunning {
-			if err := run.Apply(core.Event{Kind: core.EvChecksPending, HeadSHA: obs.HeadSHA}); err != nil {
-				return decision, err
-			}
-			if run.ObserveSHA(obs.HeadSHA, obs.BaseSHA) {
-				return decision, r.Store.Save(ctx, run)
-			}
-			return decision, nil
-		}
-		return decision, nil
-	}
+	return r.applyDecision(ctx, run, obs, decision)
 }
 
 func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Event, observed ...string) error {
@@ -193,7 +113,7 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 	r.notifyParent(ctx, run, obs.PRNumber, string(run.State))
 	if !run.IsFixer {
 		if err := r.Source.Complete(ctx, run.TaskID); err != nil {
-			return err
+			slog.Error("complete task after merge", "run", run.ID, "task", run.TaskID, "error", err)
 		}
 		if err := r.Store.SetTaskStatus(ctx, run.TaskID, "done"); err != nil {
 			return err
@@ -326,6 +246,11 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 }
 
 func (r *Reconciler) safeReconcile(ctx context.Context, pr int) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.Error("reconcile panic", "pr", pr, "panic", rec)
+		}
+	}()
 	if _, err := r.Reconcile(ctx, pr); err != nil {
 		slog.Error("reconcile PR", "pr", pr, "error", err)
 	}

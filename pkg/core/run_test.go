@@ -14,6 +14,7 @@ func TestRunTransitions(t *testing.T) {
 	}{
 		{"start", RunPending, EvStart, RunRunning},
 		{"register pr", RunRunning, EvPRRegistered, RunWaitingCI},
+		{"checks pending after spawn", RunRunning, EvChecksPending, RunWaitingCI},
 		{"behind", RunWaitingCI, EvBehind, RunNeedsRebase},
 		{"rebase", RunNeedsRebase, EvRebased, RunWaitingCI},
 		{"failed ci", RunWaitingCI, EvChecksFailed, RunNeedsAgentFix},

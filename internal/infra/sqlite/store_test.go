@@ -255,6 +255,45 @@ func TestRunScopeAndIncidentPersistence(t *testing.T) {
 	}
 }
 
+func TestCreateIncidentReopensResolvedSignature(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	in, err := store.CreateIncident(ctx, &core.BaseIncident{
+		Repo: "o/r", BaseBranch: "main", Signature: "sig-a",
+		FailedChecksJSON: `["check"]`, Attempts: 2,
+	})
+	if err != nil || in == nil {
+		t.Fatalf("create = %+v err=%v", in, err)
+	}
+	in.Status = "resolved"
+	in.Attempts = 2
+	if err := store.UpdateIncident(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := store.FindOpenIncident(ctx, "o/r", "main", "sig-a"); err != nil || open != nil {
+		t.Fatalf("resolved incident still open: %+v err=%v", open, err)
+	}
+
+	reopened, err := store.CreateIncident(ctx, &core.BaseIncident{
+		Repo: "o/r", BaseBranch: "main", Signature: "sig-a",
+		FailedChecksJSON: `["check","other"]`,
+	})
+	if err != nil || reopened == nil {
+		t.Fatalf("reopen = %+v err=%v (must not be nil, nil)", reopened, err)
+	}
+	if reopened.Status != "open" || reopened.Attempts != 0 || reopened.FixerRunID != "" {
+		t.Fatalf("reopened incident = %+v", reopened)
+	}
+	if reopened.FailedChecksJSON != `["check","other"]` {
+		t.Fatalf("failed checks = %s", reopened.FailedChecksJSON)
+	}
+}
+
 func TestObservedBaseSHARoundTrip(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -421,7 +460,7 @@ func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 	})
 	app.RecordDecision(ctx, app.Decision{Kind: "dispatch.candidates"})
 
-	decisions, err := store.ListDecisions(ctx, []string{"r1", "r2"})
+	decisions, err := store.ListDecisions(ctx, []string{"r1", "r2"}, 0, 0)
 	if err != nil || len(decisions) != 3 {
 		t.Fatalf("decisions = %+v err=%v", decisions, err)
 	}
@@ -451,6 +490,81 @@ func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 	if m.SkipCount != 1 || m.Skips["scope_overlap"] != 1 || m.MergeCount != 1 ||
 		m.DispatchCycles != 1 || m.ActiveCount != 1 || m.RecentCount != 1 || m.CIWaitSeconds < 60 {
 		t.Fatalf("metrics = %+v", m)
+	}
+}
+
+func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	app.SetDecisionSink(store)
+	t.Cleanup(func() { app.SetDecisionSink(nil) })
+
+	run := core.NewRun("r1", "T-1", time.Now().UTC())
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Hour)
+	for i := 0; i < 5; i++ {
+		app.RecordDecision(ctx, app.Decision{
+			Kind: "dispatch.skip", RunID: "r1", Verdict: "overlap",
+			At: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	for i := 0; i < 7; i++ {
+		app.RecordDecision(ctx, app.Decision{
+			Kind: "dispatch.candidates", At: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	decisions, err := store.ListDecisions(ctx, []string{"r1"}, 2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 5 {
+		t.Fatalf("decisions = %d, want 2 per-run + 3 orphan", len(decisions))
+	}
+	inRun, orphan := 0, 0
+	for _, d := range decisions {
+		if d.RunID == "r1" {
+			inRun++
+		} else {
+			orphan++
+		}
+	}
+	if inRun != 2 || orphan != 3 {
+		t.Fatalf("in-run=%d orphan=%d", inRun, orphan)
+	}
+
+	counts, err := store.DecisionCounts(ctx, []string{"r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	totalSkips, totalCycles := 0, 0
+	for _, c := range counts {
+		switch c.Kind {
+		case "dispatch.skip":
+			totalSkips += c.Count
+		case "dispatch.candidates":
+			totalCycles += c.Count
+		}
+	}
+	if totalSkips != 5 || totalCycles != 7 {
+		t.Fatalf("counts: skips=%d cycles=%d", totalSkips, totalCycles)
+	}
+
+	snap, err := (app.SnapshotService{Store: store, DecisionsLimit: 2, OrphanDecisionsLimit: 3}).Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Metrics.SkipCount != 5 || snap.Metrics.DispatchCycles != 7 {
+		t.Fatalf("snapshot metrics = %+v", snap.Metrics)
+	}
+	if len(snap.Active[0].Decisions) != 2 {
+		t.Fatalf("snapshot decisions = %d, want 2", len(snap.Active[0].Decisions))
 	}
 }
 

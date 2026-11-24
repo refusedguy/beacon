@@ -1,19 +1,5 @@
 {
-  "$comment": "T3.39. Детерминированная проверка 'только при новом факте' перед комментарием и мержем. Аналог PreToolUse из ADR 0035 п5 для OpenCode.",
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "^(Bash|gh).*(issue comment|pr comment|pr merge|issue close)",
-        "handler": "node tests/adapter/new-fact-check.test.js --check",
-        "on": {
-          "noNewFact": {
-            "permissionDecision": "deny",
-            "reason": "Комментарий или мерж без нового факта не отправляется"
-          }
-        }
-      }
-    ]
-  },
+  "$comment": "Keep only settings that map to files in this repository. The removed PreToolUse hook pointed at tests/adapter/new-fact-check.test.js, which does not exist here.",
   "hookFailureContract": {
     "$comment": "T3.50 / ADR 0037 п4. Failure contract вызова hook адаптера пробуждения в Go-ядре. Отказ адаптера: код 0 и пустой stdout, причина пишется в лог. Сломанный адаптер не роняет сервер и остальные ожидания. Это контракт вызова hook, а не fail-open JS-плагина из ADR 0006 / T3.5.",
     "scope": "hook-call",
@@ -25,19 +11,5 @@
     "isolateWaits": true,
     "waits": 15,
     "distinctFrom": ["ADR 0006 plugin fail-open", "T3.5"]
-  },
-  "checks": {
-    "newFact": {
-      "templatePhrases": [
-        "Прогресс:\\s*PR\\s+\\S+\\s+влит,\\s*CI\\s+зелёный",
-        "Прогресс:\\s*PR\\s+\\S+\\s+влит,\\s*CI\\s+зелёный,\\s*всё\\s+хорошо"
-      ],
-      "factPatterns": {
-        "mergedPRHash": "\\b[0-9a-fA-F]{7,40}\\b",
-        "measurement": "\\b\\d+(?:[.,]\\d+)?\\s*(?:%|мс|ms|с|s|ops|rps)(?![\\p{L}])",
-        "ownerDecision": "решение владельца|владелец решил|одобрено владельцем|решение принято владельцем",
-        "blocker": "блокер|блокирует|заблокирован|blocker"
-      }
-    }
   }
 }

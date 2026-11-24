@@ -46,7 +46,28 @@ type wiring struct {
 	status      app.StatusService
 	wait        app.WaitService
 	taskCreator *app.TaskCreator
+	taskDeleter *app.TaskDeleter
+	taskUpdater *app.TaskUpdater
 	recon       *app.Reconciler
+}
+
+// wiredInfra holds the adapters shared by every application service.
+type wiredInfra struct {
+	store     *sqlite.Store
+	source    core.TaskSource
+	harness   core.AgentHarness
+	workspace *workspace.GitWorktree
+	scm       core.ScmGateway
+	changes   chan int
+}
+
+// projectRoot prefers the explicit environment root. The pooled MCP daemon is
+// started with a cwd, but a caller can pin the root without changing that cwd.
+func projectRoot() (string, error) {
+	if fromEnv := os.Getenv("BEACON_PROJECT_ROOT"); fromEnv != "" {
+		return filepath.Abs(fromEnv)
+	}
+	return filepath.Abs(".")
 }
 
 func wire(path, parentSession string) (*wiring, error) {
@@ -54,6 +75,19 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
+	root, err := projectRoot()
+	if err != nil {
+		return nil, err
+	}
+	infra, err := wireInfra(cfg, root, parentSession)
+	if err != nil {
+		return nil, err
+	}
+	return wireServices(cfg, root, parentSession, infra), nil
+}
+
+// wireInfra builds the adapters. It has no dependency on the service layer.
+func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, error) {
 	scmToken, sourceToken, harnessToken := loadTokens(cfg)
 	store, err := sqlite.Open(cfg.StateDB)
 	if err != nil {
@@ -77,10 +111,6 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := filepath.Abs(".")
-	if err != nil {
-		return nil, err
-	}
 	if oc, ok := h.(*opencode.Harness); ok {
 		oc.Repo = root
 	}
@@ -91,35 +121,49 @@ func wire(path, parentSession string) (*wiring, error) {
 	if refresher, ok := h.(core.WorktreeRefresher); ok {
 		wt.Refresher = refresher
 	}
-	changes := make(chan int, 64)
-	taskCreator := &app.TaskCreator{
-		Source: source, Workspace: wt,
-		Root: core.Workspace{Path: root, Branch: cfg.BaseBranch},
+	return &wiredInfra{store: store, source: source, harness: h,
+		workspace: wt, scm: scmGW, changes: make(chan int, 64)}, nil
+}
+
+// wireServices builds the application services on top of the adapters.
+func wireServices(cfg config.Config, root, parentSession string, infra *wiredInfra) *wiring {
+	workspaceRoot := core.Workspace{Path: root, Branch: cfg.BaseBranch}
+	creator := &app.TaskCreator{
+		Store: infra.store, Source: infra.source,
+		Workspace: infra.workspace, Root: workspaceRoot,
+	}
+	deleter := &app.TaskDeleter{
+		Store: infra.store, Workspace: infra.workspace, Root: workspaceRoot,
+	}
+	updater := &app.TaskUpdater{
+		Store: infra.store, Workspace: infra.workspace, Root: workspaceRoot,
 	}
 	disp := &app.Dispatcher{
-		Source:    source,
+		Source:    infra.source,
 		Planner:   planner.New(planner.Options{ByPath: true, ByDependency: true, Strict: cfg.StrictScope}),
-		Workspace: wt, Harness: h, Store: store,
+		Workspace: infra.workspace, Harness: infra.harness, Store: infra.store,
 		Concurrency:        core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
 		StrictScope:        cfg.StrictScope,
 		MaxAttempts:        cfg.Merge.MaxAttempts,
 		ParentSessionID:    firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
 		WorkerInstructions: cfg.Harness.WorkerInstructions,
 	}
-	ctrl := &app.Control{Store: store, Harness: h, Workspace: wt, OnChange: func(pr int) {
+	ctrl := &app.Control{Store: infra.store, Harness: infra.harness, Workspace: infra.workspace, OnChange: func(pr int) {
 		select {
-		case changes <- pr:
+		case infra.changes <- pr:
 		default:
 		}
 	}}
-	recon := newReconciler(cfg, store, scmGW, h, source, wt, disp, changes, parentSession)
+	recon := newReconciler(cfg, infra.store, infra.scm, infra.harness,
+		infra.source, infra.workspace, disp, infra.changes, parentSession)
 	return &wiring{
-		cfg: cfg, store: store, source: source, harness: h, workspace: wt,
-		scm: scmGW, policy: recon.Policy, changes: changes, dispatcher: disp,
-		control: ctrl, status: app.StatusService{Store: store},
-		wait:        app.WaitService{Store: store, Interval: time.Second},
-		taskCreator: taskCreator, recon: recon,
-	}, nil
+		cfg: cfg, store: infra.store, source: infra.source, harness: infra.harness,
+		workspace: infra.workspace, scm: infra.scm, policy: recon.Policy,
+		changes: infra.changes, dispatcher: disp, control: ctrl,
+		status:      app.StatusService{Store: infra.store},
+		wait:        app.WaitService{Store: infra.store, Interval: time.Second},
+		taskCreator: creator, taskDeleter: deleter, taskUpdater: updater, recon: recon,
+	}
 }
 
 func newReconciler(
