@@ -5,7 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./index.js",
-    "./tui": "./ui.js"
+    "./tui": "./ui/ui.js"
   },
   "peerDependencies": {
     "@opentui/core": ">=0.8.4",
