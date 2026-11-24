@@ -31,13 +31,14 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 
 ## MCP tools
 
-`beacon mcp` serves five worker tools and three orchestrator tools over stdio:
+`beacon mcp` serves six worker and read-only tools plus three orchestrator tools over stdio:
 
 | Tool | Purpose | Agent |
 | --- | --- | --- |
 | `beacon_dispatch` | Pick up to N non-overlapping tasks and start runs. | worker |
 | `beacon_watch_pr` | Bind a run ID to a pull request number. | worker |
 | `beacon_status` | List active runs, pull requests and blockers. | worker |
+| `beacon_recent` | List the most recently finished runs. | worker |
 | `beacon_wait` | Wait for a run to reach a verdict or a terminal state. | worker |
 | `beacon_control` | Approve, unblock, cancel or retry a run. | worker |
 | `beacon_task_create` | Create a task card and publish it for dispatch. | orchestrator only |
@@ -46,7 +47,7 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 
 `opencode.json` tool permissions are generated, not hand-edited. `ToolCatalog()` in `internal/infra/mcp/registry.go` lists every tool and marks the orchestrator-only ones. Run `go generate ./...` after changing the catalog. `cmd/beacon-gen` rewrites only the permission entries it owns and keeps every other config key, agent description, mode and custom permission as they were. Generation happens at development time, never at binary startup. `TestPermissionsUpToDate` in `internal/infra/mcp/permissions_test.go` regenerates the file into a temp copy and fails when the committed `opencode.json` differs, so CI catches a stale permission list.
 
-No other `beacon_*` MCP tool exists. The OpenCode plugin starts the server from `.opencode/bin/beacon` when that binary exists. Before each start it compares `.opencode/bin/beacon.build-sha` with `git rev-parse HEAD` and runs `scripts/build-beacon.sh` when the sha file is missing or stale. The build script writes the current HEAD into `beacon.build-sha`, so the tool list comes from current source rather than a stale binary. The plugin polls HEAD in the project root every few seconds and reloads MCP when it changes. A reload re-resolves the command, so a change on main rebuilds a stale binary before the daemon restarts. No manual rebuild or MCP reconnect is needed after a main change. When no local binary exists, the plugin falls back to `bin/beacon`, a binary on `PATH`, or `go run ./cmd/beacon mcp`. `opencode.json` denies `beacon_task_create`, `beacon_task_delete` and `beacon_task_update` globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows.
+No other `beacon_*` MCP tool exists. The MCP server runs as one pooled `beacon mcp` process started from the project `opencode.json`. The local plugin resolves `.opencode/bin/beacon` when it exists and rebuilds a stale binary with `scripts/build-beacon.sh` when the build inputs are newer. There is no HEAD watcher and no automatic `ctx.mcp.reload()`. After Go code lands on `main`, run `bash scripts/build-beacon.sh` explicitly, then restart the MCP daemon and the OpenCode TUI. When no local binary exists, the plugin falls back to `bin/beacon`, a binary on `PATH`, or `go run ./cmd/beacon mcp`. `beacon status --snapshot` bounds its decision history; `--recent-limit` and `--decisions-limit` tighten it further without a rebuild. `opencode.json` denies `beacon_task_create`, `beacon_task_delete` and `beacon_task_update` globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows.
 
 Spawn workers with `harness.command: worker` in `.beacon/config.yaml`. The OpenCode harness passes that value as the session agent, so each worker inherits the global deny rules for `beacon_task_create`, `beacon_task_delete` and `beacon_task_update`. A worker must never create, delete or update task cards. It reports new work to the orchestrator instead.
 
