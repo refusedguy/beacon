@@ -393,7 +393,9 @@ func (s *Store) ListQueueTasks(ctx context.Context) ([]app.QueueTask, error) {
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, title, priority FROM tasks
-WHERE status NOT IN ('done', 'dropped') ORDER BY priority DESC, id`)
+WHERE status IN ('available','todo')
+  AND id NOT IN (SELECT task_id FROM runs WHERE state NOT IN ('merged','closed','dropped'))
+ORDER BY priority DESC, id`)
 	if err != nil {
 		return nil, err
 	}

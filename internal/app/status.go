@@ -243,8 +243,8 @@ type Snapshot struct {
 	Active       []RunSnapshot         `json:"active"`
 	Recent       []RunSnapshot         `json:"recent"`
 	Queue        []QueueItemSnapshot   `json:"queue"`
-	BaseIncident *BaseIncidentSnapshot `json:"base_incident,omitempty"`
-	Daemon       *DaemonSnapshot       `json:"daemon,omitempty"`
+	BaseIncident *BaseIncidentSnapshot `json:"base_incident"`
+	Daemon       *DaemonSnapshot       `json:"daemon"`
 	Metrics      Metrics               `json:"metrics"`
 }
 
@@ -384,7 +384,7 @@ func makeQueue(tasks []QueueTask) []QueueItemSnapshot {
 
 func makeBaseIncident(in *core.BaseIncident) *BaseIncidentSnapshot {
 	if in == nil {
-		return nil
+		return &BaseIncidentSnapshot{ID: "", FailedChecks: []string{}}
 	}
 	return &BaseIncidentSnapshot{
 		ID: in.ID, BaseBranch: in.BaseBranch,

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -591,7 +592,7 @@ func TestSnapshotIncludesLocalQueueAndBaseIncident(t *testing.T) {
 	if err != nil || incident == nil {
 		t.Fatalf("incident = %+v err=%v", incident, err)
 	}
-	run := core.NewRun("r-snap", "T-1", time.Now().UTC())
+	run := core.NewRun("r-snap", "T-OUT", time.Now().UTC())
 	run.State = core.RunWaitingCI
 	run.PRNumber = 42
 	if err := store.Save(ctx, run); err != nil {
@@ -710,6 +711,106 @@ INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r1', 'T-1
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestListQueueTasksFiltersByStatusAndActiveRuns(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	tasks := []core.Task{
+		{ID: "T-READY", Title: "ready", Priority: 5, Status: core.TaskAvailable},
+		{ID: "T-TODO", Title: "todo", Priority: 4, Status: core.TaskStatus("todo")},
+		{ID: "T-CLAIMED", Title: "claimed", Priority: 8, Status: core.TaskClaimed},
+		{ID: "T-DONE", Title: "done", Priority: 9, Status: core.TaskDone},
+		{ID: "T-DROPPED", Title: "dropped", Priority: 7, Status: core.TaskDropped},
+		{ID: "T-RUNNING", Title: "running", Priority: 6, Status: core.TaskAvailable},
+		{ID: "T-BLOCKED", Title: "blocked", Priority: 6, Status: core.TaskAvailable},
+		{ID: "T-CLOSED", Title: "closed", Priority: 6, Status: core.TaskAvailable},
+		{ID: "T-MERGED", Title: "merged", Priority: 6, Status: core.TaskAvailable},
+		{ID: "T-WAITING", Title: "waiting", Priority: 2, Status: core.TaskAvailable,
+			DependsOn: []core.TaskID{"T-READY"}},
+	}
+	if err := store.SyncTasks(ctx, tasks); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		task  string
+		state core.RunState
+	}{
+		{"T-RUNNING", core.RunRunning},
+		{"T-BLOCKED", core.RunBlocked},
+		{"T-CLOSED", core.RunClosed},
+		{"T-MERGED", core.RunMerged},
+	} {
+		run := core.NewRun(core.RunID("run-"+tc.task), core.TaskID(tc.task), time.Now().UTC())
+		run.State = tc.state
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	queue, err := store.ListQueueTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"T-CLOSED", "T-MERGED", "T-READY", "T-TODO", "T-WAITING"}
+	if len(queue) != len(want) {
+		t.Fatalf("queue = %+v, want %v", queue, want)
+	}
+	for i, id := range want {
+		if queue[i].ID != id {
+			t.Fatalf("queue[%d] = %s, want %s", i, queue[i].ID, id)
+		}
+		if queue[i].DependsOn == nil {
+			t.Fatalf("%s has null dependencies", id)
+		}
+	}
+	last := queue[len(queue)-1]
+	if !last.Waiting || len(last.DependsOn) != 1 || last.DependsOn[0] != "T-READY" {
+		t.Fatalf("waiting task = %+v", last)
+	}
+}
+
+func TestEmptySnapshotJSONHasStableKeysAndArrays(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	snap, err := (app.SnapshotService{Store: store}).Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"active", "recent", "queue", "daemon", "base_incident"} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("snapshot JSON is missing %q: %s", key, b)
+		}
+	}
+	for _, key := range []string{"active", "recent", "queue"} {
+		if got := string(raw[key]); got != "[]" {
+			t.Fatalf("%s JSON = %s, want []", key, got)
+		}
+	}
+	if got := string(raw["daemon"]); !strings.Contains(got, `"state":"absent"`) {
+		t.Fatalf("daemon JSON = %s, want state absent", got)
+	}
+	if got := string(raw["base_incident"]); !strings.Contains(got, `"id":""`) {
+		t.Fatalf("base incident JSON = %s, want empty id", got)
 	}
 }
 
