@@ -184,7 +184,8 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		}
 	}}
 	recon := newReconciler(cfg, infra.store, infra.scm, infra.harness,
-		infra.source, infra.workspace, disp, infra.changes, parentSession)
+		infra.source, infra.workspace, disp, infra.changes,
+		firstNonEmpty(parentSession, cfg.Harness.ParentSessionID))
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: infra.harness,
 		workspace: infra.workspace, scm: infra.scm, policy: recon.Policy,

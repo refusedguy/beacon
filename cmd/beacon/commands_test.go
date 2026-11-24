@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -250,4 +251,99 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func captureCLIWire(t *testing.T, stop error) *string {
+	t.Helper()
+	orig := cliWire
+	t.Cleanup(func() { cliWire = orig })
+	got := new(string)
+	cliWire = func(_ string, parent string) (*wiring, error) {
+		*got = parent
+		if stop != nil {
+			return nil, stop
+		}
+		return &wiring{}, nil
+	}
+	return got
+}
+
+func TestParentSessionFromEnv(t *testing.T) {
+	t.Setenv("BEACON_PARENT_SESSION", "ses_cli_parent")
+	if got := parentSessionFromEnv(); got != "ses_cli_parent" {
+		t.Fatalf("parentSessionFromEnv() = %q", got)
+	}
+	t.Setenv("BEACON_PARENT_SESSION", "")
+	if got := parentSessionFromEnv(); got != "" {
+		t.Fatalf("parentSessionFromEnv() = %q, want empty", got)
+	}
+}
+
+func TestWireCLIPassesEnvironmentParent(t *testing.T) {
+	t.Setenv("BEACON_PARENT_SESSION", "ses_cli_parent")
+	got := captureCLIWire(t, nil)
+	if _, err := wireCLI("cfg.yaml"); err != nil {
+		t.Fatal(err)
+	}
+	if *got != "ses_cli_parent" {
+		t.Fatalf("wire parent = %q, want ses_cli_parent", *got)
+	}
+}
+
+func TestWireCLIAcceptsEmptyEnvironment(t *testing.T) {
+	t.Setenv("BEACON_PARENT_SESSION", "")
+	got := captureCLIWire(t, nil)
+	if _, err := wireCLI("cfg.yaml"); err != nil {
+		t.Fatal(err)
+	}
+	if *got != "" {
+		t.Fatalf("wire parent = %q, want empty", *got)
+	}
+}
+
+func TestDispatchCommandWiresWithEnvironmentParent(t *testing.T) {
+	for _, tc := range []struct{ name, env, want string }{
+		{"environment parent", "ses_cli_parent", "ses_cli_parent"},
+		{"empty environment", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEACON_PARENT_SESSION", tc.env)
+			stop := errors.New("wire stopped")
+			got := captureCLIWire(t, stop)
+			configPath := ""
+			cmd := newDispatchCommand(&configPath)
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			cmd.SetArgs([]string{"1"})
+			if err := cmd.Execute(); !errors.Is(err, stop) {
+				t.Fatalf("dispatch error = %v, want %v", err, stop)
+			}
+			if *got != tc.want {
+				t.Fatalf("wire parent = %q, want %q", *got, tc.want)
+			}
+		})
+	}
+}
+
+func TestControlFallbackWiresWithEnvironmentParent(t *testing.T) {
+	for _, tc := range []struct{ name, env, want string }{
+		{"environment parent", "ses_cli_parent", "ses_cli_parent"},
+		{"empty environment", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEACON_PROJECT_ROOT", t.TempDir())
+			t.Setenv("BEACON_PARENT_SESSION", tc.env)
+			stop := errors.New("wire stopped")
+			got := captureCLIWire(t, stop)
+			configPath := ""
+			cmd := newControlCommand(&configPath)
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			cmd.SetArgs([]string{"--action", "approve", "--run-id", "r1", "--sha", "abc"})
+			if err := cmd.Execute(); !errors.Is(err, stop) {
+				t.Fatalf("control error = %v, want %v", err, stop)
+			}
+			if *got != tc.want {
+				t.Fatalf("wire parent = %q, want %q", *got, tc.want)
+			}
+		})
+	}
 }
