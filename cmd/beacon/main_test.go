@@ -11,7 +11,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/internal/infra/sqlite"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -176,6 +178,26 @@ func TestWireInfraDoesNotRefreshWorktreesAtStartup(t *testing.T) {
 	}
 	if reloads != 0 {
 		t.Fatalf("startup location reloads = %d, want 0", reloads)
+	}
+}
+
+func TestWireServicesInjectsDecisionSink(t *testing.T) {
+	cfg := config.Config{BaseBranch: "main"}
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	infra := &wiredInfra{
+		store: store, changes: make(chan int, 1),
+		decisions: app.DecisionLogger{Sink: store},
+	}
+	w := wireServices(cfg, t.TempDir(), "", infra)
+	if w.dispatcher.Decisions.Sink != store {
+		t.Error("dispatcher is missing the decision sink")
+	}
+	if w.recon.Decisions.Sink != store {
+		t.Error("reconciler is missing the decision sink")
 	}
 }
 

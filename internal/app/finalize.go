@@ -26,10 +26,10 @@ func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, st
 	text := fmt.Sprintf("Beacon: PR #%d run %s state %s", pr, run.ID, state)
 	if err := r.Harness.NotifyParent(ctx, run.ParentSessionID, text); err != nil {
 		slog.Error("notify parent", "run", run.ID, "error", err)
-		logTransitionParentNotify(ctx, run.ID, pr, "failed")
+		r.Decisions.logTransitionParentNotify(ctx, run.ID, pr, "failed")
 		return
 	}
-	logTransitionParentNotify(ctx, run.ID, pr, "notified")
+	r.Decisions.logTransitionParentNotify(ctx, run.ID, pr, "notified")
 }
 
 func compact(s string) string {

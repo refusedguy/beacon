@@ -92,9 +92,10 @@ func countDecisionRecords(h *captureDecisionHandler, message string) int {
 func TestDecisionLogDispatchAndReconcileFields(t *testing.T) {
 	h := captureDecisions(t)
 	ctx := WithCycleID(context.Background(), "run-1")
+	logger := DecisionLogger{}
 
-	logDispatchCandidates(ctx, 7, 3, 4, 2)
-	logDispatchSkip(ctx, SkippedTask{
+	logger.logDispatchCandidates(ctx, 7, 3, 4, 2)
+	logger.logDispatchSkip(ctx, SkippedTask{
 		TaskID:       "T-2",
 		Code:         SkipSelectedScopeOverlap,
 		BlockedBy:    "T-1",
@@ -108,7 +109,7 @@ func TestDecisionLogDispatchAndReconcileFields(t *testing.T) {
 	run.ObservedSHA = "old-sha"
 	obs := core.Observation{PRNumber: 42, HeadSHA: "new-sha", BaseSHA: "base", Behind: true}
 	decision := core.MergeDecision{Verdict: core.VerdictNeedsRebase, Reason: "branch is behind base"}
-	logReconcileDecision(ctx, 42, run, obs, decision, reconcileAction(decision))
+	logger.logReconcileDecision(ctx, 42, run, obs, decision, reconcileAction(decision))
 
 	for _, r := range h.snapshot() {
 		if r.Level != slog.LevelInfo {
@@ -135,14 +136,15 @@ func TestDecisionLogDispatchAndReconcileFields(t *testing.T) {
 func TestDecisionLogTransitionFields(t *testing.T) {
 	h := captureDecisions(t)
 	ctx := WithCycleID(context.Background(), "run-9")
+	logger := DecisionLogger{}
 
-	logTransitionSpawn(ctx, "run-9", "T-9", "beacon/T-9")
-	logTransitionWatchPR(ctx, "run-9", 77)
-	logTransitionRebase(ctx, "run-9", 77, 2, "sha-new", "rebased")
-	logTransitionWake(ctx, "run-9", 77, "woke")
-	logTransitionMerge(ctx, "run-9", 77, "attempt")
-	logTransitionDeliveryClaim(ctx, "run-9", 77, true)
-	logTransitionParentNotify(ctx, "run-9", 77, "notified")
+	logger.logTransitionSpawn(ctx, "run-9", "T-9", "beacon/T-9")
+	logger.logTransitionWatchPR(ctx, "run-9", 77)
+	logger.logTransitionRebase(ctx, "run-9", 77, 2, "sha-new", "rebased")
+	logger.logTransitionWake(ctx, "run-9", 77, "woke")
+	logger.logTransitionMerge(ctx, "run-9", 77, "attempt")
+	logger.logTransitionDeliveryClaim(ctx, "run-9", 77, true)
+	logger.logTransitionParentNotify(ctx, "run-9", 77, "notified")
 
 	cases := []struct {
 		message string
