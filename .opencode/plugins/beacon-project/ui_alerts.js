@@ -160,7 +160,9 @@ export function checksSummary(checks = []) {
   if (!list.length) return ""
   const passed = list.filter((c) => str(c?.state).toLowerCase() === "success").length
   const failed = list.length - passed
-  const total = list.reduce((n, c) => n + (Number(c?.durationSeconds) || 0), 0)
-  const duration = total > 0 ? ` · ${clockDuration(total)}` : ""
+  // GitHub runs required checks in parallel. Their durations overlap, so the
+  // longest job, not their sum, is the honest CI time to show in the header.
+  const longest = list.reduce((max, c) => Math.max(max, Number(c?.durationSeconds) || 0), 0)
+  const duration = longest > 0 ? ` · longest ${clockDuration(longest)}` : ""
   return failed ? `${failed} failed · ${passed}/${list.length}` : `${passed}/${list.length}${duration}`
 }

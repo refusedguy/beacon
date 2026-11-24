@@ -6,10 +6,11 @@ import { createBox, createLineMount, createText } from "./ui_nodes.js"
 export const CARD_PANEL_NAME = "beacon.card"
 export const CARD_LINES = CARD_BODY_LINES + 8
 const fieldKey = (text) => text.padEnd(10, " ")
+export const cardRelativePath = (card) => card?.relativePath || `docs/tasks/${card?.id}.md`
 
 export function fixPrompt(card) {
   if (!card) return ""
-  return `Fix ${card.id}: ${card.title} in ${card.path}. Scope: ${card.scope}. Depends: ${card.depends}.`
+  return `Fix ${card.id}: ${card.title} in ${cardRelativePath(card)}. Scope: ${card.scope}. Depends: ${card.depends}.`
 }
 
 export function cardModel(card) {
@@ -23,7 +24,7 @@ export function cardModel(card) {
   meta("Priority", card.priority)
   meta("Status", card.status)
   meta("Depends", card.depends)
-  meta("Path", card.path)
+  meta("Path", cardRelativePath(card))
   rows.push({ marker: "", name: "", status: "", color: "muted", kind: "card-divider" })
   for (const line of card.body.split(/\r?\n/)) rows.push({
     marker: "", name: line, status: "", color: "muted", kind: "card-body",
@@ -37,7 +38,7 @@ const COPY_LABEL = Object.freeze({
 
 export function createCardMount(ui, deps) {
   const { insert } = ui
-  const { color, BOLD, onCopy, setProp } = deps
+  const { color, BOLD, onCopy, onClose, setProp } = deps
   const set = setProp ?? ((node, key, value) => { node.props[key] = value })
   const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
 
@@ -46,8 +47,16 @@ export function createCardMount(ui, deps) {
   })
   const title = createText(ui, { content: "Task card", fg: color("action"), bold: true })
   set(title, "attributes", BOLD)
-  const hint = createText(ui, { content: "read-only", fg: color("muted") })
-  insert(header, title); insert(header, hint)
+  const controls = createBox(ui, { flexDirection: "row", minWidth: 0, flexShrink: 0 })
+  const hint = createText(ui, { content: "ctrl+g", fg: color("action"), onMouseUp: onClose })
+  set(hint, "paddingLeft", 1); set(hint, "paddingRight", 1)
+  const readonly = createText(ui, { content: "read-only", fg: color("muted") })
+  set(readonly, "paddingLeft", 1); set(readonly, "paddingRight", 1)
+  const gap = createText(ui, { content: " ", fg: color("muted") })
+  const close = createText(ui, { content: "✕", fg: color("error"), onMouseUp: onClose })
+  set(close, "paddingLeft", 1); set(close, "paddingRight", 1)
+  insert(controls, hint); insert(controls, readonly); insert(controls, gap); insert(controls, close)
+  insert(header, title); insert(header, controls)
   insert(container, header)
 
   // A bordered, padded card holds the full metadata and body. Body cells are
@@ -55,10 +64,10 @@ export function createCardMount(ui, deps) {
   const plate = createBox(ui, {
     border: true, borderStyle: "rounded", borderColor: color("action"),
     backgroundColor: color("panel"), paddingLeft: 1, paddingRight: 1,
-    paddingTop: 1, paddingBottom: 1, marginTop: 1, flexShrink: 0,
+    paddingTop: 1, paddingBottom: 1, marginTop: 1,
     flexDirection: "column", minWidth: 0,
   })
-  const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0 })
+  const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0, minHeight: 0 })
   const body = createLineMount(ui, { ...deps, maxLines: CARD_LINES, wrap: true })
   body.node.forEach((node) => insert(scroll, node))
   insert(plate, scroll)

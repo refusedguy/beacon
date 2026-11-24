@@ -62,6 +62,7 @@ async function setup({ queue = [], extra = {}, files = cardDeps, copied = [], co
   const renderers = Object.create(null)
   const toasts = []
   const opened = []
+  const closed = []
   const rpc = {
     snapshot: async () => ({ active: [], recent: [], queue, ...extra }),
     control: async () => ({ ok: true }),
@@ -81,7 +82,7 @@ async function setup({ queue = [], extra = {}, files = cardDeps, copied = [], co
     ui: {
       toast: { show: (item) => toasts.push(item) },
       slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
-      panel: { open: (name) => opened.push(name), close: () => {} },
+      panel: { open: (name) => opened.push(name), close: () => closed.push(true) },
     },
     keymap: { layer: () => () => {} },
   }
@@ -97,7 +98,7 @@ async function setup({ queue = [], extra = {}, files = cardDeps, copied = [], co
     cardDeps: files,
   })
   await new Promise((resolve) => setImmediate(resolve))
-  return { renderers, toasts, opened, created, copied, dispose }
+  return { renderers, toasts, opened, closed, created, copied, dispose }
 }
 
 test("a stable zero-value base incident raises no banner", () => {
@@ -136,10 +137,11 @@ test("clicking a Queue row opens the full read-only card", async () => {
   const content = texts(card)
   for (const expected of [
     "A very long human readable card title", "T-42", "7", "available",
-    "T-40", "/p/docs/tasks/T-42.md", "Goal: a short goal.", "Steps: do the work.",
+    "T-40", "docs/tasks/T-42.md", "Goal: a short goal.", "Steps: do the work.",
   ]) {
     assert.ok(content.includes(expected), `card view missing ${expected}`)
   }
+  assert.equal(content.some((line) => line.startsWith("/p/")), false, "no absolute path in the card")
   h.dispose()
 
   const other = await setup({ queue: [{ id: "T-42", status: "ready" }] })
@@ -200,7 +202,8 @@ test("card copy buttons write the exact text and report honest results", async (
   assert.equal(h.toasts.at(-1).variant, "success")
 
   findText(panel, "⧉ Copy path").props.onMouseUp()
-  assert.equal(copied[1], card.path)
+  assert.equal(copied[1], "docs/tasks/T-42.md")
+  assert.equal(copied[1], card.relativePath)
   assert.match(h.toasts.at(-1).message, /^Copied path /)
 
   findText(panel, "⧉ Copy fix prompt").props.onMouseUp()
@@ -217,4 +220,17 @@ test("card copy buttons write the exact text and report honest results", async (
   assert.equal(refused.toasts.at(-1).variant, "warning")
   h.dispose()
   refused.dispose()
+})
+
+test("the card header offers the detail panel controls and both close the panel", async () => {
+  const h = await setup({ queue: [{ id: "T-42", status: "ready" }] })
+  const sidebar = h.renderers["sidebar.content"]()
+  findItem(sidebar, (item) => item.action === "card:T-42").props.onMouseDown()
+  const panel = h.renderers["session.panel"]({ name: CARD_PANEL_NAME })
+  assert.ok(findText(panel, "ctrl+g"), "the ctrl+g hint is visible on the card")
+  assert.ok(findText(panel, "read-only"), "read-only stays visible")
+  findText(panel, "ctrl+g").props.onMouseUp()
+  findText(panel, "✕").props.onMouseUp()
+  assert.equal(h.closed.length, 2, "both header controls close the panel")
+  h.dispose()
 })

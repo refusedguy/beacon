@@ -74,7 +74,7 @@ export const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(ru
 export function phaseLabel(run, now = Date.now()) {
   const d = run.durations ?? {}
   const state = str(run.state).toLowerCase()
-  const phase = state === "waiting_ci" ? ["ci", d.waitingCI]
+  const phase = state === "waiting_ci" ? ["CI wait", d.waitingCI]
     : state === "blocked" ? ["block", d.blocked]
       : state === "running" ? ["run", d.running] : null
   if (phase && Number(phase[1]) > 0) return `${phase[0]} ${elapsed(Number(phase[1]) * 1000)}`
@@ -243,7 +243,7 @@ export function detailActions(run) {
 }
 function phaseSummary(run) {
   const d = run.durations ?? {}
-  return `Run ${shortTaskID(run.id)} · Coding ${elapsed((d.running ?? 0) * 1000)} · CI ${elapsed((d.waitingCI ?? 0) * 1000)} · Blocked ${elapsed((d.blocked ?? 0) * 1000)}`
+  return `Run ${shortTaskID(run.id)} · Coding ${elapsed((d.running ?? 0) * 1000)} · CI wait ${elapsed((d.waitingCI ?? 0) * 1000)} · Blocked ${elapsed((d.blocked ?? 0) * 1000)}`
 }
 export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_OPEN) {
   if (!run) return {

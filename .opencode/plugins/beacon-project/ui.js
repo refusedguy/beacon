@@ -24,7 +24,7 @@ import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
 import { createDetailMount } from "./ui_detail_view.js"
 import { clipboardCopier, createActionRunner } from "./ui_actions.js"
-import { CARD_PANEL_NAME, cardModel, createCardMount, fixPrompt } from "./ui_card_view.js"
+import { CARD_PANEL_NAME, cardModel, cardRelativePath, createCardMount, fixPrompt } from "./ui_card_view.js"
 import { createRunChangeBridge } from "./ui_bridge.js"
 import { projectRoot } from "./location.js"
 import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
@@ -180,7 +180,10 @@ async function setup(ctx, deps = {}) {
     const card = currentCard
     if (!card) return false
     if (kind === "id") return copyText(card.id, `ID ${card.id}`)
-    if (kind === "path") return copyText(card.path, `path ${card.path}`)
+    if (kind === "path") {
+      const path = cardRelativePath(card)
+      return copyText(path, `path ${path}`)
+    }
     if (kind === "fix") return copyText(fixPrompt(card), "fix prompt")
     return false
   }
@@ -212,7 +215,7 @@ async function setup(ctx, deps = {}) {
         color, BOLD, onItem: handleSidebarItem, onCard: showCard, hoverBg: theme.background.raised.high,
       })
     } else if (key === "card") {
-      entry = createCardMount(ui, { color, BOLD, onCopy: copyCard, setProp })
+      entry = createCardMount(ui, { color, BOLD, onCopy: copyCard, onClose: closePanel, setProp })
     } else if (key === "footer") {
       const footer = createBox(ui, { flexDirection: "column", minWidth: 0 })
       const mount = createLineMount(ui, { color, BOLD, maxLines: FOOTER_ROWS })
