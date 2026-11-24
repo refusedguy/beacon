@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
@@ -272,11 +274,16 @@ func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) 
 
 func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, error) {
 	parent = firstNonEmpty(parent, cfg.Harness.ParentSessionID)
-	switch cfg.Harness.Provider {
+	switch strings.ToLower(cfg.Harness.Provider) {
 	case "opencode", "":
 		h := opencode.New(cfg.Harness.Endpoint, cfg.Harness.Model, cfg.Harness.Command, token, parent)
 		h.ModelRef = h.ResolveModel(parent)
 		return h, nil
+	case "acp":
+		if strings.TrimSpace(cfg.Harness.Command) == "" {
+			return nil, fmt.Errorf("acp harness requires command")
+		}
+		return acp.New(cfg.Harness.Command, cfg.Harness.Model, parent), nil
 	default:
 		return harness.New(harness.Config{
 			Provider: cfg.Harness.Provider, Command: cfg.Harness.Command,
@@ -285,12 +292,19 @@ func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, err
 	}
 }
 
-// resolveModel builds a harness from config and asks it for the model ref.
-// The resolution logic lives on the harness so a second harness can provide
-// its own. config_watch.go still calls this helper for a reload snapshot.
+// resolveModel builds the configured harness and asks it for a model ref. The
+// resolution logic lives on the harness, so a provider without the resolver
+// port simply has no model to resolve. config_watch.go calls this for reloads.
 func resolveModel(cfg config.Config, token, parent string) map[string]string {
-	h := opencode.New(cfg.Harness.Endpoint, cfg.Harness.Model, cfg.Harness.Command, token, parent)
-	return h.ResolveModel(parent)
+	h, err := newHarness(cfg, token, parent)
+	if err != nil {
+		return nil
+	}
+	resolver := modelResolverFrom(h)
+	if resolver == nil {
+		return nil
+	}
+	return resolver(parent)
 }
 
 // setHarnessRepo points a harness that keeps a project registry at this repo.
