@@ -148,6 +148,19 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// modelRef returns the resolved model as a Model.Ref object. OpenCode child
+// sessions do not inherit the parent session's model, so the model must be
+// supplied when the session is created. A bare model id is not a valid ref.
+func (h *Harness) modelRef() map[string]string {
+	if len(h.ModelRef) > 0 {
+		return h.ModelRef
+	}
+	if h.Model != "" {
+		return map[string]string{"providerID": "opencode", "id": h.Model}
+	}
+	return nil
+}
+
 func messageID(prefix string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
@@ -235,11 +248,6 @@ func (h *Harness) prompt(ctx context.Context, session, text, id string) error {
 		"delivery": "steer",
 		"resume":   true,
 	}
-	if len(h.ModelRef) > 0 {
-		body["model"] = h.ModelRef
-	} else if h.Model != "" {
-		body["model"] = map[string]string{"providerID": "opencode", "id": h.Model}
-	}
 	_, status, err := h.do(ctx, http.MethodPost, path, body)
 	if status == http.StatusConflict {
 		return nil
@@ -294,8 +302,8 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	if agent := firstNonEmpty(strings.TrimSpace(req.Task.WorkerAgent), h.Agent); agent != "" {
 		body["agent"] = agent
 	}
-	if h.Model != "" {
-		body["model"] = h.Model
+	if ref := h.modelRef(); ref != nil {
+		body["model"] = ref
 	}
 	data, _, err := h.do(ctx, http.MethodPost, "/api/session", body)
 	if err != nil {

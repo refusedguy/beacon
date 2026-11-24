@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -345,5 +346,76 @@ func TestStopAndIsAlive(t *testing.T) {
 	alive, err = h.IsAlive(context.Background(), "missing")
 	if err != nil || alive {
 		t.Fatalf("IsAlive(missing) = %v, %v", alive, err)
+	}
+}
+
+// TestSpawnCreatesOneSessionWithResolvedModel records every session create and
+// model switch. A prompt that carries a model makes the fake server spin up a
+// second, model-less session, the failure observed in the smoke test.
+func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
+	var mu sync.Mutex
+	var sessions, prompts []map[string]any
+	var models []struct {
+		path string
+		body map[string]any
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			body := decodeBody(r)
+			mu.Lock()
+			sessions = append(sessions, body)
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"id":"ses_worker"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/model"):
+			body := decodeBody(r)
+			mu.Lock()
+			models = append(models, struct {
+				path string
+				body map[string]any
+			}{r.URL.Path, body})
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			body := decodeBody(r)
+			mu.Lock()
+			prompts = append(prompts, body)
+			if _, ok := body["model"]; ok {
+				sessions = append(sessions, map[string]any{"model": nil})
+			}
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	ref := map[string]any{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
+	h := New(srv.URL, "", "worker", "ses_parent")
+	h.ModelRef = map[string]string{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
+	sess, err := h.Spawn(context.Background(), testSpawnRequest())
+	if err != nil || sess.ID != "ses_worker" {
+		t.Fatalf("Spawn = %q, %v", sess.ID, err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("session creates = %d, want 1: %v", len(sessions), sessions)
+	}
+	created := sessions[0]
+	if got := created["model"]; !reflect.DeepEqual(got, ref) {
+		t.Errorf("session model = %v, want %v", got, ref)
+	}
+	if created["parentID"] != "ses_parent" {
+		t.Errorf("parentID = %v, want ses_parent", created["parentID"])
+	}
+	if len(models) != 1 || models[0].path != "/api/session/ses_worker/model" {
+		t.Fatalf("model switches = %v, want one on ses_worker", models)
+	}
+	if !reflect.DeepEqual(models[0].body["model"], ref) {
+		t.Errorf("model switch body = %v, want %v", models[0].body, ref)
+	}
+	if len(prompts) != 1 || prompts[0]["model"] != nil {
+		t.Errorf("prompt must not carry a model: %v", prompts)
 	}
 }
