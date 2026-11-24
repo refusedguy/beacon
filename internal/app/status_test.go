@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -139,5 +140,65 @@ func TestReconcileServiceTickWithoutReconciler(t *testing.T) {
 	got := (&ReconcileService{}).Tick(context.Background(), 5)
 	if got.Error != "reconciler is not configured" {
 		t.Fatalf("error = %q", got.Error)
+	}
+}
+
+func TestMakeRunSnapshotMapsChecksWithoutSCM(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	start := now.Add(-time.Minute)
+	run := core.NewRun("run-checks", "T-CHECK", now)
+	run.Checks = []core.CheckResult{
+		{Name: "build", State: core.CheckSuccess, StartedAt: start, CompletedAt: start.Add(28 * time.Second)},
+		{Name: "lint", State: core.CheckPending},
+	}
+	got := makeRunSnapshot(run, nil, nil, now)
+	if len(got.Checks) != 2 {
+		t.Fatalf("checks = %+v", got.Checks)
+	}
+	if got.Checks[0].Name != "build" || got.Checks[0].State != "success" || got.Checks[0].DurationSeconds != 28 {
+		t.Fatalf("first check = %+v", got.Checks[0])
+	}
+	if got.Checks[1].Name != "lint" || got.Checks[1].State != "pending" || got.Checks[1].DurationSeconds != 0 {
+		t.Fatalf("second check = %+v", got.Checks[1])
+	}
+}
+
+func TestRunSnapshotJSONChecksContract(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	run := core.NewRun("run-checks", "T-CHECK", now)
+	got := makeRunSnapshot(run, nil, nil, now)
+	if got.Checks == nil || len(got.Checks) != 0 {
+		t.Fatalf("old run checks = %+v, want empty array", got.Checks)
+	}
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Checks []struct {
+			Name            string `json:"name"`
+			State           string `json:"state"`
+			DurationSeconds int64  `json:"duration_seconds"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Checks == nil || len(decoded.Checks) != 0 {
+		t.Fatalf("json checks = %+v, want []", decoded.Checks)
+	}
+
+	run.Checks = []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
+	b, err = json.Marshal(makeRunSnapshot(run, nil, nil, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Checks) != 1 || decoded.Checks[0].Name != "ci" ||
+		decoded.Checks[0].State != "failure" || decoded.Checks[0].DurationSeconds != 0 {
+		t.Fatalf("json checks = %+v", decoded.Checks)
 	}
 }

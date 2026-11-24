@@ -156,6 +156,7 @@ WHERE r.updated_at > r.created_at
 // databases keep their rows.
 var runMigrationColumns = []struct{ name, ddl string }{
 	{"observed_base_sha", "observed_base_sha TEXT NOT NULL DEFAULT ''"},
+	{"checks_json", "checks_json TEXT NOT NULL DEFAULT '[]'"},
 }
 
 func ensureRunColumns(db *sql.DB) error {

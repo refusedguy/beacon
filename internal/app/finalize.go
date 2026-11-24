@@ -240,7 +240,11 @@ func (r *Reconciler) finalizeExternal(ctx context.Context, run *core.Run, obs co
 	if obs.HeadSHA != "" {
 		run.HeadSHA = obs.HeadSHA
 	}
-	run.Reason = "pull request " + obs.PRState
+	if merged {
+		run.Reason = fmt.Sprintf("merged PR #%d via squash", obs.PRNumber)
+	} else {
+		run.Reason = "pull request " + obs.PRState
+	}
 	run.UpdatedAt = time.Now().UTC()
 	if err := r.Store.Save(ctx, run); err != nil {
 		return err
