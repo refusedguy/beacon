@@ -109,7 +109,7 @@ test("a base incident banner is clickable and opens its fixer run", async () => 
   h.dispose()
 })
 
-test("queue lists ready and waiting tasks and Dispatch counts the ready ones", () => {
+test("queue shows a full title, a compact state line and short clickable dependencies", () => {
   const snap = {
     active: [], recent: [],
     queue: [
@@ -120,14 +120,40 @@ test("queue lists ready and waiting tasks and Dispatch counts the ready ones", (
   const open = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true })
   const lines = open.listItems.map((i) => [i.marker, i.name, i.status].filter(Boolean).join(" "))
   assert.ok(lines.includes("▼ Queue 2"))
-  assert.ok(lines.includes("○ Ready task ready · P9"))
-  assert.ok(lines.includes("◌ Blocked task blocked by T-2 · P2"))
+  assert.ok(lines.includes("○ Ready task"), "line one keeps the title")
+  assert.ok(lines.includes("ready · P9 · 0 deps"), "line two carries state, priority and count")
+  assert.ok(lines.includes("◌ Blocked task"), "a blocked card still shows its title")
+  assert.ok(lines.includes("blocked · P2 · 1 dep"))
+  assert.ok(lines.includes("↳ T-2"), "the dependency is short and on its own clickable row")
+  assert.equal(lines.some((line) => line.includes("blocked by")), false)
+  const dep = open.listItems.find((i) => i.kind === "queue-dep")
+  assert.equal(dep.action, "card:T-2")
   assert.ok(lines.includes("▶ Dispatch (1 ready)"))
   assert.equal(open.ready, 1)
 
   const collapsed = sidebarModel(snap, null, NOW, { active: true, queue: false, recent: true })
   assert.equal(collapsed.listItems.some((i) => i.name === "Ready task"), false, "the queue starts collapsed")
   assert.equal(collapsed.listItems.some((i) => i.action === "dispatch"), true, "Dispatch stays available")
+})
+
+test("epic and child queue rows carry distinct markers and keep their link", () => {
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      { id: "T-EPIC", title: "Harness epic", priority: 9, status: "ready", kind: "epic", depends_on: ["T-EPIC-01"] },
+      { id: "T-EPIC-01", title: "Child card", priority: 8, status: "waiting_deps", depends_on: ["T-BLOCK"] },
+    ],
+  }
+  const open = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true })
+  const epic = open.listItems.find((i) => i.kind === "queue-title" && i.cardID === "T-EPIC")
+  const child = open.listItems.find((i) => i.kind === "queue-title" && i.cardID === "T-EPIC-01")
+  assert.equal(epic.marker, "◆")
+  assert.equal(epic.name, "Harness epic")
+  assert.equal(epic.status, "EPIC")
+  assert.equal(child.marker, "└")
+  assert.equal(child.name, "Child card")
+  assert.ok(open.listItems.some((i) => i.name === "child · blocked · P8 · 1 dep"))
+  assert.equal(open.listItems.find((i) => i.kind === "queue-dep" && i.name === "T-BLOCK").depID, "T-BLOCK")
 })
 
 test("detail shows the fixer badge, next step, Session and the new buttons", async () => {

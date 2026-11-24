@@ -6,8 +6,9 @@ import {
 } from "./ui_model.js"
 import {
   baseIncidentItem, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, nextStepLine, queueLineItems, readyCount, timelineText, truncate,
+  dispatchItem, nextStepLine, queueLineItems, readyCount, shortTaskID, timelineText, truncate,
 } from "./ui_alerts.js"
+export { shortTaskID }
 
 export const STATE_BAR_WIDTH = 30
 // If the host font lacks U+2501, switch FILLED to █ here. Nothing else needs
@@ -48,10 +49,6 @@ export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "pr", "
 // the end with an explicit ellipsis. Detail text keeps its full width.
 export const SIDEBAR_TITLE_WIDTH = 29
 export const truncateSidebarTitle = (value) => truncate(value, SIDEBAR_TITLE_WIDTH)
-export function shortTaskID(value) {
-  const id = str(value)
-  return id ? (id.length > 10 ? id.slice(-8) : id) : "-"
-}
 export function elapsed(ms) {
   if (!Number.isFinite(ms) || ms < 0) return ""
   const s = Math.floor(ms / 1000)

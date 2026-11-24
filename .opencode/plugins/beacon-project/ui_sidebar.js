@@ -24,8 +24,8 @@ export function sidebarPresentation(items = []) {
       const isSection = Boolean(item.sectionKey)
       return {
         ...item,
-        nameColor: isDispatch ? "success" : isSection ? "action" : "muted",
-        nameBold: false,
+        nameColor: item.nameColor ?? (isDispatch ? "success" : isSection ? "action" : "muted"),
+        nameBold: item.nameBold ?? false,
         markerColor: item.color ?? "muted",
         statusColor: "muted",
       }
