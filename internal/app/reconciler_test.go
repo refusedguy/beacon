@@ -1063,3 +1063,98 @@ func TestReconcilePersistsObservedChecks(t *testing.T) {
 		t.Fatalf("duration = %d, want 28", got.Checks[0].DurationSeconds())
 	}
 }
+
+func TestApplyAndSaveRecordsBothSHAsFromExplicitObservation(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name     string
+		obs      core.Observation
+		wantHead string
+		wantBase string
+	}{
+		{
+			name:     "head and base",
+			obs:      core.Observation{HeadSHA: "head-1", BaseSHA: "base-1"},
+			wantHead: "head-1", wantBase: "base-1",
+		},
+		{
+			name:     "replaced head keeps the new base",
+			obs:      core.Observation{HeadSHA: "head-2", BaseSHA: "base-2"},
+			wantHead: "head-2", wantBase: "base-2",
+		},
+		{
+			name:     "zero observation leaves the pair unchanged",
+			obs:      core.Observation{},
+			wantHead: "old-head", wantBase: "old-base",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			run := makeRun("r-obs", 42, core.RunWaitingCI)
+			run.ObservedSHA = "old-head"
+			run.ObservedBaseSHA = "old-base"
+			if err := store.Save(ctx, run); err != nil {
+				t.Fatal(err)
+			}
+			r := &Reconciler{Store: store}
+			e := core.Event{Kind: core.EvChecksPending, HeadSHA: tc.obs.HeadSHA}
+			if err := r.applyAndSave(ctx, run, e, tc.obs); err != nil {
+				t.Fatal(err)
+			}
+			got := store.runs[run.ID]
+			if got.ObservedSHA != tc.wantHead || got.ObservedBaseSHA != tc.wantBase {
+				t.Fatalf("observed pair = %q/%q, want %q/%q",
+					got.ObservedSHA, got.ObservedBaseSHA, tc.wantHead, tc.wantBase)
+			}
+		})
+	}
+}
+
+func TestObservationCallSitesPreserveBothSHAs(t *testing.T) {
+	ctx := context.Background()
+	const baseSHA = "base-2"
+	cases := []struct {
+		name     string
+		verdict  core.Verdict
+		obs      core.Observation
+		breakSCM bool
+		wantHead string
+	}{
+		{
+			name:     "rebase failure records observed head and base",
+			verdict:  core.VerdictNeedsRebase,
+			obs:      core.Observation{PRNumber: 42, HeadSHA: "sha2", BaseSHA: baseSHA, PRState: "open", Behind: true},
+			breakSCM: true,
+			wantHead: "sha2",
+		},
+		{
+			name:     "rebase success records new head and observed base",
+			verdict:  core.VerdictNeedsRebase,
+			obs:      core.Observation{PRNumber: 42, HeadSHA: "sha2", BaseSHA: baseSHA, PRState: "open", Behind: true},
+			wantHead: "new-sha2",
+		},
+		{
+			name:     "wake records observed head and base",
+			verdict:  core.VerdictNeedsAgentFix,
+			obs:      core.Observation{PRNumber: 42, HeadSHA: "sha2", BaseSHA: baseSHA, PRState: "open", FailureExcerpt: "boom"},
+			wantHead: "sha2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, store, scm, _, _ := newReconciler(t, tc.verdict, tc.obs)
+			if tc.breakSCM {
+				scm.updateErr = errors.New("rebase conflict")
+			}
+			if _, err := r.Reconcile(ctx, 42); err != nil {
+				t.Fatal(err)
+			}
+			got := store.runs["r1"]
+			if got.ObservedSHA != tc.wantHead || got.ObservedBaseSHA != baseSHA {
+				t.Fatalf("observed pair = %q/%q, want %q/%q",
+					got.ObservedSHA, got.ObservedBaseSHA, tc.wantHead, baseSHA)
+			}
+		})
+	}
+}

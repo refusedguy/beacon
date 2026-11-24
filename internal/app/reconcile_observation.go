@@ -70,7 +70,7 @@ func (r *Reconciler) handleNeedsRebase(
 		return decision, nil
 	}
 	if run.State == core.RunWaitingCI || run.State == core.RunRunning {
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBehind, Reason: decision.Reason}); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBehind, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}
 	}
@@ -87,7 +87,7 @@ func (r *Reconciler) greenButBehind(
 ) (core.MergeDecision, error) {
 	if run.State == core.RunNeedsAgentFix {
 		run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
-		return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksPassed, HeadSHA: obs.HeadSHA})
+		return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksPassed, HeadSHA: obs.HeadSHA}, obs)
 	}
 	mergeable := obs
 	mergeable.Behind = false
@@ -98,13 +98,13 @@ func (r *Reconciler) greenButBehind(
 	if run.State == core.RunNeedsRebase || run.State == core.RunRunning {
 		run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
 		if run.State == core.RunNeedsRebase && !run.CanRebase() {
-			return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase attempts exhausted"})
+			return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase attempts exhausted"}, obs)
 		}
 		kind := core.EvChecksPassed
 		if run.State == core.RunNeedsRebase {
 			kind = core.EvRebased
 		}
-		return decision, r.applyAndSave(ctx, run, core.Event{Kind: kind, HeadSHA: obs.HeadSHA, Reason: "base green"})
+		return decision, r.applyAndSave(ctx, run, core.Event{Kind: kind, HeadSHA: obs.HeadSHA, Reason: "base green"}, obs)
 	}
 	return decision, nil
 }
@@ -119,7 +119,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 		return decision, nil
 	}
 	if run.State == core.RunWaitingCI || run.State == core.RunRunning {
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksFailed, Reason: decision.Reason}); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksFailed, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}
 	}
@@ -141,7 +141,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 
 func (r *Reconciler) handleBlocked(ctx context.Context, run *core.Run, decision core.MergeDecision) (core.MergeDecision, error) {
 	if run.State != core.RunBlocked {
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}
 	}
