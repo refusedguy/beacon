@@ -170,6 +170,8 @@ type RunSnapshot struct {
 	HeadSHA           string          `json:"head_sha"`
 	Branch            string          `json:"branch"`
 	SessionID         string          `json:"session_id,omitempty"`
+	LaunchSource      string          `json:"launch_source,omitempty"`
+	AgentIdentity     string          `json:"agent_identity,omitempty"`
 	IsFixer           bool            `json:"is_fixer,omitempty"`
 	BlockedIncidentID string          `json:"blocked_incident_id,omitempty"`
 	Reason            string          `json:"reason"`
@@ -191,6 +193,7 @@ type Metrics struct {
 	DispatchCycles int            `json:"dispatch_cycles"`
 	SkipCount      int            `json:"skip_count"`
 	Skips          map[string]int `json:"skips"`
+	LaunchSources  map[string]int `json:"launch_sources"`
 	RebaseCount    int            `json:"rebase_count"`
 	FixCount       int            `json:"fix_count"`
 	MergeCount     int            `json:"merge_count"`
@@ -472,6 +475,7 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		ID: string(run.ID), TaskID: string(run.TaskID), State: string(run.State),
 		PR: run.PRNumber, PRURL: link, HeadSHA: run.HeadSHA, Branch: run.Branch,
 		SessionID: run.SessionID, IsFixer: run.IsFixer,
+		LaunchSource: string(run.LaunchSource), AgentIdentity: run.AgentIdentity,
 		BlockedIncidentID: run.BlockedIncidentID, Reason: run.Reason,
 		RebaseAttempts: run.RebaseAttempts, FixAttempts: run.FixAttempts,
 		MaxAttempts: run.MaxAttempts, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
@@ -549,10 +553,11 @@ func makeMetrics(
 	counts []DecisionCount,
 	now time.Time,
 ) Metrics {
-	m := Metrics{Skips: map[string]int{}, Blocked: map[string]int{}}
+	m := Metrics{Skips: map[string]int{}, Blocked: map[string]int{}, LaunchSources: map[string]int{}}
 	merged := make(map[string]bool)
 	blocked := make(map[string]bool)
 	addRunMetrics(&m, active, recent, timeline, merged, blocked, now)
+	addLaunchMetrics(&m, active, recent)
 	for _, events := range timeline {
 		for _, event := range events {
 			if event.Kind == "merged" {
@@ -605,6 +610,20 @@ func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][
 	}
 	m.ActiveCount = len(active)
 	m.RecentCount = len(recent)
+}
+
+// addLaunchMetrics counts runs by the path that started them. A run with no
+// recorded source came from an automatic path, so it counts as daemon.
+func addLaunchMetrics(m *Metrics, active, recent []*core.Run) {
+	if m.LaunchSources == nil {
+		m.LaunchSources = map[string]int{}
+	}
+	for _, group := range [][]*core.Run{active, recent} {
+		for _, run := range group {
+			source := core.ParseLaunchSource(string(run.LaunchSource))
+			m.LaunchSources[string(source)]++
+		}
+	}
 }
 
 func addDecisionMetrics(m *Metrics, histories map[string][]Decision, merged, blocked map[string]bool) {

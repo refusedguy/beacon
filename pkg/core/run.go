@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,34 @@ const (
 func (s RunState) Terminal() bool { return s == RunMerged || s == RunClosed }
 
 func (s RunState) ActiveAgent() bool { return s == RunRunning || s == RunNeedsAgentFix }
+
+// LaunchSource names the path that started a run. It describes the caller, not
+// a credential, so it is safe to serialize in snapshots and metrics.
+type LaunchSource string
+
+const (
+	LaunchMCP    LaunchSource = "mcp"
+	LaunchCLI    LaunchSource = "cli"
+	LaunchUI     LaunchSource = "ui"
+	LaunchDaemon LaunchSource = "daemon"
+)
+
+// ParseLaunchSource accepts a source token from MCP metadata, the CLI
+// environment or an automatic path. Unknown and empty values resolve to
+// daemon, the automatic path, so a caller cannot inject arbitrary labels into
+// metrics.
+func ParseLaunchSource(raw string) LaunchSource {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(LaunchMCP), "opencode":
+		return LaunchMCP
+	case string(LaunchCLI):
+		return LaunchCLI
+	case string(LaunchUI), "tui":
+		return LaunchUI
+	default:
+		return LaunchDaemon
+	}
+}
 
 type EventKind string
 
@@ -69,6 +98,8 @@ type Run struct {
 	ObservedBaseSHA   string
 	SessionID         string
 	ParentSessionID   string
+	AgentIdentity     string
+	LaunchSource      LaunchSource
 	WorkspacePath     string
 	Branch            string
 	Scope             []ScopePath
@@ -85,6 +116,14 @@ type Run struct {
 
 func NewRun(id RunID, task TaskID, now time.Time) *Run {
 	return &Run{ID: id, TaskID: task, State: RunPending, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
+}
+
+// RecordLaunch attaches the caller to a run. The parent session keeps the
+// orchestrator session; the agent name records who launched the run. Tokens
+// have no place here.
+func (r *Run) RecordLaunch(source LaunchSource, agent string) {
+	r.LaunchSource = ParseLaunchSource(string(source))
+	r.AgentIdentity = strings.TrimSpace(agent)
 }
 
 func (r *Run) CanRebase() bool { return r.RebaseAttempts < r.effectiveMax() }
