@@ -8,7 +8,7 @@ try {
 }
 
 import { projectRoot } from "./location.js"
-import { registerBeaconMcp } from "./mcp.js"
+import { noopMcpRegistration, registerBeaconMcp } from "./mcp.js"
 import { installProjectContext } from "./context.js"
 import {
   pluginOptions, pollIntervalMs, snapshotLimits,
@@ -155,6 +155,54 @@ export function guardMode(config = {}, env = process.env) {
   return config.shellGuard
 }
 
+// Workers inherit the pooled MCP daemon from the parent session. The agent may
+// be named "worker" or a project variant such as "beacon-worker".
+export function isWorkerAgent(agent) {
+  return typeof agent === "string" && agent.trim().toLowerCase().includes("worker")
+}
+
+// OpenCode does not hand a session ID to plugin setup. Read the agent from a
+// context hint first, then from the newest session through the session domain.
+// This mirrors context.js's eventAgent/resolvedAgent lookup without a hook
+// event. An unknown agent falls back to registering, which is the safe path.
+export async function currentSessionAgent(ctx) {
+  if (!ctx || typeof ctx !== "object") return null
+  const direct = eventAgent(ctx)
+  if (direct) return direct
+
+  const sessionID = ctx.sessionID ?? ctx.session?.id ?? ctx.session?.sessionID
+  if (typeof sessionID === "string" && sessionID && typeof ctx.session?.get === "function") {
+    try {
+      const info = await ctx.session.get({ sessionID })
+      const data = info?.data ?? info
+      return eventAgent(data) ?? (typeof data?.agent === "string" ? data.agent : null)
+    } catch {}
+  }
+
+  if (typeof ctx.session?.list === "function") {
+    try {
+      const listed = await ctx.session.list({ order: "desc", limit: 1 })
+      const sessions = Array.isArray(listed) ? listed : listed?.data ?? []
+      const data = sessions[0]
+      if (data) return eventAgent(data) ?? (typeof data.agent === "string" ? data.agent : null)
+    } catch {}
+  }
+  return null
+}
+
+// Resolve once. Workers get a no-op so no command resolution runs and no config
+// is registered. Every other agent keeps the registration behavior as it was.
+export async function resolveMcpRegistration(ctx, root, { agent } = {}) {
+  const resolved = agent ?? (await currentSessionAgent(ctx))
+  const options = ctx?.options && typeof ctx.options === "object" ? ctx.options : {}
+  if (isWorkerAgent(resolved)) {
+    return typeof options.noopMcpRegistration === "function"
+      ? options.noopMcpRegistration()
+      : noopMcpRegistration()
+  }
+  return registerBeaconMcp(ctx, root, options.mcpDeps ?? {})
+}
+
 export async function registerShellGuard(ctx, config = {}, env = process.env) {
   if (typeof ctx?.tool?.hook !== "function") return null
   const mode = guardMode(config, env)
@@ -218,20 +266,28 @@ export const beaconProject = Plugin.define({
 
     // Config values may arrive under options or the full config object.
     const options = pluginOptions(ctx)
+    const agent = await currentSessionAgent(ctx)
+    const isWorker = isWorkerAgent(agent)
 
-    // Record the server config for the operator's manual attach. This does not
-    // register an MCP server with OpenCode, so no daemon starts per session.
-    const mcp = await registerBeaconMcp(ctx, root)
+    // Record the server config for the operator's manual attach. No daemon
+    // starts per session. A worker skips this because it already inherits the
+    // parent's pooled connection and re-registering reconnects the operator's
+    // TUI. The no-op keeps the cleanup path identical.
+    const mcp = await resolveMcpRegistration(ctx, root, { agent })
     const context = await installProjectContext(ctx, root, options)
     const guard = await registerShellGuard(ctx, options)
 
-    // One CLI snapshot feeds every panel. The handler normalizes the same
-    // shape the TUI source uses, so old fields stay available to both.
-    const limits = snapshotLimits(options)
-    const statusSource = createCliStatusSource({ root, limits })
-    const panelEnabled = statusPanelEnabled(options)
+    // The status panel and its watcher are for the operator's TUI. Building
+    // their source in a worker would resolve the MCP command through
+    // CliStatusSource and start a new poll loop, so workers get neither.
+    const panelEnabled = !isWorker && statusPanelEnabled(options)
     let statusRpc = null
+    let watcher = null
     if (panelEnabled && typeof ctx.rpc?.register === "function") {
+      // One CLI snapshot feeds every panel. The handler normalizes the same
+      // shape the TUI source uses, so old fields stay available to both.
+      const limits = snapshotLimits(options)
+      const statusSource = createCliStatusSource({ root, limits })
       try {
         statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
           snapshot: async (input) => normalizeSnapshot(await statusSource.snapshot(input ?? limits)),
@@ -241,21 +297,21 @@ export const beaconProject = Plugin.define({
       } catch (error) {
         console.warn(`beacon status panel: RPC registration failed: ${error.message}`)
       }
-    }
 
-    const pollMs = pollIntervalMs(options.statusPollMs)
-    const watcher = statusRpc && watcherEnabled(options) && pollMs > 0
-      ? createRunChangeWatcher(statusSource, {
-        emit: (change) => statusRpc.events?.emit?.(RUN_CHANGED_EVENT, change),
-        deps: { intervalMs: pollMs },
-      }) : null
-    watcher?.start()
+      const pollMs = pollIntervalMs(options.statusPollMs)
+      watcher = statusRpc && watcherEnabled(options) && pollMs > 0
+        ? createRunChangeWatcher(statusSource, {
+          emit: (change) => statusRpc.events?.emit?.(RUN_CHANGED_EVENT, change),
+          deps: { intervalMs: pollMs },
+        }) : null
+      watcher?.start()
+    }
 
     return async () => {
       watcher?.stop()
       await guard?.dispose?.()
       await context?.()
-      await mcp?.registration?.dispose?.()
+      await mcp?.dispose?.()
       await statusRpc?.dispose?.()
     }
   },

@@ -7,6 +7,7 @@ import { delimiter, join } from "node:path"
 import {
   beaconCommand,
   beaconServerConfig,
+  noopMcpRegistration,
   registeredBeaconConfig,
   registerBeaconMcp,
   BEACON_SERVER,
@@ -322,4 +323,25 @@ test("server config carries the project root and enables the server", () => {
   assert.equal(config.environment[BEACON_PROJECT_ROOT_ENV], ROOT)
   assert.equal(config.disabled, false)
   assert.throws(() => beaconServerConfig("", deps), /project root is required/)
+})
+
+test("a deps override for beaconCommand is used instead of probing the filesystem", () => {
+  const calls = []
+  const override = (root) => { calls.push(root); return ["/bin/beacon", "mcp"] }
+  const config = beaconServerConfig(ROOT, { beaconCommand: override })
+
+  assert.deepEqual(calls, [ROOT])
+  assert.deepEqual(config.command, ["/bin/beacon", "mcp"])
+})
+
+test("a no-op registration disposes once and registers no config", async () => {
+  const registration = noopMcpRegistration()
+
+  assert.equal(registration.server, BEACON_SERVER)
+  assert.equal(registration.config, null)
+  assert.equal(registration.disposed, false)
+  await registration.dispose()
+  await registration.dispose()
+  assert.equal(registration.disposed, true)
+  assert.equal(registeredBeaconConfig(ROOT), null)
 })
