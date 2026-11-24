@@ -1,15 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/refusedguy/beacon/internal/infra/config"
+	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
 type initFlags struct {
@@ -18,6 +22,27 @@ type initFlags struct {
 	taskSource      string
 	scm             string
 	harness         string
+	harnessEndpoint string
+	pluginDir       string
+	force           bool
+	nonInteractive  bool
+	yes             bool
+	weakPC          bool
+	weakPCSet       bool
+	skipPlugin      bool
+}
+
+type initOptions struct {
+	taskSource      string
+	scm             string
+	harness         string
+	endpoint        string
+	maxInFlight     int
+	maxActiveAgents int
+	weakPC          bool
+	skipPlugin      bool
+	pluginDir       string
+	nonInteractive  bool
 	force           bool
 }
 
@@ -25,18 +50,51 @@ func newInitCommand() *cobra.Command {
 	f := &initFlags{}
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Create .beacon/config.yaml from the git remote",
+		Short: "Set up Beacon in any git project",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			f.weakPCSet = cmd.Flags().Changed("weak-pc")
 			return runInit(f)
 		},
 	}
-	cmd.Flags().IntVar(&f.maxInFlight, "max-in-flight", 20, "maximum unfinished runs")
-	cmd.Flags().IntVar(&f.maxActiveAgents, "max-active-agents", 4, "maximum active agent sessions")
-	cmd.Flags().StringVar(&f.taskSource, "task-source", "", "markdown, github_issues or gitlab_issues")
+	cmd.Flags().IntVar(&f.maxInFlight, "max-in-flight", 10, "maximum unfinished runs")
+	cmd.Flags().IntVar(&f.maxActiveAgents, "max-active-agents", 2, "maximum active agent sessions")
+	cmd.Flags().StringVar(&f.taskSource, "task-source", "markdown", "markdown, github_issues or gitlab_issues")
 	cmd.Flags().StringVar(&f.scm, "scm", "", "github or gitlab")
 	cmd.Flags().StringVar(&f.harness, "harness", "opencode", "opencode or cli")
+	cmd.Flags().StringVar(&f.harnessEndpoint, "harness-endpoint", "", "OpenCode HTTP endpoint")
+	cmd.Flags().StringVar(&f.pluginDir, "plugin-dir", "", "source directory for the project plugin")
 	cmd.Flags().BoolVar(&f.force, "force", false, "overwrite existing config")
+	cmd.Flags().BoolVar(&f.nonInteractive, "non-interactive", false, "use defaults without prompting")
+	cmd.Flags().BoolVar(&f.yes, "yes", false, "accept defaults without prompting")
+	cmd.Flags().BoolVar(&f.weakPC, "weak-pc", true, "use targeted test instructions for a weak PC")
+	cmd.Flags().BoolVar(&f.skipPlugin, "skip-plugin", false, "do not deploy the project plugin")
 	return cmd
+}
+
+func resolveInitOptions(f *initFlags) initOptions {
+	o := initOptions{
+		taskSource:      firstNonEmpty(f.taskSource, "markdown"),
+		scm:             f.scm,
+		harness:         firstNonEmpty(f.harness, "opencode"),
+		endpoint:        firstNonEmpty(f.harnessEndpoint, os.Getenv("OPENCODE_ENDPOINT"), os.Getenv("BEACON_OPENCODE_ENDPOINT"), "http://127.0.0.1:4096"),
+		maxInFlight:     f.maxInFlight,
+		maxActiveAgents: f.maxActiveAgents,
+		weakPC:          true,
+		skipPlugin:      f.skipPlugin,
+		pluginDir:       f.pluginDir,
+		nonInteractive:  f.nonInteractive || f.yes,
+		force:           f.force,
+	}
+	if o.maxInFlight <= 0 {
+		o.maxInFlight = 10
+	}
+	if o.maxActiveAgents <= 0 {
+		o.maxActiveAgents = 2
+	}
+	if f.weakPCSet {
+		o.weakPC = f.weakPC
+	}
+	return o
 }
 
 type remote struct {
@@ -96,60 +154,350 @@ func gitOutput(args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func runInit(f *initFlags) error {
+func detectRemoteAndBase() (remote, string, error) {
 	r, err := parseRemote(gitOutput("remote", "get-url", "origin"))
 	if err != nil {
-		return err
+		return remote{}, "", err
 	}
-	base := gitOutput("rev-parse", "--abbrev-ref", "origin/HEAD")
-	base = strings.TrimPrefix(base, "origin/")
+	base := strings.TrimPrefix(gitOutput("rev-parse", "--abbrev-ref", "origin/HEAD"), "origin/")
 	if base == "" || base == "origin/HEAD" {
 		base = "main"
 	}
-	source := f.taskSource
-	if source == "" {
-		source = "github_issues"
-		if r.provider == "gitlab" {
-			source = "gitlab_issues"
+	return r, base, nil
+}
+
+func stdinIsTTY() bool {
+	info, err := os.Stdin.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func confirmInit(out io.Writer, in io.Reader, r remote, base string) (bool, error) {
+	_, _ = fmt.Fprintf(out, "Configure Beacon for %s/%s (base %s)? [Y/n] ", r.owner, r.repo, base)
+	var answer string
+	if _, err := fmt.Fscanln(in, &answer); err != nil {
+		if err == io.EOF {
+			return true, nil
+		}
+		return false, err
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "" || answer == "y" || answer == "yes", nil
+}
+
+func runInit(f *initFlags) error {
+	root, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	opts := resolveInitOptions(f)
+	r, base, err := detectRemoteAndBase()
+	if err != nil {
+		return err
+	}
+	if !opts.nonInteractive && stdinIsTTY() {
+		ok, err := confirmInit(os.Stdout, os.Stdin, r, base)
+		if err != nil || !ok {
+			return err
 		}
 	}
-	provider := f.scm
-	if provider == "" {
-		provider = r.provider
+	cfg := buildInitConfig(root, opts, r, base)
+	fmt.Printf("Detected required checks: %v (review merge.required_checks)\n", cfg.Merge.RequiredChecks)
+	if err := writeInitArtifacts(root, cfg, opts); err != nil {
+		return err
 	}
+	printHandoff(os.Stdout, r)
+	return nil
+}
+
+func buildInitConfig(root string, o initOptions, r remote, base string) config.Config {
+	provider := firstNonEmpty(o.scm, r.provider)
 	tokenEnv := "GITHUB_TOKEN"
 	baseURL := ""
 	if provider == "gitlab" {
 		tokenEnv = "GITLAB_TOKEN"
-		if r.host != "gitlab.com" {
-			baseURL = "https://" + r.host + "/api/v4"
-		} else {
-			baseURL = "https://gitlab.com/api/v4"
-		}
+		baseURL = gitlabAPI(r.host)
 	}
-	cfg := config.Config{
+	stack := detectStack(root)
+	return config.Config{
 		StateDB:      ".beacon/state.db",
 		WorkspaceDir: ".beacon/worktrees",
 		BaseBranch:   base,
 		PollInterval: "30s",
 		Concurrency: config.Concurrency{
-			MaxInFlight: f.maxInFlight, MaxActiveAgents: f.maxActiveAgents,
+			MaxInFlight: o.maxInFlight, MaxActiveAgents: o.maxActiveAgents,
 		},
-		TaskSource: config.TaskSource{Provider: source, Dir: "docs/tasks", Owner: r.owner, Repo: r.repo, TokenEnv: tokenEnv},
-		SCM:        config.SCM{Provider: provider, Owner: r.owner, Repo: r.repo, TokenEnv: tokenEnv, BaseURL: baseURL},
-		Harness:    config.Harness{Provider: f.harness, Endpoint: "http://127.0.0.1:4096"},
-		Merge:      config.Merge{RequiredChecks: []string{}, RequiredApprovals: 0, Labels: []string{}, CommandGate: "", AutoRebase: true, MaxAttempts: 12},
-		OnBaseRed:  config.OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
+		TaskSource: config.TaskSource{
+			Provider: o.taskSource, Dir: "docs/tasks", Owner: r.owner, Repo: r.repo, TokenEnv: tokenEnv,
+		},
+		SCM: config.SCM{
+			Provider: provider, Owner: r.owner, Repo: r.repo, TokenEnv: tokenEnv, BaseURL: baseURL,
+		},
+		Harness: config.Harness{
+			Provider: o.harness, Endpoint: o.endpoint, Command: "worker",
+			WorkerInstructions: stack.workerInstructions(o.weakPC),
+		},
+		Merge:     config.Merge{RequiredChecks: detectRequiredChecks(root), MaxAttempts: 12, AutoRebase: true, Labels: []string{}},
+		OnBaseRed: config.OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
-	path := ".beacon/config.yaml"
-	if err := config.WriteDefault(path, cfg, f.force); err != nil {
+}
+
+func gitlabAPI(host string) string {
+	if host == "" || host == "gitlab.com" {
+		return "https://gitlab.com/api/v4"
+	}
+	return "https://" + host + "/api/v4"
+}
+
+func writeInitArtifacts(root string, cfg config.Config, o initOptions) error {
+	path := filepath.Join(root, ".beacon", "config.yaml")
+	if err := config.WriteDefault(path, cfg, o.force); err != nil {
 		return err
 	}
-	if err := appendGitignore(".gitignore"); err != nil {
+	if err := ensureTasksDir(root); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s for %s/%s (%s)\n", path, r.owner, r.repo, provider)
+	if err := appendGitignore(filepath.Join(root, ".gitignore")); err != nil {
+		return err
+	}
+	if err := mergeOpenCodeConfig(root); err != nil {
+		return err
+	}
+	return deployPlugin(root, o)
+}
+
+func ensureTasksDir(root string) error {
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, ".gitkeep")
+	if existsIn(dir, ".gitkeep") {
+		return nil
+	}
+	return os.WriteFile(path, nil, 0o644)
+}
+
+type stackInfo struct {
+	kind     string
+	targeted string
+}
+
+func (s stackInfo) workerInstructions(weakPC bool) string {
+	if !weakPC {
+		return "Run the full test suite, the full build and the repository linters before reporting done."
+	}
+	return s.targeted
+}
+
+func detectStack(root string) stackInfo {
+	if existsIn(root, "go.mod") {
+		return stackInfo{"go", "Worker environment: weak PC. Run targeted tests only for the packages you changed (for example, go test ./internal/app). Leave full go test ./..., go build ./... and repo linters to CI."}
+	}
+	if existsIn(root, "package.json") {
+		return stackInfo{"node", "Worker environment: weak PC. Run targeted tests only for the files you changed; do not run a full npm run build. Leave full builds and repo linters to CI."}
+	}
+	if existsIn(root, "pyproject.toml") || existsIn(root, "requirements.txt") {
+		return stackInfo{"python", "Worker environment: weak PC. Run targeted tests only for the files you changed (for example, pytest path/to/test.py). Leave the full suite and repo linters to CI."}
+	}
+	if existsIn(root, "Cargo.toml") {
+		return stackInfo{"rust", "Worker environment: weak PC. Run targeted tests only for the module you changed (for example, cargo test <module>). Leave the full suite and repo linters to CI."}
+	}
+	if hasMarker(root, "*.sln") || hasMarker(root, "*.csproj") {
+		return stackInfo{"dotnet", "Worker environment: weak PC. Run targeted tests only for the project you changed (for example, dotnet test path/to/project.csproj). Leave the full suite and repo linters to CI."}
+	}
+	return stackInfo{"generic", config.DefaultWorkerInstructions}
+}
+
+func existsIn(root, name string) bool {
+	_, err := os.Stat(filepath.Join(root, name))
+	return err == nil
+}
+
+func hasMarker(root, pattern string) bool {
+	matches, err := filepath.Glob(filepath.Join(root, pattern))
+	return err == nil && len(matches) > 0
+}
+
+func detectRequiredChecks(root string) []string {
+	files, err := filepath.Glob(filepath.Join(root, ".github", "workflows", "*.y*ml"))
+	if err != nil {
+		return []string{}
+	}
+	seen := make(map[string]bool)
+	for _, file := range files {
+		if data, err := os.ReadFile(file); err == nil {
+			for _, name := range parseJobNames(string(data)) {
+				seen[name] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func parseJobNames(content string) []string {
+	var names []string
+	inJobs := false
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "jobs:") {
+			inJobs = true
+			continue
+		}
+		if !inJobs {
+			continue
+		}
+		if line != "" && !strings.HasPrefix(line, " ") {
+			break
+		}
+		if !strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "    ") {
+			continue
+		}
+		name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && name != "" && !strings.HasPrefix(name, "#") {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func mergeOpenCodeConfig(root string) error {
+	path := filepath.Join(root, "opencode.json")
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if os.IsNotExist(err) {
+		data = []byte("{}")
+	}
+	var doc map[string]any
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		return fmt.Errorf("opencode.json: %w", err)
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+	gen := beaconmcp.GeneratedPermissions(beaconmcp.ToolCatalog())
+	agents, _ := doc["agents"].(map[string]any)
+	if agents == nil {
+		agents = map[string]any{}
+		doc["agents"] = agents
+	}
+	for name, role := range roleDefinitions(gen) {
+		agent, ok := agents[name].(map[string]any)
+		if !ok {
+			agent = map[string]any{"description": role.description}
+			if role.mode != "" {
+				agent["mode"] = role.mode
+			}
+		}
+		agent["permissions"] = beaconmcp.MergePermissions(agent["permissions"], role.perms)
+		agents[name] = agent
+	}
+	doc["permissions"] = beaconmcp.MergePermissions(doc["permissions"], gen.Global)
+	mergeMCPServer(doc, root)
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(out, '\n'), 0o644)
+}
+
+type roleDefinition struct {
+	description string
+	mode        string
+	perms       []beaconmcp.Permission
+}
+
+func roleDefinitions(gen beaconmcp.PermissionSet) map[string]roleDefinition {
+	return map[string]roleDefinition{
+		"orchestrator": {"Creates and dispatches Beacon tasks.", "all", gen.Allow},
+		"build":        {"Default coding agent allowed to manage Beacon tasks.", "", gen.Allow},
+		"worker":       {"Executes one Beacon task in its own worktree.", "subagent", gen.Deny},
+	}
+}
+
+func mergeMCPServer(doc map[string]any, root string) {
+	mcpMap, _ := doc["mcp"].(map[string]any)
+	if mcpMap == nil {
+		mcpMap = map[string]any{}
+		doc["mcp"] = mcpMap
+	}
+	server, _ := mcpMap["beacon"].(map[string]any)
+	if server == nil {
+		server = map[string]any{}
+	}
+	server["type"] = "local"
+	server["command"] = []any{"beacon", "mcp"}
+	server["environment"] = map[string]any{"BEACON_PROJECT_ROOT": root}
+	server["pool"] = true
+	mcpMap["beacon"] = server
+}
+
+func pluginSource(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if fromEnv := os.Getenv("BEACON_PLUGIN_DIR"); fromEnv != "" {
+		return fromEnv
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	candidate := filepath.Clean(filepath.Join(filepath.Dir(exe), "..", "..", ".opencode", "plugins", "beacon-project"))
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		return candidate
+	}
+	return ""
+}
+
+func deployPlugin(root string, o initOptions) error {
+	if o.skipPlugin {
+		return nil
+	}
+	src := pluginSource(o.pluginDir)
+	if src == "" {
+		fmt.Fprintln(os.Stderr, "warning: no plugin source found; pass --plugin-dir to install the project plugin")
+		return nil
+	}
+	info, err := os.Stat(src)
+	if err != nil || !info.IsDir() {
+		fmt.Fprintln(os.Stderr, "warning: plugin source is not a directory; pass --plugin-dir")
+		return nil
+	}
+	dst := filepath.Join(root, ".opencode", "plugins", "beacon-project")
+	if err := copyTree(src, dst); err != nil {
+		return err
+	}
+	fmt.Printf("installed project plugin from %s\n", src)
 	return nil
+}
+
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
 }
 
 func appendGitignore(path string) error {
@@ -158,6 +506,8 @@ func appendGitignore(path string) error {
 		".beacon/worktrees/",
 		".beacon/connection.json",
 		".beacon/*.lock",
+		".beacon/daemon*",
+		".beacon/config.yaml",
 	}
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -185,4 +535,12 @@ func appendGitignore(path string) error {
 		return err
 	}
 	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+func printHandoff(out io.Writer, r remote) {
+	_, _ = fmt.Fprintln(out, "\nBeacon setup complete. Next steps:")
+	_, _ = fmt.Fprintln(out, "  1. Export GITHUB_TOKEN (or GITLAB_TOKEN) and BEACON_OPENCODE_TOKEN if needed.")
+	_, _ = fmt.Fprintln(out, "  2. Run `beacon doctor` and fix any FAIL lines.")
+	_, _ = fmt.Fprintln(out, "  3. Restart OpenCode so it loads the new opencode.json and plugin.")
+	_, _ = fmt.Fprintf(out, "  4. Dispatch the first task with beacon_dispatch (repo %s/%s).\n", r.owner, r.repo)
 }

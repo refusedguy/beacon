@@ -317,6 +317,7 @@ func main() {
 	configPath := root.PersistentFlags().String("config", "", "path to config.yaml")
 
 	root.AddCommand(newInitCommand())
+	root.AddCommand(newDoctorCommand(configPath))
 	root.AddCommand(newDispatchCommand(configPath))
 	root.AddCommand(newStatusCommand(configPath))
 	root.AddCommand(newControlCommand(configPath))
