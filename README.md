@@ -166,3 +166,7 @@ go test ./...
 ```
 
 The lint job checks `gofmt -l cmd internal pkg harnesses ui arch_test.go` and runs golangci-lint v2.15. The advisory job runs `bash scripts/ci-advisory.sh`.
+
+## Notes and decisions
+
+Some Beacon behavior is surprising until you know the reason. `docs/decisions/` records those cases, what caused them, and the options that were considered. Start with [parent session notification delivery](docs/decisions/0001-parent-notify-delivery.md) if a merge notice reaches the chat late.
