@@ -298,14 +298,7 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	decisionLimit := s.DecisionsLimit
-	if decisionLimit <= 0 {
-		decisionLimit = DefaultDecisionsLimit
-	}
-	orphanLimit := s.OrphanDecisionsLimit
-	if orphanLimit <= 0 {
-		orphanLimit = DefaultOrphanDecisionsLimit
-	}
+	decisionLimit, orphanLimit := snapshotDecisionLimits(s)
 	decisions, err := s.Store.ListDecisions(ctx, ids, decisionLimit, orphanLimit)
 	if err != nil {
 		return nil, err
@@ -344,6 +337,18 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 		out.Recent = append(out.Recent, makeRunSnapshot(run, timeline, histories, now, s.Repo))
 	}
 	return out, nil
+}
+
+func snapshotDecisionLimits(s SnapshotService) (int, int) {
+	decisionLimit := s.DecisionsLimit
+	if decisionLimit <= 0 {
+		decisionLimit = DefaultDecisionsLimit
+	}
+	orphanLimit := s.OrphanDecisionsLimit
+	if orphanLimit <= 0 {
+		orphanLimit = DefaultOrphanDecisionsLimit
+	}
+	return decisionLimit, orphanLimit
 }
 
 func readQueue(ctx context.Context, store SnapshotStore) ([]QueueTask, error) {
