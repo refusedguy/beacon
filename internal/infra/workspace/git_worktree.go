@@ -109,6 +109,7 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 		if _, err := g.run(ctx, "worktree", "remove", path); err != nil {
 			return core.Workspace{}, err
 		}
+		g.refresh(ctx)
 	} else if !os.IsNotExist(err) {
 		return core.Workspace{}, err
 	}
@@ -121,6 +122,7 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	mergeBase, err := g.run(ctx, "merge-base", "origin/"+base, branch)
 	if err != nil {
 		_, _ = g.run(ctx, "worktree", "remove", path)
+		g.refresh(ctx)
 		return core.Workspace{}, err
 	}
 	return core.Workspace{Path: path, Branch: branch, Base: strings.TrimSpace(mergeBase)}, nil
@@ -229,6 +231,9 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	if ws.Path == "" {
 		return nil
 	}
+	// The editor can hold a stale row even when git refuses to remove the
+	// worktree. Defer the refresh so a failed removal still cleans it up.
+	defer g.refresh(ctx)
 	// A directory removed outside this method is not dirty. It still needs the
 	// editor registration refreshed, so skip the clean check but keep going.
 	clean := true
@@ -247,7 +252,6 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	if _, err := g.run(ctx, "worktree", "remove", ws.Path); err != nil {
 		return err
 	}
-	g.refresh(ctx)
 	if ws.Branch != "" {
 		_, _ = g.run(ctx, "branch", "-d", ws.Branch)
 	}
@@ -255,12 +259,10 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 }
 
 func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error {
+	defer g.refresh(ctx)
 	_, err := g.run(ctx, "worktree", "remove", "--force", ws.Path)
-	if err == nil {
-		g.refresh(ctx)
-		if ws.Branch != "" {
-			_, _ = g.run(ctx, "branch", "-D", ws.Branch)
-		}
+	if err == nil && ws.Branch != "" {
+		_, _ = g.run(ctx, "branch", "-D", ws.Branch)
 	}
 	return err
 }

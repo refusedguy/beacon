@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -347,7 +348,7 @@ func canonicalPath(path string) string {
 }
 
 // RefreshWorktrees removes stale OpenCode worktree rows for the configured
-// repo. A missing project or a rejected refresh means there is nothing to do.
+// repo, then tells the live editor to drop the locations it has cached.
 func (h *Harness) RefreshWorktrees(ctx context.Context) error {
 	if h.Repo == "" {
 		return nil
@@ -363,16 +364,26 @@ func (h *Harness) RefreshWorktrees(ctx context.Context) error {
 	if err := json.Unmarshal(data, &projects); err != nil {
 		return err
 	}
+	repo := canonicalPath(h.Repo)
 	for _, p := range projects {
-		if canonicalPath(p.Canonical) != canonicalPath(h.Repo) {
+		if canonicalPath(p.Canonical) != repo {
 			continue
 		}
 		_, status, err := h.do(ctx, http.MethodPost, "/api/worktree/refresh", map[string]string{"projectID": p.ID})
 		if status == http.StatusBadRequest || status == http.StatusNotFound {
+			slog.Warn("worktree refresh rejected", "status", status, "project", p.ID)
 			return nil
 		}
-		return err
+		if err != nil {
+			slog.Warn("worktree refresh POST failed", "error", err, "project", p.ID)
+			return err
+		}
+		if _, _, err := h.do(ctx, http.MethodPost, "/api/location/reload", nil); err != nil {
+			slog.Warn("worktree location reload failed", "error", err)
+		}
+		return nil
 	}
+	slog.Warn("worktree refresh: no project matches repo", "repo", h.Repo)
 	return nil
 }
 
