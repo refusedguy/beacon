@@ -258,6 +258,32 @@ test("status source uses RPC for snapshot, control and dispatch and falls back w
   assert.deepEqual(cliCalls, [["/bin/beacon", "status", "--snapshot"]])
 })
 
+test("an unverified root keeps every queue card instead of filtering them all", async () => {
+  const rpc = { snapshot: async () => ({ active: [], recent: [], queue: [{ id: "T-A" }, { id: "T-B" }] }) }
+  const source = createStatusSource({ client: { rpc: () => rpc } }, {})
+  const snap = await source.snapshot()
+  assert.equal(source.verified(), false)
+  assert.deepEqual(snap.queue.map((q) => q.id), ["T-A", "T-B"])
+})
+
+test("a late location verifies the root and drops only missing or done cards", async () => {
+  const root = "/work/project"
+  const files = {
+    [`${root}/docs/tasks/T-A.md`]: "---\ntitle: Alpha\nstatus: todo\n---\n",
+    [`${root}/docs/tasks/T-B.md`]: "---\ntitle: Beta\nstatus: done\n---\n",
+  }
+  const deps = { existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p] }
+  const rpc = { snapshot: async () => ({ active: [], recent: [], queue: [{ id: "T-A" }, { id: "T-B" }, { id: "T-GONE" }] }) }
+  const ctx = { client: { rpc: () => rpc } }
+  const source = createStatusSource(ctx, { deps })
+  assert.equal((await source.snapshot()).queue.length, 3, "no verified root keeps all cards")
+  ctx.location = { project: { canonical: root } }
+  const snap = await source.snapshot()
+  assert.equal(source.verified(), true)
+  assert.equal(source.root(), root)
+  assert.deepEqual(snap.queue.map((q) => q.id), ["T-A"])
+})
+
 test("RPC definition validates snapshot, control and dispatch shapes", () => {
   const { snapshot, control, dispatch } = BeaconStatusRpc.methods
   assert.equal(BeaconStatusRpc.id, "beacon.project.status")

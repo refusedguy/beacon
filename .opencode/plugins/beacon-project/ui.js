@@ -80,7 +80,7 @@ async function setup(ctx, deps = {}) {
   ])
   let BOLD = 0
   try { ({ TextAttributes: { BOLD } } = await load("@opentui/core")) } catch {}
-  const root = deps.root ?? projectRoot(ctx) ?? process.cwd()
+  const root = deps.root ?? projectRoot(ctx)
   const { sessionID, model } = await sessionIdentity(ctx)
   const source = createStatusSource(ctx, {
     root, limits: snapshotLimits(options), deps: deps.cardDeps ?? {}, sessionID, model,
@@ -167,7 +167,8 @@ async function setup(ctx, deps = {}) {
     ctx.ui.panel.open(PANEL_NAME)
   }
   function showCard(id, { push = false } = {}) {
-    const card = readCard(root, id, deps.cardDeps ?? {})
+    const cardRoot = source.root()
+    const card = cardRoot ? readCard(cardRoot, id, deps.cardDeps ?? {}) : null
     if (!card) {
       ctx.ui?.toast?.show?.({ message: `Card ${id} is not available on disk`, variant: "warning" })
       return
@@ -267,27 +268,25 @@ async function setup(ctx, deps = {}) {
     if (stopped) return
     if (inFlight) { pending = true; return }
     inFlight = true
+    let rendered = false
     try {
       const next = await source.snapshot()
       if (stopped) return
-      const snap = next ?? EMPTY_SNAPSHOT
-      // A snapshot taken during an outage may miss transitions. Skip toasts
-      // until a later, confirmed poll reports them.
-      if (!stale) notify(snap)
-      setSnapshot(snap)
+      // An empty cwd snapshot is not a baseline. A snapshot taken during an
+      // outage may miss transitions, so toasts wait for a confirmed poll.
+      const empty = !next || (!next.active?.length && !next.recent?.length && !next.queue?.length)
+      if (next != null && !(empty && !source.verified())) { if (!stale) notify(next); setSnapshot(next); rendered = true }
       failures = 0
       stale = false
       setError(null)
     } catch (cause) {
       if (stopped) return
       failures += 1
-      if (failures >= 2) {
-        stale = true
-        setError(cleanErrorMessage(cause))
-      }
+      if (failures >= 2) { stale = true; setError(cleanErrorMessage(cause)) }
+      rendered = true
     }
     finally { inFlight = false }
-    if (!stopped) applyAll()
+    if (rendered && !stopped) applyAll()
     if (pending && !stopped) { pending = false; void refresh() }
   }
   let rpc = null
