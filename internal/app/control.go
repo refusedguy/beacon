@@ -121,25 +121,73 @@ func (c *Control) Approve(ctx context.Context, id core.RunID, sha string) error 
 	return nil
 }
 
-// Retry re-arms an exhausted run by resetting attempt counters once.
+// Retry re-arms an exhausted run or a closed run that has no replacement.
+// Blocked runs reset their attempt counters and return to waiting_ci. Closed
+// runs keep their PR when they have one, otherwise they return to pending so
+// the dispatcher can spawn a fresh worker.
 func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 	run, err := c.get(ctx, id)
 	if err != nil {
 		return err
 	}
-	if run.State != core.RunBlocked {
-		return core.Errorf(core.CodeConflict, "run %s is not blocked", id)
-	}
-	run.RebaseAttempts = 0
-	run.FixAttempts = 0
-	if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "retried by operator"}); err != nil {
-		return err
+	switch run.State {
+	case core.RunBlocked:
+		run.RebaseAttempts = 0
+		run.FixAttempts = 0
+		if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "retried by operator"}); err != nil {
+			return err
+		}
+	case core.RunClosed:
+		if err := c.retryClosed(ctx, run); err != nil {
+			return err
+		}
+	default:
+		return core.Errorf(core.CodeConflict, "run %s is not blocked or closed", id)
 	}
 	if err := c.Store.Save(ctx, run); err != nil {
 		return err
 	}
 	c.signal(run)
 	return nil
+}
+
+func (c *Control) retryClosed(ctx context.Context, run *core.Run) error {
+	active, err := c.Store.FindActiveByTask(ctx, run.TaskID)
+	if err != nil {
+		return err
+	}
+	if active != nil && active.ID != run.ID {
+		return core.Errorf(core.CodeConflict, "task %s already has active run %s", run.TaskID, active.ID)
+	}
+	if err := run.Retry("retried by operator"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Nudge sends operator guidance to the live session of an active run.
+func (c *Control) Nudge(ctx context.Context, id core.RunID, message string) error {
+	run, err := c.get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if run.State.Terminal() {
+		return core.Errorf(core.CodeConflict, "run %s is %s", id, run.State)
+	}
+	if run.SessionID == "" {
+		return core.Errorf(core.CodeConflict, "run %s has no session", id)
+	}
+	if message == "" {
+		return core.Errorf(core.CodeInvalidInput, "message is required")
+	}
+	if c.Harness == nil {
+		return core.Errorf(core.CodeConflict, "harness is not configured")
+	}
+	return c.Harness.Wake(ctx, run.SessionID, core.WakeContext{
+		RunID: run.ID, PRNumber: run.PRNumber, HeadSHA: run.HeadSHA,
+		Reason: "operator guidance", Excerpt: message,
+		Workspace: run.WorkspacePath, Branch: run.Branch,
+	})
 }
 
 func (c *Control) signal(run *core.Run) {

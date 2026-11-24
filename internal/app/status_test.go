@@ -163,6 +163,119 @@ func TestMakeRunSnapshotMapsChecksWithoutSCM(t *testing.T) {
 	}
 }
 
+func TestRunSnapshotCarriesSessionIncidentAndPRURL(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	run := core.NewRun("run-fields", "T-FIELDS", now)
+	run.State = core.RunBlocked
+	run.PRNumber = 42
+	run.SessionID = "sess-fields"
+	run.IsFixer = true
+	run.BlockedIncidentID = "inc-7"
+
+	got := makeRunSnapshot(run, nil, nil, now, "owner/repo")
+	if got.SessionID != "sess-fields" || !got.IsFixer || got.BlockedIncidentID != "inc-7" {
+		t.Fatalf("run fields = %+v", got)
+	}
+	if got.PRURL != "https://github.com/owner/repo/pull/42" {
+		t.Fatalf("pr url = %q", got.PRURL)
+	}
+	if link := prLink("owner/repo", 0); link != "" {
+		t.Fatalf("url without PR = %q", link)
+	}
+	if link := prLink("https://github.com/owner/repo", 42); link != "" {
+		t.Fatalf("url for non owner/repo = %q", link)
+	}
+}
+
+type snapshotStubStore struct {
+	active   []*core.Run
+	recent   []*core.Run
+	queue    []QueueTask
+	incident *core.BaseIncident
+}
+
+func (s *snapshotStubStore) ListActive(context.Context) ([]*core.Run, error) { return s.active, nil }
+func (s *snapshotStubStore) ListRecent(context.Context, int) ([]*core.Run, error) {
+	return s.recent, nil
+}
+func (s *snapshotStubStore) ListRunEvents(context.Context, []string) ([]RunEvent, error) {
+	return nil, nil
+}
+func (s *snapshotStubStore) ListDecisions(context.Context, []string, int, int) ([]Decision, error) {
+	return nil, nil
+}
+func (s *snapshotStubStore) DecisionCounts(context.Context, []string) ([]DecisionCount, error) {
+	return nil, nil
+}
+func (s *snapshotStubStore) ListQueueTasks(context.Context) ([]QueueTask, error) {
+	return s.queue, nil
+}
+func (s *snapshotStubStore) CurrentIncident(context.Context) (*core.BaseIncident, error) {
+	return s.incident, nil
+}
+
+func TestSnapshotCarriesQueueIncidentAndDaemon(t *testing.T) {
+	ctx := context.Background()
+	run := core.NewRun("run-snap", "T-SNAP", time.Now().UTC())
+	run.State = core.RunWaitingCI
+	run.PRNumber = 9
+	store := &snapshotStubStore{
+		active: []*core.Run{run},
+		queue: []QueueTask{
+			{ID: "T-1", Title: "ready card", Priority: 5},
+			{ID: "T-2", Title: "blocked card", Priority: 3, DependsOn: []string{"T-1"}, Waiting: true},
+		},
+		incident: &core.BaseIncident{
+			ID: "inc-1", BaseBranch: "main", FailedChecksJSON: `[{"name":"build"},{"name":"lint"}]`,
+			FixerRunID: "run-fixer", Attempts: 2,
+		},
+	}
+	daemon := &DaemonSnapshot{State: "alive", PID: 123, HeartbeatAgeSeconds: 1.5}
+	svc := SnapshotService{Store: store, Repo: "owner/repo", Daemon: daemon}
+
+	snap, err := svc.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Queue == nil || len(snap.Queue) != 2 {
+		t.Fatalf("queue = %+v, want two items", snap.Queue)
+	}
+	if snap.Queue[0].Status != "ready" || snap.Queue[0].DependsOn == nil {
+		t.Fatalf("first queue item = %+v", snap.Queue[0])
+	}
+	if snap.Queue[1].Status != "waiting_deps" || len(snap.Queue[1].DependsOn) != 1 {
+		t.Fatalf("second queue item = %+v", snap.Queue[1])
+	}
+	if snap.BaseIncident == nil || snap.BaseIncident.ID != "inc-1" ||
+		snap.BaseIncident.BaseBranch != "main" || len(snap.BaseIncident.FailedChecks) != 2 ||
+		snap.BaseIncident.FixerRunID != "run-fixer" || snap.BaseIncident.Attempts != 2 {
+		t.Fatalf("base incident = %+v", snap.BaseIncident)
+	}
+	if snap.Daemon != daemon || snap.Daemon.State != "alive" || snap.Daemon.PID != 123 {
+		t.Fatalf("daemon = %+v", snap.Daemon)
+	}
+	if len(snap.Active) != 1 || snap.Active[0].PRURL != "https://github.com/owner/repo/pull/9" {
+		t.Fatalf("active = %+v", snap.Active)
+	}
+}
+
+func TestSnapshotWithoutOptionalStoresStillHasNonNullCollections(t *testing.T) {
+	store := &snapshotStubStore{}
+	snap, err := (SnapshotService{Store: store}).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Queue == nil || len(snap.Queue) != 0 {
+		t.Fatalf("queue = %+v, want empty array", snap.Queue)
+	}
+	if snap.Daemon == nil || snap.Daemon.State != "absent" {
+		t.Fatalf("daemon = %+v, want absent", snap.Daemon)
+	}
+	if snap.BaseIncident != nil {
+		t.Fatalf("base incident = %+v, want nil without an open incident", snap.BaseIncident)
+	}
+}
+
 func TestRunSnapshotJSONChecksContract(t *testing.T) {
 	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
 	run := core.NewRun("run-checks", "T-CHECK", now)

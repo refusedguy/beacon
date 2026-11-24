@@ -38,6 +38,141 @@ func TestRetrySignalsReconciler(t *testing.T) {
 	}
 }
 
+func TestRetryClosedRunWithPRReturnsToWaitingCI(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := core.NewRun("r-closed-pr", "T-1", time.Now().UTC())
+	run.State = core.RunClosed
+	run.PRNumber = 42
+	run.SessionID = "sess-old"
+	run.WorkspacePath = "/ws/T-1"
+	run.Reason = "worker session exited without PR"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	var signals []int
+	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
+	if err := c.Retry(ctx, "r-closed-pr"); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r-closed-pr"]
+	if got.State != core.RunWaitingCI || got.PRNumber != 42 {
+		t.Fatalf("state=%s pr=%d, want waiting_ci/42", got.State, got.PRNumber)
+	}
+	if got.Reason != "retried by operator" {
+		t.Fatalf("reason = %q", got.Reason)
+	}
+	if len(signals) != 1 || signals[0] != 42 {
+		t.Fatalf("signals = %v, want [42]", signals)
+	}
+}
+
+func TestRetryClosedRunWithoutPRReturnsToPending(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := core.NewRun("r-closed-no-pr", "T-1", time.Now().UTC())
+	run.State = core.RunClosed
+	run.SessionID = "sess-old"
+	run.WorkspacePath = "/ws/T-1"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	var signals []int
+	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
+	if err := c.Retry(ctx, "r-closed-no-pr"); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r-closed-no-pr"]
+	if got.State != core.RunPending || got.SessionID != "" || got.WorkspacePath != "" {
+		t.Fatalf("run = %+v, want pending with cleared session and worktree", got)
+	}
+	if got.Reason != "retried by operator" {
+		t.Fatalf("reason = %q", got.Reason)
+	}
+	if len(signals) != 0 {
+		t.Fatalf("signals = %v, want none", signals)
+	}
+}
+
+func TestRetryClosedRunRejectsActiveSibling(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	closed := core.NewRun("r-closed", "T-1", time.Now().UTC())
+	closed.State = core.RunClosed
+	active := core.NewRun("r-active", "T-1", time.Now().UTC())
+	active.State = core.RunRunning
+	for _, run := range []*core.Run{closed, active} {
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &Control{Store: store}
+	err := c.Retry(ctx, "r-closed")
+	if core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("error = %v, want conflict", err)
+	}
+	if got := store.runs["r-closed"]; got.State != core.RunClosed {
+		t.Fatalf("state = %s, want closed", got.State)
+	}
+}
+
+func TestNudgeCallsWakeWithOperatorGuidance(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := core.NewRun("r-nudge", "T-1", time.Now().UTC())
+	run.State = core.RunWaitingCI
+	run.PRNumber = 42
+	run.HeadSHA = "sha42"
+	run.SessionID = "sess-nudge"
+	run.WorkspacePath = "/ws/T-1"
+	run.Branch = "beacon/T-1"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	h := &fakeHarness{}
+	c := &Control{Store: store, Harness: h}
+	if err := c.Nudge(ctx, "r-nudge", "please rebase first"); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.wakes) != 1 {
+		t.Fatalf("wakes = %+v, want one", h.wakes)
+	}
+	w := h.wakes[0]
+	if w.RunID != "r-nudge" || w.PRNumber != 42 || w.HeadSHA != "sha42" ||
+		w.Reason != "operator guidance" || w.Excerpt != "please rebase first" ||
+		w.Workspace != "/ws/T-1" || w.Branch != "beacon/T-1" {
+		t.Fatalf("wake = %+v", w)
+	}
+}
+
+func TestNudgeRejectsRunsWithoutLiveSession(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	terminal := core.NewRun("r-terminal", "T-1", time.Now().UTC())
+	terminal.State = core.RunClosed
+	terminal.SessionID = "sess-old"
+	noSession := core.NewRun("r-no-session", "T-2", time.Now().UTC())
+	noSession.State = core.RunRunning
+	for _, run := range []*core.Run{terminal, noSession} {
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &fakeHarness{}
+	c := &Control{Store: store, Harness: h}
+	if err := c.Nudge(ctx, "r-terminal", "hello"); core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("terminal error = %v, want conflict", err)
+	}
+	if err := c.Nudge(ctx, "r-no-session", "hello"); core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("no session error = %v, want conflict", err)
+	}
+	if len(h.wakes) != 0 {
+		t.Fatalf("wakes = %+v, want none", h.wakes)
+	}
+}
+
 func TestWatchPRBindsActiveRun(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()

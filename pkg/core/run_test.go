@@ -53,6 +53,37 @@ func TestRunRejectsInvalidAndExhausted(t *testing.T) {
 	}
 }
 
+func TestRetryClosedRunWithPRReturnsToWaitingCI(t *testing.T) {
+	r := &Run{ID: "r1", State: RunClosed, PRNumber: 42, Reason: "worker session exited",
+		SessionID: "sess", WorkspacePath: "/ws/T-1", FixAttempts: 2, RebaseAttempts: 1}
+	if err := r.Retry("retried by operator"); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != RunWaitingCI || r.PRNumber != 42 {
+		t.Fatalf("state=%s pr=%d, want waiting_ci/42", r.State, r.PRNumber)
+	}
+	if r.FixAttempts != 0 || r.RebaseAttempts != 0 || r.Reason != "retried by operator" {
+		t.Fatalf("run = %+v, want reset attempts and retry reason", r)
+	}
+}
+
+func TestRetryClosedRunWithoutPRReturnsToPending(t *testing.T) {
+	r := &Run{ID: "r2", State: RunClosed, SessionID: "sess", WorkspacePath: "/ws/T-2"}
+	if err := r.Retry("retried by operator"); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != RunPending || r.SessionID != "" || r.WorkspacePath != "" {
+		t.Fatalf("run = %+v, want pending with cleared session and worktree", r)
+	}
+}
+
+func TestRetryRejectsNonClosedRun(t *testing.T) {
+	r := &Run{ID: "r3", State: RunWaitingCI}
+	if err := r.Retry("retried by operator"); CodeOf(err) != CodeInvalidTransition {
+		t.Fatalf("error = %v, want invalid transition", err)
+	}
+}
+
 func TestObserveSHAIsIdempotent(t *testing.T) {
 	r := &Run{ID: "r1"}
 	if !r.ObserveSHA("abc") {

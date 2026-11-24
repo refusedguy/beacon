@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -33,6 +34,12 @@ type DecisionSink interface {
 	RecordDecision(ctx context.Context, d Decision) error
 }
 
+// DecisionLookup is an optional read side of a sink. A sink that implements it
+// lets repeated reconcile decisions be dropped instead of filling history.
+type DecisionLookup interface {
+	LastDecision(ctx context.Context, runID string) (*Decision, error)
+}
+
 var decisionCapture = struct {
 	sync.RWMutex
 	sink DecisionSink
@@ -54,12 +61,41 @@ func RecordDecision(ctx context.Context, d Decision) {
 	if sink == nil {
 		return
 	}
+	if d.Kind == "reconcile.decision" && d.RunID != "" && duplicateDecision(ctx, sink, d) {
+		slog.DebugContext(ctx, "decision.duplicate_skipped", "kind", d.Kind, "run_id", d.RunID)
+		return
+	}
 	if d.At.IsZero() {
 		d.At = time.Now().UTC()
 	}
 	if err := sink.RecordDecision(ctx, d); err != nil {
 		slog.WarnContext(ctx, "decision.persist_failed", "kind", d.Kind, "error", err)
 	}
+}
+
+// duplicateDecision compares a decision with the newest stored one for the
+// same run. Only reconcile decisions are deduplicated; every other kind is a
+// distinct event in a run's timeline.
+func duplicateDecision(ctx context.Context, sink DecisionSink, d Decision) bool {
+	lookup, ok := sink.(DecisionLookup)
+	if !ok {
+		return false
+	}
+	last, err := lookup.LastDecision(ctx, d.RunID)
+	if err != nil {
+		slog.WarnContext(ctx, "decision.last_lookup_failed", "run_id", d.RunID, "error", err)
+		return false
+	}
+	return last != nil && decisionSignature(*last) == decisionSignature(d)
+}
+
+// decisionSignature is the part of a reconcile decision that describes a real
+// change. Cycle IDs and timestamps are ignored so repeated polls stay equal.
+func decisionSignature(d Decision) string {
+	return strings.Join([]string{
+		d.Kind, d.Verdict, d.Action, d.Reason,
+		fmt.Sprint(d.Fields["head_sha"]), fmt.Sprint(d.Fields["state"]),
+	}, "\x00")
 }
 
 // shortLogReason keeps a log field scalar and bounded. Failure excerpts can be

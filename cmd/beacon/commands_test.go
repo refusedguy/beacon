@@ -15,10 +15,11 @@ import (
 )
 
 type fakeControl struct {
-	actions    []string
-	ids        []core.RunID
-	approveSHA string
-	err        error
+	actions       []string
+	ids           []core.RunID
+	approveSHA    string
+	nudgeMessages []string
+	err           error
 }
 
 func (f *fakeControl) Approve(_ context.Context, id core.RunID, sha string) error {
@@ -43,6 +44,13 @@ func (f *fakeControl) Cancel(_ context.Context, id core.RunID) error {
 func (f *fakeControl) Retry(_ context.Context, id core.RunID) error {
 	f.actions = append(f.actions, "retry")
 	f.ids = append(f.ids, id)
+	return f.err
+}
+
+func (f *fakeControl) Nudge(_ context.Context, id core.RunID, message string) error {
+	f.actions = append(f.actions, "nudge")
+	f.ids = append(f.ids, id)
+	f.nudgeMessages = append(f.nudgeMessages, message)
 	return f.err
 }
 
@@ -78,6 +86,77 @@ func TestApplyControlRoutesEveryAction(t *testing.T) {
 				t.Fatalf("approve sha = %q", ctrl.approveSHA)
 			}
 		})
+	}
+}
+
+func TestValidateControlRequiresNudgeMessage(t *testing.T) {
+	if err := validateControl("nudge", "r1", "follow the checklist"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateControl("nudge", "r1"); err == nil {
+		t.Fatal("nudge without a message was accepted")
+	}
+}
+
+func TestApplyControlForwardsNudgeMessage(t *testing.T) {
+	ctrl := &fakeControl{}
+	if err := applyControl(context.Background(), ctrl, "nudge", "r1", "", "please rebase first"); err != nil {
+		t.Fatal(err)
+	}
+	if len(ctrl.actions) != 1 || ctrl.actions[0] != "nudge" {
+		t.Fatalf("actions = %v", ctrl.actions)
+	}
+	if len(ctrl.nudgeMessages) != 1 || ctrl.nudgeMessages[0] != "please rebase first" {
+		t.Fatalf("messages = %v", ctrl.nudgeMessages)
+	}
+}
+
+func TestControlCommandForwardsNudgeMessageToDaemon(t *testing.T) {
+	var got controlRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, ".beacon")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info := connectionInfo{Addr: srv.URL, Token: "tok", PID: os.Getpid()}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "connection.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEACON_PROJECT_ROOT", root)
+
+	configPath := ""
+	cmd := newControlCommand(&configPath)
+	cmd.SetArgs([]string{"--action", "nudge", "--run-id", "r1", "--message", "check the tests"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if got.Action != "nudge" || got.RunID != "r1" || got.Message != "check the tests" {
+		t.Fatalf("forwarded = %+v", got)
+	}
+}
+
+func TestDaemonSnapshotCarriesLivenessFields(t *testing.T) {
+	got := daemonSnapshot(daemonStatus{
+		State: "stale", PID: 42, HeartbeatAgeSecond: 55,
+		Error: &daemonError{Message: "last tick failed"},
+	})
+	if got.State != "stale" || got.PID != 42 || got.HeartbeatAgeSeconds != 55 {
+		t.Fatalf("daemon = %+v", got)
+	}
+	if got.Error != "last tick failed" {
+		t.Fatalf("error = %q", got.Error)
 	}
 }
 

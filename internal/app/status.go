@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -160,22 +162,26 @@ type CheckSnapshot struct {
 
 // RunSnapshot carries a run, its history and its derived timings.
 type RunSnapshot struct {
-	ID             string          `json:"id"`
-	TaskID         string          `json:"task_id"`
-	State          string          `json:"state"`
-	PR             int             `json:"pr"`
-	HeadSHA        string          `json:"head_sha"`
-	Branch         string          `json:"branch"`
-	Reason         string          `json:"reason"`
-	RebaseAttempts int             `json:"rebase_attempts"`
-	FixAttempts    int             `json:"fix_attempts"`
-	MaxAttempts    int             `json:"max_attempts"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
-	Durations      Durations       `json:"durations"`
-	Timeline       []RunEvent      `json:"timeline"`
-	Decisions      []Decision      `json:"decisions"`
-	Checks         []CheckSnapshot `json:"checks"`
+	ID                string          `json:"id"`
+	TaskID            string          `json:"task_id"`
+	State             string          `json:"state"`
+	PR                int             `json:"pr"`
+	PRURL             string          `json:"pr_url,omitempty"`
+	HeadSHA           string          `json:"head_sha"`
+	Branch            string          `json:"branch"`
+	SessionID         string          `json:"session_id,omitempty"`
+	IsFixer           bool            `json:"is_fixer,omitempty"`
+	BlockedIncidentID string          `json:"blocked_incident_id,omitempty"`
+	Reason            string          `json:"reason"`
+	RebaseAttempts    int             `json:"rebase_attempts"`
+	FixAttempts       int             `json:"fix_attempts"`
+	MaxAttempts       int             `json:"max_attempts"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"`
+	Durations         Durations       `json:"durations"`
+	Timeline          []RunEvent      `json:"timeline"`
+	Decisions         []Decision      `json:"decisions"`
+	Checks            []CheckSnapshot `json:"checks"`
 }
 
 // Metrics are numeric totals for the whole snapshot.
@@ -194,13 +200,63 @@ type Metrics struct {
 	RecentCount    int            `json:"recent_count"`
 }
 
+// QueueItemSnapshot is one local task card in the operator's queue.
+type QueueItemSnapshot struct {
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	Priority  int      `json:"priority"`
+	Status    string   `json:"status"`
+	DependsOn []string `json:"depends_on"`
+}
+
+// QueueTask is a local task card with its unresolved dependencies.
+type QueueTask struct {
+	ID        string
+	Title     string
+	Priority  int
+	DependsOn []string
+	Waiting   bool
+}
+
+// BaseIncidentSnapshot describes the open base-branch incident being fixed.
+type BaseIncidentSnapshot struct {
+	ID           string   `json:"id"`
+	BaseBranch   string   `json:"base_branch"`
+	FailedChecks []string `json:"failed_checks"`
+	FixerRunID   string   `json:"fixer_run_id"`
+	Attempts     int      `json:"attempts"`
+}
+
+// DaemonSnapshot is the daemon liveness view handed in by the composition
+// layer. internal/app never reads daemon state files itself.
+type DaemonSnapshot struct {
+	State               string  `json:"state"`
+	PID                 int     `json:"pid,omitempty"`
+	HeartbeatAgeSeconds float64 `json:"heartbeat_age_seconds"`
+	Error               string  `json:"error,omitempty"`
+}
+
 // Snapshot is the single response the status panel needs. The active and
 // recent sections keep the field names of the older two-call API.
 type Snapshot struct {
-	GeneratedAt time.Time     `json:"generated_at"`
-	Active      []RunSnapshot `json:"active"`
-	Recent      []RunSnapshot `json:"recent"`
-	Metrics     Metrics       `json:"metrics"`
+	GeneratedAt  time.Time             `json:"generated_at"`
+	Active       []RunSnapshot         `json:"active"`
+	Recent       []RunSnapshot         `json:"recent"`
+	Queue        []QueueItemSnapshot   `json:"queue"`
+	BaseIncident *BaseIncidentSnapshot `json:"base_incident,omitempty"`
+	Daemon       *DaemonSnapshot       `json:"daemon,omitempty"`
+	Metrics      Metrics               `json:"metrics"`
+}
+
+// QueueStore is an optional read side for the local task queue. A store that
+// omits it yields an empty, non-null queue.
+type QueueStore interface {
+	ListQueueTasks(ctx context.Context) ([]QueueTask, error)
+}
+
+// IncidentStore is an optional read side for the current base incident.
+type IncidentStore interface {
+	CurrentIncident(ctx context.Context) (*core.BaseIncident, error)
 }
 
 // SnapshotStore is the batched read side of a snapshot. History queries take
@@ -218,6 +274,8 @@ type SnapshotService struct {
 	RecentLimit          int
 	DecisionsLimit       int
 	OrphanDecisionsLimit int
+	Repo                 string
+	Daemon               *DaemonSnapshot
 }
 
 // Snapshot returns active and recent runs with their timelines, decisions and
@@ -240,14 +298,7 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	decisionLimit := s.DecisionsLimit
-	if decisionLimit <= 0 {
-		decisionLimit = DefaultDecisionsLimit
-	}
-	orphanLimit := s.OrphanDecisionsLimit
-	if orphanLimit <= 0 {
-		orphanLimit = DefaultOrphanDecisionsLimit
-	}
+	decisionLimit, orphanLimit := snapshotDecisionLimits(s)
 	decisions, err := s.Store.ListDecisions(ctx, ids, decisionLimit, orphanLimit)
 	if err != nil {
 		return nil, err
@@ -256,21 +307,124 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	queue, err := readQueue(ctx, s.Store)
+	if err != nil {
+		return nil, err
+	}
+	incident, err := readCurrentIncident(ctx, s.Store)
+	if err != nil {
+		return nil, err
+	}
 	timeline, histories := groupHistory(events, decisions)
 	now := time.Now().UTC()
+	daemon := s.Daemon
+	if daemon == nil {
+		daemon = &DaemonSnapshot{State: "absent"}
+	}
 	out := &Snapshot{
-		GeneratedAt: now,
-		Active:      make([]RunSnapshot, 0, len(active)),
-		Recent:      make([]RunSnapshot, 0, len(recent)),
-		Metrics:     makeMetrics(active, recent, timeline, histories, counts, now),
+		GeneratedAt:  now,
+		Active:       make([]RunSnapshot, 0, len(active)),
+		Recent:       make([]RunSnapshot, 0, len(recent)),
+		Queue:        makeQueue(queue),
+		BaseIncident: makeBaseIncident(incident),
+		Daemon:       daemon,
+		Metrics:      makeMetrics(active, recent, timeline, histories, counts, now),
 	}
 	for _, run := range active {
-		out.Active = append(out.Active, makeRunSnapshot(run, timeline, histories, now))
+		out.Active = append(out.Active, makeRunSnapshot(run, timeline, histories, now, s.Repo))
 	}
 	for _, run := range recent {
-		out.Recent = append(out.Recent, makeRunSnapshot(run, timeline, histories, now))
+		out.Recent = append(out.Recent, makeRunSnapshot(run, timeline, histories, now, s.Repo))
 	}
 	return out, nil
+}
+
+func snapshotDecisionLimits(s SnapshotService) (int, int) {
+	decisionLimit := s.DecisionsLimit
+	if decisionLimit <= 0 {
+		decisionLimit = DefaultDecisionsLimit
+	}
+	orphanLimit := s.OrphanDecisionsLimit
+	if orphanLimit <= 0 {
+		orphanLimit = DefaultOrphanDecisionsLimit
+	}
+	return decisionLimit, orphanLimit
+}
+
+func readQueue(ctx context.Context, store SnapshotStore) ([]QueueTask, error) {
+	source, ok := store.(QueueStore)
+	if !ok {
+		return nil, nil
+	}
+	return source.ListQueueTasks(ctx)
+}
+
+func readCurrentIncident(ctx context.Context, store SnapshotStore) (*core.BaseIncident, error) {
+	source, ok := store.(IncidentStore)
+	if !ok {
+		return nil, nil
+	}
+	return source.CurrentIncident(ctx)
+}
+
+func makeQueue(tasks []QueueTask) []QueueItemSnapshot {
+	out := make([]QueueItemSnapshot, 0, len(tasks))
+	for _, task := range tasks {
+		status := "ready"
+		if task.Waiting {
+			status = "waiting_deps"
+		}
+		out = append(out, QueueItemSnapshot{
+			ID: task.ID, Title: task.Title, Priority: task.Priority,
+			Status: status, DependsOn: nonNullStrings(task.DependsOn),
+		})
+	}
+	return out
+}
+
+func makeBaseIncident(in *core.BaseIncident) *BaseIncidentSnapshot {
+	if in == nil {
+		return nil
+	}
+	return &BaseIncidentSnapshot{
+		ID: in.ID, BaseBranch: in.BaseBranch,
+		FailedChecks: failedCheckNames(in.FailedChecksJSON),
+		FixerRunID:   string(in.FixerRunID), Attempts: in.Attempts,
+	}
+}
+
+func failedCheckNames(raw string) []string {
+	out := []string{}
+	if raw == "" {
+		return out
+	}
+	var named []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(raw), &named); err == nil {
+		for _, c := range named {
+			if c.Name != "" {
+				out = append(out, c.Name)
+			}
+		}
+		return out
+	}
+	var names []string
+	if err := json.Unmarshal([]byte(raw), &names); err == nil {
+		for _, name := range names {
+			if name != "" {
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+func nonNullStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func collectRunIDs(groups ...[]*core.Run) []string {
@@ -300,7 +454,7 @@ func groupHistory(events []RunEvent, decisions []Decision) (map[string][]RunEven
 	return timeline, histories
 }
 
-func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time) RunSnapshot {
+func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time, repo ...string) RunSnapshot {
 	events := timeline[string(run.ID)]
 	if events == nil {
 		events = []RunEvent{}
@@ -309,14 +463,33 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 	if decisions == nil {
 		decisions = []Decision{}
 	}
+	link := ""
+	if len(repo) > 0 {
+		link = prLink(repo[0], run.PRNumber)
+	}
 	return RunSnapshot{
 		ID: string(run.ID), TaskID: string(run.TaskID), State: string(run.State),
-		PR: run.PRNumber, HeadSHA: run.HeadSHA, Branch: run.Branch, Reason: run.Reason,
+		PR: run.PRNumber, PRURL: link, HeadSHA: run.HeadSHA, Branch: run.Branch,
+		SessionID: run.SessionID, IsFixer: run.IsFixer,
+		BlockedIncidentID: run.BlockedIncidentID, Reason: run.Reason,
 		RebaseAttempts: run.RebaseAttempts, FixAttempts: run.FixAttempts,
 		MaxAttempts: run.MaxAttempts, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 		Durations: deriveDurations(run, events, now), Timeline: events, Decisions: decisions,
 		Checks: checkSnapshots(run.Checks),
 	}
+}
+
+// prLink builds the GitHub PR URL. A repo that is not owner/repo has no URL,
+// which keeps other SCM providers from showing a broken link.
+func prLink(repo string, pr int) string {
+	if pr <= 0 {
+		return ""
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return ""
+	}
+	return "https://github.com/" + owner + "/" + name + "/pull/" + fmt.Sprint(pr)
 }
 
 // checkSnapshots maps stored checks to the UI contract without any SCM call.
