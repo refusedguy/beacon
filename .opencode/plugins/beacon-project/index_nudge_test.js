@@ -3,7 +3,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { beaconProject } from "./index.js"
-import { BeaconStatusRpc, CliStatusSource } from "./ui.js"
+import { BeaconStatusRpc, CliStatusSource } from "./ui/ui.js"
 
 test("the registered status RPC forwards nudge and message to CLI control", async (t) => {
   const captured = []

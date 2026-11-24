@@ -6,7 +6,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { join } from "node:path"
 import { SHELL_GUARD_RULES, buildShellGuardRules, findShellGuardHit } from "./index.js"
-import { beaconCommand, beaconServerConfig } from "./mcp.js"
+import { beaconCommand, beaconServerConfig } from "./mcp/mcp.js"
 
 const ROOT = "/plain-project"
 

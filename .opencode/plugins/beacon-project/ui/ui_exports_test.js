@@ -8,11 +8,11 @@ const modulePaths = [
   "./ui_view.js",
   "./ui_bridge.js",
   "./ui.js",
-  "./index.js",
-  "./location.js",
-  "./mcp.js",
-  "./context.js",
-  "./options.js",
+  "../index.js",
+  "../state/location.js",
+  "../mcp/mcp.js",
+  "../rules/context.js",
+  "../state/options.js",
   "./ui_alerts.js",
 ]
 
