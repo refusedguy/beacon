@@ -254,6 +254,22 @@ test("CLI source makes one batched call and keeps numeric metrics", async () => 
   assert.deepEqual(calls, [["/bin/beacon", "status", "--snapshot"]])
 })
 
+test("CLI source raises maxBuffer so multi-megabyte snapshots fit", async () => {
+  let options
+  const execFile = async (program, args, opts) => {
+    options = opts
+    return { stdout: JSON.stringify({ active: [], recent: [] }) }
+  }
+  const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
+  await source.snapshot()
+  assert.ok(options, "execFile receives an options object")
+  assert.ok(Number.isFinite(options.maxBuffer), "maxBuffer is set to a finite number")
+  assert.ok(options.maxBuffer >= 4 * 1024 * 1024,
+    `maxBuffer ${options.maxBuffer} must hold a multi-megabyte snapshot`)
+  assert.equal(options.cwd, "/p")
+  assert.equal(options.encoding, "utf8")
+})
+
 test("status source uses the RPC when it works and falls back when it throws", async () => {
   let calls = 0
   const ctx = { client: { rpc: () => ({ snapshot: async () => {
