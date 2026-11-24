@@ -19,6 +19,7 @@ export const RESUBSCRIBE_MAX_MS = 30000
 export const TITLE_WIDTH = 18
 export const REASON_WIDTH = 20
 export const RECENT_LIMIT = 5
+export const MAX_ROWS = 64
 export const DECISION_LIMIT = 20
 export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [] })
 
@@ -407,9 +408,13 @@ export function detailCommand(open) {
   }
 }
 
-// Builds row nodes once. Every later apply() only changes props, so focus and
-// click handlers survive a refresh. Kept free of Solid so tests can drive it.
-export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg }) {
+// Builds a fixed pool of row nodes once, while the caller is inside a slot
+// render callback. Every later apply() only changes props on those nodes: it
+// never calls createElement or insert. That keeps repeated calls from refresh()
+// (a setInterval timer with no renderer context) from throwing
+// "No renderer found" whenever the run count changes. Kept free of Solid so
+// tests can drive it.
+export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg, maxRows = MAX_ROWS }) {
   const { createElement, insert, setProp } = ui
   const cell = (grow = false) => {
     const t = createElement("text")
@@ -422,28 +427,30 @@ export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg }) {
   }
   return (container, items) => {
     const slots = []
+    for (let i = 0; i < maxRows; i++) {
+      const box = createElement("box")
+      setProp(box, "flexDirection", "row")
+      setProp(box, "gap", 1)
+      setProp(box, "minWidth", 0)
+      const dot = cell()
+      const name = cell(true)
+      const status = cell()
+      insert(box, dot); insert(box, name); insert(box, status)
+      insert(container, box)
+      const s = { box, dot, name, status }
+      if (onRow) {
+        setProp(box, "onMouseDown", () => { if (s.item?.runID) onRow(s.item) })
+        setProp(box, "onMouseOver", () => setProp(box, "backgroundColor", hoverBg))
+        setProp(box, "onMouseOut", () => setProp(box, "backgroundColor", undefined))
+      }
+      setProp(box, "visible", false)
+      slots.push(s)
+    }
     const apply = () => {
       const rows = items()
       rows.forEach((item, i) => {
-        let s = slots[i]
-        if (!s) {
-          const box = createElement("box")
-          setProp(box, "flexDirection", "row")
-          setProp(box, "gap", 1)
-          setProp(box, "minWidth", 0)
-          const dot = cell()
-          const name = cell(true)
-          const status = cell()
-          insert(box, dot); insert(box, name); insert(box, status)
-          insert(container, box)
-          s = { box, dot, name, status }
-          if (onRow) {
-            setProp(box, "onMouseDown", () => { if (s.item?.runID) onRow(s.item) })
-            setProp(box, "onMouseOver", () => setProp(box, "backgroundColor", hoverBg))
-            setProp(box, "onMouseOut", () => setProp(box, "backgroundColor", undefined))
-          }
-          slots[i] = s
-        }
+        const s = slots[i]
+        if (!s) return
         const isLine = item.text !== undefined
         s.item = item
         setProp(s.dot, "content", isLine ? "" : str(item.marker))
@@ -455,7 +462,7 @@ export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg }) {
         setProp(s.status, "fg", color("muted"))
         setProp(s.box, "visible", true)
       })
-      slots.slice(rows.length).forEach((s) => setProp(s.box, "visible", false))
+      slots.slice(rows.length).forEach((s) => { s.item = undefined; setProp(s.box, "visible", false) })
     }
     apply()
     return apply

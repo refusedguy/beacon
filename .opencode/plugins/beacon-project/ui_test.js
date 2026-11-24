@@ -458,6 +458,96 @@ test("setup defers every createElement to a slot render callback", async () => {
   assert.equal(Object.keys(renderers).length, 0, "dispose removes every slot")
 })
 
+test("a row count change during refresh creates no nodes outside a render callback", async () => {
+  let current = { active: [], recent: [] }
+  const created = []
+  let renderActive = false
+  const ui = {
+    createElement: (tag) => {
+      const node = { tag, props: {}, children: [] }
+      created.push({ node, renderActive })
+      return node
+    },
+    insert: (parent, child) => parent.children.push(child),
+    setProp: (node, name, value) => { node.props[name] = value },
+  }
+  const createSignal = (initial) => {
+    let value = initial
+    return [() => value, (next) => { value = typeof next === "function" ? next(value) : next }]
+  }
+  const modules = {
+    "@opentui/solid": ui,
+    "solid-js": { createSignal },
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+  const renderers = Object.create(null)
+  let tick = null
+  const ctx = {
+    theme: {
+      text: {
+        base: "base", muted: "muted", action: { primary: { base: "action" } },
+        feedback: {
+          error: { base: "error" }, warning: { base: "warning" },
+          success: { base: "success" }, info: { base: "info" },
+        },
+      },
+      background: { raised: { high: "hover" } },
+    },
+    client: { rpc: () => ({
+      snapshot: async () => current,
+      events: { on: () => () => {} },
+    }) },
+    storage: { store: () => [{ id: "" }, async () => {}] },
+    ui: {
+      slot: ({ append, render }) => {
+        renderers[append] = render
+        return () => { delete renderers[append] }
+      },
+      panel: { open: () => {} },
+    },
+    keymap: { layer: () => {} },
+  }
+  const deps = {
+    import: (specifier) => modules[specifier],
+    setInterval: (fn) => { tick = fn; return 1 },
+    clearInterval: () => {},
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+  }
+
+  const dispose = await beaconStatusDefinition.setup(ctx, deps)
+  assert.equal(created.length, 0, "setup creates nothing before a render callback")
+  assert.equal(typeof tick, "function", "the refresh timer is installed")
+
+  renderActive = true
+  const sidebar = renderers["sidebar.content"]()
+  renderActive = false
+  assert.ok(sidebar, "the first render callback returns the sidebar node")
+  const afterEnsure = created.length
+  assert.ok(afterEnsure > 0, "the first render callback allocates the row pool")
+  assert.ok(created.every((call) => call.renderActive), "every node was created inside a render callback")
+
+  const beforeVisible = sidebar.children.filter((child) => child.props.visible === true).length
+  current = {
+    active: [
+      makeRun({ ID: "run-a", TaskID: "T-A", title: "First" }),
+      makeRun({ ID: "run-b", TaskID: "T-B", title: "Second" }),
+      makeRun({ ID: "run-c", TaskID: "T-C", title: "Third" }),
+    ],
+    recent: [],
+  }
+  renderActive = false
+  tick()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(created.length, afterEnsure, "refresh with more rows must not create nodes")
+  assert.ok(created.every((call) => call.renderActive), "no node was created outside a render callback")
+  const afterVisible = sidebar.children.filter((child) => child.props.visible === true).length
+  assert.ok(afterVisible > beforeVisible, "the panel shows the new rows")
+
+  dispose()
+})
+
 test("setup without injected deps keeps the TUI imports literal", async () => {
   const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
   for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {
