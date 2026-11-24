@@ -156,7 +156,7 @@ export class CliStatusSource {
   #exec(base, args) {
     const [program, ...rest] = base
     return this.deps.execFile(program, [...rest, ...args], {
-      cwd: this.root, encoding: "utf8",
+      cwd: this.root, encoding: "utf8", maxBuffer: 16 * 1024 * 1024,
       env: { ...process.env, BEACON_PROJECT_ROOT: this.root }, timeout: RPC_TIMEOUT_MS,
     })
   }
