@@ -17,6 +17,14 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// cardsPath is the repository pathspec for task cards. Creation and completion
+// share it so no caller hardcodes where cards live.
+const cardsPath = "docs/tasks"
+
+// cardPath is the repository path of one card. It is the single place that
+// turns a task ID into a file path.
+func cardPath(id core.TaskID) string { return cardsPath + "/" + string(id) + ".md" }
+
 // PathCommitter is the part of the workspace port that publishes a new card.
 type PathCommitter interface {
 	CommitPath(ctx context.Context, ws core.Workspace, pathspec, message string) error
@@ -148,7 +156,7 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		Priority: in.Priority, Status: core.TaskAvailable,
 		Kind: kind, BaseBranch: strings.TrimSpace(in.BaseBranch),
 		RequireReview: normalizeReview(in.RequireReview), Plan: in.Plan,
-		SourceRef: "docs/tasks/" + string(id) + ".md",
+		SourceRef: cardPath(id),
 	}
 	if epic {
 		for _, child := range children {
@@ -238,7 +246,7 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 			written = append(written, core.Task{ID: core.TaskID(out.ID), SourceRef: out.Path})
 		}
 		for _, id := range out.IDs {
-			written = append(written, core.Task{ID: core.TaskID(id), SourceRef: "docs/tasks/" + id + ".md"})
+			written = append(written, core.Task{ID: core.TaskID(id), SourceRef: cardPath(core.TaskID(id))})
 		}
 		created = append(created, out)
 	}
@@ -335,7 +343,7 @@ func (c *TaskCreator) existingCard(ctx context.Context, id core.TaskID) (Created
 		if task.ID == id {
 			path := task.SourceRef
 			if path == "" {
-				path = "docs/tasks/" + string(id) + ".md"
+				path = cardPath(id)
 			}
 			return CreatedTask{ID: string(id), Path: path, Pushed: true}, true
 		}
@@ -358,7 +366,7 @@ func (c *TaskCreator) rememberBatch(ids []core.TaskID, created []CreatedTask) {
 }
 
 func (c *TaskCreator) publish(ctx context.Context, id core.TaskID) error {
-	return publishPath(ctx, c.Workspace, c.Root, "docs/tasks", "beacon: create task "+string(id))
+	return publishPath(ctx, c.Workspace, c.Root, cardsPath, "beacon: create task "+string(id))
 }
 
 func (c *TaskCreator) writeTasks(ctx context.Context, tasks []core.Task) ([]core.Task, error) {
@@ -429,9 +437,9 @@ func (c *TaskCreator) lookup(ctx context.Context, key string, id core.TaskID, ch
 		}
 		out := make([]core.Task, 0, len(children)+1)
 		for _, child := range children {
-			out = append(out, core.Task{ID: child.ID, SourceRef: "docs/tasks/" + string(child.ID) + ".md"})
+			out = append(out, core.Task{ID: child.ID, SourceRef: cardPath(child.ID)})
 		}
-		return append(out, core.Task{ID: id, SourceRef: "docs/tasks/" + string(id) + ".md"}), true
+		return append(out, core.Task{ID: id, SourceRef: cardPath(id)}), true
 	}
 	return nil, false
 }
