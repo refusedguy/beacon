@@ -31,6 +31,8 @@ type Dispatcher struct {
 	ResolveModel       ModelResolver
 }
 
+var _ core.AgentSlots = (*Dispatcher)(nil)
+
 type DispatchResult struct {
 	Runs     []*core.Run
 	Skipped  []SkippedTask
@@ -71,7 +73,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	if free := d.inFlightLimit() - len(active); free < limit {
 		limit = free
 	}
-	budget := d.agentBudget(active)
+	budget := d.Available(ctx)
 	logDispatchCandidates(ctx, len(ready), len(active), limit, budget)
 	if limit <= 0 {
 		return out, nil
@@ -127,7 +129,7 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	budget := d.agentBudget(active)
+	budget := d.Available(ctx)
 	if budget <= 0 {
 		return nil, nil
 	}
@@ -257,7 +259,15 @@ func (d *Dispatcher) inFlightLimit() int {
 	return 20
 }
 
-func (d *Dispatcher) agentBudget(active []*core.Run) int {
+// Available is the single agent-slot operation. It counts free slots against
+// MaxActiveAgents, falling back to the in-flight limit when no agent limit is
+// configured. A failed active-run listing fails open with one slot so a
+// transient store error never stalls dispatch, promotion or wake.
+func (d *Dispatcher) Available(ctx context.Context) int {
+	active, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return 1
+	}
 	limit := d.Concurrency.MaxActiveAgents
 	if limit <= 0 {
 		limit = d.inFlightLimit()
