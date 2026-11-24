@@ -69,12 +69,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	return r.applyDecision(ctx, run, obs, decision)
 }
 
-func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Event, observed ...string) error {
+// applyAndSave applies e and persists the run. A non-zero obs records both the
+// head and base SHA; the zero value leaves the recorded observation untouched.
+func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Event, obs core.Observation) error {
 	if err := run.Apply(e); err != nil {
 		return err
 	}
-	if len(observed) == 2 {
-		recordObservation(run, observed[0], observed[1])
+	if obs.HeadSHA != "" || obs.BaseSHA != "" {
+		recordObservation(run, obs.HeadSHA, obs.BaseSHA)
 	}
 	return r.Store.Save(ctx, run)
 }
@@ -157,7 +159,7 @@ func (r *Reconciler) commitCard(ctx context.Context, ws core.Workspace, pathspec
 
 func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observation) error {
 	if !run.CanRebase() {
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase attempts exhausted"}); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase attempts exhausted"}, core.Observation{}); err != nil {
 			return err
 		}
 		return r.notify(run, "rebase exhausted", "automatic rebase attempts exhausted")
@@ -168,12 +170,12 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	newSHA, err := r.SCM.UpdateBranch(ctx, obs.PRNumber, obs.HeadSHA)
 	if err != nil {
 		logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts+1, "", "failed")
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}, obs.HeadSHA, obs.BaseSHA); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}, obs); err != nil {
 			return err
 		}
 		return r.wake(ctx, run, obs, "automatic rebase failed: "+err.Error())
 	}
-	if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}, newSHA, obs.BaseSHA); err != nil {
+	if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}, core.Observation{HeadSHA: newSHA, BaseSHA: obs.BaseSHA}); err != nil {
 		return err
 	}
 	logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts, newSHA, "rebased")
@@ -185,7 +187,7 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 		return nil
 	}
 	if !run.CanWake() {
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "fix attempts exhausted"}); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "fix attempts exhausted"}, core.Observation{}); err != nil {
 			return err
 		}
 		return r.notify(run, "fix exhausted", "agent fix attempts exhausted")
@@ -203,7 +205,7 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 		return fmt.Errorf("wake: %w", err)
 	}
 	logTransitionWake(ctx, run.ID, obs.PRNumber, "woke")
-	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed, Reason: reason}, obs.HeadSHA, obs.BaseSHA)
+	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed, Reason: reason}, obs)
 }
 
 func (r *Reconciler) hasAgentSlot(ctx context.Context) bool {
