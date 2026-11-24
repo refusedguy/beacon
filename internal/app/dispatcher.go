@@ -15,7 +15,7 @@ import (
 // ModelResolver resolves a worker model from its parent session. The
 // composition root supplies the OpenCode session lookup. A nil resolver keeps
 // the harness default.
-type ModelResolver func(parentSession string) map[string]string
+type ModelResolver func(parentSession string) core.ModelRef
 
 type Dispatcher struct {
 	Source             core.TaskSource
@@ -29,7 +29,10 @@ type Dispatcher struct {
 	ParentSessionID    string
 	WorkerInstructions string
 	ResolveModel       ModelResolver
+	Decisions          DecisionLogger
 }
+
+var _ core.AgentSlots = (*Dispatcher)(nil)
 
 type DispatchResult struct {
 	Runs     []*core.Run
@@ -71,8 +74,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	if free := d.inFlightLimit() - len(active); free < limit {
 		limit = free
 	}
-	budget := d.agentBudget(active)
-	logDispatchCandidates(ctx, len(ready), len(active), limit, budget)
+	budget := d.Available(ctx)
+	d.Decisions.logDispatchCandidates(ctx, len(ready), len(active), limit, budget)
 	if limit <= 0 {
 		return out, nil
 	}
@@ -82,7 +85,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	}
 	out.Skipped = skipped
 	for _, s := range skipped {
-		logDispatchSkip(ctx, s)
+		d.Decisions.logDispatchSkip(ctx, s)
 	}
 	for _, task := range chosen {
 		if existing, err := d.Store.FindActiveByTask(ctx, task.ID); err != nil {
@@ -96,7 +99,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 				Reason:       "already has an active run",
 			}
 			out.Skipped = append(out.Skipped, skip)
-			logDispatchSkip(ctx, skip)
+			d.Decisions.logDispatchSkip(ctx, skip)
 			continue
 		}
 		run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
@@ -127,7 +130,7 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	budget := d.agentBudget(active)
+	budget := d.Available(ctx)
 	if budget <= 0 {
 		return nil, nil
 	}
@@ -190,7 +193,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	run.SessionID = session.ID
 	if session.PR != 0 {
 		run.PRNumber = session.PR
-		logTransitionWatchPR(ctx, run.ID, session.PR)
+		d.Decisions.logTransitionWatchPR(ctx, run.ID, session.PR)
 	}
 	if err := run.Apply(core.Event{Kind: core.EvStart}); err != nil {
 		return err
@@ -198,7 +201,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	if err := d.Store.Save(ctx, run); err != nil {
 		return fmt.Errorf("save: %w", err)
 	}
-	logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
+	d.Decisions.logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
 	// MarkInWorkspace already sets in_progress inside the worker branch, and
 	// FindActiveByTask blocks a second run. Claiming through the root source
 	// would only rewrite the card on the operator's main checkout, leaving it
@@ -257,7 +260,15 @@ func (d *Dispatcher) inFlightLimit() int {
 	return 20
 }
 
-func (d *Dispatcher) agentBudget(active []*core.Run) int {
+// Available is the single agent-slot operation. It counts free slots against
+// MaxActiveAgents, falling back to the in-flight limit when no agent limit is
+// configured. A failed active-run listing fails open with one slot so a
+// transient store error never stalls dispatch, promotion or wake.
+func (d *Dispatcher) Available(ctx context.Context) int {
+	active, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return 1
+	}
 	limit := d.Concurrency.MaxActiveAgents
 	if limit <= 0 {
 		limit = d.inFlightLimit()
@@ -283,9 +294,9 @@ func firstNonEmptyLocal(values ...string) string {
 // modelRef resolves the worker model from the run's parent session. The MCP
 // daemon has no BEACON_PARENT_SESSION, so the parent arrives per dispatch in
 // the request metadata and must be resolved here, not at process start.
-func (d *Dispatcher) modelRef(parent string) map[string]string {
+func (d *Dispatcher) modelRef(parent string) core.ModelRef {
 	if d.ResolveModel == nil || parent == "" {
-		return nil
+		return core.ModelRef{}
 	}
 	return d.ResolveModel(parent)
 }

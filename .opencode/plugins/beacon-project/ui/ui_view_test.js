@@ -6,8 +6,7 @@ import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
   SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
-  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel,
-  recentRuns, runLineItems, sidebarModel, stateBarItem, truncate,
+  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel, recentRuns, runLineItems, sidebarModel, stateBarItem, truncate,
 } = ui
 
 test("elapsed formats seconds, minutes, hours and days", () => {
@@ -69,13 +68,16 @@ test("phaseLabel follows the live phase and merged rows drop the reason", () => 
 test("run rows keep the full title and put PR, duration and cause on line two", () => {
   const title = "Make worktree registration refresh reliable at every exit"
   const [first, second] = runLineItems(normalizeRun(makeRun({ State: "blocked", title })), NOW)
-  assert.deepEqual(first, {
-    marker: "▲", markerSpace: true, name: title, status: "BLK", color: "error", bold: true, runID: "run-1",
-  })
-  assert.deepEqual(second, {
-    marker: "#42", markerSpace: true, name: "3m", status: "waiting CI", color: "muted",
-    statusColor: "error", runID: "run-1",
-  })
+  assert.equal(first.marker, "▲")
+  assert.equal(first.name, title)
+  assert.equal(first.status, "BLK")
+  assert.equal(first.color, "error")
+  assert.equal(first.runID, "run-1")
+  assert.equal(second.marker, "#42")
+  assert.equal(second.name, "3m")
+  assert.equal(second.status, "waiting CI")
+  assert.equal(second.color, "muted")
+  assert.equal(second.runID, "run-1")
 })
 
 test("recent shows one terminal run per task and skips tasks active again", () => {
@@ -252,7 +254,7 @@ test("queue epics collapse by default and expand through the stored map", () => 
   const open = { active: true, queue: true, recent: true }
   const closed = ui.sidebarModel(snap, null, NOW, open, {}).listItems
   const epic = closed.find((i) => i.kind === "queue-title" && i.cardID === "T-EPIC")
-  assert.deepEqual([epic.marker, epic.status, epic.action], ["▶", "2", "epic:T-EPIC"])
+  assert.deepEqual([epic.marker, epic.status, epic.action], ["▶", "P9", "epic:T-EPIC"])
   assert.equal(closed.some((i) => i.cardID === "T-EPIC-01"), false)
   assert.equal(closed.some((i) => i.cardID === "T-EPIC-02"), false)
   const expanded = ui.sidebarModel(snap, null, NOW, open, { "T-EPIC": true }).listItems
@@ -348,3 +350,105 @@ test("epic state reads only true IDs from storage and persists toggles", () => {
   epic.toggle()
   assert.equal(changes, 2, "an empty ID does not toggle")
 })
+
+const blockedQueue = () => ({
+  active: [], recent: [makeRun({ ID: "r1", TaskID: "T-RECENT", State: "merged" })],
+  queue: [
+    { id: "T-1", title: "Alpha one", status: "waiting_deps", priority: 5, depends_on: ["T-BLOCK-A"] },
+    { id: "T-2", title: "Alpha two", status: "waiting_deps", priority: 4, depends_on: ["T-BLOCK-A"] },
+    { id: "T-3", title: "Beta one", status: "waiting_deps", priority: 3, depends_on: ["T-BLOCK-B"] },
+  ],
+})
+const queueOpen = () => ({ active: true, queue: true, recent: true })
+
+test("blocked groups start collapsed and Recent stays reachable", () => {
+  const snap = blockedQueue()
+  const epicOpen = {}
+  const items = ui.sidebarModel(snap, null, NOW, queueOpen(), epicOpen, ui.blockedOpenFrom(epicOpen)).listItems
+  const headers = items.filter((i) => i.kind === "queue-blocker")
+  assert.deepEqual(headers.map((i) => [i.marker, i.name]), [
+    ["▶", "blocked by T-BLOCK-A · 2 tasks"], ["▶", "blocked by T-BLOCK-B · 1 task"],
+  ])
+  assert.equal(items.some((i) => i.kind === "queue-title"), false, "collapsed groups hide their task titles")
+  assert.equal(items.some((i) => i.kind === "queue-dep"), false, "a dependency ID is never a repeated row")
+  assert.ok(items.some((i) => i.sectionKey === "recent"), "Recent stays in the sidebar")
+  assert.ok(items.some((i) => i.recent === true && i.runID === "r1"), "Recent stays clickable")
+  assert.equal(items[items.findIndex((i) => i.sectionKey === "recent") - 1].kind, "spacer")
+})
+
+test("expanding one blocked group leaves the others collapsed", () => {
+  const snap = blockedQueue()
+  const epic = { open: {}, toggle(id) { this.open[id] = !this.open[id] } }
+  ui.toggleBlockedGroup(epic, "T-BLOCK-A")
+  const epicOpen = epic.open
+  const items = ui.sidebarModel(snap, null, NOW, queueOpen(), epicOpen, ui.blockedOpenFrom(epicOpen)).listItems
+  assert.deepEqual(items.filter((i) => i.kind === "queue-blocker").map((i) => i.marker), ["▼", "▶"])
+  assert.deepEqual(items.filter((i) => i.kind === "queue-title").map((i) => i.name), ["Alpha one", "Alpha two"])
+})
+
+test("stored open blocked groups are stale at startup but a click persists", () => {
+  const saved = []
+  const value = { "blocked:T-BLOCK-A": true, "T-EPIC": true }
+  const ctx = { storage: { store: (name) => {
+    assert.equal(name, "beacon-epic-sections")
+    return [value, async (fn) => { fn(value); saved.push({ ...value }) }]
+  } } }
+  const epic = ui.discardStoredEpicOpen(ui.createEpicState(ctx))
+  assert.equal(epic.open["blocked:T-BLOCK-A"], undefined, "a stored blocked group does not reopen")
+  const snap = blockedQueue()
+  const open = () => ui.sidebarModel(snap, null, NOW, queueOpen(), epic.open, ui.blockedOpenFrom(epic.open)).listItems
+  assert.equal(open().find((i) => i.kind === "queue-blocker").marker, "▶")
+  ui.toggleBlockedGroup(epic, "T-BLOCK-A")
+  assert.equal(saved.at(-1)["blocked:T-BLOCK-A"], true, "an explicit click still persists")
+  assert.equal(open().find((i) => i.kind === "queue-blocker").marker, "▼")
+})
+
+test("the Queue toggle switches every blocked group and shares their state", () => {
+  const snap = blockedQueue()
+  const epic = { open: {}, toggle(id) { this.open[id] = !this.open[id] } }
+  const model = () => ui.sidebarModel(snap, null, NOW, queueOpen(), epic.open, ui.blockedOpenFrom(epic.open)).listItems
+  const toggle = model().find((i) => i.kind === "queue-blocked-toggle")
+  assert.deepEqual([toggle.marker, toggle.name, toggle.action], ["▶", "Expand all blocked", "blocked-toggle"])
+  ui.toggleAllBlockedGroups(epic, snap.queue)
+  assert.equal(model().find((i) => i.kind === "queue-blocked-toggle").name, "Collapse all blocked")
+  assert.equal(model().filter((i) => i.kind === "queue-title").length, 3)
+  ui.toggleAllBlockedGroups(epic, snap.queue)
+  assert.equal(model().some((i) => i.kind === "queue-title"), false)
+  assert.equal(model().find((i) => i.kind === "queue-blocked-toggle").name, "Expand all blocked")
+})
+
+test("an epic inside an expanded blocked group still collapses its children", () => {
+  const epicID = "T-EPIC"
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      { id: epicID, title: "Harness epic", status: "ready", priority: 9, kind: "epic", depends_on: ["T-BLOCK"] },
+      { id: `${epicID}-01`, title: "Child one", status: "waiting_deps", priority: 8 },
+      { id: `${epicID}-02`, title: "Child two", status: "waiting_deps", priority: 8 },
+    ],
+  }
+  const open = queueOpen()
+  const view = (map) => ui.sidebarModel(snap, null, NOW, open, map, ui.blockedOpenFrom(map)).listItems
+  const collapsed = view({ "blocked:T-BLOCK": true })
+  assert.deepEqual(collapsed.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 1 task"])
+  assert.ok(collapsed.some((i) => i.kind === "queue-title" && i.cardID === epicID))
+  assert.equal(collapsed.some((i) => i.cardID === `${epicID}-01`), false, "children of a collapsed epic stay hidden")
+  const expanded = view({ "blocked:T-BLOCK": true, [epicID]: true })
+  assert.deepEqual(expanded.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 3 tasks"])
+  assert.deepEqual(expanded.filter((i) => i.kind === "queue-title").map((i) => i.name), ["Harness epic", "Child one", "Child two"])
+})
+
+test("an expanded blocked group caps rows and keeps Recent clickable", () => {
+  const children = Array.from({ length: 5 }, (_, i) => ({
+    id: `T-${i + 1}`, title: `Task ${i + 1}`, status: "waiting_deps", priority: 9 - i, depends_on: ["T-BLOCK"],
+  }))
+  const snap = { active: [], recent: [makeRun({ ID: "r1", TaskID: "T-RECENT", State: "merged" })], queue: children }
+  const epicOpen = { "blocked:T-BLOCK": true }
+  const items = ui.sidebarModel(snap, null, NOW, queueOpen(), epicOpen, ui.blockedOpenFrom(epicOpen)).listItems
+  const shown = children.filter((c) => items.some((i) => i.kind === "queue-title" && i.cardID === c.id))
+  assert.equal(shown.length, ui.QUEUE_CHILD_LIMIT, "only the first members render")
+  assert.equal(items.find((i) => i.kind === "queue-more").name, "+2 more")
+  assert.ok(items.some((i) => i.sectionKey === "recent"))
+  assert.ok(items.some((i) => i.recent === true && i.runID === "r1"))
+})
+

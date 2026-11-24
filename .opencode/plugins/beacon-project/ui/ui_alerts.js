@@ -73,54 +73,111 @@ const queueParent = (list, id) => list
   .filter((parent) => parent && parent !== id && id.startsWith(`${parent}-`))
   .sort((a, b) => b.length - a.length)[0] || ""
 
-export function queueLineItems(queue = []) {
-  const list = Array.isArray(queue) ? queue : []
-  const parents = new Map(list.map((item) => [str(item?.id), queueParent(list, str(item?.id))]))
-  const parentsWithChildren = new Set(parents.values())
-  // A generated child is already a row. A parent that lists its children in
-  // depends must not draw those IDs a second time as dependency lines.
-  const childIDs = new Set([...parents].filter(([, parent]) => parent).map(([id]) => id))
-  return list.flatMap((item) => {
-    const cardID = str(item?.id)
-    const parent = parents.get(cardID) || ""
-    const epic = str(item?.kind).toLowerCase() === "epic" || parentsWithChildren.has(cardID)
-    const waiting = str(item?.status).toLowerCase() === "waiting_deps"
-    const deps = (Array.isArray(item?.dependsOn) ? item.dependsOn : []).map(str).filter(Boolean)
-    const state = waiting ? "blocked" : str(item?.status).replace(/_/g, " ") || "ready"
-    const summary = `${epic ? "epic" : parent ? "child" : ""}${epic || parent ? " · " : ""}${state} · P${str(item?.priority) || "?"} · ${deps.length} dep${deps.length === 1 ? "" : "s"}`
-    const rows = [
-      {
-        marker: epic ? "◆" : parent ? "└" : waiting ? "◌" : "○",
-        markerSpace: parent ? 2 : true,
-        name: str(item?.title) || cardID || "-",
-        status: epic ? "EPIC" : "", statusColor: "muted",
-        color: "base", nameColor: "base", nameBold: epic, cardID, kind: "queue-title",
-        action: cardID ? `card:${cardID}` : undefined,
-      },
-      {
-        marker: "", name: summary, status: "", color: "muted", statusColor: "muted",
-        cardID, kind: "queue-status", action: cardID ? `card:${cardID}` : undefined,
-      },
-    ]
-    for (const dep of deps) {
-      if (childIDs.has(dep)) continue
-      rows.push({
-        marker: "↳", name: shortTaskID(dep), status: "", color: "muted", kind: "queue-dep",
-        depID: dep, action: `card:${dep}`,
-      })
-    }
-    return rows
+export const spacerItem = () => ({
+  marker: "", name: "", status: "", color: "muted", kind: "spacer",
+})
+const countLabel = (n, one, many) => `${n} ${n === 1 ? one : many}`
+
+// The snapshot carries only unresolved deps. Children of an epic already have
+// their own rows, so they never become blocker headers.
+const queueBlockers = (item, childIDs) => (Array.isArray(item?.dependsOn) ? item.dependsOn
+  : Array.isArray(item?.depends_on) ? item.depends_on : [])
+  .map(str).filter((dep) => dep && !childIDs.has(dep))
+
+function taskRows(item, { epic, parent, blockers, children }) {
+  const id = str(item?.id)
+  const blocked = str(item?.status).toLowerCase() === "waiting_deps"
+  const status = [
+    `P${str(item?.priority) || "?"}`,
+    blockers.length ? countLabel(blockers.length, "dep", "deps") : "",
+  ].filter(Boolean).join(" · ")
+  const rows = [{
+    marker: epic ? "◆" : parent ? "└" : blocked ? "◌" : "○",
+    markerSpace: parent ? 2 : true,
+    name: str(item?.title) || id || "-",
+    status, statusColor: "muted",
+    color: "base", nameColor: "base", nameBold: epic, cardID: id, kind: "queue-title",
+    action: id ? `card:${id}` : undefined,
+  }]
+  if (epic) rows.push({
+    marker: "", name: `epic · ${countLabel(children, "child", "children")}`,
+    status: "", color: "muted", statusColor: "muted", cardID: id, kind: "queue-status",
+    action: id ? `card:${id}` : undefined,
   })
+  return rows
 }
 
-// An expanded epic shows at most this many children. The rest collapse into a
-// "+N more" line so the queue never pushes Recent out of the sidebar.
+// One group per unresolved blocker. A child with no dep of its own follows its
+// epic's blocker, so an expanded epic keeps a single header. The rendered
+// headers and the global Queue toggle share this grouping.
+export function queueGroups(queue = [], hidden = null) {
+  const list = Array.isArray(queue) ? queue : []
+  const shown = hidden ? list.filter((item) => !hidden.has(str(item?.id))) : list
+  const parents = new Map(list.map((item) => [str(item?.id), queueParent(list, str(item?.id))]))
+  const parentsWithChildren = new Set(parents.values())
+  const childIDs = new Set([...parents].filter(([, parent]) => parent).map(([id]) => id))
+  const childCount = new Map()
+  for (const parent of parents.values()) childCount.set(parent, (childCount.get(parent) ?? 0) + 1)
+  const blockers = new Map(list.map((item) => [str(item?.id), queueBlockers(item, childIDs)]))
+  const groupOf = (item) => {
+    const id = str(item?.id)
+    const own = blockers.get(id) ?? []
+    return own[0] || (blockers.get(parents.get(id) || "") ?? [])[0] || ""
+  }
+  const groups = new Map()
+  const order = []
+  for (const item of shown) {
+    const key = groupOf(item)
+    if (!groups.has(key)) { groups.set(key, []); order.push(key) }
+    groups.get(key).push(item)
+  }
+  return { groups, order, parents, parentsWithChildren, childCount, blockers }
+}
+
+export const blockedGroupKeys = (queue = []) => queueGroups(queue).order.filter(Boolean)
+
+// An expanded epic or blocked group shows at most this many member rows. The
+// rest collapse into a "+N more" line so Recent stays inside the sidebar.
 export const QUEUE_CHILD_LIMIT = 3
 
-export function queueRows(queue = [], epicOpen = null) {
+// A null blockedOpen keeps the flat legacy rows for pure callers that never
+// drive the toggle. With a map, only groups marked true expand.
+export function queueLineItems(queue = [], hidden = null, blockedOpen = null) {
+  const { groups, order, parents, parentsWithChildren, childCount, blockers } = queueGroups(queue, hidden)
+  const rows = []
+  for (const key of order) {
+    if (rows.length) rows.push(spacerItem())
+    const members = groups.get(key)
+    if (key) {
+      const expanded = blockedOpen == null || blockedOpen[key] === true
+      rows.push({
+        marker: expanded ? "▼" : "▶",
+        name: `blocked by ${shortTaskID(key)} · ${countLabel(members.length, "task", "tasks")}`,
+        status: "", color: "muted", kind: "queue-blocker", depID: key,
+        blockedKey: key, action: `blocked:${key}`,
+      })
+      if (!expanded) continue
+    }
+    const capped = Boolean(key) && blockedOpen != null && members.length > QUEUE_CHILD_LIMIT
+    for (const item of capped ? members.slice(0, QUEUE_CHILD_LIMIT) : members) {
+      const id = str(item?.id)
+      rows.push(...taskRows(item, {
+        epic: str(item?.kind).toLowerCase() === "epic" || parentsWithChildren.has(id),
+        parent: parents.get(id) || "", blockers: blockers.get(id) ?? [],
+        children: childCount.get(id) ?? 0,
+      }))
+    }
+    if (capped) rows.push({
+      marker: "", name: `+${members.length - QUEUE_CHILD_LIMIT} more`, status: "",
+      color: "muted", kind: "queue-more",
+    })
+  }
+  return rows
+}
+
+export function queueRows(queue = [], epicOpen = null, blockedOpen = null) {
   const list = Array.isArray(queue) ? queue : []
-  const rows = queueLineItems(list)
-  if (!epicOpen) return rows
+  if (!epicOpen) return queueLineItems(list, null, blockedOpen)
   const ids = list.map((item) => str(item?.id))
   const parentOf = (id) => ids.filter((p) => p && p !== id && id.startsWith(`${p}-`))
     .sort((a, b) => b.length - a.length)[0] || ""
@@ -154,7 +211,7 @@ export function queueRows(queue = [], epicOpen = null) {
       parent = parentOf(parent)
     }
   }
-  const visible = rows.filter((row) => !hidden.has(row.cardID))
+  const rows = queueLineItems(list, hidden, blockedOpen)
   const summaries = []
   for (const id of ids) {
     if (!isEpic(id) || epicOpen[id] !== true) continue
@@ -162,20 +219,19 @@ export function queueRows(queue = [], epicOpen = null) {
     if (children.length <= QUEUE_CHILD_LIMIT) continue
     const last = children[QUEUE_CHILD_LIMIT - 1]
     let at = -1
-    for (let i = visible.length - 1; i >= 0; i -= 1) {
-      if (visible[i].cardID === last) { at = i + 1; break }
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      if (rows[i].cardID === last) { at = i + 1; break }
     }
     if (at > 0) summaries.push({ at, item: {
       marker: "", name: `+${children.length - QUEUE_CHILD_LIMIT} more`, status: "",
       color: "muted", kind: "queue-more",
     } })
   }
-  for (const { at, item } of summaries.sort((a, b) => b.at - a.at)) visible.splice(at, 0, item)
-  return visible.map((row) => {
+  for (const { at, item } of summaries.sort((a, b) => b.at - a.at)) rows.splice(at, 0, item)
+  return rows.map((row) => {
     if (row.kind !== "queue-title" || !isEpic(row.cardID)) return row
     const chevron = epicOpen[row.cardID] === true ? "▼" : "▶"
-    return { ...row, marker: chevron, status: String(counts.get(row.cardID) ?? 0),
-      statusColor: "muted", epicKey: row.cardID, action: `epic:${row.cardID}` }
+    return { ...row, marker: chevron, epicKey: row.cardID, action: `epic:${row.cardID}` }
   })
 }
 

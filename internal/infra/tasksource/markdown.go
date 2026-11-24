@@ -3,10 +3,8 @@ package tasksource
 
 import (
 	"context"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -29,7 +27,7 @@ func (m *Markdown) parser() core.EpicParser {
 
 func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	_ = ctx
-	paths, err := m.cards()
+	paths, err := CardStore{Dir: m.Dir}.cards()
 	if err != nil {
 		return nil, err
 	}
@@ -47,27 +45,6 @@ func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	}
 	core.SortTasks(out)
 	return out, nil
-}
-
-func (m *Markdown) cards() ([]string, error) {
-	var paths []string
-	err := filepath.WalkDir(m.Dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if path != m.Dir && strings.HasPrefix(d.Name(), ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
-			paths = append(paths, path)
-		}
-		return nil
-	})
-	sort.Strings(paths)
-	return paths, err
 }
 
 type frontmatter struct {
@@ -184,60 +161,27 @@ func parseLegacy(content, dir string) core.Task {
 	return t
 }
 
-func (m *Markdown) findCard(id core.TaskID) (string, bool) {
-	paths, err := m.cards()
-	if err != nil {
-		return "", false
-	}
-	for _, path := range paths {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		t, ok := parseCard(string(b), path)
-		if ok && t.ID == id {
-			return path, true
-		}
-	}
-	return "", false
-}
-
 // Children returns the child tasks declared in an epic card's plan. A card
 // that is not an epic has no children and returns an empty slice.
 func (m *Markdown) Children(ctx context.Context, id core.TaskID) ([]core.Task, error) {
 	_ = ctx
-	path, ok := m.findCard(id)
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	b, err := os.ReadFile(path)
+	c, err := CardStore{Dir: m.Dir}.find(id)
 	if err != nil {
 		return nil, err
 	}
-	epic, ok := parseCard(string(b), path)
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	if epic.Kind != core.TaskKindEpic {
+	if c.task.Kind != core.TaskKindEpic {
 		return nil, nil
 	}
-	return m.parser().Children(epic), nil
+	return m.parser().Children(c.task), nil
 }
 
-func (m *Markdown) rewriteStatus(ctx context.Context, id core.TaskID, status string) error {
-	_ = ctx
-	path, ok := m.findCard(id)
-	if !ok {
-		return os.ErrNotExist
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(strings.ReplaceAll(string(b), "\r", ""), "\n")
-	inFM := len(lines) > 0 && strings.TrimSpace(lines[0]) == "---"
+// rewriteStatus replaces the status field in one card's text. It stays a
+// narrow text transform so its complexity does not grow as callers deepen;
+// lookup, parsing and format detection live in CardStore.
+func rewriteStatus(content, status string, hasFM bool) string {
+	lines := strings.Split(strings.ReplaceAll(content, "\r", ""), "\n")
 	closeAt := -1
-	if inFM {
+	if hasFM {
 		for i := 1; i < len(lines); i++ {
 			if strings.TrimSpace(lines[i]) == "---" {
 				closeAt = i
@@ -247,11 +191,11 @@ func (m *Markdown) rewriteStatus(ctx context.Context, id core.TaskID, status str
 	}
 	updated := false
 	for i, line := range lines {
-		if inFM && closeAt >= 0 && i > closeAt {
+		if hasFM && closeAt >= 0 && i > closeAt {
 			break
 		}
 		trim := strings.TrimSpace(line)
-		if inFM && i > 0 && i < closeAt {
+		if hasFM && i > 0 && i < closeAt {
 			if strings.HasPrefix(trim, "status:") {
 				lines[i] = "status: " + status
 				updated = true
@@ -268,27 +212,27 @@ func (m *Markdown) rewriteStatus(ctx context.Context, id core.TaskID, status str
 		}
 	}
 	if !updated {
-		if inFM && closeAt >= 0 {
+		if hasFM && closeAt >= 0 {
 			lines = append(lines[:closeAt], append([]string{"status: " + status}, lines[closeAt:]...)...)
 		} else {
 			lines = append([]string{"Статус: " + status}, lines...)
 		}
 	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
+	return strings.Join(lines, "\n")
 }
 
 func (m *Markdown) Claim(ctx context.Context, id core.TaskID) error {
-	return m.rewriteStatus(ctx, id, "in_progress")
+	return CardStore{Dir: m.Dir}.PatchStatus(ctx, id, "in_progress")
 }
 
 func (m *Markdown) Complete(ctx context.Context, id core.TaskID) error {
-	return m.rewriteStatus(ctx, id, "done")
+	return CardStore{Dir: m.Dir}.PatchStatus(ctx, id, "done")
 }
 
 // MarkInWorkspace rewrites the card inside a worker workspace so the status change
 // travels in the worker pull request.
 func (m *Markdown) MarkInWorkspace(ctx context.Context, id core.TaskID, workspacePath, status string) error {
-	return NewMarkdown(filepath.Join(workspacePath, "docs", "tasks")).rewriteStatus(ctx, id, status)
+	return CardStore{Dir: filepath.Join(workspacePath, "docs", "tasks")}.PatchStatus(ctx, id, status)
 }
 
 // Create writes a new card with available status. It refuses to overwrite an

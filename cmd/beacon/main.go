@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,7 +17,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
@@ -61,6 +62,7 @@ type wiredInfra struct {
 	scm          core.ScmGateway
 	changes      chan int
 	resolveModel app.ModelResolver
+	decisions    app.DecisionLogger
 }
 
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
@@ -172,7 +174,9 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 	if err != nil {
 		return nil, err
 	}
-	setHarnessRepo(h, root)
+	if oc, ok := h.(*opencode.Harness); ok {
+		oc.Repo = root
+	}
 	wt, err := workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
 	if err != nil {
 		return nil, err
@@ -181,10 +185,13 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 		wt.Refresher = refresher
 	}
 	infra := &wiredInfra{store: store, source: source, harness: h,
-		workspace: wt, scm: scmGW, changes: make(chan int, 64)}
-	// A harness without the resolver port leaves the dispatcher's resolver nil,
-	// which makes dispatch use the harness default.
-	infra.resolveModel = modelResolverFrom(h)
+		workspace: wt, scm: scmGW, changes: make(chan int, 64),
+		decisions: app.DecisionLogger{Sink: store}}
+	// resolveModel closes over the wired endpoint and token so a dispatch can
+	// look up the parent session's model even when no parent was known at start.
+	infra.resolveModel = func(parent string) core.ModelRef {
+		return resolveModel(cfg, harnessToken, parent)
+	}
 	return infra, nil
 }
 
@@ -211,6 +218,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		ParentSessionID:    firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
 		WorkerInstructions: cfg.Harness.WorkerInstructions,
 		ResolveModel:       infra.resolveModel,
+		Decisions:          infra.decisions,
 	}
 	ctrl := &app.Control{Store: infra.store, Harness: infra.harness, Workspace: infra.workspace, OnChange: func(pr int) {
 		select {
@@ -221,6 +229,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 	recon := newReconciler(cfg, infra.store, infra.scm, infra.harness,
 		infra.source, infra.workspace, disp, infra.changes,
 		firstNonEmpty(parentSession, cfg.Harness.ParentSessionID))
+	recon.Decisions = infra.decisions
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: infra.harness,
 		workspace: infra.workspace, scm: infra.scm, policy: recon.Policy,
@@ -274,16 +283,17 @@ func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) 
 
 func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, error) {
 	parent = firstNonEmpty(parent, cfg.Harness.ParentSessionID)
-	switch strings.ToLower(cfg.Harness.Provider) {
+	switch cfg.Harness.Provider {
 	case "opencode", "":
-		h := opencode.New(cfg.Harness.Endpoint, cfg.Harness.Model, cfg.Harness.Command, token, parent)
-		h.ModelRef = h.ResolveModel(parent)
+		h := opencode.New(opencode.Config{
+			Endpoint:        cfg.Harness.Endpoint,
+			Model:           cfg.Harness.Model,
+			Agent:           cfg.Harness.Command,
+			Token:           token,
+			ParentSessionID: parent,
+		})
+		h.ModelRef = resolveModel(cfg, token, parent)
 		return h, nil
-	case "acp":
-		if strings.TrimSpace(cfg.Harness.Command) == "" {
-			return nil, fmt.Errorf("acp harness requires command")
-		}
-		return acp.New(cfg.Harness.Command, cfg.Harness.Model, parent), nil
 	default:
 		return harness.New(harness.Config{
 			Provider: cfg.Harness.Provider, Command: cfg.Harness.Command,
@@ -292,36 +302,54 @@ func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, err
 	}
 }
 
-// resolveModel builds the configured harness and asks it for a model ref. The
-// resolution logic lives on the harness, so a provider without the resolver
-// port simply has no model to resolve. config_watch.go calls this for reloads.
-func resolveModel(cfg config.Config, token, parent string) map[string]string {
-	h, err := newHarness(cfg, token, parent)
+// resolveModel uses the configured model, then BEACON_MODEL, then the model
+// of the orchestrator session so workers run with the user's current choice.
+func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
+	if v := os.Getenv("BEACON_MODEL"); v != "" {
+		return core.ModelRef{ProviderID: "opencode", ID: v}
+	}
+	if cfg.Harness.Model != "" {
+		return core.ModelRef{ProviderID: "opencode", ID: cfg.Harness.Model}
+	}
+	if parent == "" || token == "" || cfg.Harness.Endpoint == "" {
+		return core.ModelRef{}
+	}
+	endpoint := strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil
+		return core.ModelRef{}
 	}
-	resolver := modelResolverFrom(h)
-	if resolver == nil {
-		return nil
+	if user, pass, ok := strings.Cut(token, ":"); ok {
+		req.SetBasicAuth(user, pass)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	return resolver(parent)
-}
-
-// setHarnessRepo points a harness that keeps a project registry at this repo.
-func setHarnessRepo(h core.AgentHarness, root string) {
-	if setter, ok := h.(core.RepoSetter); ok {
-		setter.SetRepo(root)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return core.ModelRef{}
 	}
-}
-
-// modelResolverFrom exposes a harness's model lookup to the dispatcher. A
-// harness without the port yields no resolver.
-func modelResolverFrom(h core.AgentHarness) app.ModelResolver {
-	resolver, ok := h.(core.ModelResolver)
-	if !ok {
-		return nil
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return core.ModelRef{}
 	}
-	return resolver.ResolveModel
+	var info struct {
+		Data struct {
+			Model struct {
+				ID         string `json:"id"`
+				ProviderID string `json:"providerID"`
+				Variant    string `json:"variant"`
+			} `json:"model"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.Data.Model.ID == "" {
+		return core.ModelRef{}
+	}
+	return core.ModelRef{
+		ProviderID: info.Data.Model.ProviderID,
+		ID:         info.Data.Model.ID,
+		Variant:    info.Data.Model.Variant,
+	}
 }
 
 func firstNonEmpty(values ...string) string {

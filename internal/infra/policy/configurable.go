@@ -59,6 +59,11 @@ func (r ChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	if o.AllRequiredPass(r.Names) {
 		return core.VerdictNoop, ""
 	}
+	if o.WorkflowSkipped {
+		if _, failed := o.Failure(); !failed {
+			return core.VerdictNoop, ""
+		}
+	}
 	var notPassed []string
 	for _, want := range r.Names {
 		state := "missing"

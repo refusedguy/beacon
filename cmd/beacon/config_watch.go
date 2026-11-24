@@ -121,7 +121,7 @@ func (cw *configWatcher) build(cfg config.Config, root string) *liveState {
 
 // modelResolver reads the current snapshot so a dispatch uses the model the
 // operator configured most recently.
-func (cw *configWatcher) modelResolver(parent string) map[string]string {
+func (cw *configWatcher) modelResolver(parent string) core.ModelRef {
 	state := cw.live.Load()
 	_, _, token := loadTokens(state.cfg)
 	return resolveModel(state.cfg, token, firstNonEmpty(parent, state.cfg.Harness.ParentSessionID))
