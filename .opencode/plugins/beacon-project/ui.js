@@ -47,7 +47,7 @@ export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg, maxRows = 
       insert(container, box)
       const s = { box, dot, name, status }
       if (onRow) {
-        setProp(box, "onMouseDown", () => { if (s.item?.runID) onRow(s.item) })
+        setProp(box, "onMouseDown", () => { if (s.item?.runID || s.item?.sectionKey) onRow(s.item) })
         setProp(box, "onMouseOver", () => setProp(box, "backgroundColor", hoverBg))
         setProp(box, "onMouseOut", () => setProp(box, "backgroundColor", undefined))
       }
@@ -110,6 +110,11 @@ async function setup(ctx, deps = {}) {
   const [footerItems, setFooterItems] = createSignal([metricsLine(EMPTY_SNAPSHOT)])
   const store = typeof ctx.storage?.store === "function"
     ? ctx.storage.store("beacon-selected-run", { initial: { id: "" } }) : [{ id: "" }, () => {}]
+  const sectionStore = typeof ctx.storage?.store === "function"
+    ? ctx.storage.store("beacon-detail-sections", { initial: {
+      Identity: false, Timing: false, Attempts: false, Reason: false, Timeline: false, Decisions: false,
+    } }) : [{}, () => {}]
+  const collapsed = { ...sectionStore[0] }
   const [selectedID, setSelectedID] = createSignal(store[0].id || "")
   let stopped = false
   let pollTimer
@@ -124,10 +129,23 @@ async function setup(ctx, deps = {}) {
     : key === "action" ? theme.text.action.primary.base
     : theme.text.feedback[key]?.base ?? theme.text.muted
   const mount = createRowMount({ createElement, insert, setProp }, {
-    color, BOLD, onRow: (item) => select(item.runID), hoverBg: theme.background.raised.high,
+    color, BOLD, onRow: (item) => {
+      if (typeof item.sectionKey === "string") toggleSection(item.sectionKey)
+      else select(item.runID)
+    },
+    hoverBg: theme.background.raised.high,
   })
   const rows = () => snapshotLineItems(snapshot(), error())
 
+  // Section clicks reuse the pooled detail rows. Toggling the flag and
+  // re-applying the one slot changes props and `visible` only, never the tree.
+  function toggleSection(key) {
+    collapsed[key] = !collapsed[key]
+    void sectionStore[1]((draft) => { draft[key] = collapsed[key] }).catch(() => {})
+    sync()
+    const slot = slots.detail
+    if (slot && !slot.node.isDestroyed) slot.apply()
+  }
   function select(id) {
     if (!id) return
     setSelectedID(id)
@@ -144,7 +162,7 @@ async function setup(ctx, deps = {}) {
     const snap = snapshot()
     setFooterItems([metricsLine(snap)])
     const run = [...snap.active, ...snap.recent].find((r) => r.id === selectedID())
-    setDetailItems(detailLines(run, snap.metrics, timers.now()))
+    setDetailItems(detailLines(run, snap.metrics, timers.now(), collapsed))
   }
 
   // The reconciler's renderer is only active inside a slot render callback.
@@ -180,12 +198,13 @@ async function setup(ctx, deps = {}) {
     const title = text("Beacon run detail", color("base"), null, true)
     setProp(title, "attributes", BOLD)
     insert(header, title)
-    // A styled ✕ plus an esc hint reads as a control, not stray punctuation.
+    // A styled ✕ plus the real ctrl+g binding reads as a control. Escape is
+    // owned by the global session interrupt, so it is not advertised here.
     const hint = createElement("box")
     setProp(hint, "flexDirection", "row")
     setProp(hint, "gap", 1)
     setProp(hint, "minWidth", 0)
-    insert(hint, text("esc", color("action")))
+    insert(hint, text("ctrl+g", color("action")))
     const close = text("✕", color("error"), closeDetail)
     setProp(close, "padding", 1)
     insert(hint, close)
@@ -263,8 +282,8 @@ async function setup(ctx, deps = {}) {
   }
   const removeKeymap = typeof ctx.keymap?.layer === "function"
     ? ctx.keymap.layer(() => ({ mode: "global", commands: [detailCommand((name) => {
-      suppressNextRowClick = false
-      ctx.ui.panel.open(name)
+      if (ctx.ui.panel.current?.()?.name === PANEL_NAME) closeDetail()
+      else { suppressNextRowClick = false; ctx.ui.panel.open(name) }
     })] }))
     : null
   const disposers = [

@@ -278,6 +278,84 @@ test("a row count change during refresh creates no nodes outside a render callba
   dispose()
 })
 
+test("section clicks toggle pooled rows and ctrl+g toggles the panel", async () => {
+  const created = []
+  const renderers = Object.create(null)
+  const initialSections = {
+    Identity: false, Timing: false, Attempts: false, Reason: false, Timeline: false, Decisions: false,
+  }
+  const sectionState = { ...initialSections }
+  const writes = []
+  let panelName = null
+  let layer = null
+  const panel = {
+    open: (name) => { panelName = name },
+    close: () => { panelName = null },
+    current: () => (panelName ? { name: panelName } : null),
+  }
+  const ctx = {
+    theme: themeStub(),
+    client: { rpc: () => ({ snapshot: async () => ({ active: [makeRun()], recent: [] }) }) },
+    storage: { store: (name, init) => {
+      if (name === "beacon-detail-sections") {
+        assert.deepEqual(init.initial, initialSections)
+        return [sectionState, async (fn) => { fn(sectionState); writes.push({ ...sectionState }) }]
+      }
+      return [{ id: "run-1" }, async () => {}]
+    } },
+    ui: {
+      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
+      panel,
+    },
+    keymap: { layer: (fn) => { layer = fn(); return () => { layer = null } } },
+  }
+  const modules = {
+    "@opentui/solid": solidModule(created),
+    "solid-js": { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } },
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    options: { statusPollMs: 0, watcherEnabled: false },
+    import: (specifier) => modules[specifier],
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const detail = renderers["session.panel"]({ name: PANEL_NAME, close: () => panel.close() })
+  assert.equal(detail.children[0].children[1].children[0].props.content, "ctrl+g", "the hint names the real binding")
+  assert.equal(JSON.stringify(detail).includes('"esc"'), false, "no esc label remains")
+  const rows = detail.children[1].children
+  const timing = rows.find((r) => r.children[1]?.props.content === "Timing")
+  assert.ok(timing, "the Timing header is rendered")
+  assert.equal(timing.children[0].props.content, "▶", "a stored false starts collapsed")
+  const visible = () => rows.filter((r) => r.props.visible === true).length
+  const before = visible()
+  const beforeCreated = created.length
+
+  timing.props.onMouseDown()
+  assert.equal(created.length, beforeCreated, "a section click creates no nodes")
+  assert.equal(timing.children[0].props.content, "▼", "the marker flips on click")
+  assert.ok(visible() > before, "body rows become visible on the pooled nodes")
+  assert.equal(writes.length, 1, "the flag is persisted")
+  assert.equal(writes[0].Timing, true)
+
+  timing.props.onMouseDown()
+  assert.equal(timing.children[0].props.content, "▶")
+  assert.equal(visible(), before, "the body is hidden again")
+  assert.equal(writes.length, 2)
+  assert.equal(writes[1].Timing, false)
+
+  const cmd = layer.commands[0]
+  assert.equal(cmd.bind, "ctrl+g")
+  assert.equal(panelName, null)
+  cmd.run()
+  assert.equal(panelName, PANEL_NAME, "ctrl+g opens the panel")
+  cmd.run()
+  assert.equal(panelName, null, "ctrl+g closes the open panel")
+  cmd.run()
+  assert.equal(panelName, PANEL_NAME, "ctrl+g reopens it")
+  dispose()
+})
+
 test("setup without injected deps keeps the TUI imports literal", async () => {
   const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
   for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {

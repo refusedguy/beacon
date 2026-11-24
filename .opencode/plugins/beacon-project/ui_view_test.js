@@ -103,6 +103,33 @@ test("detail groups fields into six sections with dim separators", () => {
   assert.ok(notes.includes("10:06:00 reconcile.decision merge"))
 })
 
+test("collapsed detail sections show ▶ and drop their body rows", () => {
+  const run = normalizeRun(makeRun())
+  const metrics = { dispatchCount: 25 }
+  const collapsed = { Timing: false, Decisions: false }
+  const detail = detailLines(run, metrics, NOW, collapsed)
+  const headers = detail.filter((i) => i.sectionKey)
+  assert.deepEqual(headers.map((i) => [i.sectionKey, i.marker, i.name, i.bold]), [
+    ["Identity", "▼", "Identity", true],
+    ["Timing", "▶", "Timing", true],
+    ["Attempts", "▼", "Attempts", true],
+    ["Reason", "▼", "Reason", true],
+    ["Timeline", "▼", "Timeline", true],
+    ["Decisions", "▶", "Decisions", true],
+  ])
+  const names = detail.map((i) => i.name ?? i.text)
+  for (const omitted of ["Created", "Updated", "Age", "Wait CI", "Running", "Blocked"]) {
+    assert.equal(names.includes(omitted), false, `collapsed Timing omits ${omitted}`)
+  }
+  assert.equal(names.some((n) => n.includes("reconcile.decision")), false, "collapsed Decisions omits its rows")
+  assert.equal(names.includes("State"), true, "Identity stays open")
+  assert.equal(names.includes("Rebase"), true, "Attempts stays open")
+  assert.equal(detail.filter((i) => i.name === RULE).length, 5, "separators stay put")
+  const expanded = detailLines(run, metrics, NOW, {})
+  assert.ok(expanded.some((i) => i.name === "Created"), "an unset flag shows the body")
+  assert.ok(expanded.every((i) => !i.sectionKey || i.marker === "▼"), "unset flags show ▼")
+})
+
 test("detail caps decisions to the most recent 20 and marks the rest", () => {
   const decisions = Array.from({ length: 25 }, (_, i) => ({
     at: `2026-11-23T10:${String(i).padStart(2, "0")}:00Z`,
