@@ -43,10 +43,11 @@ export function createDetailMount(ui, deps) {
     border: true, borderStyle: "rounded", borderColor: color("action"),
     backgroundColor: color("panel"), paddingLeft: 1, paddingRight: 1,
     paddingTop: 1, paddingBottom: 1, marginTop: 1, flexShrink: 0,
-    flexDirection: "column", minWidth: 0,
+    flexDirection: "column", minWidth: 0, overflow: "hidden",
   })
   const badgeRow = createBox(ui, {
     flexDirection: "row", justifyContent: "space-between", minWidth: 0, flexShrink: 0,
+    flexWrap: "wrap", rowGap: 1,
   })
   const badge = createText(ui, { content: "", fg: color("base"), bold: true })
   set(badge, "attributes", BOLD)
@@ -84,7 +85,10 @@ export function createDetailMount(ui, deps) {
   // Each action is a padded raised plate. Copy ID stays mounted so merged and
   // closed runs can still be copied. Cancel shows an inline confirmation.
   const showConfirm = (visible) => set(confirmBox, "visible", visible)
-  const actions = createBox(ui, { flexDirection: "row", minWidth: 0, marginTop: 1, flexShrink: 0 })
+  const actions = createBox(ui, {
+    flexDirection: "row", minWidth: 0, marginTop: 1, flexShrink: 0,
+    flexWrap: "wrap", rowGap: 1,
+  })
   const buttons = Object.create(null)
   const buttonBoxes = Object.create(null)
   for (const name of ACTION_NAMES) {
@@ -142,7 +146,7 @@ export function createDetailMount(ui, deps) {
   insert(heroCard, confirmBox)
   insert(container, heroCard)
 
-  const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0 })
+  const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0, minHeight: 0 })
   const body = createLineMount(ui, { ...deps, maxLines: DETAIL_LINES, wrap: true })
   body.node.forEach((node) => insert(scroll, node))
   insert(container, scroll)

@@ -34,11 +34,32 @@ export function cardFamily(card, queue = []) {
   return { deps, parent, children }
 }
 
-export function cardModel(card, queue = []) {
+// The queue and card panels share one persisted set of expanded epic IDs.
+// An absent map means every epic is collapsed, which is the operator default.
+export function createEpicState(ctx, onChange = () => {}) {
+  const store = typeof ctx.storage?.store === "function"
+    ? ctx.storage.store("beacon-epic-sections", { initial: {} }) : [{}, () => {}]
+  const open = Object.create(null)
+  for (const [id, value] of Object.entries(store[0] ?? {})) {
+    if (typeof id === "string" && value === true) open[id] = true
+  }
+  const toggle = (id) => {
+    if (!id) return
+    open[id] = !open[id]
+    void store[1]((draft) => { draft[id] = open[id] }).catch(() => {})
+    onChange()
+  }
+  return { open, toggle }
+}
+
+// A null map keeps the flat legacy rows for pure callers that never drive the
+// toggle. The real panel passes the persisted map so epics start collapsed.
+export function cardModel(card, queue = [], epicOpen = null) {
   if (!card) return null
   const { deps, parent, children } = cardFamily(card, queue)
   const queued = new Map((Array.isArray(queue) ? queue : []).map((item) => [str(item?.id), item]))
   const titleOf = (id) => str(queued.get(id)?.title)
+  const childIDs = new Set(children)
   const rows = []
   const meta = (label, value) => rows.push({
     marker: fieldKey(label), name: value || "-", status: "", color: "base", kind: "card-meta",
@@ -49,9 +70,12 @@ export function cardModel(card, queue = []) {
   meta("Status", card.status)
   meta("Kind", str(card.kind) || "task")
   meta("Depends", card.depends)
-  for (const dep of deps) rows.push({
-    marker: "↳", name: dep, status: titleOf(dep), color: "muted", kind: "card-dep", action: `card:${dep}`,
-  })
+  for (const dep of deps) {
+    if (childIDs.has(dep)) continue
+    rows.push({
+      marker: "↳", name: dep, status: titleOf(dep), color: "muted", kind: "card-dep", action: `card:${dep}`,
+    })
+  }
   if (parent) {
     rows.push({ marker: "", name: "Parent epic", status: "", color: "action", kind: "card-section" })
     rows.push({
@@ -60,8 +84,12 @@ export function cardModel(card, queue = []) {
     })
   }
   if (children.length) {
-    rows.push({ marker: "", name: `Children (${children.length})`, status: "", color: "action", kind: "card-section" })
-    for (const child of children) {
+    const expanded = epicOpen === null || epicOpen[str(card.id)] === true
+    rows.push({
+      marker: expanded ? "▼" : "▶", name: `Children (${children.length})`, status: "",
+      color: "action", kind: "card-section", epicKey: str(card.id), action: `epic:${card.id}`,
+    })
+    if (expanded) for (const child of children) {
       const title = titleOf(child)
       rows.push({
         marker: "↳", name: title ? `${child} · ${title}` : child,
@@ -101,7 +129,9 @@ export function createCardMount(ui, deps) {
   })
   const title = createText(ui, { content: "Task card", fg: color("action"), bold: true })
   set(title, "attributes", BOLD)
-  const controls = createBox(ui, { flexDirection: "row", minWidth: 0, flexShrink: 0 })
+  const controls = createBox(ui, {
+    flexDirection: "row", minWidth: 0, flexShrink: 0, flexWrap: "wrap", rowGap: 1,
+  })
   const back = createText(ui, { content: "← Back", fg: color("action"), onMouseUp: onBack })
   set(back, "paddingLeft", 1); set(back, "paddingRight", 1)
   const hint = createText(ui, { content: "ctrl+g", fg: color("action"), onMouseUp: onClose })
@@ -124,7 +154,9 @@ export function createCardMount(ui, deps) {
     flexDirection: "column", minWidth: 0,
   })
   const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0, minHeight: 0 })
-  const body = createLineMount(ui, { ...deps, onItem, maxLines: CARD_LINES, wrap: true })
+  const body = createLineMount(ui, {
+    ...deps, onItem, maxLines: CARD_LINES, wrap: true, shrinkStatus: true,
+  })
   body.node.forEach((node) => insert(scroll, node))
   insert(plate, scroll)
   insert(container, plate)

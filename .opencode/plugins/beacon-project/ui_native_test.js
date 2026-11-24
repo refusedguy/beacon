@@ -5,8 +5,9 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import {
   ACTION_NAMES, DETAIL_OPEN, SIDEBAR_OPEN, SIDEBAR_TITLE_WIDTH, STATE_BAR_WIDTH,
-  beaconStatusDefinition, createDetailMount, createSidebarMount, detailModel,
-  normalizeRun, sidebarModel, sidebarPresentation, stateBarItem, timelineText,
+  beaconStatusDefinition, cardModel, createCardMount, createDetailMount,
+  createSidebarMount, detailModel, normalizeRun, sidebarModel, sidebarPresentation,
+  stateBarItem, timelineText,
 } from "./ui.js"
 import { NOW, hostModule, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -236,6 +237,74 @@ test("Dispatch and Control still reach the RPC through the real setup", async ()
   assert.deepEqual(controls, [{ action: "retry", runID: "run-1", sha: "abcdef1234567890" }])
   assert.deepEqual(dispatches, [{ n: 1 }])
   assert.ok(toasts.length >= 2, "actions report through a toast")
+  dispose()
+})
+
+test("card controls wrap at narrow widths while status cells yield to titles", () => {
+  const mount = createCardMount(solidModule([]), {
+    color, BOLD: 1, onCopy: () => {}, onClose: () => {}, onBack: () => {}, onItem: () => {},
+  })
+  mount.apply(cardModel({
+    id: "T-42", title: "A very long card title", status: "ready", priority: 7,
+    depends: "T-40", body: "Goal: work.",
+  }, [{ id: "T-40", title: "Dependency", status: "available" }], {}))
+  const controls = mount.node.children[0].children[1]
+  assert.equal(controls.props.flexWrap, "wrap")
+  assert.equal(controls.props.rowGap, 1)
+  assert.equal(controls.children.length, 5, "Back, ctrl+g, read-only, gap and ✕ stay mounted")
+  assert.ok(controls.children.every((node) => node.props.flexShrink === 0))
+  const meta = mount.body.node.find((box) => box.item?.kind === "card-meta" && box.item.marker.trim() === "ID")
+  const [marker, name, status] = meta.children
+  assert.equal(marker.props.content, "ID        ", "the padded label column stays aligned")
+  assert.equal(name.props.wrapMode, "word", "long values wrap")
+  assert.equal(name.props.truncate, false)
+  assert.equal(status.props.flexShrink, 1, "the status cell yields width")
+  assert.equal(status.props.minWidth, 0)
+  assert.equal(status.props.truncate, true)
+})
+
+test("an epic chevron toggles the queue and persists through the real setup", async () => {
+  const renderers = Object.create(null)
+  const saved = []
+  const epicValue = {}
+  const ctx = {
+    theme: themeStub(),
+    client: { rpc: () => ({ snapshot: async () => ({
+      active: [], recent: [],
+      queue: [
+        { id: "T-EPIC", title: "Harness epic", status: "ready", priority: 9 },
+        { id: "T-EPIC-01", title: "Child card", status: "available", priority: 8 },
+      ],
+    }) }) },
+    storage: { store: (name, init) => {
+      const value = name === "beacon-sidebar-sections" ? { ...init.initial, queue: true } : { ...init.initial }
+      if (name === "beacon-epic-sections") {
+        return [epicValue, async (fn) => { fn(epicValue); saved.push({ ...epicValue }) }]
+      }
+      return [value, async () => {}]
+    } },
+    ui: {
+      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
+      panel: { open: () => {}, close: () => {} },
+    },
+    keymap: { layer: () => () => {} },
+  }
+  const modules = {
+    "@opentui/solid": solidModule(), "solid-js": signals(),
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    options: { statusPollMs: 0, watcherEnabled: false }, import: (specifier) => modules[specifier],
+    cardDeps: { existsSync: () => true, readFileSync: () => "---\nid: T-EPIC\nstatus: ready\n---\n" },
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  const sidebar = renderers["sidebar.content"]()
+  const chevron = findItem(sidebar, (item) => item.epicKey === "T-EPIC" && item.kind === "queue-title")
+  assert.ok(chevron, "the epic title carries the toggle")
+  assert.equal(chevron.children[0].props.content.trim(), "▶", "epics start collapsed")
+  chevron.props.onMouseDown()
+  assert.equal(chevron.children[0].props.content.trim(), "▼", "the chevron flips on click")
+  assert.equal(saved.at(-1)["T-EPIC"], true, "the state reaches storage")
   dispose()
 })
 
