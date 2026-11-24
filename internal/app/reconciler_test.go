@@ -3,12 +3,192 @@ package app
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+type orphanHarness struct {
+	*fakeHarness
+	alive   bool
+	err     error
+	checked []string
+}
+
+func (h *orphanHarness) IsAlive(_ context.Context, sessionID string) (bool, error) {
+	h.checked = append(h.checked, sessionID)
+	return h.alive, h.err
+}
+
+type memoryDecisionSink struct{ decisions []Decision }
+
+func (m *memoryDecisionSink) RecordDecision(_ context.Context, d Decision) error {
+	m.decisions = append(m.decisions, d)
+	return nil
+}
+
+func (m *memoryDecisionSink) LastDecision(_ context.Context, runID string) (*Decision, error) {
+	for i := len(m.decisions) - 1; i >= 0; i-- {
+		if m.decisions[i].RunID == runID {
+			d := m.decisions[i]
+			return &d, nil
+		}
+	}
+	return nil, nil
+}
+
+func orphanReconciler(store *fakeStore, scm *fakeSCM, h *orphanHarness, ws *fakeWorkspace) (*Reconciler, chan int) {
+	changes := make(chan int, 4)
+	r := &Reconciler{
+		Store: store, SCM: scm, Harness: h, Workspace: ws,
+		Source: &fakeSource{}, Changes: changes, OrphanTimeout: time.Minute,
+	}
+	return r, changes
+}
+
+func TestOrphanWatchdogLeavesLiveRunWithoutPRAlone(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := makeRun("r-live", 0, core.RunRunning)
+	run.UpdatedAt = time.Now().UTC().Add(-10 * time.Minute)
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	h := &orphanHarness{fakeHarness: &fakeHarness{}, alive: true}
+	ws := &fakeWorkspace{}
+	r, _ := orphanReconciler(store, &fakeSCM{}, h, ws)
+
+	r.reconcileOrphanRunning(ctx, []*core.Run{run})
+
+	if got := store.runs["r-live"]; got.State != core.RunRunning || got.PRNumber != 0 {
+		t.Fatalf("state=%s pr=%d, want running/0", got.State, got.PRNumber)
+	}
+	if h.stops != 0 || ws.forcedRemoves != 0 || len(h.checked) != 1 {
+		t.Fatalf("live run was disturbed: stops=%d forced=%d checked=%v", h.stops, ws.forcedRemoves, h.checked)
+	}
+}
+
+func TestOrphanWatchdogBindsPRByBranch(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := makeRun("r-bind", 0, core.RunRunning)
+	run.Branch = "beacon/T-1"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	h := &orphanHarness{fakeHarness: &fakeHarness{}, alive: true}
+	r, changes := orphanReconciler(store, &fakeSCM{foundPR: 77}, h, &fakeWorkspace{})
+
+	r.reconcileOrphanRunning(ctx, []*core.Run{run})
+
+	got := store.runs["r-bind"]
+	if got.State != core.RunWaitingCI || got.PRNumber != 77 {
+		t.Fatalf("state=%s pr=%d, want waiting_ci/77", got.State, got.PRNumber)
+	}
+	select {
+	case pr := <-changes:
+		if pr != 77 {
+			t.Fatalf("signal = %d, want 77", pr)
+		}
+	default:
+		t.Fatal("no reconcile signal after binding PR")
+	}
+	if len(h.checked) != 0 {
+		t.Fatalf("liveness checked after binding: %v", h.checked)
+	}
+}
+
+func TestOrphanWatchdogClosesDeadSessionAndFreesSlot(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := makeRun("r-dead", 0, core.RunRunning)
+	run.Branch = "beacon/T-1"
+	run.UpdatedAt = time.Now().UTC().Add(-10 * time.Minute)
+	run.ParentSessionID = "parent-session"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	h := &orphanHarness{fakeHarness: &fakeHarness{}, alive: false}
+	ws := &fakeWorkspace{dirty: true}
+	r, _ := orphanReconciler(store, &fakeSCM{}, h, ws)
+
+	r.reconcileOrphanRunning(ctx, []*core.Run{run})
+
+	got := store.runs["r-dead"]
+	if got.State != core.RunClosed || got.Reason != "worker session exited without PR" {
+		t.Fatalf("state=%s reason=%q, want closed with orphan reason", got.State, got.Reason)
+	}
+	if active, err := store.FindActiveByTask(ctx, "T-1"); err != nil || active != nil {
+		t.Fatalf("active run after close = %+v err=%v, want none", active, err)
+	}
+	if h.stops != 1 || ws.forcedRemoves != 1 {
+		t.Fatalf("stops=%d forced=%d, want 1/1", h.stops, ws.forcedRemoves)
+	}
+	if len(h.notifications) != 1 || h.notifications[0].sessionID != "parent-session" {
+		t.Fatalf("parent notifications = %+v", h.notifications)
+	}
+}
+
+func TestOrphanWatchdogSkipsRecentAndFailedLivenessChecks(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	recent := makeRun("r-recent", 0, core.RunRunning)
+	recent.Branch = "beacon/recent"
+	old := makeRun("r-error", 0, core.RunRunning)
+	old.Branch = "beacon/error"
+	old.UpdatedAt = time.Now().UTC().Add(-10 * time.Minute)
+	for _, run := range []*core.Run{recent, old} {
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &orphanHarness{fakeHarness: &fakeHarness{}, err: errors.New("liveness unavailable")}
+	r, _ := orphanReconciler(store, &fakeSCM{}, h, &fakeWorkspace{})
+
+	r.reconcileOrphanRunning(ctx, []*core.Run{recent, old})
+
+	if len(h.checked) != 1 || h.checked[0] != "sess" {
+		t.Fatalf("checked = %v, want only the stale run", h.checked)
+	}
+	if store.runs["r-recent"].State != core.RunRunning || store.runs["r-error"].State != core.RunRunning {
+		t.Fatalf("runs = %+v, want both still running", store.runs)
+	}
+}
+
+func TestDuplicateReconcileDecisionsAreSkipped(t *testing.T) {
+	ctx := context.Background()
+	logs := captureDecisions(t)
+	sink := &memoryDecisionSink{}
+	SetDecisionSink(sink)
+	t.Cleanup(func() { SetDecisionSink(nil) })
+
+	run := makeRun("r-decision", 42, core.RunWaitingCI)
+	obs := core.Observation{HeadSHA: "sha42", PRNumber: 42}
+	decision := core.MergeDecision{Verdict: core.VerdictWait, Reason: "checks pending"}
+	logReconcileDecision(ctx, 42, run, obs, decision, "wait")
+	logReconcileDecision(ctx, 42, run, obs, decision, "wait")
+	if len(sink.decisions) != 1 {
+		t.Fatalf("stored decisions = %d, want 1", len(sink.decisions))
+	}
+	debugSeen := false
+	for _, record := range logs.snapshot() {
+		if record.Message == "decision.duplicate_skipped" && record.Level == slog.LevelDebug {
+			debugSeen = true
+		}
+	}
+	if !debugSeen {
+		t.Fatal("duplicate decision was not logged at debug level")
+	}
+
+	obs.HeadSHA = "sha43"
+	logReconcileDecision(ctx, 42, run, obs, decision, "wait")
+	if len(sink.decisions) != 2 {
+		t.Fatalf("stored decisions = %d, want 2 after head change", len(sink.decisions))
+	}
+}
 
 func newReconciler(t *testing.T, decision core.Verdict, obs core.Observation) (*Reconciler, *fakeStore, *fakeSCM, *fakeHarness, *fakeSource) {
 	t.Helper()

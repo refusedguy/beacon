@@ -90,6 +90,28 @@ func NewRun(id RunID, task TaskID, now time.Time) *Run {
 func (r *Run) CanRebase() bool { return r.RebaseAttempts < r.effectiveMax() }
 func (r *Run) CanWake() bool   { return r.FixAttempts < r.effectiveMax() }
 
+// Retry re-arms a closed run. A run that already has a PR returns to
+// waiting_ci so the reconciler can finalize it. A run without a PR returns to
+// pending with its session and worktree cleared, ready for PromotePending to
+// spawn a fresh worker.
+func (r *Run) Retry(reason string) error {
+	if r.State != RunClosed {
+		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot retry run %s in %s", r.ID, r.State)}
+	}
+	r.RebaseAttempts = 0
+	r.FixAttempts = 0
+	if r.PRNumber > 0 {
+		r.State = RunWaitingCI
+	} else {
+		r.State = RunPending
+		r.SessionID = ""
+		r.WorkspacePath = ""
+	}
+	r.Reason = reason
+	r.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
 func (r *Run) effectiveMax() int {
 	if r.MaxAttempts <= 0 {
 		return 3

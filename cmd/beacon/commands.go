@@ -38,6 +38,19 @@ func wireReadOnly(path string) (config.Config, *sqlite.Store, *workspace.GitWork
 	return cfg, store, wt, nil
 }
 
+// daemonSnapshot converts the CLI's daemon liveness record into the app-level
+// snapshot type. The daemon files stay owned by the composition root.
+func daemonSnapshot(status daemonStatus) *app.DaemonSnapshot {
+	out := &app.DaemonSnapshot{
+		State: status.State, PID: status.PID,
+		HeartbeatAgeSeconds: status.HeartbeatAgeSecond,
+	}
+	if status.Error != nil {
+		out.Error = status.Error.Message
+	}
+	return out
+}
+
 func newDispatchCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "dispatch [n]",
@@ -77,7 +90,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				}
 				return printJSON(readDaemonStatus(filepath.Dir(cfg.StateDB)))
 			}
-			_, store, _, err := wireReadOnly(*configPath)
+			cfg, store, _, err := wireReadOnly(*configPath)
 			if err != nil {
 				return err
 			}
@@ -88,6 +101,8 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				decisionsLimit, _ := cmd.Flags().GetInt("decisions-limit")
 				result, err := (app.SnapshotService{
 					Store: store, RecentLimit: recentLimit, DecisionsLimit: decisionsLimit,
+					Repo:   cfg.SCM.Owner + "/" + cfg.SCM.Repo,
+					Daemon: daemonSnapshot(readDaemonStatus(filepath.Dir(cfg.StateDB))),
 				}).Snapshot(cmd.Context())
 				if err != nil {
 					return err
@@ -166,6 +181,7 @@ const (
 	controlUnblock = "unblock"
 	controlCancel  = "cancel"
 	controlRetry   = "retry"
+	controlNudge   = "nudge"
 )
 
 // controlResult is the stable JSON contract printed by beacon control on success.
@@ -176,9 +192,19 @@ type controlResult struct {
 }
 
 type controlRequest struct {
-	Action string `json:"action"`
-	RunID  string `json:"run_id"`
-	SHA    string `json:"sha"`
+	Action  string `json:"action"`
+	RunID   string `json:"run_id"`
+	SHA     string `json:"sha"`
+	Message string `json:"message,omitempty"`
+}
+
+// controlMessage picks the optional message used by nudge. The variadic form
+// keeps older callers of the control helpers unchanged.
+func controlMessage(messages []string) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	return messages[0]
 }
 
 // newControlCommand freezes the CLI contract. The json flag is accepted for
@@ -186,56 +212,61 @@ type controlRequest struct {
 func newControlCommand(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "control",
-		Short: "Approve, unblock, cancel or retry a run",
+		Short: "Approve, unblock, cancel, retry or nudge a run",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			action, _ := cmd.Flags().GetString("action")
 			runID, _ := cmd.Flags().GetString("run-id")
 			sha, _ := cmd.Flags().GetString("sha")
-			if err := validateControl(action, runID); err != nil {
+			message, _ := cmd.Flags().GetString("message")
+			if err := validateControl(action, runID, message); err != nil {
 				return err
 			}
-			if err := dispatchControl(cmd.Context(), *configPath, action, runID, sha); err != nil {
+			if err := dispatchControl(cmd.Context(), *configPath, action, runID, sha, message); err != nil {
 				return err
 			}
 			return printJSON(controlResult{OK: true, Action: action, RunID: runID})
 		},
 	}
-	cmd.Flags().String("action", "", "approve, unblock, cancel or retry")
+	cmd.Flags().String("action", "", "approve, unblock, cancel, retry or nudge")
 	cmd.Flags().String("run-id", "", "run ID to control")
 	cmd.Flags().String("sha", "", "observed SHA used by an approve action")
+	cmd.Flags().String("message", "", "guidance sent to the worker by a nudge action")
 	cmd.Flags().Bool("json", false, "print a machine readable result")
 	return cmd
 }
 
-func validateControl(action, runID string) error {
+func validateControl(action, runID string, message ...string) error {
 	switch action {
-	case controlApprove, controlUnblock, controlCancel, controlRetry:
+	case controlApprove, controlUnblock, controlCancel, controlRetry, controlNudge:
 	default:
 		return fmt.Errorf("unknown action %q", action)
 	}
 	if runID == "" {
 		return errors.New("run-id is required")
 	}
+	if action == controlNudge && controlMessage(message) == "" {
+		return errors.New("message is required for nudge")
+	}
 	return nil
 }
 
 // dispatchControl forwards to the daemon when it owns the state database and
 // connection file. Without a live daemon it applies the control directly.
-func dispatchControl(ctx context.Context, configPath, action, runID, sha string) error {
+func dispatchControl(ctx context.Context, configPath, action, runID, sha string, message ...string) error {
 	cfg, _, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
 	if info, err := readConnection(filepath.Dir(cfg.StateDB)); err == nil && daemonAlive(cfg.StateDB) {
-		return postControl(ctx, info, action, runID, sha)
+		return postControl(ctx, info, action, runID, sha, message...)
 	}
 	w, err := wire(configPath, "")
 	if err != nil {
 		return err
 	}
 	defer w.close()
-	return applyControl(ctx, w.control, action, runID, sha)
+	return applyControl(ctx, w.control, action, runID, sha, message...)
 }
 
 // controlPort is the slice of app.Control that the command drives.
@@ -244,9 +275,10 @@ type controlPort interface {
 	Unblock(ctx context.Context, id core.RunID) error
 	Cancel(ctx context.Context, id core.RunID) error
 	Retry(ctx context.Context, id core.RunID) error
+	Nudge(ctx context.Context, id core.RunID, message string) error
 }
 
-func applyControl(ctx context.Context, ctrl controlPort, action, runID, sha string) error {
+func applyControl(ctx context.Context, ctrl controlPort, action, runID, sha string, message ...string) error {
 	id := core.RunID(runID)
 	switch action {
 	case controlApprove:
@@ -257,13 +289,17 @@ func applyControl(ctx context.Context, ctrl controlPort, action, runID, sha stri
 		return ctrl.Cancel(ctx, id)
 	case controlRetry:
 		return ctrl.Retry(ctx, id)
+	case controlNudge:
+		return ctrl.Nudge(ctx, id, controlMessage(message))
 	default:
 		return fmt.Errorf("unknown action %q", action)
 	}
 }
 
-func postControl(ctx context.Context, info *connectionInfo, action, runID, sha string) error {
-	payload, err := json.Marshal(controlRequest{Action: action, RunID: runID, SHA: sha})
+func postControl(ctx context.Context, info *connectionInfo, action, runID, sha string, message ...string) error {
+	payload, err := json.Marshal(controlRequest{
+		Action: action, RunID: runID, SHA: sha, Message: controlMessage(message),
+	})
 	if err != nil {
 		return err
 	}
