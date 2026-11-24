@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/infra/config"
@@ -299,5 +300,92 @@ func TestDoctorHTTPCheckAuth(t *testing.T) {
 				t.Fatalf("Authorization = %q, want Bearer %q", gotAuth, tc.wantBearer)
 			}
 		})
+	}
+}
+
+func TestDoctorSCMCheckToleratesSlowServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(2500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config.Config{
+		BaseBranch: "main",
+		SCM: config.SCM{
+			Provider: "gitlab",
+			BaseURL:  srv.URL,
+			Owner:    "acme",
+			Repo:     "demo",
+			TokenEnv: "BEACON_DOCTOR_SLOW_TOKEN",
+		},
+	}
+	checks := doctorNetworkChecks(cfg, doctorHTTPClient())
+
+	var scm doctorCheck
+	for _, c := range checks {
+		if c.name == "scm base branch" {
+			scm = c
+		}
+	}
+	if scm.level != checkOK || scm.detail != "HTTP 200" {
+		t.Fatalf("scm base branch check = %v %q, want OK HTTP 200", scm.level, scm.detail)
+	}
+}
+
+func TestDoctorSCMCheckUnreachable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	cfg := config.Config{
+		BaseBranch: "main",
+		SCM: config.SCM{
+			Provider: "gitlab",
+			BaseURL:  url,
+			Owner:    "acme",
+			Repo:     "demo",
+			TokenEnv: "BEACON_DOCTOR_UNREACHABLE_TOKEN",
+		},
+	}
+	checks := doctorNetworkChecks(cfg, doctorHTTPClient())
+
+	var scm doctorCheck
+	for _, c := range checks {
+		if c.name == "scm base branch" {
+			scm = c
+		}
+	}
+	if scm.level != checkWarn || scm.detail != "unreachable" {
+		t.Fatalf("scm base branch check = %v %q, want WARN unreachable", scm.level, scm.detail)
+	}
+}
+
+func TestDoctorSCMCheckHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := config.Config{
+		BaseBranch: "main",
+		SCM: config.SCM{
+			Provider: "gitlab",
+			BaseURL:  srv.URL,
+			Owner:    "acme",
+			Repo:     "demo",
+			TokenEnv: "BEACON_DOCTOR_HTTP_ERROR_TOKEN",
+		},
+	}
+	checks := doctorNetworkChecks(cfg, doctorHTTPClient())
+
+	var scm doctorCheck
+	for _, c := range checks {
+		if c.name == "scm base branch" {
+			scm = c
+		}
+	}
+	if scm.level != checkWarn || scm.detail != "HTTP 500" {
+		t.Fatalf("scm base branch check = %v %q, want WARN HTTP 500", scm.level, scm.detail)
 	}
 }
