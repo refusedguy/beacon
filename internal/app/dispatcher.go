@@ -216,7 +216,10 @@ func (d *Dispatcher) handleStartFailure(ctx context.Context, run *core.Run, caus
 		_ = d.Harness.Stop(ctx, run.SessionID)
 	}
 	if run.WorkspacePath != "" {
-		_ = d.Workspace.Remove(ctx, Workspace{Path: run.WorkspacePath, Branch: run.Branch})
+		// A failed spawn can leave the card rewritten to in_progress inside the
+		// worktree, making it dirty. A plain Remove would refuse it and leave a
+		// stale path that blocks the next dispatch, so force the removal.
+		_ = d.Workspace.ForceRemove(ctx, Workspace{Path: run.WorkspacePath, Branch: run.Branch})
 	}
 }
 

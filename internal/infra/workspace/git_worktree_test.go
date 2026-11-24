@@ -193,13 +193,20 @@ func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 		t.Fatalf("agent file removed by Remove(): %v", err)
 	}
 
-	_, err = wt.Create(ctx, core.Task{ID: "T-CLEAN"})
-	var appErr *core.AppError
-	if !errors.As(err, &appErr) || appErr.Code != core.CodeConflict {
-		t.Fatalf("Create() error = %v, want *core.AppError with CodeConflict", err)
+	// A retry with a dirty stale path force-removes it and recreates the
+	// worktree, so the next dispatch is not blocked by a leftover conflict.
+	recreated, err := wt.Create(ctx, core.Task{ID: "T-CLEAN"})
+	if err != nil {
+		t.Fatalf("Create() with dirty stale path error = %v", err)
 	}
-	if _, err := os.Stat(dirty); err != nil {
-		t.Fatalf("agent file removed by Create(): %v", err)
+	if _, err := os.Stat(dirty); !os.IsNotExist(err) {
+		t.Fatalf("dirty file survived Create(): %v", err)
+	}
+	if clean, err := wt.Clean(ctx, recreated); err != nil || !clean {
+		t.Fatalf("recreated worktree Clean() = %v, %v; want true, nil", clean, err)
+	}
+	if recreated.Branch != ws.Branch {
+		t.Fatalf("branch = %q, want %q", recreated.Branch, ws.Branch)
 	}
 }
 
@@ -219,6 +226,30 @@ func TestGitWorktreeRemoveCleanWorktreeAndRecreate(t *testing.T) {
 	}
 	if _, err := wt.Create(ctx, task); err != nil {
 		t.Fatalf("Create() after Remove() error = %v", err)
+	}
+}
+
+func TestGitWorktreeCreateReportsBranchCheckedOutElsewhere(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	root := filepath.Dir(repo)
+	task := core.Task{ID: "T-BRANCH-ELSEWHERE"}
+	branch := branchName(task.ID)
+
+	// Check the task branch out in a worktree outside the directory Create
+	// manages. git then refuses to delete it with `branch -D`.
+	elsewhere := filepath.Join(root, "elsewhere")
+	gitCmd(t, repo, "worktree", "add", "-b", branch, elsewhere, "origin/main")
+
+	_, err := wt.Create(ctx, task)
+	if err == nil {
+		t.Fatal("Create() error = nil, want an error when the branch is checked out elsewhere")
+	}
+	if !strings.Contains(err.Error(), "delete branch "+branch) {
+		t.Fatalf("Create() error = %q, want it to name the branch it could not delete", err)
+	}
+	if !strings.Contains(err.Error(), "cannot delete branch") {
+		t.Fatalf("Create() error = %q, want git's refusal detail", err)
 	}
 }
 

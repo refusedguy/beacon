@@ -358,8 +358,35 @@ func TestDispatchClosesRunWhenWorkerIsGone(t *testing.T) {
 	if saved.State != core.RunClosed || saved.Reason != "claim rejected" {
 		t.Fatalf("state=%s reason=%q, want closed with cause", saved.State, saved.Reason)
 	}
-	if h.stops != 1 || ws.removed != 1 {
-		t.Fatalf("stops=%d removals=%d, want 1/1", h.stops, ws.removed)
+	if h.stops != 1 || ws.forcedRemoves != 1 || ws.removed != 0 {
+		t.Fatalf("stops=%d forcedRemoves=%d removals=%d, want 1/1/0", h.stops, ws.forcedRemoves, ws.removed)
+	}
+}
+
+func TestDispatchSpawnFailureForceRemovesDirtyWorktree(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	ws := &fakeWorkspace{dirty: true}
+	d := &Dispatcher{
+		Source:    &fakeSource{tasks: []core.Task{{ID: "T-SPAWN-DIRTY", Status: core.TaskAvailable}}},
+		Planner:   NewPlanner(nil),
+		Workspace: ws,
+		Harness: failingHarness{
+			fakeHarness: &fakeHarness{},
+			err:         errors.New("spawn exploded"),
+		},
+		Store:       store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	res, err := d.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failures) != 1 {
+		t.Fatalf("failures = %d, want 1", len(res.Failures))
+	}
+	if ws.forcedRemoves != 1 || ws.removed != 0 {
+		t.Fatalf("forcedRemoves = %d, removed = %d; want 1 and 0", ws.forcedRemoves, ws.removed)
 	}
 }
 
