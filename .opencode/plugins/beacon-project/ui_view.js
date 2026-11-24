@@ -68,7 +68,16 @@ export function runLineItems(run, now = Date.now(), recent = false) {
     { marker: "", name: meta, status: reason, color: "muted", runID: run.id },
   ]
 }
-const section = (label, count) => ({ marker: "▼", name: label, status: count == null ? "" : String(count), color: "action", bold: true })
+// Detail sections carry a key so a click can toggle them. `collapsed[key] ===
+// false` is the collapsed state, which shows ▶ and omits the body rows.
+const section = (label, key, collapsed = {}) => ({
+  marker: collapsed[key] === false ? "▶" : "▼",
+  name: label, status: "", color: "action", bold: true, sectionKey: key,
+})
+// Snapshot headers are counted but not clickable, so they keep the plain shape.
+const countedSection = (label, count) => ({
+  marker: "▼", name: label, status: count == null ? "" : String(count), color: "action", bold: true,
+})
 export function metricCounts(view = EMPTY_SNAPSHOT) {
   const m = view.metrics ?? {}
   return {
@@ -122,10 +131,10 @@ export function snapshotLineItems(snapshot = EMPTY_SNAPSHOT, error = null, now =
   const c = metricCounts(view)
   const items = [{ marker: "", name: "Beacon", status: `A${c.active} B${c.blocked} R${c.rebase} F${c.fix} ${clockOf(view)}`, color: "action", bold: true }]
   if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
-  items.push(section("Active", active.length))
+  items.push(countedSection("Active", active.length))
   if (!active.length) items.push({ marker: "", name: "No active runs", status: "", color: "muted" })
   else active.forEach((r) => items.push(...runLineItems(r, now)))
-  items.push(section("Recent", recent.length))
+  items.push(countedSection("Recent", recent.length))
   if (!recent.length) items.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
   else recent.forEach((r) => items.push(...runLineItems(r, now, true)))
   return items
@@ -138,7 +147,7 @@ export function metricsLine(snapshot = EMPTY_SNAPSHOT) {
   const c = metricCounts(view)
   return { marker: "", name: `Beacon active ${c.active} · blocked ${c.blocked} · rebase ${c.rebase} · fix ${c.fix} · updated ${clockOf(view)}`, status: "", color: "muted" }
 }
-export function detailLines(run, metrics, now = Date.now()) {
+export function detailLines(run, metrics, now = Date.now(), collapsed = {}) {
   if (!run) return [{ text: "No run selected", color: "muted" }]
   const v = stateView(run.state)
   const m = metrics ?? {}
@@ -148,35 +157,44 @@ export function detailLines(run, metrics, now = Date.now()) {
   })
   const note = (text, color = "muted") => ({ marker: "", name: text, status: "", color })
   const out = []
-  out.push(section("Identity"), field("State", `${v.marker} ${run.state} · ${v.label}`, v.color),
+  // A section keeps its header and separator even when collapsed. Only the
+  // body rows are skipped, so the pooled slots below shift up with no gap.
+  const add = (label, rows, first = false) => {
+    if (!first) out.push({ marker: "", name: RULE, status: "", color: "muted" })
+    out.push(section(label, label, collapsed))
+    if (collapsed[label] !== false) rows.forEach((row) => out.push(row))
+  }
+  const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
+  add("Identity", [
+    field("State", `${v.marker} ${run.state} · ${v.label}`, v.color),
     field("Run", run.id || "-"), field("Task", run.taskID || "-"),
     field("Title", run.title || "-", "base"), field("PR", run.pr ? `#${run.pr}` : "-"),
-    field("Branch", run.branch || "-"), field("SHA", run.sha ? truncate(run.sha, 12) : "-"))
-  out.push({ marker: "", name: RULE, status: "", color: "muted" })
-  const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
-  out.push(section("Timing"), field("Created", stamp(run.createdAt)), field("Updated", stamp(run.updatedAt)),
+    field("Branch", run.branch || "-"), field("SHA", run.sha ? truncate(run.sha, 12) : "-"),
+  ], true)
+  add("Timing", [
+    field("Created", stamp(run.createdAt)), field("Updated", stamp(run.updatedAt)),
     field("Age", ageOf(run, now)), field("Wait CI", elapsed(d.waitingCI * 1000)),
-    field("Running", elapsed(d.running * 1000)), field("Blocked", elapsed(d.blocked * 1000)))
-  out.push({ marker: "", name: RULE, status: "", color: "muted" })
-  out.push(section("Attempts"), field("Rebase", `${run.rebaseAttempts}/${run.maxAttempts || "?"}`),
+    field("Running", elapsed(d.running * 1000)), field("Blocked", elapsed(d.blocked * 1000)),
+  ])
+  add("Attempts", [
+    field("Rebase", `${run.rebaseAttempts}/${run.maxAttempts || "?"}`),
     field("Fix", `${run.fixAttempts}/${run.maxAttempts || "?"}`), field("Dispatch", m.dispatchCount ?? 0),
     field("Rebases", m.rebaseCount ?? 0), field("Merges", m.mergeCount ?? 0),
-    field("CI wait", elapsed((m.ciWaitSeconds ?? 0) * 1000)))
-  out.push({ marker: "", name: RULE, status: "", color: "muted" })
-  out.push(section("Reason"), note(run.reason || "-", run.state === "blocked" ? "error" : "base"))
-  out.push({ marker: "", name: RULE, status: "", color: "muted" })
-  out.push(section("Timeline"))
+    field("CI wait", elapsed((m.ciWaitSeconds ?? 0) * 1000)),
+  ])
+  add("Reason", [note(run.reason || "-", run.state === "blocked" ? "error" : "base")])
   const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
-  timeline.length ? timeline.forEach((e) => out.push(note(`${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`)))
-    : out.push(note("(none)"))
-  out.push({ marker: "", name: RULE, status: "", color: "muted" })
-  out.push(section("Decisions"))
+  add("Timeline", timeline.length
+    ? timeline.map((e) => note(`${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`))
+    : [note("(none)")])
   const allDecisions = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
   const decisions = allDecisions.slice(-DECISION_LIMIT)
   const earlier = allDecisions.length - decisions.length
-  if (earlier > 0) out.push(note(`... ${earlier} earlier decisions`))
-  decisions.length ? decisions.forEach((d) => out.push(note(`${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd())))
-    : out.push(note("(none)"))
+  const decisionRows = []
+  if (earlier > 0) decisionRows.push(note(`... ${earlier} earlier decisions`))
+  decisions.forEach((d) => decisionRows.push(note(`${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd())))
+  if (!decisions.length) decisionRows.push(note("(none)"))
+  add("Decisions", decisionRows)
   return out
 }
 export function detailCommand(open) {
