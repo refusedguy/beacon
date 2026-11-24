@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ var (
 
 type Harness struct {
 	Endpoint        string
+	Repo            string
 	Model           string
 	ModelRef        map[string]string
 	Agent           string
@@ -337,12 +339,50 @@ func (h *Harness) IsAlive(ctx context.Context, sessionID string) (bool, error) {
 	return true, nil
 }
 
+func canonicalPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return filepath.Clean(path)
+}
+
+// RefreshWorktrees removes stale OpenCode worktree rows for the configured
+// repo. A missing project or a rejected refresh means there is nothing to do.
+func (h *Harness) RefreshWorktrees(ctx context.Context) error {
+	if h.Repo == "" {
+		return nil
+	}
+	data, _, err := h.do(ctx, http.MethodGet, "/api/project", nil)
+	if err != nil {
+		return err
+	}
+	var projects []struct {
+		ID        string `json:"id"`
+		Canonical string `json:"canonical"`
+	}
+	if err := json.Unmarshal(data, &projects); err != nil {
+		return err
+	}
+	for _, p := range projects {
+		if canonicalPath(p.Canonical) != canonicalPath(h.Repo) {
+			continue
+		}
+		_, status, err := h.do(ctx, http.MethodPost, "/api/worktree/refresh", map[string]string{"projectID": p.ID})
+		if status == http.StatusBadRequest || status == http.StatusNotFound {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 func (h *Harness) Events() <-chan core.HarnessEvent {
 	h.init()
 	return h.events
 }
 
 var (
-	_ core.AgentHarness = (*Harness)(nil)
-	_ core.AgentHarness = (*OpenCode)(nil)
+	_ core.AgentHarness      = (*Harness)(nil)
+	_ core.AgentHarness      = (*OpenCode)(nil)
+	_ core.WorktreeRefresher = (*Harness)(nil)
 )
