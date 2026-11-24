@@ -5,7 +5,7 @@ import assert from "node:assert/strict"
 import {
   PANEL_NAME, beaconStatusDefinition, collectTransitionToasts,
   createDetailMount, createSidebarMount, detailModel, normalizeRun,
-  sidebarModel,
+  shortTaskID, sidebarModel,
 } from "./ui.js"
 import { NOW, hostModule, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -154,6 +154,28 @@ test("epic and child queue rows carry distinct markers and keep their link", () 
   assert.equal(child.name, "Child card")
   assert.ok(open.listItems.some((i) => i.name === "child · blocked · P8 · 1 dep"))
   assert.equal(open.listItems.find((i) => i.kind === "queue-dep" && i.name === "T-BLOCK").depID, "T-BLOCK")
+})
+
+test("child dependencies are not repeated and long IDs keep the readable suffix", () => {
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      {
+        id: "T-20261124-51f36", title: "Harness epic", status: "ready", priority: 9, kind: "epic",
+        depends_on: ["T-20261124-51f36-01", "T-20261124-51f36-02", "T-BLOCK"],
+      },
+      { id: "T-20261124-51f36-01", title: "Child one", status: "available", priority: 8 },
+      { id: "T-20261124-51f36-02", title: "Child two", status: "available", priority: 8 },
+    ],
+  }
+  const open = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true })
+  const deps = open.listItems.filter((i) => i.kind === "queue-dep")
+  assert.equal(deps.length, 1, "a child that is also a dependency is drawn once")
+  assert.equal(deps[0].depID, "T-BLOCK")
+  assert.equal(deps[0].name, "T-BLOCK")
+  assert.equal(shortTaskID("T-20261124-51f36-01"), "51f36-01", "the date prefix is dropped, not the ID middle cut")
+  assert.equal(shortTaskID("T-2"), "T-2")
+  assert.equal(shortTaskID(""), "-")
 })
 
 test("detail shows the fixer badge, next step, Session and the new buttons", async () => {

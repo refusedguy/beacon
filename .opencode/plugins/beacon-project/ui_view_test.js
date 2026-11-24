@@ -278,6 +278,58 @@ test("card children collapse by default and a child ID is drawn once", () => {
   assert.ok(expanded.some((r) => r.kind === "card-child" && r.name === "T-EPIC-01 · Child"))
 })
 
+test("stored open epics are stale at startup and only a click expands them", () => {
+  const saved = []
+  const value = { "T-EPIC": true, "T-OTHER": true }
+  const ctx = { storage: { store: (name) => {
+    assert.equal(name, "beacon-epic-sections")
+    return [value, async (fn) => { fn(value); saved.push({ ...value }) }]
+  } } }
+  const epic = ui.discardStoredEpicOpen(ui.createEpicState(ctx))
+  assert.equal(epic.open["T-EPIC"], undefined, "a stored open value does not reopen an epic")
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      { id: "T-EPIC", title: "Harness epic", status: "ready", priority: 9, kind: "epic" },
+      { id: "T-EPIC-01", title: "Child one", status: "available", priority: 8 },
+    ],
+  }
+  const open = { active: true, queue: true, recent: true }
+  const closed = ui.sidebarModel(snap, null, NOW, open, epic.open).listItems
+  assert.equal(closed.find((i) => i.cardID === "T-EPIC").marker, "▶")
+  assert.equal(closed.some((i) => i.cardID === "T-EPIC-01"), false)
+  epic.toggle("T-EPIC")
+  assert.equal(saved.at(-1)["T-EPIC"], true, "an explicit click still persists")
+  const expanded = ui.sidebarModel(snap, null, NOW, open, epic.open).listItems
+  assert.equal(expanded.find((i) => i.cardID === "T-EPIC").marker, "▼")
+  assert.ok(expanded.some((i) => i.cardID === "T-EPIC-01"))
+})
+
+test("an expanded epic caps child rows and keeps Recent reachable", () => {
+  const epicID = "T-20261124-51f36"
+  const children = Array.from({ length: 5 }, (_, i) => ({
+    id: `${epicID}-${String(i + 1).padStart(2, "0")}`,
+    title: `Child ${i + 1}`, status: "ready", priority: 8,
+  }))
+  const snap = {
+    active: [], recent: [makeRun({ ID: "r1", TaskID: "T-RECENT", State: "merged" })],
+    queue: [
+      { id: epicID, title: "Harness epic", status: "ready", priority: 9, kind: "epic" },
+      ...children,
+    ],
+  }
+  const open = { active: true, queue: true, recent: true }
+  const items = ui.sidebarModel(snap, null, NOW, open, { [epicID]: true }).listItems
+  const shown = children.filter((child) => items.some((i) => i.kind === "queue-title" && i.cardID === child.id))
+  assert.equal(shown.length, ui.QUEUE_CHILD_LIMIT, "only the first children render")
+  assert.equal(items.some((i) => i.cardID === children[4].id), false, "later children stay hidden")
+  const more = items.find((i) => i.kind === "queue-more")
+  assert.equal(more.name, "+2 more")
+  assert.equal(more.marker, "")
+  assert.ok(items.some((i) => i.sectionKey === "recent"), "Recent stays reachable")
+  assert.ok(items.some((i) => i.recent === true && i.runID === "r1"), "a recent run stays clickable")
+})
+
 test("epic state reads only true IDs from storage and persists toggles", () => {
   const saved = []
   const value = { "T-EPIC": true, stale: "yes" }

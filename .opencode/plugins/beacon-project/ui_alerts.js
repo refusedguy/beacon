@@ -61,7 +61,9 @@ export function baseIncidentItem(incident) {
 
 export function shortTaskID(value) {
   const id = str(value)
-  return id ? (id.length > 10 ? id.slice(-8) : id) : "-"
+  // Cards are T-YYYYMMDD-<slug>[-NN]. Drop the date prefix and keep the
+  // readable slug with its child suffix instead of cutting the ID in half.
+  return id ? id.replace(/^T-\d{8}-/, "") : "-"
 }
 
 // A generated child carries its parent's ID as a prefix. Longest match wins
@@ -75,6 +77,9 @@ export function queueLineItems(queue = []) {
   const list = Array.isArray(queue) ? queue : []
   const parents = new Map(list.map((item) => [str(item?.id), queueParent(list, str(item?.id))]))
   const parentsWithChildren = new Set(parents.values())
+  // A generated child is already a row. A parent that lists its children in
+  // depends must not draw those IDs a second time as dependency lines.
+  const childIDs = new Set([...parents].filter(([, parent]) => parent).map(([id]) => id))
   return list.flatMap((item) => {
     const cardID = str(item?.id)
     const parent = parents.get(cardID) || ""
@@ -97,11 +102,80 @@ export function queueLineItems(queue = []) {
         cardID, kind: "queue-status", action: cardID ? `card:${cardID}` : undefined,
       },
     ]
-    for (const dep of deps) rows.push({
-      marker: "↳", name: shortTaskID(dep), status: "", color: "muted", kind: "queue-dep",
-      depID: dep, action: `card:${dep}`,
-    })
+    for (const dep of deps) {
+      if (childIDs.has(dep)) continue
+      rows.push({
+        marker: "↳", name: shortTaskID(dep), status: "", color: "muted", kind: "queue-dep",
+        depID: dep, action: `card:${dep}`,
+      })
+    }
     return rows
+  })
+}
+
+// An expanded epic shows at most this many children. The rest collapse into a
+// "+N more" line so the queue never pushes Recent out of the sidebar.
+export const QUEUE_CHILD_LIMIT = 3
+
+export function queueRows(queue = [], epicOpen = null) {
+  const list = Array.isArray(queue) ? queue : []
+  const rows = queueLineItems(list)
+  if (!epicOpen) return rows
+  const ids = list.map((item) => str(item?.id))
+  const parentOf = (id) => ids.filter((p) => p && p !== id && id.startsWith(`${p}-`))
+    .sort((a, b) => b.length - a.length)[0] || ""
+  const childrenOf = (id) => ids.filter((child) => parentOf(child) === id)
+  const counts = new Map()
+  for (const id of ids) {
+    const parent = parentOf(id)
+    if (parent) counts.set(parent, (counts.get(parent) ?? 0) + 1)
+  }
+  const isEpic = (id) => counts.has(id)
+    || list.some((i) => str(i?.id) === id && str(i?.kind).toLowerCase() === "epic")
+  // Walk up to the direct child under each ancestor epic. This hides the whole
+  // subtree of a collapsed epic and of a child beyond the cap.
+  const childUnder = (id, ancestor) => {
+    let current = id
+    let parent = parentOf(current)
+    while (parent && parent !== ancestor) {
+      current = parent
+      parent = parentOf(current)
+    }
+    return parent === ancestor ? current : ""
+  }
+  const hidden = new Set()
+  for (const id of ids) {
+    let parent = parentOf(id)
+    while (parent) {
+      if (isEpic(parent)) {
+        if (epicOpen[parent] !== true) { hidden.add(id); break }
+        if (childrenOf(parent).indexOf(childUnder(id, parent)) >= QUEUE_CHILD_LIMIT) { hidden.add(id); break }
+      }
+      parent = parentOf(parent)
+    }
+  }
+  const visible = rows.filter((row) => !hidden.has(row.cardID))
+  const summaries = []
+  for (const id of ids) {
+    if (!isEpic(id) || epicOpen[id] !== true) continue
+    const children = childrenOf(id)
+    if (children.length <= QUEUE_CHILD_LIMIT) continue
+    const last = children[QUEUE_CHILD_LIMIT - 1]
+    let at = -1
+    for (let i = visible.length - 1; i >= 0; i -= 1) {
+      if (visible[i].cardID === last) { at = i + 1; break }
+    }
+    if (at > 0) summaries.push({ at, item: {
+      marker: "", name: `+${children.length - QUEUE_CHILD_LIMIT} more`, status: "",
+      color: "muted", kind: "queue-more", epicKey: id,
+    } })
+  }
+  for (const { at, item } of summaries.sort((a, b) => b.at - a.at)) visible.splice(at, 0, item)
+  return visible.map((row) => {
+    if (row.kind !== "queue-title" || !isEpic(row.cardID)) return row
+    const chevron = epicOpen[row.cardID] === true ? "▼" : "▶"
+    return { ...row, marker: chevron, status: String(counts.get(row.cardID) ?? 0),
+      statusColor: "muted", epicKey: row.cardID, action: `epic:${row.cardID}` }
   })
 }
 
