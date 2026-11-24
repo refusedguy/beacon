@@ -101,23 +101,11 @@ test("setup defers every createElement to a slot render callback", async () => {
   }
   const renderers = Object.create(null)
   const ctx = {
-    theme: {
-      text: {
-        base: "base", muted: "muted", action: { primary: { base: "action" } },
-        feedback: {
-          error: { base: "error" }, warning: { base: "warning" },
-          success: { base: "success" }, info: { base: "info" },
-        },
-      },
-      background: { raised: { high: "hover" } },
-    },
+    theme: themeStub(),
     client: { rpc: () => ({ snapshot: async () => ({ active: [], recent: [] }) }) },
     storage: { store: () => [{ id: "" }, async () => {}] },
     ui: {
-      slot: ({ append, render }) => {
-        renderers[append] = render
-        return () => { delete renderers[append] }
-      },
+      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
       panel: { open: () => {} },
     },
     keymap: { layer: () => {} },
@@ -135,13 +123,13 @@ test("setup defers every createElement to a slot render callback", async () => {
 
   const before = created.length
   assert.equal(renderers["sidebar.content"](), sidebar, "sidebar node is reused")
-  assert.equal(renderers["home.footer.status"]() !== sidebar, true, "footer has its own node")
   assert.equal(created.length, before, "repeat renders create no new nodes")
-
+  const footer = renderers["home.footer.status"]()
+  assert.notEqual(footer, sidebar, "footer has its own node")
   const detail = renderers["session.panel"]({ name: PANEL_NAME })
   assert.ok(detail, "panel render returns the detail node")
   assert.equal(renderers["session.panel"]({ name: "other" }), null, "other panels render nothing")
-  assert.equal(created.length, before, "opening the detail panel creates no new nodes")
+  assert.equal(renderers["session.panel"]({ name: PANEL_NAME }), detail, "detail node is reused")
 
   dispose()
   assert.equal(Object.keys(renderers).length, 0, "dispose removes every slot")
@@ -172,26 +160,14 @@ test("a row count change during refresh creates no nodes outside a render callba
   const renderers = Object.create(null)
   let tick = null
   const ctx = {
-    theme: {
-      text: {
-        base: "base", muted: "muted", action: { primary: { base: "action" } },
-        feedback: {
-          error: { base: "error" }, warning: { base: "warning" },
-          success: { base: "success" }, info: { base: "info" },
-        },
-      },
-      background: { raised: { high: "hover" } },
-    },
+    theme: themeStub(),
     client: { rpc: () => ({
       snapshot: async () => current,
       events: { on: () => () => {} },
     }) },
     storage: { store: () => [{ id: "" }, async () => {}] },
     ui: {
-      slot: ({ append, render }) => {
-        renderers[append] = render
-        return () => { delete renderers[append] }
-      },
+      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
       panel: { open: () => {} },
     },
     keymap: { layer: () => {} },
@@ -337,5 +313,38 @@ test("detail panel ✕ closes once and swallows the next row click", async () =>
   row.props.onMouseDown()
   assert.equal(openCount, 1, "the next click reopens the panel")
 
+  dispose()
+})
+
+test("a destroyed sidebar slot is rebuilt without touching the other slots", async () => {
+  const created = []
+  const renderers = Object.create(null)
+  const ctx = {
+    theme: themeStub(),
+    client: { rpc: () => ({ snapshot: async () => ({ active: [makeRun({ ID: "run-1", TaskID: "T-1", title: "First" })], recent: [] }) }) },
+    storage: { store: () => [{ id: "" }, async () => {}] },
+    ui: { slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }, panel: { open: () => {} } },
+    keymap: { layer: () => () => {} },
+  }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    options: { statusPollMs: 0, watcherEnabled: false },
+    import: (specifier) => ({
+      "@opentui/solid": solidModule(created),
+      "solid-js": { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } },
+      "@opentui/core": { TextAttributes: { BOLD: 1 } },
+    })[specifier],
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  const first = renderers["sidebar.content"]()
+  const footer = renderers["home.footer.status"]()
+  const detail = renderers["session.panel"]({ name: PANEL_NAME })
+  for (const node of [first, ...first.children]) node.isDestroyed = true
+  const before = created.length
+  const second = renderers["sidebar.content"]()
+  assert.notEqual(second, first, "remount returns a fresh sidebar node")
+  assert.ok(created.length > before, "the destroyed slot allocates a fresh row pool")
+  assert.equal(renderers["home.footer.status"](), footer, "the footer node is kept")
+  assert.equal(renderers["session.panel"]({ name: PANEL_NAME }), detail, "the detail node is kept")
+  assert.ok(second.children.some((c) => c.props.visible === true && String(c.children[1]?.props.content ?? "").includes("T-1")), "the new node shows current runs")
   dispose()
 })

@@ -150,47 +150,57 @@ async function setup(ctx, deps = {}) {
   // The reconciler's renderer is only active inside a slot render callback.
   // Creating nodes here reaches it before any renderer exists and throws
   // "No renderer found", so the first render callback builds every node once.
-  let nodes = null
-  function ensureNodes() {
-    if (nodes) return nodes
-    const listBox = () => {
-      const box = createElement("box")
-      setProp(box, "flexDirection", "column")
-      return box
-    }
-    const text = (content, fg, onMouseUp, grow = false) => {
-      const node = createElement("text")
-      setProp(node, "content", content)
-      setProp(node, "fg", fg)
-      setProp(node, "wrapMode", "none")
-      setProp(node, "selectable", false)
-      if (onMouseUp) setProp(node, "onMouseUp", onMouseUp)
-      if (grow) { setProp(node, "flexGrow", 1); setProp(node, "minWidth", 0) }
-      return node
-    }
-    const sidebar = listBox()
-    const footer = listBox()
-    const detailBox = listBox()
-    setProp(detailBox, "flexGrow", 1)
+  // OpenCode unmounts sidebar.content when a panel opens and destroys those
+  // nodes. Each slot owns its node and is rebuilt only when that node reports
+  // isDestroyed, so an undestroyed slot keeps its cache and its row pool.
+  const slots = Object.create(null)
+  const SLOT_KEYS = ["sidebar", "footer", "detail"]
+  const listBox = () => {
+    const box = createElement("box")
+    setProp(box, "flexDirection", "column")
+    return box
+  }
+  const text = (content, fg, onMouseUp, grow = false) => {
+    const node = createElement("text")
+    setProp(node, "content", content)
+    setProp(node, "fg", fg)
+    setProp(node, "wrapMode", "none")
+    setProp(node, "selectable", false)
+    if (onMouseUp) setProp(node, "onMouseUp", onMouseUp)
+    if (grow) { setProp(node, "flexGrow", 1); setProp(node, "minWidth", 0) }
+    return node
+  }
+  function makeDetail() {
+    const box = listBox()
+    setProp(box, "flexGrow", 1)
     const header = createElement("box")
     setProp(header, "flexDirection", "row")
     setProp(header, "justifyContent", "space-between")
     insert(header, text("Beacon run detail", color("base"), null, true))
     insert(header, text("✕", color("muted"), closeDetail))
-    const detail = listBox()
-    insert(detailBox, header)
-    insert(detailBox, detail)
-    nodes = {
-      sidebar, footer, detail: detailBox,
-      applySidebar: mount(sidebar, rows, MAX_ROWS),
-      applyFooter: mount(footer, footerItems, FOOTER_ROWS),
-      applyDetail: mount(detail, detailItems, DETAIL_ROWS),
+    const list = listBox()
+    insert(box, header)
+    insert(box, list)
+    return { node: box, list }
+  }
+  function ensureSlot(key) {
+    const slot = slots[key]
+    if (slot && !slot.node.isDestroyed) return slot
+    let entry
+    if (key === "sidebar") {
+      const sidebar = listBox()
+      entry = { node: sidebar, apply: mount(sidebar, rows, MAX_ROWS) }
+    } else if (key === "footer") {
+      const footer = listBox()
+      entry = { node: footer, apply: mount(footer, footerItems, FOOTER_ROWS) }
+    } else {
+      const { node: detailBox, list: detail } = makeDetail()
+      entry = { node: detailBox, apply: mount(detail, detailItems, DETAIL_ROWS) }
+      sync()
     }
-    nodes.applySidebar()
-    nodes.applyFooter()
-    sync()
-    nodes.applyDetail()
-    return nodes
+    slots[key] = entry
+    entry.apply()
+    return entry
   }
 
   let pending = false
@@ -205,11 +215,12 @@ async function setup(ctx, deps = {}) {
       setError(null)
     } catch (cause) { if (!stopped) setError(errorMessage(cause)) }
     finally { inFlight = false }
-    if (!stopped && nodes) {
+    if (!stopped) {
       sync()
-      nodes.applySidebar()
-      nodes.applyFooter()
-      nodes.applyDetail()
+      for (const key of SLOT_KEYS) {
+        const slot = slots[key]
+        if (slot && !slot.node.isDestroyed) slot.apply()
+      }
     }
     if (pending && !stopped) {
       pending = false
@@ -235,15 +246,15 @@ async function setup(ctx, deps = {}) {
     })] }))
     : null
   const disposers = [
-    ctx.ui.slot({ append: "sidebar.content", render: () => ensureNodes().sidebar }),
-    ctx.ui.slot({ append: "home.footer.status", render: () => ensureNodes().footer }),
+    ctx.ui.slot({ append: "sidebar.content", render: () => ensureSlot("sidebar").node }),
+    ctx.ui.slot({ append: "home.footer.status", render: () => ensureSlot("footer").node }),
     ctx.ui.slot({ append: "session.panel", render: (input) => {
       if (input.name !== PANEL_NAME) return null
       if (typeof input?.close === "function") panelClose = input.close
-      const n = ensureNodes()
+      const slot = ensureSlot("detail")
       sync()
-      n.applyDetail()
-      return n.detail
+      slot.apply()
+      return slot.node
     } }),
     // Keymap registration happens once in setup; this slot only keeps the
     // registration point stable for the operator's layout.
