@@ -33,9 +33,11 @@ type UpdatedTask struct {
 
 // UpdateResult reports every id; Refused lists ids with an active run.
 type UpdateResult struct {
-	Results []UpdatedTask `json:"results"`
-	Refused []string      `json:"refused,omitempty"`
-	Pushed  bool          `json:"pushed"`
+	Results     []UpdatedTask `json:"results"`
+	Refused     []string      `json:"refused,omitempty"`
+	Pushed      bool          `json:"pushed"`
+	Status      string        `json:"status,omitempty"`
+	OperationID string        `json:"operation_id,omitempty"`
 }
 
 // TaskUpdater edits several task cards in one commit and push.

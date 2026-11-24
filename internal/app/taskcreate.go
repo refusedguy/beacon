@@ -65,11 +65,13 @@ type CreateTaskInput struct {
 }
 
 type CreatedTask struct {
-	ID       string        `json:"id"`
-	Path     string        `json:"path"`
-	Pushed   bool          `json:"pushed"`
-	IDs      []string      `json:"ids,omitempty"`
-	Children []CreatedTask `json:"children,omitempty"`
+	ID          string        `json:"id"`
+	Path        string        `json:"path"`
+	Pushed      bool          `json:"pushed"`
+	IDs         []string      `json:"ids,omitempty"`
+	Children    []CreatedTask `json:"children,omitempty"`
+	Status      string        `json:"status,omitempty"`
+	OperationID string        `json:"operation_id,omitempty"`
 }
 
 // CreatedCard is one entry in a batch create response.
@@ -80,9 +82,15 @@ type CreatedCard struct {
 
 // CreateBatchResult is the response for a batch task creation.
 type CreateBatchResult struct {
-	Created []CreatedCard `json:"created"`
-	Pushed  bool          `json:"pushed"`
+	Created     []CreatedCard `json:"created"`
+	Pushed      bool          `json:"pushed"`
+	Status      string        `json:"status,omitempty"`
+	OperationID string        `json:"operation_id,omitempty"`
 }
+
+// detachedPushTimeout bounds a push that must finish after the caller's
+// context was cancelled. A committed card must not stay unpublished.
+const detachedPushTimeout = 30 * time.Second
 
 // TaskCreator writes cards through the source, then commits and pushes them.
 // An epic with a plan expands into deterministic child cards before the epic.
@@ -177,6 +185,11 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput) ([]CreatedTask, error) {
 	if len(inputs) == 0 {
 		return nil, nil
+	}
+	for _, in := range inputs {
+		if id := strings.TrimSpace(in.ID); id != "" && !validTaskID(id) {
+			return nil, core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
+		}
 	}
 	ids := c.batchIDs(inputs)
 	resolved := make([]CreateTaskInput, len(inputs))
@@ -357,8 +370,10 @@ func (c *TaskCreator) rollback(ctx context.Context, tasks []core.Task) {
 	if !ok {
 		return
 	}
+	opCtx, cancel := detachedContext(ctx)
+	defer cancel()
 	for i := len(tasks) - 1; i >= 0; i-- {
-		_ = remover.Remove(ctx, tasks[i].ID)
+		_ = remover.Remove(opCtx, tasks[i].ID)
 	}
 }
 
@@ -426,30 +441,62 @@ func (c *TaskCreator) result(created []core.Task) CreatedTask {
 	return out
 }
 
-// publishPath rebases, commits pathspec and retries one non-fast-forward push. Creation and deletion share it.
+// publishPath rebases, commits pathspec and retries one non-fast-forward push.
+// Creation, update and deletion share it. Cancellation before the commit aborts
+// the publish so the caller can restore the cards. Cancellation after the
+// commit cannot undo it, so the push and its retry finish with a bounded
+// context detached from the caller.
 func publishPath(ctx context.Context, ws PathCommitter, root core.Workspace, pathspec, message string) error {
-	base := root.Base
-	if base == "" {
-		base = root.Branch
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if base == "" {
-		base = "main"
-	}
-	commit := func() error { return ws.CommitPath(ctx, root, pathspec, message) }
+	base := publishBase(root)
 	if err := rebaseBase(ctx, ws, root, base); err != nil {
 		return err
 	}
-	if err := commit(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ws.CommitPath(ctx, root, pathspec, message); err != nil {
 		var nff *NonFastForwardError
 		if !errors.As(err, &nff) {
 			return err
 		}
-		if err := rebaseBase(ctx, ws, root, base); err != nil {
-			return err
-		}
-		return commit()
+		return retryPublish(ctx, ws, root, pathspec, message, base)
 	}
 	return nil
+}
+
+func publishBase(root core.Workspace) string {
+	if root.Base != "" {
+		return root.Base
+	}
+	if root.Branch != "" {
+		return root.Branch
+	}
+	return "main"
+}
+
+// retryPublish completes a push rejected as non-fast-forward. A cancelled
+// caller must not leave a committed card unpublished, so the retry uses a
+// detached bounded context.
+func retryPublish(ctx context.Context, ws PathCommitter, root core.Workspace, pathspec, message, base string) error {
+	opCtx, cancel := detachedContext(ctx)
+	defer cancel()
+	if err := rebaseBase(opCtx, ws, root, base); err != nil {
+		return err
+	}
+	return ws.CommitPath(opCtx, root, pathspec, message)
+}
+
+// detachedContext returns the caller's context while it is live. Once it is
+// cancelled, a bounded background context takes over so work that cannot be
+// undone still finishes. The no-op cancel keeps callers uniform.
+func detachedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() != nil {
+		return context.WithTimeout(context.Background(), detachedPushTimeout)
+	}
+	return ctx, func() {}
 }
 
 func rebaseBase(ctx context.Context, ws PathCommitter, root core.Workspace, base string) error {

@@ -241,11 +241,28 @@ func (g *GitWorktree) CommitPath(ctx context.Context, ws core.Workspace, pathspe
 			return err
 		}
 	}
-	_, err = g.runInDir(ctx, ws.Path, "push", "origin", ws.Branch)
+	// The commit is durable. Cancellation after it must not leave cards
+	// committed but unpublished, so finish the push with a bounded context
+	// detached from the cancelled caller.
+	pushCtx, cancel := detachedPushContext(ctx, g.Timeout)
+	defer cancel()
+	_, err = g.runInDir(pushCtx, ws.Path, "push", "origin", ws.Branch)
 	if err != nil && isNonFastForward(err) {
 		return &app.NonFastForwardError{Err: err}
 	}
 	return err
+}
+
+// detachedPushContext keeps a live caller context and replaces a cancelled one
+// with a bounded background context. A zero timeout falls back to one minute.
+func detachedPushContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	if timeout <= 0 {
+		timeout = time.Minute
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 func (g *GitWorktree) HasChanges(ctx context.Context, ws core.Workspace, base string) (bool, error) {

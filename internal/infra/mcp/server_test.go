@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -858,5 +860,250 @@ func TestTaskCreateBatchRollsBackOverInMemoryTransport(t *testing.T) {
 	// its file but cannot undo that commit.
 	if committer.calls != 1 {
 		t.Fatalf("commit calls = %d, want the first card's publish only", committer.calls)
+	}
+}
+
+func decodeToolResult[T any](t *testing.T, res *msdk.CallToolResult) T {
+	t.Helper()
+	if res.IsError || len(res.Content) == 0 {
+		t.Fatalf("unexpected tool result: %+v", res)
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatalf("unexpected result: %+v", res.Content)
+	}
+	var out T
+	if err := json.Unmarshal([]byte(text.Text), &out); err != nil {
+		t.Fatalf("unmarshal %q: %v", text.Text, err)
+	}
+	return out
+}
+
+func callUpdateArgs(t *testing.T, cs *msdk.ClientSession, args map[string]any) app.UpdateResult {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_task_update", Arguments: args,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decodeToolResult[app.UpdateResult](t, res)
+}
+
+func callDeleteArgs(t *testing.T, cs *msdk.ClientSession, args map[string]any) app.DeleteResult {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_task_delete", Arguments: args,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decodeToolResult[app.DeleteResult](t, res)
+}
+
+func TestTaskCreateOperationIDIsIdempotentOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	committer := &stubCommitter{}
+	creator := &app.TaskCreator{
+		Source: tasksource.NewMarkdown(dir), Workspace: committer,
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	cs := deleteClient(t, Services{TaskCreator: creator})
+	args := createBatchArgs()
+	args["operation_id"] = "op-create-1"
+
+	first, res := callCreateBatch(t, cs, args)
+	if res.IsError {
+		t.Fatalf("unexpected tool error: %+v", res)
+	}
+	if first.Status != "applied" || first.OperationID != "op-create-1" || len(first.Created) != 2 {
+		t.Fatalf("first = %+v", first)
+	}
+	commits := committer.calls
+
+	second, res := callCreateBatch(t, cs, args)
+	if res.IsError {
+		t.Fatalf("unexpected tool error: %+v", res)
+	}
+	if second.Status != "duplicate" || second.OperationID != "op-create-1" {
+		t.Fatalf("second = %+v", second)
+	}
+	if len(second.Created) != len(first.Created) {
+		t.Fatalf("duplicate changed the card count: %d vs %d", len(second.Created), len(first.Created))
+	}
+	for i := range first.Created {
+		if second.Created[i].ID != first.Created[i].ID {
+			t.Fatalf("card %d changed: %+v vs %+v", i, second.Created[i], first.Created[i])
+		}
+	}
+	if committer.calls != commits {
+		t.Fatalf("duplicate committed %d more times", committer.calls-commits)
+	}
+}
+
+func TestTaskUpdateOperationIDIsIdempotentOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpdateTestCard(t, dir, "T-A", "---\nid: T-A\ntitle: Old\n---\nbody\n")
+	committer := &deleteCommitter{}
+	cs := deleteClient(t, updateService(dir, &deleteRunStore{}, committer))
+	args := map[string]any{
+		"operation_id": "op-update-1",
+		"updates":      []any{map[string]any{"id": "T-A", "title": "New"}},
+	}
+
+	first := callUpdateArgs(t, cs, args)
+	if first.Status != "applied" || first.OperationID != "op-update-1" || !first.Pushed {
+		t.Fatalf("first = %+v", first)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "title: New") {
+		t.Fatalf("card not updated: %s", content)
+	}
+	commits := committer.calls
+
+	second := callUpdateArgs(t, cs, args)
+	if second.Status != "duplicate" || second.OperationID != "op-update-1" || !second.Pushed {
+		t.Fatalf("second = %+v", second)
+	}
+	if committer.calls != commits {
+		t.Fatalf("duplicate committed %d more times", committer.calls-commits)
+	}
+}
+
+func TestTaskDeleteOperationIDIsIdempotentOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	writeDeleteCards(t, dir, "T-A", "T-B")
+	committer := &deleteCommitter{}
+	deleter := &app.TaskDeleter{
+		Store: &deleteRunStore{}, Workspace: committer,
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	cs := deleteClient(t, Services{TaskDeleter: deleter})
+	args := map[string]any{"operation_id": "op-delete-1", "ids": []any{"T-A", "T-B"}}
+
+	first := callDeleteArgs(t, cs, args)
+	if first.Status != "applied" || first.OperationID != "op-delete-1" || !first.Pushed {
+		t.Fatalf("first = %+v", first)
+	}
+	commits := committer.calls
+
+	second := callDeleteArgs(t, cs, args)
+	if second.Status != "duplicate" || second.OperationID != "op-delete-1" {
+		t.Fatalf("second = %+v", second)
+	}
+	if len(second.Results) != len(first.Results) {
+		t.Fatalf("duplicate changed the result count: %d vs %d", len(second.Results), len(first.Results))
+	}
+	if committer.calls != commits {
+		t.Fatalf("duplicate committed %d more times", committer.calls-commits)
+	}
+}
+
+func TestOpJournalRunIsIdempotent(t *testing.T) {
+	j := newOpJournal()
+	calls := 0
+	fn := func(context.Context) (any, error) {
+		calls++
+		return app.DeleteResult{Pushed: true}, nil
+	}
+	first, err := j.run(context.Background(), "op-1", fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := first.(app.DeleteResult); !ok || got.Status != "applied" {
+		t.Fatalf("first = %+v", first)
+	}
+	second, err := j.run(context.Background(), "op-1", fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("mutation ran %d times, want 1", calls)
+	}
+	if got, ok := second.(app.DeleteResult); !ok || got.Status != "duplicate" {
+		t.Fatalf("second = %+v", second)
+	}
+}
+
+func TestOpJournalRunSerializesConcurrentCalls(t *testing.T) {
+	j := newOpJournal()
+	calls := 0
+	release := make(chan struct{})
+	fn := func(context.Context) (any, error) {
+		calls++
+		<-release
+		return app.DeleteResult{Pushed: true}, nil
+	}
+	results := make([]app.DeleteResult, 8)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			v, err := j.run(context.Background(), "op-concurrent", fn)
+			if err != nil {
+				return
+			}
+			results[i], _ = v.(app.DeleteResult)
+		}(i)
+	}
+	close(release)
+	wg.Wait()
+	if calls != 1 {
+		t.Fatalf("mutation ran %d times under concurrency, want 1", calls)
+	}
+	for _, got := range results {
+		if got.Status != "duplicate" && got.Status != "applied" {
+			t.Fatalf("unexpected status %q", got.Status)
+		}
+	}
+}
+
+func TestOpJournalRunMarksRecoveredCaller(t *testing.T) {
+	j := newOpJournal()
+	ctx, cancel := context.WithCancel(context.Background())
+	result, err := j.run(ctx, "op-recovered", func(context.Context) (any, error) {
+		cancel()
+		return app.DeleteResult{Pushed: true, Results: []app.DeletedTask{{ID: "T-A", Status: "deleted"}}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := result.(app.DeleteResult)
+	if !ok || got.Status != "recovered" || got.OperationID != "op-recovered" || !got.Pushed {
+		t.Fatalf("result = %+v", result)
+	}
+	repeat, err := j.run(context.Background(), "op-recovered", func(context.Context) (any, error) {
+		t.Fatal("duplicate ran the mutation again")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, ok := repeat.(app.DeleteResult); !ok || again.Status != "duplicate" {
+		t.Fatalf("repeat = %+v", repeat)
+	}
+}
+
+func TestOpJournalIsBounded(t *testing.T) {
+	j := newOpJournal()
+	for i := 0; i < operationJournalLimit+5; i++ {
+		if _, err := j.run(context.Background(), fmt.Sprintf("op-%d", i), func(context.Context) (any, error) {
+			return app.DeleteResult{}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j.mu.Lock()
+	size, order := len(j.done), len(j.order)
+	j.mu.Unlock()
+	if size > operationJournalLimit || order > operationJournalLimit {
+		t.Fatalf("journal grew to %d entries and %d order keys", size, order)
+	}
+	if _, ok := j.cached("op-0"); ok {
+		t.Fatal("oldest entry was not evicted")
 	}
 }
