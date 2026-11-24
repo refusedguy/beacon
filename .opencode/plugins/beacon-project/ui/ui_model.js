@@ -4,9 +4,9 @@ import { execFile as nodeExecFile } from "node:child_process"
 import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
 import { join, relative, resolve } from "node:path"
 import { promisify } from "node:util"
-import { beaconCommand } from "./mcp.js"
-import { locationInfo, projectRoot } from "./location.js"
-import { cliEnv } from "./session_identity.js"
+import { beaconCommand } from "../mcp/mcp.js"
+import { locationInfo, projectRoot } from "../state/location.js"
+import { cliEnv } from "../state/session_identity.js"
 const execFileAsync = promisify(nodeExecFile)
 export const REFRESH_MS = 5000
 export const RPC_TIMEOUT_MS = 10000

@@ -19,15 +19,15 @@ import {
   metricsLine, sidebarModel, toggleAllBlockedGroups, toggleBlockedGroup,
 } from "./ui_view.js"
 import { compactReason } from "./ui_alerts.js"
-import { sessionIdentity } from "./session_identity.js"
+import { sessionIdentity } from "../state/session_identity.js"
 import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
 import { createDetailMount } from "./ui_detail_view.js"
 import { clipboardCopier, createActionRunner } from "./ui_actions.js"
 import { CARD_PANEL_NAME, cardBackCommand, cardModel, cardRelativePath, createCardMount, createEpicState, fixPrompt } from "./ui_card_view.js"
 import { createRunChangeBridge } from "./ui_bridge.js"
-import { projectRoot } from "./location.js"
-import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
+import { projectRoot } from "../state/location.js"
+import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "../state/options.js"
 
 export const FOOTER_ROWS = 1
 // Compatibility adapter for tests and callers that drive one pooled row list.

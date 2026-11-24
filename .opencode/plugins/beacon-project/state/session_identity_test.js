@@ -2,7 +2,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { cliEnv, sessionIdentity } from "./session_identity.js"
-import { CliStatusSource, createStatusSource, errorMessage } from "./ui.js"
+import { CliStatusSource, createStatusSource, errorMessage } from "../ui/ui.js"
 
 test("cliEnv carries the project root, session and model into the child env", () => {
   const env = cliEnv("/p", { sessionID: "ses_123", model: "hy4-flash-free", env: { PATH: "/bin" } })
