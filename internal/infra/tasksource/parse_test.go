@@ -17,6 +17,7 @@ scope:
 priority: 3
 plan:
   - title: First child
+    body: Implement the first child.
     scope: [internal/app/a.go, internal/**/*.go]
     depends: [T-BASE]
     priority: 9
@@ -42,6 +43,9 @@ func TestParseTaskFieldsEpic(t *testing.T) {
 	if first.Title != "First child" || first.Priority != 9 {
 		t.Fatalf("first child = %+v", first)
 	}
+	if first.Body != "Implement the first child." {
+		t.Fatalf("first child body = %q", first.Body)
+	}
 	wantScope := []core.ScopePath{"f:internal/app/a.go", "g:internal/**/*.go"}
 	if len(first.Scope) != len(wantScope) {
 		t.Fatalf("first scope = %v", first.Scope)
@@ -58,6 +62,9 @@ func TestParseTaskFieldsEpic(t *testing.T) {
 	if second.Title != "Second child" || second.Priority != 4 || len(second.Scope) != 1 ||
 		second.Scope[0] != "f:internal/infra/b.go" || len(second.Depends) != 1 || second.Depends[0] != "T-BASE" {
 		t.Fatalf("second child = %+v", second)
+	}
+	if second.Body != "" {
+		t.Fatalf("second child body = %q, want empty", second.Body)
 	}
 }
 
@@ -78,6 +85,7 @@ func TestPlanParserChildren(t *testing.T) {
 		Plan: []core.ChildSpec{
 			{
 				Title:    "First child",
+				Body:     "Implement the first child.",
 				Scope:    []core.ScopePath{core.ScopeFile("internal/app/a.go")},
 				Depends:  []core.TaskID{"T-BASE"},
 				Priority: 9,
@@ -95,6 +103,9 @@ func TestPlanParserChildren(t *testing.T) {
 		first.Kind != core.TaskKindTask || first.Status != core.TaskAvailable {
 		t.Fatalf("first child = %+v", first)
 	}
+	if first.Body != "Implement the first child." {
+		t.Fatalf("first child body = %q", first.Body)
+	}
 	if len(first.Scope) != 1 || first.Scope[0] != "f:internal/app/a.go" {
 		t.Fatalf("first scope = %v", first.Scope)
 	}
@@ -107,6 +118,9 @@ func TestPlanParserChildren(t *testing.T) {
 	}
 	if len(second.Scope) != 0 || len(second.DependsOn) != 0 {
 		t.Fatalf("second child carried unexpected scope or depends: %+v", second)
+	}
+	if second.Body != "" {
+		t.Fatalf("second child body = %q, want empty", second.Body)
 	}
 }
 

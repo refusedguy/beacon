@@ -178,6 +178,83 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 	}
 }
 
+func TestTaskCreateChildBodiesOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	source := tasksource.NewMarkdown(dir)
+	creator := &app.TaskCreator{
+		Source: source, Workspace: &stubCommitter{},
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	server := NewServer(Services{TaskCreator: creator})
+
+	clientTransport, serverTransport := msdk.NewInMemoryTransports()
+	ss, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
+	cs, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_task_create",
+		Arguments: map[string]any{
+			"id": "T-EPIC", "title": "Epic", "kind": "epic",
+			"plan": []any{
+				map[string]any{"title": "Child one", "body": "Write the first module."},
+				map[string]any{"title": "Child two", "priority": 4},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Content) == 0 {
+		t.Fatal("empty tool result")
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatalf("unexpected result: %+v", res.Content)
+	}
+	var created app.CreatedTask
+	if err := json.Unmarshal([]byte(text.Text), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID != "T-EPIC" || len(created.Children) != 2 {
+		t.Fatalf("created = %+v", created)
+	}
+
+	first, err := os.ReadFile(filepath.Join(dir, "T-EPIC-01.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(first), "Write the first module.") {
+		t.Fatalf("first child card missing body:\n%s", first)
+	}
+	second, err := os.ReadFile(filepath.Join(dir, "T-EPIC-02.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(second), "Write the first module.") {
+		t.Fatalf("second child carried the first body:\n%s", second)
+	}
+
+	epic, err := os.ReadFile(filepath.Join(dir, "T-EPIC.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(epic), "body: Write the first module.") {
+		t.Fatalf("epic card plan missing child body:\n%s", epic)
+	}
+	if strings.HasPrefix(strings.TrimSpace(string(epic)), "body:") {
+		t.Fatalf("child body leaked into epic frontmatter outside plan:\n%s", epic)
+	}
+}
+
 type deleteRunStore struct {
 	active map[string]bool
 	err    error

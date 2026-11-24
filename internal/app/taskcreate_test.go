@@ -265,6 +265,64 @@ func TestTaskCreatorExpandsEpic(t *testing.T) {
 	}
 }
 
+func TestTaskCreatorCopiesChildBodies(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+	plan := []core.ChildSpec{
+		{Title: "First child", Body: "  Do the first thing.  "},
+		{Title: "Second child", Body: "Do the second thing."},
+	}
+
+	if _, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: plan,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.created) != 3 {
+		t.Fatalf("created cards = %d, want epic plus two children", len(src.created))
+	}
+	if got := src.created[0].Body; got != "Do the first thing." {
+		t.Fatalf("first child body = %q", got)
+	}
+	if got := src.created[1].Body; got != "Do the second thing." {
+		t.Fatalf("second child body = %q", got)
+	}
+	if got := src.created[2].Body; got != "" {
+		t.Fatalf("epic body = %q, want empty", got)
+	}
+}
+
+func TestTaskCreatorChildBodyDoesNotChangeIDs(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+	in := CreateTaskInput{Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic,
+		Plan: []core.ChildSpec{{Title: "Child", Body: "First instruction."}}}
+
+	first, err := creator.Create(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Plan[0].Body = "Changed instruction."
+	second, err := creator.Create(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if second.ID != first.ID || len(second.IDs) != len(first.IDs) || len(second.Children) != len(first.Children) {
+		t.Fatalf("first = %+v, second = %+v", first, second)
+	}
+	for i := range first.IDs {
+		if second.IDs[i] != first.IDs[i] {
+			t.Fatalf("ids changed: %v vs %v", first.IDs, second.IDs)
+		}
+	}
+	if len(src.created) != 2 || len(ws.commits) != 1 {
+		t.Fatalf("body change wrote %d cards and %d commits", len(src.created), len(ws.commits))
+	}
+}
+
 func TestTaskCreatorSyncsFullAvailableSet(t *testing.T) {
 	src := &recordingEpicSource{fakeSource: &fakeSource{
 		log: &callLog{},

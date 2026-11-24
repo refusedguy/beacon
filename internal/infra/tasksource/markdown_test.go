@@ -269,6 +269,7 @@ depends: [T-BASE]
 priority: 5
 plan:
   - title: Foo child
+    body: Split off the foo work.
     scope: [internal/app/foo.go]
     depends: [T-BASE]
     priority: 8
@@ -308,8 +309,14 @@ func TestMarkdownFrontmatterEpic(t *testing.T) {
 		len(got.Plan[0].Depends) != 1 || got.Plan[0].Depends[0] != "T-BASE" {
 		t.Fatalf("first plan entry = %+v", got.Plan[0])
 	}
+	if got.Plan[0].Body != "Split off the foo work." {
+		t.Fatalf("first plan body = %q", got.Plan[0].Body)
+	}
 	if got.Plan[1].Title != "Bar child" || got.Plan[1].Priority != 3 {
 		t.Fatalf("second plan entry = %+v", got.Plan[1])
+	}
+	if got.Plan[1].Body != "" {
+		t.Fatalf("second plan body = %q, want empty", got.Plan[1].Body)
 	}
 
 	children, err := s.Children(context.Background(), "T-EPIC")
@@ -321,6 +328,9 @@ func TestMarkdownFrontmatterEpic(t *testing.T) {
 	}
 	if children[0].Title != "Foo child" || children[0].Priority != 8 || children[0].Kind != core.TaskKindTask {
 		t.Fatalf("first child = %+v", children[0])
+	}
+	if children[0].Body != "Split off the foo work." {
+		t.Fatalf("first child body = %q", children[0].Body)
 	}
 }
 
@@ -336,6 +346,7 @@ func TestMarkdownCreateEpic(t *testing.T) {
 		RequireReview: core.ReviewModeNone,
 		Plan: []core.ChildSpec{{
 			Title:    "Child one",
+			Body:     "Handle the create path.",
 			Scope:    []core.ScopePath{core.ScopeFile("internal/app/create.go")},
 			Depends:  []core.TaskID{"T-BASE"},
 			Priority: 6,
@@ -354,7 +365,7 @@ func TestMarkdownCreateEpic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"kind: epic", "base_branch: main", "require_review: none", "title: Child one", "priority: 6", "internal/app/create.go"} {
+	for _, want := range []string{"kind: epic", "base_branch: main", "require_review: none", "title: Child one", "body: Handle the create path.", "priority: 6", "internal/app/create.go"} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("card missing %q:\n%s", want, b)
 		}
@@ -376,12 +387,18 @@ func TestMarkdownCreateEpic(t *testing.T) {
 		len(got.Plan[0].Depends) != 1 || got.Plan[0].Depends[0] != "T-BASE" {
 		t.Fatalf("round-trip plan = %+v", got.Plan)
 	}
+	if got.Plan[0].Body != "Handle the create path." {
+		t.Fatalf("round-trip child body = %q", got.Plan[0].Body)
+	}
 	children, err := s.Children(context.Background(), "T-EPIC-2")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(children) != 1 || children[0].ID != "T-EPIC-2-01" || children[0].Title != "Child one" {
 		t.Fatalf("children = %+v", children)
+	}
+	if children[0].Body != "Handle the create path." {
+		t.Fatalf("child body = %q", children[0].Body)
 	}
 }
 

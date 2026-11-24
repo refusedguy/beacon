@@ -88,6 +88,7 @@ type batchTaskArgs struct {
 
 type epicChildArg struct {
 	Title    string   `json:"title"`
+	Body     string   `json:"body,omitempty"`
 	Scope    []string `json:"scope,omitempty"`
 	Depends  []string `json:"depends,omitempty"`
 	Priority int      `json:"priority,omitempty"`
@@ -108,7 +109,7 @@ func buildCreateInput(title, body string, scope, depends []string, priority int,
 	children := make([]core.ChildSpec, 0, len(plan))
 	for _, spec := range plan {
 		children = append(children, core.ChildSpec{
-			Title: spec.Title, Scope: specScopes(spec.Scope),
+			Title: spec.Title, Body: spec.Body, Scope: specScopes(spec.Scope),
 			Depends: specDeps(spec.Depends), Priority: spec.Priority,
 		})
 	}
