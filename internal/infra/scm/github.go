@@ -115,9 +115,11 @@ func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, er
 	var out []core.CheckResult
 	for _, c := range res.CheckRuns {
 		out = append(out, core.CheckResult{
-			Name:   c.GetName(),
-			State:  checkState(c),
-			Output: strings.TrimSpace(c.GetOutput().GetTitle() + " " + c.GetOutput().GetText()),
+			Name:        c.GetName(),
+			State:       checkState(c),
+			Output:      strings.TrimSpace(c.GetOutput().GetTitle() + " " + c.GetOutput().GetText()),
+			StartedAt:   c.GetStartedAt().Time,
+			CompletedAt: c.GetCompletedAt().Time,
 		})
 	}
 	return out, nil

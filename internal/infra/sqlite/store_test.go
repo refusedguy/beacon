@@ -625,3 +625,101 @@ INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r1', 'T-1
 		}
 	}
 }
+
+func TestChecksRoundTrip(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	start := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+
+	run := core.NewRun("r-checks", "T-1", time.Now().UTC())
+	run.Checks = []core.CheckResult{{
+		Name: "ci", State: core.CheckSuccess,
+		StartedAt: start, CompletedAt: start.Add(28 * time.Second),
+	}}
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "r-checks")
+	if err != nil || got == nil || len(got.Checks) != 1 {
+		t.Fatalf("get = %+v err=%v", got, err)
+	}
+	check := got.Checks[0]
+	if check.Name != "ci" || check.State != core.CheckSuccess || check.DurationSeconds() != 28 {
+		t.Fatalf("check = %+v", check)
+	}
+	if !check.StartedAt.Equal(start) || !check.CompletedAt.Equal(start.Add(28*time.Second)) {
+		t.Fatalf("timestamps = %s / %s", check.StartedAt, check.CompletedAt)
+	}
+
+	run.Checks = nil
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Get(ctx, "r-checks")
+	if err != nil || got == nil || got.Checks == nil || len(got.Checks) != 0 {
+		t.Fatalf("cleared checks = %+v err=%v", got, err)
+	}
+}
+
+func TestChecksMigrationPreservesRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	legacy, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+CREATE TABLE runs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  pr_number INTEGER NOT NULL DEFAULT 0,
+  head_sha TEXT NOT NULL DEFAULT '',
+  observed_sha TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  parent_session_id TEXT NOT NULL DEFAULT '',
+  workspace_path TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '',
+  scope_json TEXT NOT NULL DEFAULT '[]',
+  blocked_incident_id TEXT NOT NULL DEFAULT '',
+  is_fixer INTEGER NOT NULL DEFAULT 0,
+  rebase_attempts INTEGER NOT NULL DEFAULT 0,
+  fix_attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r-old', 'T-1', 'waiting_ci', 1, 2);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	got, err := store.Get(ctx, "r-old")
+	if err != nil || got == nil || got.State != core.RunWaitingCI {
+		t.Fatalf("get migrated run = %+v err=%v", got, err)
+	}
+	if got.Checks == nil || len(got.Checks) != 0 {
+		t.Fatalf("old run checks = %+v, want empty array", got.Checks)
+	}
+	got.Checks = []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
+	if err := store.Save(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Get(ctx, "r-old")
+	if err != nil || got == nil || len(got.Checks) != 1 || got.Checks[0].State != core.CheckFailure {
+		t.Fatalf("write after migration = %+v err=%v", got, err)
+	}
+}

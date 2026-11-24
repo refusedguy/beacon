@@ -78,6 +78,7 @@ type Run struct {
 	FixAttempts       int
 	MaxAttempts       int
 	Reason            string
+	Checks            []CheckResult
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }

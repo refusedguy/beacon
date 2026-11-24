@@ -29,7 +29,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 const runColumns = `id, task_id, state, pr_number, head_sha, observed_sha, observed_base_sha, session_id,
  parent_session_id, workspace_path, branch, scope_json, blocked_incident_id, is_fixer,
- rebase_attempts, fix_attempts, max_attempts, reason, created_at, updated_at`
+ rebase_attempts, fix_attempts, max_attempts, reason, checks_json, created_at, updated_at`
 
 func (s *Store) Save(ctx context.Context, r *core.Run) error {
 	now := time.Now().UTC()
@@ -38,6 +38,10 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 	}
 	r.UpdatedAt = now
 	scope, err := json.Marshal(r.Scope)
+	if err != nil {
+		return err
+	}
+	checks, err := json.Marshal(checksForSave(r.Checks))
 	if err != nil {
 		return err
 	}
@@ -57,7 +61,7 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO runs (`+runColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+INSERT INTO runs (`+runColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
  state=excluded.state, pr_number=excluded.pr_number, head_sha=excluded.head_sha,
  observed_sha=excluded.observed_sha, observed_base_sha=excluded.observed_base_sha,
@@ -66,11 +70,12 @@ ON CONFLICT(id) DO UPDATE SET
  branch=excluded.branch, scope_json=excluded.scope_json,
  blocked_incident_id=excluded.blocked_incident_id, is_fixer=excluded.is_fixer,
  rebase_attempts=excluded.rebase_attempts, fix_attempts=excluded.fix_attempts,
- max_attempts=excluded.max_attempts, reason=excluded.reason, updated_at=excluded.updated_at`,
+ max_attempts=excluded.max_attempts, reason=excluded.reason,
+ checks_json=excluded.checks_json, updated_at=excluded.updated_at`,
 		string(r.ID), string(r.TaskID), string(r.State), r.PRNumber, r.HeadSHA,
 		r.ObservedSHA, r.ObservedBaseSHA, r.SessionID, r.ParentSessionID, r.WorkspacePath, r.Branch,
 		string(scope), r.BlockedIncidentID, boolInt(r.IsFixer), r.RebaseAttempts,
-		r.FixAttempts, r.MaxAttempts, r.Reason, r.CreatedAt.UnixNano(), r.UpdatedAt.UnixNano())
+		r.FixAttempts, r.MaxAttempts, r.Reason, string(checks), r.CreatedAt.UnixNano(), r.UpdatedAt.UnixNano())
 	if err != nil {
 		return err
 	}
@@ -118,6 +123,15 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// checksForSave keeps checks_json an array even when a run was never observed.
+// The UI reads run.checks directly and expects [] for older runs.
+func checksForSave(checks []core.CheckResult) []core.CheckResult {
+	if checks == nil {
+		return []core.CheckResult{}
+	}
+	return checks
 }
 
 func (s *Store) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
@@ -173,13 +187,13 @@ type scanner interface{ Scan(...any) error }
 
 func scanRun(row scanner) (*core.Run, error) {
 	var r core.Run
-	var id, task, state, scopeJSON string
+	var id, task, state, scopeJSON, checksJSON string
 	var created, updated int64
 	var fixer int
 	err := row.Scan(&id, &task, &state, &r.PRNumber, &r.HeadSHA, &r.ObservedSHA,
 		&r.ObservedBaseSHA, &r.SessionID, &r.ParentSessionID, &r.WorkspacePath, &r.Branch, &scopeJSON,
 		&r.BlockedIncidentID, &fixer, &r.RebaseAttempts, &r.FixAttempts,
-		&r.MaxAttempts, &r.Reason, &created, &updated)
+		&r.MaxAttempts, &r.Reason, &checksJSON, &created, &updated)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +204,10 @@ func scanRun(row scanner) (*core.Run, error) {
 	if err := json.Unmarshal([]byte(scopeJSON), &r.Scope); err != nil {
 		return nil, fmt.Errorf("scope_json: %w", err)
 	}
+	if err := json.Unmarshal([]byte(checksJSON), &r.Checks); err != nil {
+		return nil, fmt.Errorf("checks_json: %w", err)
+	}
+	r.Checks = checksForSave(r.Checks)
 	r.CreatedAt = time.Unix(0, created).UTC()
 	r.UpdatedAt = time.Unix(0, updated).UTC()
 	return &r, nil

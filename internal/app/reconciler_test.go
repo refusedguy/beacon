@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -821,5 +822,64 @@ func TestMergeWithFailedRefreshWarnsAndStillMerges(t *testing.T) {
 	decisionRecord(t, logs, "card publish failed before merge")
 	if got.ObservedSHA != "sha2" || got.ObservedBaseSHA != "base1" {
 		t.Fatalf("observation not persisted: sha=%q base=%q", got.ObservedSHA, got.ObservedBaseSHA)
+	}
+}
+
+func TestMergeSetsHumanReason(t *testing.T) {
+	r, store, _, _, _ := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunMerged {
+		t.Fatalf("state = %s, want merged", got.State)
+	}
+	if got.Reason != "merged PR #42 via squash" {
+		t.Fatalf("reason = %q, want merge reason", got.Reason)
+	}
+}
+
+func TestExternalMergeSetsHumanReason(t *testing.T) {
+	store := newFakeStore()
+	if err := store.Save(context.Background(), makeRun("r1", 42, core.RunWaitingCI)); err != nil {
+		t.Fatal(err)
+	}
+	r := &Reconciler{
+		Store: store,
+		SCM: &fakeSCM{obs: core.Observation{
+			PRNumber: 42, HeadSHA: "sha9", PRState: "merged",
+		}},
+		Harness: &fakeHarness{}, Source: &fakeSource{}, Workspace: &fakeWorkspace{},
+	}
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunMerged {
+		t.Fatalf("state = %s, want merged", got.State)
+	}
+	if got.Reason != "merged PR #42 via squash" {
+		t.Fatalf("reason = %q, want merge reason", got.Reason)
+	}
+}
+
+func TestReconcilePersistsObservedChecks(t *testing.T) {
+	start := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	checks := []core.CheckResult{{
+		Name: "ci", State: core.CheckSuccess,
+		StartedAt: start, CompletedAt: start.Add(28 * time.Second),
+	}}
+	r, store, _, _, _ := newReconciler(t, core.VerdictWait,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Checks: checks})
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if len(got.Checks) != 1 || got.Checks[0].Name != "ci" {
+		t.Fatalf("checks = %+v", got.Checks)
+	}
+	if got.Checks[0].DurationSeconds() != 28 {
+		t.Fatalf("duration = %d, want 28", got.Checks[0].DurationSeconds())
 	}
 }

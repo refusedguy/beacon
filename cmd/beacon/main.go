@@ -319,6 +319,7 @@ func main() {
 	root.AddCommand(newInitCommand())
 	root.AddCommand(newDispatchCommand(configPath))
 	root.AddCommand(newStatusCommand(configPath))
+	root.AddCommand(newControlCommand(configPath))
 	root.AddCommand(newMCPCommand(configPath))
 	root.AddCommand(newServeCommand(configPath))
 	root.AddCommand(newGCCommand(configPath))
