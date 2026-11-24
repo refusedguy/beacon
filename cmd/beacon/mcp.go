@@ -24,19 +24,17 @@ func newMCPCommand(configPath *string) *cobra.Command {
 		Use:   "mcp",
 		Short: "Serve six worker and read-only MCP tools plus three orchestrator tools over stdio",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
 			parent := os.Getenv("BEACON_PARENT_SESSION")
 			w, err := wire(*configPath, parent)
 			if err != nil {
 				return err
 			}
 			defer w.close()
+			go w.watcher.Run(ctx)
 
-			services := beaconmcp.Services{
-				Dispatcher: w.dispatcher, Control: w.control, Status: w.status,
-				Wait: w.wait, TaskCreator: w.taskCreator,
-				TaskDeleter: w.taskDeleter, TaskUpdater: w.taskUpdater,
-				Reconcile: w.reconcile,
-			}
+			services := mcpServices(w)
 			dir := filepath.Dir(w.cfg.StateDB)
 			info, connErr := readConnection(dir)
 			if connErr == nil && daemonAlive(w.cfg.StateDB) {
@@ -46,9 +44,7 @@ func newMCPCommand(configPath *string) *cobra.Command {
 				slog.Error("acquire daemon lock", "error", err)
 				writeDaemonError(dir, "lock", err)
 			} else {
-				ctx, cancel := context.WithCancel(cmd.Context())
 				defer lock.Close()
-				defer cancel()
 				tracker, stateErr := startDaemonState(dir)
 				if stateErr != nil {
 					slog.Error("write daemon state", "error", stateErr)
@@ -68,6 +64,15 @@ func newMCPCommand(configPath *string) *cobra.Command {
 			}
 			return beaconmcp.ServeStdio(beaconmcp.NewServer(services))
 		},
+	}
+}
+
+func mcpServices(w *wiring) beaconmcp.Services {
+	return beaconmcp.Services{
+		Dispatcher: w.dispatcher, Control: w.control, Status: w.status,
+		Wait: w.wait, TaskCreator: w.taskCreator,
+		TaskDeleter: w.taskDeleter, TaskUpdater: w.taskUpdater,
+		Reconcile: w.reconcile,
 	}
 }
 
