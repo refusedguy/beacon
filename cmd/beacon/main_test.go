@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 func TestProjectRootPrefersEnvironment(t *testing.T) {
@@ -70,6 +72,54 @@ func TestLoadConfigPinsRelativePathsToProjectRoot(t *testing.T) {
 		if got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
+	}
+}
+
+func TestResolveModelPrefersEnvironmentOverConfig(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "env-model")
+	cfg := config.Config{}
+	cfg.Harness.Model = "config-model"
+	got := resolveModel(cfg, "", "")
+	want := core.ModelRef{ProviderID: "opencode", ID: "env-model"}
+	if got != want {
+		t.Fatalf("resolveModel() = %+v, want %+v", got, want)
+	}
+}
+
+func TestResolveModelUsesConfiguredModel(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	cfg := config.Config{}
+	cfg.Harness.Model = "config-model"
+	got := resolveModel(cfg, "", "")
+	want := core.ModelRef{ProviderID: "opencode", ID: "config-model"}
+	if got != want {
+		t.Fatalf("resolveModel() = %+v, want %+v", got, want)
+	}
+}
+
+func TestResolveModelIsZeroWithoutSource(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	if got := resolveModel(config.Config{}, "", ""); !got.IsZero() {
+		t.Fatalf("resolveModel() = %+v, want zero value", got)
+	}
+}
+
+func TestResolveModelReadsParentSession(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/session/ses_parent" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"model":{"id":"hy4-flash-free","providerID":"opencode","variant":"default"}}}`)
+	}))
+	defer srv.Close()
+	cfg := config.Config{}
+	cfg.Harness.Endpoint = srv.URL
+	got := resolveModel(cfg, "token", "ses_parent")
+	want := core.ModelRef{ProviderID: "opencode", ID: "hy4-flash-free", Variant: "default"}
+	if got != want {
+		t.Fatalf("resolveModel() = %+v, want %+v", got, want)
 	}
 }
 
