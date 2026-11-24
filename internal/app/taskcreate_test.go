@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"regexp"
 	"testing"
 
@@ -566,6 +568,45 @@ func TestTaskCreatorCreateBatchRejectsForwardPlaceholder(t *testing.T) {
 	}
 }
 
+// fileSource writes real card files so a rollback can be observed on disk.
+type fileSource struct {
+	*fakeSource
+	dir string
+}
+
+func (f *fileSource) Create(ctx context.Context, task core.Task) (core.Task, error) {
+	path := filepath.Join(f.dir, string(task.ID)+".md")
+	if err := os.WriteFile(path, []byte("id: "+string(task.ID)+"\n"), 0o644); err != nil {
+		return core.Task{}, err
+	}
+	created := task
+	created.SourceRef = path
+	f.log.add("create:" + string(task.ID))
+	return created, nil
+}
+
+func (f *fileSource) Remove(ctx context.Context, id core.TaskID) error {
+	if err := os.Remove(filepath.Join(f.dir, string(id)+".md")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return f.fakeSource.Remove(ctx, id)
+}
+
+// interruptibleCommitter cancels the caller at the commit boundary and still
+// pushes, modelling a harness abort that arrives after the commit is durable.
+type interruptibleCommitter struct {
+	commits int
+	pushes  int
+	cancel  context.CancelFunc
+}
+
+func (c *interruptibleCommitter) CommitPath(context.Context, core.Workspace, string, string) error {
+	c.commits++
+	c.cancel()
+	c.pushes++
+	return nil
+}
+
 type failOnIDSource struct {
 	*fakeSource
 	failID core.TaskID
@@ -598,5 +639,73 @@ func TestTaskCreatorCreateBatchRollsBackOnFailure(t *testing.T) {
 	// expected. Rollback removes its file but cannot undo that commit.
 	if len(ws.commits) != 1 {
 		t.Fatalf("commits = %d, want the first card's publish only", len(ws.commits))
+	}
+}
+
+func TestTaskCreatorCancelBeforeCommitLeavesNoFiles(t *testing.T) {
+	dir := t.TempDir()
+	src := &fileSource{fakeSource: &fakeSource{log: &callLog{}}, dir: dir}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: dir, Branch: "main"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := creator.CreateBatch(ctx, []CreateTaskInput{
+		{ID: "T-CANCEL-A", Title: "A"},
+		{ID: "T-CANCEL-B", Title: "B"},
+	}); err == nil {
+		t.Fatal("cancelled batch did not surface an error")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("cancelled batch left files: %v", entries)
+	}
+	if len(src.removed) != 1 || src.removed[0] != "T-CANCEL-A" {
+		t.Fatalf("removed = %v, want the one card written before commit", src.removed)
+	}
+	if len(ws.commits) != 0 {
+		t.Fatalf("commits = %d, want none", len(ws.commits))
+	}
+}
+
+func TestTaskCreatorFinishesPushWhenCancelledAfterCommit(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := &interruptibleCommitter{cancel: cancel}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	got, err := creator.Create(ctx, CreateTaskInput{ID: "T-INTERRUPT", Title: "Card"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Pushed || ws.commits != 1 || ws.pushes != 1 {
+		t.Fatalf("result = %+v, commits = %d, pushes = %d", got, ws.commits, ws.pushes)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("test did not cancel the context at the commit boundary")
+	}
+	if len(src.removed) != 0 {
+		t.Fatalf("cancelled create removed cards: %v", src.removed)
+	}
+}
+
+func TestTaskCreatorCreateBatchRejectsInvalidIDWritesNothing(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	_, err := creator.CreateBatch(context.Background(), []CreateTaskInput{
+		{ID: "T-GOOD", Title: "A"},
+		{ID: "../escape", Title: "B"},
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v", err)
+	}
+	if len(src.log.items) != 0 || len(ws.commits) != 0 {
+		t.Fatalf("invalid id wrote cards = %v, commits = %d", src.log.items, len(ws.commits))
 	}
 }

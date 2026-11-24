@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -21,39 +22,209 @@ func NewServer(sv Services) *msdk.Server {
 	for _, register := range toolRegistrations {
 		register(s, sv)
 	}
-	// The catalog keeps one task-create tool. Replace its basic registration
-	// with one that also accepts the epic fields, so a single call expands a
-	// plan into child cards.
-	s.RemoveTools(taskCreateTool.Name)
+	// The catalog holds the plain mutations. Replace all three with wrappers
+	// that journal operation ids, so an interrupted call can be retried without
+	// writing the same cards twice. The create wrapper also accepts epic fields.
+	journal := newOpJournal()
+	s.RemoveTools(taskCreateTool.Name, taskUpdateTool.Name, taskDeleteTool.Name)
 	msdk.AddTool(s, taskCreateTool, func(ctx context.Context, _ *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
 		if sv.TaskCreator == nil {
 			return nil, nil, core.Errorf(core.CodeUnavailable, "task creator is not configured")
 		}
-		inputs := []app.CreateTaskInput{createInput(a)}
-		batch := len(a.Tasks) > 0
-		if batch {
-			inputs = inputs[:0]
-			for _, item := range a.Tasks {
-				inputs = append(inputs, batchInput(item))
-			}
+		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
+			return createTasks(ctx, sv.TaskCreator, a)
+		})
+	})
+	msdk.AddTool(s, taskUpdateTool, func(ctx context.Context, _ *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
+		if sv.TaskUpdater == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "task updater is not configured")
 		}
-		created, err := sv.TaskCreator.CreateBatch(ctx, inputs)
-		if err != nil {
-			return nil, nil, err
+		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
+			return updateTasks(ctx, sv.TaskUpdater, a)
+		})
+	})
+	msdk.AddTool(s, taskDeleteTool, func(ctx context.Context, _ *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
+		if sv.TaskDeleter == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "task deleter is not configured")
 		}
-		if !batch {
-			return jsonResult(created[0]), nil, nil
-		}
-		out := app.CreateBatchResult{
-			Created: make([]app.CreatedCard, 0, len(created)),
-			Pushed:  true,
-		}
-		for _, item := range created {
-			out.Created = append(out.Created, app.CreatedCard{ID: item.ID, Path: item.Path})
-		}
-		return jsonResult(out), nil, nil
+		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
+			return deleteTasks(ctx, sv.TaskDeleter, a)
+		})
 	})
 	return s
+}
+
+func createTasks(ctx context.Context, creator *app.TaskCreator, a epicCreateArgs) (any, error) {
+	inputs := []app.CreateTaskInput{createInput(a)}
+	batch := len(a.Tasks) > 0
+	if batch {
+		inputs = inputs[:0]
+		for _, item := range a.Tasks {
+			inputs = append(inputs, batchInput(item))
+		}
+	}
+	created, err := creator.CreateBatch(ctx, inputs)
+	if err != nil {
+		return nil, err
+	}
+	if !batch {
+		return created[0], nil
+	}
+	out := app.CreateBatchResult{Created: make([]app.CreatedCard, 0, len(created)), Pushed: true}
+	for _, item := range created {
+		out.Created = append(out.Created, app.CreatedCard{ID: item.ID, Path: item.Path})
+	}
+	return out, nil
+}
+
+func updateTasks(ctx context.Context, updater *app.TaskUpdater, a updateTaskArgs) (any, error) {
+	updates := make([]app.UpdateInput, 0, len(a.Updates))
+	for _, item := range a.Updates {
+		updates = append(updates, updateInput(item))
+	}
+	return updater.Update(ctx, updates)
+}
+
+func deleteTasks(ctx context.Context, deleter *app.TaskDeleter, a deleteTaskArgs) (any, error) {
+	return deleter.Delete(ctx, a.IDs)
+}
+
+// operationJournalLimit bounds the completed mutations kept for idempotency.
+const operationJournalLimit = 128
+
+// maxOperationIDLength keeps a caller-supplied key from growing the map without bound.
+const maxOperationIDLength = 256
+
+type journalEntry struct{ result any }
+
+// opJournal stores the result of each completed mutation by operation id. A
+// single-flight channel keeps concurrent calls with the same id from writing
+// twice. Entries are bounded and the oldest are evicted first.
+type opJournal struct {
+	mu       sync.Mutex
+	done     map[string]journalEntry
+	order    []string
+	inflight map[string]chan struct{}
+}
+
+func newOpJournal() *opJournal {
+	return &opJournal{
+		done:     make(map[string]journalEntry),
+		inflight: make(map[string]chan struct{}),
+	}
+}
+
+// claim returns a nil wait when the caller owns the operation. A done entry
+// also yields no owner; the caller reads it with cached instead.
+func (j *opJournal) claim(id string) (<-chan struct{}, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if _, ok := j.done[id]; ok {
+		j.touch(id)
+		return nil, false
+	}
+	if wait, ok := j.inflight[id]; ok {
+		return wait, false
+	}
+	wait := make(chan struct{})
+	j.inflight[id] = wait
+	return wait, true
+}
+
+func (j *opJournal) touch(id string) {
+	for i, key := range j.order {
+		if key == id {
+			j.order = append(j.order[:i], j.order[i+1:]...)
+			break
+		}
+	}
+	j.order = append(j.order, id)
+}
+
+func (j *opJournal) finish(id string, result any, err error) {
+	j.mu.Lock()
+	wait := j.inflight[id]
+	delete(j.inflight, id)
+	if err == nil {
+		j.done[id] = journalEntry{result: result}
+		j.touch(id)
+		if len(j.order) > operationJournalLimit {
+			oldest := j.order[0]
+			j.order = j.order[1:]
+			delete(j.done, oldest)
+		}
+	}
+	j.mu.Unlock()
+	close(wait)
+}
+
+func (j *opJournal) cached(id string) (any, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	entry, ok := j.done[id]
+	if ok {
+		j.touch(id)
+	}
+	return entry.result, ok
+}
+
+// run applies fn once per operation id. Repeats and concurrent callers reuse
+// the stored result with a duplicate status. A caller cancelled after its
+// commit records a recovered status, since the push finished in a detached
+// context.
+func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context) (any, error)) (any, error) {
+	if id == "" {
+		return fn(ctx)
+	}
+	if len(id) > maxOperationIDLength {
+		return nil, core.Errorf(core.CodeInvalidInput, "operation_id is too long")
+	}
+	wait, owner := j.claim(id)
+	if !owner {
+		if wait != nil {
+			<-wait
+		}
+		if result, ok := j.cached(id); ok {
+			return withMeta(result, id, "duplicate"), nil
+		}
+		return nil, core.Errorf(core.CodeUnavailable, "operation %q did not complete", id)
+	}
+	result, err := fn(ctx)
+	status := "applied"
+	if err == nil && ctx.Err() != nil {
+		status = "recovered"
+	}
+	j.finish(id, result, err)
+	if err != nil {
+		return nil, err
+	}
+	return withMeta(result, id, status), nil
+}
+
+func mutationTool(ctx context.Context, journal *opJournal, id string, fn func(context.Context) (any, error)) (*msdk.CallToolResult, any, error) {
+	result, err := journal.run(ctx, id, fn)
+	if err != nil {
+		return nil, nil, err
+	}
+	return jsonResult(result), nil, nil
+}
+
+func withMeta(v any, id, status string) any {
+	switch r := v.(type) {
+	case app.CreatedTask:
+		r.Status, r.OperationID = status, id
+		return r
+	case app.CreateBatchResult:
+		r.Status, r.OperationID = status, id
+		return r
+	case app.UpdateResult:
+		r.Status, r.OperationID = status, id
+		return r
+	case app.DeleteResult:
+		r.Status, r.OperationID = status, id
+		return r
+	}
+	return v
 }
 
 // epicCreateArgs is the input schema of beacon_task_create. It extends the
@@ -70,6 +241,7 @@ type epicCreateArgs struct {
 	RequireReview string          `json:"require_review,omitempty"`
 	Plan          []epicChildArg  `json:"plan,omitempty"`
 	Tasks         []batchTaskArgs `json:"tasks,omitempty"`
+	OperationID   string          `json:"operation_id,omitempty"`
 }
 
 // batchTaskArgs is one entry of the optional tasks array in beacon_task_create.
@@ -123,7 +295,8 @@ func buildCreateInput(title, body string, scope, depends []string, priority int,
 // updateTaskArgs is the input schema of beacon_task_update. A nil field is
 // omitted from the call and leaves that card field unchanged.
 type updateTaskArgs struct {
-	Updates []updateOneArgs `json:"updates"`
+	Updates     []updateOneArgs `json:"updates"`
+	OperationID string          `json:"operation_id,omitempty"`
 }
 
 type updateOneArgs struct {
@@ -182,7 +355,8 @@ func updateInput(a updateOneArgs) app.UpdateInput {
 
 // deleteTaskArgs is the input schema of beacon_task_delete.
 type deleteTaskArgs struct {
-	IDs []string `json:"ids"`
+	IDs         []string `json:"ids"`
+	OperationID string   `json:"operation_id,omitempty"`
 }
 
 var taskDeleteTool = &msdk.Tool{
