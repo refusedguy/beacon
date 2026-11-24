@@ -709,3 +709,113 @@ func TestTaskCreatorCreateBatchRejectsInvalidIDWritesNothing(t *testing.T) {
 		t.Fatalf("invalid id wrote cards = %v, commits = %d", src.log.items, len(ws.commits))
 	}
 }
+
+// branchWorkspace records branch publication alongside the shared fake's
+// commits, so tests can prove the branch is pushed before any card is written.
+type branchWorkspace struct {
+	*fakeWorkspace
+	branches     []string
+	baseBranches []string
+	branchErr    error
+}
+
+func (b *branchWorkspace) EnsureBranch(_ context.Context, branch, base string) error {
+	if b.branchErr != nil {
+		return b.branchErr
+	}
+	b.branches = append(b.branches, branch)
+	b.baseBranches = append(b.baseBranches, base)
+	b.log.add("branch:" + branch)
+	return nil
+}
+
+func (b *branchWorkspace) Create(ctx context.Context, t core.Task) (core.Workspace, error) {
+	b.log.add("create:" + string(t.ID))
+	return b.fakeWorkspace.Create(ctx, t)
+}
+
+func TestTaskCreatorPublishesEpicBranchBeforeChildren(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}}
+	creator := &TaskCreator{Source: src, Workspace: ws,
+		Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	got, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: epicPlan(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.branches) != 1 || ws.branches[0] != "beacon/T-EPIC" {
+		t.Fatalf("branches = %v, want beacon/T-EPIC", ws.branches)
+	}
+	if len(ws.baseBranches) != 1 || ws.baseBranches[0] != "main" {
+		t.Fatalf("base branches = %v, want main", ws.baseBranches)
+	}
+	if ws.log.items[0] != "branch:beacon/T-EPIC" {
+		t.Fatalf("call order = %v, want branch before cards", ws.log.items)
+	}
+	if len(src.created) != 3 {
+		t.Fatalf("created cards = %d, want epic plus two children", len(src.created))
+	}
+	for _, task := range src.created[:2] {
+		if task.BaseBranch != "beacon/T-EPIC" {
+			t.Fatalf("child %s base branch = %q", task.ID, task.BaseBranch)
+		}
+	}
+	if got.ID != "T-EPIC" || !got.Pushed {
+		t.Fatalf("result = %+v", got)
+	}
+}
+
+func TestTaskCreatorDoesNotRepublishEpicBranch(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}}
+	creator := &TaskCreator{Source: src, Workspace: ws,
+		Root: core.Workspace{Path: "/root", Branch: "main"}}
+	in := CreateTaskInput{Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: epicPlan()}
+
+	for i := 0; i < 2; i++ {
+		if _, err := creator.Create(context.Background(), in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(ws.branches) != 1 || len(ws.commits) != 1 {
+		t.Fatalf("branches = %v, commits = %d, want one each", ws.branches, len(ws.commits))
+	}
+}
+
+func TestTaskCreatorBranchFailureWritesNoCards(t *testing.T) {
+	want := errors.New("push rejected")
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}, branchErr: want}
+	creator := &TaskCreator{Source: src, Workspace: ws,
+		Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	_, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: epicPlan(),
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+	if len(src.log.items) != 0 || len(ws.commits) != 0 || ws.creates != 0 {
+		t.Fatalf("failed branch left cards = %v, commits = %d, creates = %d",
+			src.log.items, len(ws.commits), ws.creates)
+	}
+}
+
+func TestTaskCreatorIgnoresNonEpicBaseBranch(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}}
+	creator := &TaskCreator{Source: src, Workspace: ws,
+		Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	if _, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Card", ID: "T-CARD", BaseBranch: "main",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.branches) != 0 || len(ws.commits) != 1 {
+		t.Fatalf("branches = %v, commits = %d, want no branch work", ws.branches, len(ws.commits))
+	}
+}

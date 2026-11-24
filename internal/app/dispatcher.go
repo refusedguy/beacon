@@ -163,6 +163,11 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 
 func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task) error {
 	ctx = WithCycleID(ctx, string(run.ID))
+	// A child card may outlive the epic creation that was supposed to publish
+	// its base branch. Check again here so a missing branch never closes a run.
+	if err := ensureBranch(ctx, d.Workspace, task.BaseBranch, ""); err != nil {
+		return fmt.Errorf("base branch: %w", err)
+	}
 	ws, err := d.Workspace.Create(ctx, task)
 	if err != nil {
 		return fmt.Errorf("workspace: %w", err)

@@ -544,3 +544,70 @@ func TestFixerPromptPrependsWorkerInstructions(t *testing.T) {
 		t.Fatalf("fixer prompt content lost: %q", prompt)
 	}
 }
+
+func TestDispatchEnsuresMissingEpicBranchBeforeWorkspace(t *testing.T) {
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}}
+	h := &fakeHarness{}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: []core.Task{{
+			ID: "T-CHILD", Status: core.TaskAvailable, BaseBranch: "beacon/T-EPIC",
+		}}},
+		Planner: NewPlanner(nil), Workspace: ws, Harness: h, Store: newFakeStore(),
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	res, err := d.Dispatch(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failures) != 0 {
+		t.Fatalf("failures = %+v", res.Failures)
+	}
+	if len(ws.branches) != 1 || ws.branches[0] != "beacon/T-EPIC" {
+		t.Fatalf("branches = %v, want beacon/T-EPIC", ws.branches)
+	}
+	if len(ws.baseBranches) != 1 || ws.baseBranches[0] != "" {
+		t.Fatalf("base branches = %v, want the configured workspace base", ws.baseBranches)
+	}
+	if len(ws.log.items) != 2 || ws.log.items[0] != "branch:beacon/T-EPIC" ||
+		ws.log.items[1] != "create:T-CHILD" {
+		t.Fatalf("call order = %v, want branch before workspace create", ws.log.items)
+	}
+}
+
+func TestDispatchReportsBranchCreationFailure(t *testing.T) {
+	want := errors.New("push failed")
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}, branchErr: want}
+	h := &fakeHarness{}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: []core.Task{{
+			ID: "T-CHILD", Status: core.TaskAvailable, BaseBranch: "beacon/T-EPIC",
+		}}},
+		Planner: NewPlanner(nil), Workspace: ws, Harness: h, Store: newFakeStore(),
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	res, err := d.Dispatch(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failures) != 1 || !strings.Contains(res.Failures[0].Err, "base branch: push failed") {
+		t.Fatalf("failures = %+v, want the branch error", res.Failures)
+	}
+	if ws.creates != 0 || len(h.sessions) != 0 {
+		t.Fatalf("creates = %d, sessions = %d, want none after a branch failure", ws.creates, len(h.sessions))
+	}
+}
+
+func TestDispatchLeavesMainTasksWithoutBranchWork(t *testing.T) {
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}}
+	d := &Dispatcher{
+		Source:  &fakeSource{tasks: []core.Task{{ID: "T-PLAIN", Status: core.TaskAvailable}}},
+		Planner: NewPlanner(nil), Workspace: ws, Harness: &fakeHarness{}, Store: newFakeStore(),
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	if _, err := d.Dispatch(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.branches) != 0 || ws.creates != 1 {
+		t.Fatalf("branches = %v, creates = %d, want no branch work", ws.branches, ws.creates)
+	}
+}
