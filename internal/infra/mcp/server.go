@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/app"
+	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -149,6 +151,29 @@ func registerTaskDelete(s *msdk.Server, sv Services) {
 			return nil, nil, err
 		}
 		return jsonResult(deleted), nil, nil
+	})
+}
+
+// reconcileArgs is the input schema of beacon_reconcile.
+type reconcileArgs struct {
+	PR int `json:"pr"`
+}
+
+var reconcileTool = &msdk.Tool{
+	Name:        "beacon_reconcile",
+	Description: "Force one reconciler tick for a PR and report its decision. Orchestrator only.",
+}
+
+func registerReconcile(s *msdk.Server, sv Services) {
+	msdk.AddTool(s, reconcileTool, func(ctx context.Context, _ *msdk.CallToolRequest, a reconcileArgs) (*msdk.CallToolResult, any, error) {
+		if sv.Reconcile == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "reconcile service is not configured")
+		}
+		result := sv.Reconcile.Tick(ctx, a.PR)
+		if result.Error != "" {
+			slog.WarnContext(ctx, "beacon_reconcile", "pr", a.PR, "error", shared.Redact(result.Error))
+		}
+		return jsonResult(result), nil, nil
 	})
 }
 

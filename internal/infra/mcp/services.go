@@ -15,5 +15,6 @@ type Services struct {
 	TaskCreator *app.TaskCreator
 	TaskDeleter *app.TaskDeleter
 	TaskUpdater *app.TaskUpdater
+	Reconcile   *app.ReconcileService
 	Remote      func(ctx context.Context, action, runID string, pr int, sha string) error
 }

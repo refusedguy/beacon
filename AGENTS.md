@@ -31,7 +31,7 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 
 ## MCP tools
 
-`beacon mcp` serves six worker and read-only tools plus three orchestrator tools over stdio:
+`beacon mcp` serves six worker and read-only tools plus four orchestrator tools over stdio:
 
 | Tool | Purpose | Agent |
 | --- | --- | --- |
@@ -44,12 +44,13 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 | `beacon_task_create` | Create a task card and publish it for dispatch. | orchestrator only |
 | `beacon_task_delete` | `{"ids": ["T-...", ...]}` deletes several task cards in one commit and push. | orchestrator only |
 | `beacon_task_update` | `{"updates": [{"id": "T-...", "title": "...", ...}]}` edits several task cards in one commit and push. Omitted fields stay unchanged and `status` is ignored. | orchestrator only |
+| `beacon_reconcile` | `{"pr": 42}` forces one reconciler tick and returns `{"pr", "decision": {"verdict", "reason", "criterion"}, "state", "error"}`. Errors and panics are captured in the result, so the daemon loop keeps running. | orchestrator only |
 
 `opencode.json` tool permissions are generated, not hand-edited. `ToolCatalog()` in `internal/infra/mcp/registry.go` lists every tool and marks the orchestrator-only ones. Run `go generate ./...` after changing the catalog. `cmd/beacon-gen` rewrites only the permission entries it owns and keeps every other config key, agent description, mode and custom permission as they were. Generation happens at development time, never at binary startup. `TestPermissionsUpToDate` in `internal/infra/mcp/permissions_test.go` regenerates the file into a temp copy and fails when the committed `opencode.json` differs, so CI catches a stale permission list.
 
-No other `beacon_*` MCP tool exists. The MCP server runs as one pooled `beacon mcp` process started from the project `opencode.json`. The local plugin resolves `.opencode/bin/beacon` when it exists and rebuilds a stale binary with `scripts/build-beacon.sh` when the build inputs are newer. There is no HEAD watcher and no automatic `ctx.mcp.reload()`. After Go code lands on `main`, run `bash scripts/build-beacon.sh` explicitly, then restart the MCP daemon and the OpenCode TUI. When no local binary exists, the plugin falls back to `bin/beacon`, a binary on `PATH`, or `go run ./cmd/beacon mcp`. `beacon status --snapshot` bounds its decision history; `--recent-limit` and `--decisions-limit` tighten it further without a rebuild. `opencode.json` denies `beacon_task_create`, `beacon_task_delete` and `beacon_task_update` globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows.
+No other `beacon_*` MCP tool exists. The MCP server runs as one pooled `beacon mcp` process started from the project `opencode.json`. The local plugin resolves `.opencode/bin/beacon` when it exists and rebuilds a stale binary with `scripts/build-beacon.sh` when the build inputs are newer. There is no HEAD watcher and no automatic `ctx.mcp.reload()`. After Go code lands on `main`, run `bash scripts/build-beacon.sh` explicitly, then restart the MCP daemon and the OpenCode TUI. When no local binary exists, the plugin falls back to `bin/beacon`, a binary on `PATH`, or `go run ./cmd/beacon mcp`. `beacon status --snapshot` bounds its decision history; `--recent-limit` and `--decisions-limit` tighten it further without a rebuild. `opencode.json` denies `beacon_task_create`, `beacon_task_delete`, `beacon_task_update` and `beacon_reconcile` globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows.
 
-Spawn workers with `harness.command: worker` in `.beacon/config.yaml`. The OpenCode harness passes that value as the session agent, so each worker inherits the global deny rules for `beacon_task_create`, `beacon_task_delete` and `beacon_task_update`. A worker must never create, delete or update task cards. It reports new work to the orchestrator instead.
+Spawn workers with `harness.command: worker` in `.beacon/config.yaml`. The OpenCode harness passes that value as the session agent, so each worker inherits the global deny rules for `beacon_task_create`, `beacon_task_delete`, `beacon_task_update` and `beacon_reconcile`. A worker must never create, delete or update task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
 
 ## Task cards
 
