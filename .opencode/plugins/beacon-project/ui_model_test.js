@@ -5,7 +5,7 @@ import { NOW, lines, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
   BeaconStatusRpc, CliStatusSource, EMPTY_SNAPSHOT, RECENT_LIMIT,
-  createCliStatusSource, createStatusSource,
+  cleanErrorMessage, createCliStatusSource, createStatusSource,
   defineBeaconStatusPlugin, errorMessage, normalizeRun, normalizeSnapshot,
   parseSnapshot, renderSnapshotLines, default: beaconStatus,
   beaconStatusDefinition,
@@ -293,6 +293,21 @@ test("errorMessage handles Error, plain object and string", () => {
   assert.equal(errorMessage(new Error("boom")), "boom")
   assert.equal(errorMessage({ message: "rpc failed" }), "rpc failed")
   assert.equal(errorMessage("down"), "down")
+})
+
+test("cleanErrorMessage turns a Cobra help dump into one short label", () => {
+  const cause = new Error("\u001b[31mError: unknown flag: --snapshot\u001b[0m\nUsage:\n  beacon status [flags]\n  --help  show help\n  at /src/main.go:42:1")
+  const clean = cleanErrorMessage(cause)
+  assert.equal(clean, "beacon status temporarily unavailable")
+  assert.equal(clean.includes("--help"), false)
+  assert.equal(/[\r\n]/.test(clean), false)
+  assert.equal(cleanErrorMessage('{"error":"boom"}'), "beacon status temporarily unavailable")
+})
+
+test("cleanErrorMessage keeps readable text, strips escapes and caps length", () => {
+  assert.equal(cleanErrorMessage("daemon   unavailable\n again"), "daemon unavailable again")
+  assert.equal(cleanErrorMessage("\u001b[31mred\u001b[0m  error"), "red error")
+  assert.equal(cleanErrorMessage("x".repeat(300)).length, 120)
 })
 
 test("empty snapshot renders both sections with an honest dispatch label", () => {

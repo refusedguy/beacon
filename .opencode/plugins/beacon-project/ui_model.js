@@ -6,7 +6,6 @@ import { join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { beaconCommand } from "./mcp.js"
 import { locationInfo, projectRoot } from "./location.js"
-
 const execFileAsync = promisify(nodeExecFile)
 export const REFRESH_MS = 5000
 export const RPC_TIMEOUT_MS = 10000
@@ -348,3 +347,4 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {} } = {}) {
   }
 }
 export const errorMessage = (error) => (error && typeof error.message === "string" ? error.message : String(error))
+export { cleanErrorMessage } from "./ui_error.js"

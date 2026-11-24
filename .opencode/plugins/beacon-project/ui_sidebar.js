@@ -2,6 +2,8 @@
 // legend and the pooled Active/Recent line list. The header and Dispatch are
 // real boxes so they align and hover like the native Context/MCP sections.
 import { createBox, createLineMount, createSegmentBar, createText } from "./ui_nodes.js"
+import { REASON_WIDTH } from "./ui_model.js"
+import { truncate } from "./ui_alerts.js"
 import { truncateSidebarTitle } from "./ui_view.js"
 
 export const SIDEBAR_ACTIVE_LIMIT = 8
@@ -107,7 +109,7 @@ export function createSidebarMount(ui, deps) {
     bar.apply(model.segments)
     set(legend, "content", model.legend ?? "")
     const metaItems = []
-    if (error) metaItems.push({ marker: "", name: `[stale] ${error}`, status: "", color: "warning" })
+    if (error) metaItems.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
     meta.apply(metaItems)
     list.apply(sidebarPresentation(model.listItems))
     decorateRows()

@@ -5,7 +5,7 @@ import { NOW, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
-  SIDEBAR_OPEN, STATE_BAR_WIDTH, compactReason, detailActions, detailCommand,
+  SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
   detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel,
   recentRuns, runLineItems, sidebarModel, stateBarItem, truncate,
 } = ui
@@ -117,6 +117,14 @@ test("a stale transport error keeps the snapshot and clips the marker", () => {
   assert.ok(stale)
   assert.ok(stale.name.length <= 9 + REASON_WIDTH)
   assert.ok(items.some((i) => i.name === "Still here"))
+})
+
+test("a sanitized stale line keeps the prefix and never shows help text", () => {
+  const clean = cleanErrorMessage(new Error("Error: bad flag\nUsage:\n  beacon --help"))
+  const stale = sidebarModel(EMPTY_SNAPSHOT, clean, NOW).items.find((i) => i.name.startsWith("[stale]"))
+  assert.equal(stale.name, "[stale] beacon status temporarily unavailable")
+  assert.equal(stale.name.includes("--help"), false)
+  assert.ok(stale.name.length <= 9 + REASON_WIDTH)
 })
 
 test("empty snapshot shows one idle line and counted headers", () => {
