@@ -54,7 +54,7 @@ func doctorExitCode(checks []doctorCheck) int {
 
 func printDoctorChecks(out io.Writer, checks []doctorCheck) {
 	for _, c := range checks {
-		fmt.Fprintf(out, "%s %s: %s\n", c.level.label(), c.name, c.detail)
+		_, _ = fmt.Fprintf(out, "%s %s: %s\n", c.level.label(), c.name, c.detail)
 	}
 }
 

@@ -172,7 +172,7 @@ func stdinIsTTY() bool {
 }
 
 func confirmInit(out io.Writer, in io.Reader, r remote, base string) (bool, error) {
-	fmt.Fprintf(out, "Configure Beacon for %s/%s (base %s)? [Y/n] ", r.owner, r.repo, base)
+	_, _ = fmt.Fprintf(out, "Configure Beacon for %s/%s (base %s)? [Y/n] ", r.owner, r.repo, base)
 	var answer string
 	if _, err := fmt.Fscanln(in, &answer); err != nil {
 		if err == io.EOF {
@@ -538,9 +538,9 @@ func appendGitignore(path string) error {
 }
 
 func printHandoff(out io.Writer, r remote) {
-	fmt.Fprintln(out, "\nBeacon setup complete. Next steps:")
-	fmt.Fprintln(out, "  1. Export GITHUB_TOKEN (or GITLAB_TOKEN) and BEACON_OPENCODE_TOKEN if needed.")
-	fmt.Fprintln(out, "  2. Run `beacon doctor` and fix any FAIL lines.")
-	fmt.Fprintln(out, "  3. Restart OpenCode so it loads the new opencode.json and plugin.")
-	fmt.Fprintf(out, "  4. Dispatch the first task with beacon_dispatch (repo %s/%s).\n", r.owner, r.repo)
+	_, _ = fmt.Fprintln(out, "\nBeacon setup complete. Next steps:")
+	_, _ = fmt.Fprintln(out, "  1. Export GITHUB_TOKEN (or GITLAB_TOKEN) and BEACON_OPENCODE_TOKEN if needed.")
+	_, _ = fmt.Fprintln(out, "  2. Run `beacon doctor` and fix any FAIL lines.")
+	_, _ = fmt.Fprintln(out, "  3. Restart OpenCode so it loads the new opencode.json and plugin.")
+	_, _ = fmt.Fprintf(out, "  4. Dispatch the first task with beacon_dispatch (repo %s/%s).\n", r.owner, r.repo)
 }
