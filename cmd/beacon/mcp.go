@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 func newMCPCommand(configPath *string) *cobra.Command {
@@ -52,7 +53,7 @@ func newMCPCommand(configPath *string) *cobra.Command {
 				} else {
 					defer tracker.Close()
 				}
-				if watcher, ok := w.harness.(idleWatcher); ok {
+				if watcher, ok := w.harness.(core.IdleWatcher); ok {
 					go watcher.WatchIdle(ctx)
 				}
 				go func() {

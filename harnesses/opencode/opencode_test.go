@@ -408,6 +408,129 @@ func TestSpawnUsesDispatchModelRef(t *testing.T) {
 	}
 }
 
+func TestHarnessClaimsCapabilityPorts(t *testing.T) {
+	var h core.AgentHarness = New("http://127.0.0.1:1")
+	if _, ok := h.(core.RepoSetter); !ok {
+		t.Error("harness does not claim RepoSetter")
+	}
+	if _, ok := h.(core.ModelResolver); !ok {
+		t.Error("harness does not claim ModelResolver")
+	}
+	if _, ok := h.(core.IdleWatcher); !ok {
+		t.Error("harness does not claim IdleWatcher")
+	}
+	if _, ok := h.(core.WorktreeRefresher); !ok {
+		t.Error("harness does not claim WorktreeRefresher")
+	}
+}
+
+func TestSetRepoScopesWorktreeRefresh(t *testing.T) {
+	refreshed := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/project":
+			_, _ = io.WriteString(w, `[{"id":"prj_1","canonical":"/repo/one"}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/worktree/refresh":
+			refreshed <- struct{}{}
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(srv.URL)
+	h.SetRepo("/repo/one")
+	if err := h.RefreshWorktrees(context.Background()); err != nil {
+		t.Fatalf("RefreshWorktrees: %v", err)
+	}
+	select {
+	case <-refreshed:
+	default:
+		t.Fatal("SetRepo did not scope the refresh to the configured repo")
+	}
+}
+
+func TestResolveModelPrefersEnvironmentAndConfig(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "env-model")
+	h := New("http://127.0.0.1:1", "cfg-model", "", "token")
+	want := map[string]string{"providerID": "opencode", "id": "env-model"}
+	if got := h.ResolveModel("ses_parent"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ResolveModel with BEACON_MODEL = %v, want %v", got, want)
+	}
+
+	t.Setenv("BEACON_MODEL", "")
+	want = map[string]string{"providerID": "opencode", "id": "cfg-model"}
+	if got := h.ResolveModel("ses_parent"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ResolveModel with configured model = %v, want %v", got, want)
+	}
+}
+
+func TestResolveModelFromParentSession(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	auth := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/session/ses_parent" {
+			auth <- r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":{"model":{"id":"hy4-flash-free","providerID":"opencode","variant":"default"}}}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	h := New(srv.URL, "", "", "worker-token")
+	h.ParentSessionID = "ses_parent"
+	ref := h.ResolveModel("")
+	want := map[string]string{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
+	if !reflect.DeepEqual(ref, want) {
+		t.Fatalf("ResolveModel = %v, want %v", ref, want)
+	}
+	select {
+	case got := <-auth:
+		if got != "Bearer worker-token" {
+			t.Errorf("Authorization = %q, want Bearer worker-token", got)
+		}
+	default:
+		t.Error("parent session was not queried")
+	}
+}
+
+func TestResolveModelUsesBasicAuthForUserPasswordToken(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	credentials := make(chan [2]string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, _ := r.BasicAuth()
+		credentials <- [2]string{user, pass}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"model":{"id":"from-parent","providerID":"opencode"}}}`)
+	}))
+	defer srv.Close()
+
+	h := New(srv.URL, "", "", "opencode:secret")
+	ref := h.ResolveModel("ses_parent")
+	if ref["id"] != "from-parent" {
+		t.Fatalf("ResolveModel = %v, want parent model", ref)
+	}
+	select {
+	case got := <-credentials:
+		if got != [2]string{"opencode", "secret"} {
+			t.Errorf("BasicAuth = %v, want opencode:secret", got)
+		}
+	default:
+		t.Error("parent session was not queried")
+	}
+}
+
+func TestResolveModelNeedsParentAndToken(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	h := New("http://127.0.0.1:1", "", "", "")
+	if ref := h.ResolveModel(""); ref != nil {
+		t.Fatalf("ResolveModel = %v, want nil without parent or token", ref)
+	}
+}
+
 func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
 	var mu sync.Mutex
 	var sessions, prompts []map[string]any
