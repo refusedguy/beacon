@@ -1158,3 +1158,35 @@ func TestObservationCallSitesPreserveBothSHAs(t *testing.T) {
 		})
 	}
 }
+
+type fakeAgentSlots int
+
+func (s fakeAgentSlots) Available(context.Context) int { return int(s) }
+
+func TestHasAgentSlotUsesInjectedPort(t *testing.T) {
+	r := &Reconciler{AgentSlots: fakeAgentSlots(0)}
+	if r.hasAgentSlot(context.Background()) {
+		t.Fatal("port reported no slots but hasAgentSlot returned true")
+	}
+	r.AgentSlots = fakeAgentSlots(2)
+	if !r.hasAgentSlot(context.Background()) {
+		t.Fatal("port reported two slots but hasAgentSlot returned false")
+	}
+	r.AgentSlots = nil
+	r.Dispatcher = nil
+	if !r.hasAgentSlot(context.Background()) {
+		t.Fatal("missing slot source should fail open")
+	}
+}
+
+func TestWakeSkippedWhenAgentSlotsExhausted(t *testing.T) {
+	r, _, _, h, _ := newReconciler(t, core.VerdictNeedsAgentFix,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", FailureExcerpt: "panic: boom"})
+	r.AgentSlots = fakeAgentSlots(0)
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.wakes) != 0 {
+		t.Fatalf("wakes = %d, want none when no agent slot is free", len(h.wakes))
+	}
+}
