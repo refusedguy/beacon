@@ -98,8 +98,7 @@ export function activeRuns(snapshot = EMPTY_SNAPSHOT) {
     return true
   })
 }
-// A closed attempt is noise once the task is active again. Repeated closed
-// attempts of one task collapse into its newest terminal run.
+// Repeated closed attempts of one task collapse into its newest terminal run.
 export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
   const view = normalizeSnapshot(snapshot)
   const activeTasks = new Set(activeRuns(view).map((r) => str(r.taskID)).filter(Boolean))
@@ -150,8 +149,7 @@ export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
   }
 }
 
-// Two pooled line slots per run: identity on line one, reference and live
-// duration and cause on line two. No fixed title width: the name cell grows.
+// Two pooled slots per run: identity, then reference and live cause.
 export function runLineItems(run, now = Date.now(), recent = false) {
   const v = stateView(run.state)
   const state = str(run.state).toLowerCase()
@@ -182,7 +180,38 @@ const sectionItem = (label, count, key, open) => ({
   color: "action", bold: true, statusColor: "muted", sectionKey: key,
 })
 
-export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN) {
+// A null map keeps flat legacy rows; the real panel stores the open epics.
+export function queueRows(queue = [], epicOpen = null) {
+  const list = Array.isArray(queue) ? queue : []
+  const rows = queueLineItems(list)
+  if (!epicOpen) return rows
+  const ids = list.map((item) => str(item?.id))
+  const parentOf = (id) => ids.filter((p) => p && p !== id && id.startsWith(`${p}-`))
+    .sort((a, b) => b.length - a.length)[0] || ""
+  const counts = new Map()
+  for (const id of ids) {
+    const parent = parentOf(id)
+    if (parent) counts.set(parent, (counts.get(parent) ?? 0) + 1)
+  }
+  const isEpic = (id) => counts.has(id)
+    || list.some((i) => str(i?.id) === id && str(i?.kind).toLowerCase() === "epic")
+  const hidden = new Set()
+  for (const id of ids) {
+    let parent = parentOf(id)
+    while (parent) {
+      if (isEpic(parent) && epicOpen[parent] !== true) { hidden.add(id); break }
+      parent = parentOf(parent)
+    }
+  }
+  return rows.filter((row) => !hidden.has(row.cardID)).map((row) => {
+    if (row.kind !== "queue-title" || !isEpic(row.cardID)) return row
+    const chevron = epicOpen[row.cardID] === true ? "▼" : "▶"
+    return { ...row, marker: chevron, status: String(counts.get(row.cardID) ?? 0),
+      statusColor: "muted", epicKey: row.cardID, action: `epic:${row.cardID}` }
+  })
+}
+
+export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null) {
   const view = normalizeSnapshot(snapshot)
   const bar = stateBarItem(view)
   const active = activeRuns(view)
@@ -208,7 +237,7 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
     }
   }
   listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
-  if (open.queue === true) listItems.push(...queueLineItems(view.queue))
+  if (open.queue === true) listItems.push(...queueRows(view.queue, epicOpen))
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
   if (open.recent !== false) {
     if (!recent.length) listItems.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
