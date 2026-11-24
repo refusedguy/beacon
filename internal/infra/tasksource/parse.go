@@ -1,6 +1,8 @@
 package tasksource
 
 import (
+	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +13,83 @@ import (
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// CardStore owns one card directory. PatchStatus is its one deep operation:
+// callers name a card and a status, and the store handles lookup, parsing,
+// format detection and the write. Card paths and status-line rules stay inside
+// this module instead of spreading across its callers.
+type CardStore struct {
+	Dir string
+}
+
+// card is one located card with the parsed task and the raw text. Carrying all
+// three lets callers work from a single read instead of re-reading the file.
+type card struct {
+	path    string
+	task    core.Task
+	content string
+	hasFM   bool
+}
+
+func (s CardStore) cards() ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(s.Dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != s.Dir && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	sort.Strings(paths)
+	return paths, err
+}
+
+// find locates a card by parsed ID, not by filename, and returns the text it
+// was parsed from so callers need no second read.
+func (s CardStore) find(id core.TaskID) (card, error) {
+	paths, err := s.cards()
+	if err != nil {
+		return card{}, err
+	}
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		t, ok := parseCard(string(b), path)
+		if !ok || t.ID != id {
+			continue
+		}
+		_, _, hasFM := splitFrontmatter(string(b))
+		return card{path: path, task: t, content: string(b), hasFM: hasFM}, nil
+	}
+	return card{}, os.ErrNotExist
+}
+
+// PatchStatus finds a card by id and rewrites its status. It owns the whole
+// chain, so Claim, Complete and workspace marking share one implementation.
+func (s CardStore) PatchStatus(ctx context.Context, id core.TaskID, status string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c, err := s.find(id)
+	if err != nil {
+		return err
+	}
+	updated := rewriteStatus(c.content, status, c.hasFM)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.WriteFile(c.path, []byte(updated), 0o644)
+}
 
 type stringList []string
 

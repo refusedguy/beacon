@@ -90,7 +90,7 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 		}
 		ws := core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}
 		message := "beacon: complete task " + string(run.TaskID)
-		if err := r.commitCard(ctx, ws, "docs/tasks", message); err != nil {
+		if err := r.commitCard(ctx, ws, cardsPath, message); err != nil {
 			slog.Warn("card publish failed before merge", "run", run.ID, "pr", obs.PRNumber, "error", err)
 			recordObservation(run, obs.HeadSHA, obs.BaseSHA)
 			if saveErr := r.Store.Save(ctx, run); saveErr != nil {
