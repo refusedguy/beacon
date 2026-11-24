@@ -53,12 +53,12 @@ test("compact list renders two lines per run with no rule and no repeated title"
   }), [
     "Beacon A1 B0 R0 F0 10:07:00",
     "▼ Active 1",
-    "● T-1 Fix TUI plugin sh… RUN",
-    "#42 3m waiting CI",
+    "● T-1 Fix TUI plugin shape … RUN",
+    "#42 run 5s waiting CI",
     "▼ Recent 0",
     "No recent runs",
   ])
-  assert.equal(truncate("abcdefghijklmnopqrst", TITLE_WIDTH).length, TITLE_WIDTH)
+  assert.equal(truncate("abcdefghijklmnopqrstuvwxyz0123456789", TITLE_WIDTH).length, TITLE_WIDTH)
 })
 
 test("normalizeRun leaves title empty instead of copying the task ID", () => {

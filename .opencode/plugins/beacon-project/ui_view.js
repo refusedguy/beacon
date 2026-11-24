@@ -49,20 +49,58 @@ function timeOf(v) {
 }
 const ageOf = (run, now) => { const t = Math.max(timeOf(run.updatedAt), timeOf(run.createdAt)); return t ? elapsed(now - t) : "" }
 const tookOf = (run) => { const a = timeOf(run.createdAt), b = timeOf(run.updatedAt); return a && b ? elapsed(b - a) : "" }
-const FAILURE_CODE = /^[A-Z][A-Z0-9_]*$|^[a-z]+(?:_[a-z0-9]+)+$/
-const failureReason = (reason) => (FAILURE_CODE.test(str(reason)) ? str(reason) : "")
+// A bare status code tells the operator nothing about what happened. Turn the
+// common prefixes into short language and keep the useful remainder.
+const REASON_RULES = [
+  [/^workspace:\s*conflict:\s*refusing to remove dirty worktree\b.*/i, "dirty worktree"],
+  [/^workspace:\s*conflict:\s*/i, ""],
+  [/^workspace:\s*/i, ""],
+  [/^conflict:\s*/i, ""],
+  [/^pull request closed\b.*/i, "PR closed"],
+  [/pull request closed/i, "PR closed"],
+  [/^reconciler:\s*/i, ""],
+  [/^harness:\s*/i, ""],
+  [/^mark in workspace:\s*/i, ""],
+  [/^spawn:\s*/i, "spawn: "],
+  [/^status:\s*/i, ""],
+]
+export function compactReason(reason) {
+  let text = str(reason).replace(/\s+/g, " ").trim()
+  if (!text) return ""
+  for (const [pattern, replacement] of REASON_RULES) {
+    if (pattern.test(text)) {
+      text = text.replace(pattern, replacement)
+      break
+    }
+  }
+  text = text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim()
+  return truncate(text, REASON_WIDTH)
+}
 const keep = (run, seen) => {
   const key = run.id || run.taskID || run.title
   if (!key || seen.has(key)) return false
   seen.add(key)
   return true
 }
+// The active run shows the timer for its current phase, not the age of the
+// whole run. The terminal run shows how long the attempt took.
+export function phaseLabel(run, now = Date.now()) {
+  const d = run.durations ?? {}
+  const state = str(run.state).toLowerCase()
+  const phase = state === "waiting_ci" ? ["ci", d.waitingCI]
+    : state === "blocked" ? ["block", d.blocked]
+      : state === "running" ? ["run", d.running] : null
+  if (phase && Number(phase[1]) > 0) return `${phase[0]} ${elapsed(Number(phase[1]) * 1000)}`
+  return ageOf(run, now)
+}
 export function runLineItems(run, now = Date.now(), recent = false) {
   const v = stateView(run.state)
   const title = run.title && run.title !== run.taskID ? truncate(run.title, TITLE_WIDTH) : ""
   const name = [shortTaskID(run.taskID), title].filter(Boolean).join(" ")
-  const meta = [run.pr ? `#${run.pr}` : "", recent ? tookOf(run) : ageOf(run, now)].filter(Boolean).join(" ")
-  const reason = recent ? failureReason(run.reason) : truncate(run.reason, REASON_WIDTH)
+  const duration = recent ? tookOf(run) : phaseLabel(run, now)
+  const meta = [run.pr ? `#${run.pr}` : "", duration].filter(Boolean).join(" ")
+  // A merged run needs no reason: the PR number and duration are the result.
+  const reason = str(run.state).toLowerCase() === "merged" ? "" : compactReason(run.reason)
   return [
     { marker: v.marker, name, status: v.label, color: v.color, bold: true, runID: run.id },
     { marker: "", name: meta, status: reason, color: "muted", runID: run.id },
@@ -108,11 +146,15 @@ export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
   for (let i = 0; spare > 0; i += 1, spare -= 1) cells[byFraction[i].i] += 1
   const bar = STATE_BAR_KEYS.map((key, i) => "█".repeat(cells[i])).join("")
     + "░".repeat(STATE_BAR_WIDTH - filled)
-  const legend = STATE_BAR_KEYS.map((key) => `${STATE_BAR_LETTER[key]}${counts[key]}`).join(" ")
+  // The recent list is capped at five rows, so its merged count is only a
+  // window. The metric carries the real total and goes in the legend.
+  const mergeTotal = view.metrics?.mergeCount ?? counts.merged
+  const legend = STATE_BAR_KEYS.map((key) =>
+    `${STATE_BAR_LETTER[key]}${key === "merged" ? mergeTotal : counts[key]}`).join(" ")
   return {
     content: `states ${bar} ${legend}`,
     fg: counts.blocked > 0 ? "error" : "base",
-    counts, total, filled, bar, legend,
+    counts, mergeTotal, total, filled, bar, legend,
   }
 }
 
@@ -127,7 +169,16 @@ export function snapshotLineItems(snapshot = EMPTY_SNAPSHOT, error = null, now =
   const view = normalizeSnapshot(snapshot)
   const seen = new Set()
   const active = view.active.filter((r) => keep(r, seen))
-  const recent = view.recent.filter((r) => keep(r, seen)).slice(0, RECENT_LIMIT)
+  const activeTasks = new Set(active.map((r) => str(r.taskID)).filter(Boolean))
+  const repeated = new Set()
+  // A closed attempt is noise once the task is running again. Several closed
+  // attempts of the same task collapse into its newest terminal run.
+  const recent = view.recent.filter((r) => {
+    const task = str(r.taskID)
+    if (activeTasks.has(task) || repeated.has(task)) return false
+    if (task) repeated.add(task)
+    return true
+  }).filter((r) => keep(r, seen)).slice(0, RECENT_LIMIT)
   const c = metricCounts(view)
   const items = [{ marker: "", name: "Beacon", status: `A${c.active} B${c.blocked} R${c.rebase} F${c.fix} ${clockOf(view)}`, color: "action", bold: true }]
   if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })

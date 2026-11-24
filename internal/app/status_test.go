@@ -34,6 +34,38 @@ func waitingRun(pr int) *core.Run {
 	return run
 }
 
+func TestDeriveDurationsTicksLiveRunUntilNow(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	run := core.NewRun("run-live", "T-LIVE", now.Add(-10*time.Minute))
+	run.State = core.RunWaitingCI
+	run.UpdatedAt = now.Add(-5 * time.Minute)
+	events := []RunEvent{{State: string(core.RunWaitingCI), At: run.UpdatedAt}}
+
+	got := deriveDurations(run, events, now)
+	if got.WaitingCI != 300 {
+		t.Fatalf("waiting CI = %ds, want 300s", got.WaitingCI)
+	}
+	if got.Running != 0 || got.Blocked != 0 {
+		t.Fatalf("live durations = %+v, want only waiting CI", got)
+	}
+}
+
+func TestDeriveDurationsFreezesTerminalRunAtUpdatedAt(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	run := core.NewRun("run-done", "T-DONE", now.Add(-10*time.Minute))
+	run.State = core.RunMerged
+	run.UpdatedAt = now.Add(-5 * time.Minute)
+	events := []RunEvent{{State: string(core.RunRunning), At: now.Add(-9 * time.Minute)}}
+
+	got := deriveDurations(run, events, now)
+	if got.Running != 240 {
+		t.Fatalf("terminal running = %ds, want 240s", got.Running)
+	}
+	if got.WaitingCI != 0 || got.Blocked != 0 {
+		t.Fatalf("terminal durations = %+v, want zero", got)
+	}
+}
+
 func TestReconcileServiceTickReturnsDecisionAndState(t *testing.T) {
 	store := newFakeStore()
 	if err := store.Save(context.Background(), waitingRun(42)); err != nil {

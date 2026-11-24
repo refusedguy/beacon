@@ -71,12 +71,40 @@ func projectRoot() (string, error) {
 	return filepath.Abs(".")
 }
 
-func wire(path, parentSession string) (*wiring, error) {
+// withRoot resolves a path from the config against the project root. Absolute
+// paths are already pinned and stay as they are.
+func withRoot(root, path string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(root, path)
+}
+
+// loadConfig reads the config and pins every relative filesystem path to the
+// project root. A pooled MCP process can start from a parent directory, and
+// without this it would open another checkout's database and worktrees.
+func loadConfig(path string) (config.Config, string, error) {
+	root, err := projectRoot()
+	if err != nil {
+		return config.Config{}, "", err
+	}
+	if path == "" {
+		path = filepath.Join(root, ".beacon", "config.yaml")
+	}
 	cfg, err := config.Load(path)
 	if err != nil {
-		return nil, err
+		return config.Config{}, "", err
 	}
-	root, err := projectRoot()
+	cfg.StateDB = withRoot(root, cfg.StateDB)
+	cfg.WorkspaceDir = withRoot(root, cfg.WorkspaceDir)
+	if cfg.TaskSource.Provider == "markdown" || cfg.TaskSource.Provider == "" {
+		cfg.TaskSource.Dir = withRoot(root, cfg.TaskSource.Dir)
+	}
+	return cfg, root, nil
+}
+
+func wire(path, parentSession string) (*wiring, error) {
+	cfg, root, err := loadConfig(path)
 	if err != nil {
 		return nil, err
 	}

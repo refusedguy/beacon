@@ -90,6 +90,15 @@ Edit only files in `Scope:`. Do not edit files owned by another card. Do not edi
 6. Use `beacon_wait` to wait for a verdict and `beacon_status` to inspect state.
 7. Use `beacon_control` for approve, unblock, cancel and retry actions.
 
+## Orchestrator practice
+
+The operator works in the default `build` agent. That agent gets orchestrator rules from the plugin. Keep the main checkout clean and let workers own their worktrees.
+
+- Do not dispatch a task again after `workspace conflict` or `dirty worktree` until you find the cause. A repeated dispatch does not clear a stale worktree.
+- Before `beacon_task_create`, check `git log -n 10 --oneline`, `beacon_status` and `beacon_recent`. Do not recreate a card for work that is in flight or already merged.
+- Give each card a narrow, disjoint `Scope`. Never run two cards that touch `ui.js`, `ui_view.js` or `reconciler.go` at the same time.
+- After Go code lands on `main`, run `bash scripts/build-beacon.sh`, then tell the operator to restart the MCP daemon and the OpenCode TUI once. Go code is not hot-reloaded.
+
 ## Shell guards
 
 The OpenCode plugin rejects three commands at the tool boundary: `grep -r` over the whole tree, `find /` and a direct push to `main`. Use `rg -n PATTERN <explicit-directory>` instead of recursive grep or root find.

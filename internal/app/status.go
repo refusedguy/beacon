@@ -249,17 +249,18 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 		return nil, err
 	}
 	timeline, histories := groupHistory(events, decisions)
+	now := time.Now().UTC()
 	out := &Snapshot{
-		GeneratedAt: time.Now().UTC(),
+		GeneratedAt: now,
 		Active:      make([]RunSnapshot, 0, len(active)),
 		Recent:      make([]RunSnapshot, 0, len(recent)),
-		Metrics:     makeMetrics(active, recent, timeline, histories, counts),
+		Metrics:     makeMetrics(active, recent, timeline, histories, counts, now),
 	}
 	for _, run := range active {
-		out.Active = append(out.Active, makeRunSnapshot(run, timeline, histories))
+		out.Active = append(out.Active, makeRunSnapshot(run, timeline, histories, now))
 	}
 	for _, run := range recent {
-		out.Recent = append(out.Recent, makeRunSnapshot(run, timeline, histories))
+		out.Recent = append(out.Recent, makeRunSnapshot(run, timeline, histories, now))
 	}
 	return out, nil
 }
@@ -291,7 +292,7 @@ func groupHistory(events []RunEvent, decisions []Decision) (map[string][]RunEven
 	return timeline, histories
 }
 
-func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision) RunSnapshot {
+func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time) RunSnapshot {
 	events := timeline[string(run.ID)]
 	if events == nil {
 		events = []RunEvent{}
@@ -305,14 +306,21 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		PR: run.PRNumber, HeadSHA: run.HeadSHA, Branch: run.Branch, Reason: run.Reason,
 		RebaseAttempts: run.RebaseAttempts, FixAttempts: run.FixAttempts,
 		MaxAttempts: run.MaxAttempts, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
-		Durations: deriveDurations(run, events), Timeline: events, Decisions: decisions,
+		Durations: deriveDurations(run, events, now), Timeline: events, Decisions: decisions,
 	}
 }
 
-func deriveDurations(run *core.Run, events []RunEvent) Durations {
+// deriveDurations measures each state interval. A live run has no closing
+// event, so its last interval runs until now and the panel sees a ticking
+// timer. Terminal runs keep the fixed UpdatedAt boundary.
+func deriveDurations(run *core.Run, events []RunEvent, now time.Time) Durations {
 	var out Durations
+	endOfRun := run.UpdatedAt
+	if !run.State.Terminal() && now.After(endOfRun) {
+		endOfRun = now
+	}
 	for i, event := range events {
-		end := run.UpdatedAt
+		end := endOfRun
 		if i+1 < len(events) {
 			end = events[i+1].At
 		}
@@ -320,10 +328,10 @@ func deriveDurations(run *core.Run, events []RunEvent) Durations {
 			addDuration(&out, core.RunState(event.State), int64(end.Sub(event.At).Seconds()))
 		}
 	}
-	// Older state databases have no events. Use the run's own window for its
-	// current state so the panel still shows an elapsed time.
-	if len(events) == 0 && run.UpdatedAt.After(run.CreatedAt) {
-		addDuration(&out, run.State, int64(run.UpdatedAt.Sub(run.CreatedAt).Seconds()))
+	// Older state databases have no events. Use the run's own window so the
+	// panel still shows an elapsed time.
+	if len(events) == 0 && endOfRun.After(run.CreatedAt) {
+		addDuration(&out, run.State, int64(endOfRun.Sub(run.CreatedAt).Seconds()))
 	}
 	return out
 }
@@ -344,11 +352,12 @@ func makeMetrics(
 	timeline map[string][]RunEvent,
 	histories map[string][]Decision,
 	counts []DecisionCount,
+	now time.Time,
 ) Metrics {
 	m := Metrics{Skips: map[string]int{}, Blocked: map[string]int{}}
 	merged := make(map[string]bool)
 	blocked := make(map[string]bool)
-	addRunMetrics(&m, active, recent, timeline, merged, blocked)
+	addRunMetrics(&m, active, recent, timeline, merged, blocked, now)
 	for _, events := range timeline {
 		for _, event := range events {
 			if event.Kind == "merged" {
@@ -384,10 +393,10 @@ func addCountMetrics(m *Metrics, counts []DecisionCount) {
 	}
 }
 
-func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][]RunEvent, merged, blocked map[string]bool) {
+func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][]RunEvent, merged, blocked map[string]bool, now time.Time) {
 	for _, group := range [][]*core.Run{active, recent} {
 		for _, run := range group {
-			m.CIWaitSeconds += deriveDurations(run, timeline[string(run.ID)]).WaitingCI
+			m.CIWaitSeconds += deriveDurations(run, timeline[string(run.ID)], now).WaitingCI
 			id := string(run.ID)
 			if run.State == core.RunMerged {
 				merged[id] = true

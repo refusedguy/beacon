@@ -15,17 +15,12 @@ import (
 )
 
 func wireReadOnly(path string) (config.Config, *sqlite.Store, *workspace.GitWorktree, error) {
-	cfg, err := config.Load(path)
+	cfg, root, err := loadConfig(path)
 	if err != nil {
 		return config.Config{}, nil, nil, err
 	}
 	store, err := sqlite.Open(cfg.StateDB)
 	if err != nil {
-		return config.Config{}, nil, nil, err
-	}
-	root, err := filepath.Abs(".")
-	if err != nil {
-		store.Close()
 		return config.Config{}, nil, nil, err
 	}
 	wt, err := workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
@@ -69,7 +64,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			daemon, _ := cmd.Flags().GetBool("daemon")
 			if daemon {
-				cfg, err := config.Load(*configPath)
+				cfg, _, err := loadConfig(*configPath)
 				if err != nil {
 					return err
 				}
