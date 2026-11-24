@@ -1,14 +1,13 @@
-// Presentation helpers for the Beacon status panel. Kept apart from the data
-// model so both files stay small and easy to test.
+// Pure view helpers for the Beacon panels. No TUI imports live here so these
+// functions stay testable with plain Node and shared by every slot.
 import {
-  DECISION_LIMIT, EMPTY_SNAPSHOT, PANEL_NAME, RECENT_LIMIT, REASON_WIDTH,
-  RULE, TITLE_WIDTH, VALUE_WIDTH, normalizeSnapshot, str,
+  DECISION_LIMIT, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH, RECENT_LIMIT,
+  normalizeSnapshot, str,
 } from "./ui_model.js"
 
-// One-row state bar in the panel header. A single text node carries the whole
-// bar, so the fill is a fixed-width run of block cells and a muted remainder.
 export const STATE_BAR_WIDTH = 12
 export const STATE_BAR_KEYS = Object.freeze(["running", "waiting_ci", "blocked", "merged"])
+const STATE_BAR_COLOR = Object.freeze({ running: "success", waiting_ci: "info", blocked: "error", merged: "success" })
 const STATE_BAR_LETTER = Object.freeze({ running: "R", waiting_ci: "C", blocked: "B", merged: "M" })
 
 const STATE_VIEW = Object.freeze({
@@ -17,11 +16,15 @@ const STATE_VIEW = Object.freeze({
   waiting_ci: { marker: "◐", color: "info", label: "CI" },
   needs_rebase: { marker: "◆", color: "warning", label: "REBASE" },
   needs_agent_fix: { marker: "◆", color: "warning", label: "FIX" },
-  blocked: { marker: "▲", color: "error", label: "BLOCK" },
+  blocked: { marker: "▲", color: "error", label: "BLK" },
   merged: { marker: "✔", color: "success", label: "MERGED" },
   closed: { marker: "✖", color: "muted", label: "CLOSED" },
 })
-const stateView = (state) => STATE_VIEW[str(state).toLowerCase()] ?? { marker: "·", color: "muted", label: "?" }
+export const stateView = (state) => STATE_VIEW[str(state).toLowerCase()] ?? { marker: "·", color: "muted", label: "?" }
+export const SIDEBAR_OPEN = Object.freeze({ active: true, recent: true })
+export const DETAIL_OPEN = Object.freeze({ why: true, checks: true, timeline: true, technical: false })
+export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "copy"])
+
 export function truncate(value, width) {
   const text = str(value)
   return text.length <= width ? text : width <= 1 ? text.slice(0, width) : `${text.slice(0, width - 1)}…`
@@ -47,10 +50,8 @@ function timeOf(v) {
   const t = Date.parse(str(v))
   return Number.isFinite(t) ? t : 0
 }
-const ageOf = (run, now) => { const t = Math.max(timeOf(run.updatedAt), timeOf(run.createdAt)); return t ? elapsed(now - t) : "" }
-const tookOf = (run) => { const a = timeOf(run.createdAt), b = timeOf(run.updatedAt); return a && b ? elapsed(b - a) : "" }
-// A bare status code tells the operator nothing about what happened. Turn the
-// common prefixes into short language and keep the useful remainder.
+export const ageOf = (run, now) => { const t = Math.max(timeOf(run?.updatedAt), timeOf(run?.createdAt)); return t ? elapsed(now - t) : "" }
+export const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(run?.updatedAt); return a && b ? elapsed(b - a) : "" }
 const REASON_RULES = [
   [/^workspace:\s*conflict:\s*refusing to remove dirty worktree\b.*/i, "dirty worktree"],
   [/^workspace:\s*conflict:\s*/i, ""],
@@ -68,22 +69,10 @@ export function compactReason(reason) {
   let text = str(reason).replace(/\s+/g, " ").trim()
   if (!text) return ""
   for (const [pattern, replacement] of REASON_RULES) {
-    if (pattern.test(text)) {
-      text = text.replace(pattern, replacement)
-      break
-    }
+    if (pattern.test(text)) { text = text.replace(pattern, replacement); break }
   }
-  text = text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim()
-  return truncate(text, REASON_WIDTH)
+  return truncate(text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim(), REASON_WIDTH)
 }
-const keep = (run, seen) => {
-  const key = run.id || run.taskID || run.title
-  if (!key || seen.has(key)) return false
-  seen.add(key)
-  return true
-}
-// The active run shows the timer for its current phase, not the age of the
-// whole run. The terminal run shows how long the attempt took.
 export function phaseLabel(run, now = Date.now()) {
   const d = run.durations ?? {}
   const state = str(run.state).toLowerCase()
@@ -93,41 +82,32 @@ export function phaseLabel(run, now = Date.now()) {
   if (phase && Number(phase[1]) > 0) return `${phase[0]} ${elapsed(Number(phase[1]) * 1000)}`
   return ageOf(run, now)
 }
-export function runLineItems(run, now = Date.now(), recent = false) {
-  const v = stateView(run.state)
-  const title = run.title && run.title !== run.taskID ? truncate(run.title, TITLE_WIDTH) : ""
-  const name = [shortTaskID(run.taskID), title].filter(Boolean).join(" ")
-  const duration = recent ? tookOf(run) : phaseLabel(run, now)
-  const meta = [run.pr ? `#${run.pr}` : "", duration].filter(Boolean).join(" ")
-  // A merged run needs no reason: the PR number and duration are the result.
-  const reason = str(run.state).toLowerCase() === "merged" ? "" : compactReason(run.reason)
-  return [
-    { marker: v.marker, name, status: v.label, color: v.color, bold: true, runID: run.id },
-    { marker: "", name: meta, status: reason, color: "muted", runID: run.id },
-  ]
+export const mergedReason = (run) => str(run?.reason).trim() || (run?.pr ? `merged PR #${run.pr}` : "merged to main")
+
+export function activeRuns(snapshot = EMPTY_SNAPSHOT) {
+  const seen = new Set()
+  return normalizeSnapshot(snapshot).active.filter((run) => {
+    if (!run.id || seen.has(run.id)) return false
+    seen.add(run.id)
+    return true
+  })
 }
-// Detail sections carry a key so a click can toggle them. `collapsed[key] ===
-// false` is the collapsed state, which shows ▶ and omits the body rows.
-const section = (label, key, collapsed = {}) => ({
-  marker: collapsed[key] === false ? "▶" : "▼",
-  name: label, status: "", color: "action", bold: true, sectionKey: key,
-})
-// Snapshot headers are counted but not clickable, so they keep the plain shape.
-const countedSection = (label, count) => ({
-  marker: "▼", name: label, status: count == null ? "" : String(count), color: "action", bold: true,
-})
-export function metricCounts(view = EMPTY_SNAPSHOT) {
-  const m = view.metrics ?? {}
-  return {
-    active: view.active.length,
-    blocked: m.blockedCount ?? view.active.filter((r) => r.state === "blocked").length,
-    rebase: m.rebaseCount ?? 0,
-    fix: m.fixCount ?? 0,
-  }
+// A closed attempt is noise once the task is active again. Repeated closed
+// attempts of one task collapse into its newest terminal run.
+export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
+  const view = normalizeSnapshot(snapshot)
+  const activeTasks = new Set(activeRuns(view).map((r) => str(r.taskID)).filter(Boolean))
+  const seenTasks = new Set()
+  const seenIDs = new Set()
+  return view.recent.filter((run) => {
+    const task = str(run.taskID)
+    if (!run.id || seenIDs.has(run.id) || activeTasks.has(task) || seenTasks.has(task)) return false
+    seenIDs.add(run.id)
+    if (task) seenTasks.add(task)
+    return true
+  }).slice(0, RECENT_LIMIT)
 }
-// Counts come from active and recent runs, which already carry every state the
-// panel shows. Up to STATE_BAR_WIDTH cells are handed out proportionally with
-// the largest-remainder method; the unused tail is drawn with shade cells.
+
 export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
   const view = normalizeSnapshot(snapshot)
   const counts = { running: 0, waiting_ci: 0, blocked: 0, merged: 0 }
@@ -141,113 +121,152 @@ export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
   const exact = STATE_BAR_KEYS.map((key) => counts[key] * share)
   const cells = exact.map(Math.floor)
   let spare = filled - cells.reduce((sum, n) => sum + n, 0)
-  const byFraction = exact.map((value, i) => ({ i, fraction: value - cells[i] }))
-    .sort((a, b) => b.fraction - a.fraction)
+  const byFraction = exact.map((value, i) => ({ i, fraction: value - cells[i] })).sort((a, b) => b.fraction - a.fraction)
   for (let i = 0; spare > 0; i += 1, spare -= 1) cells[byFraction[i].i] += 1
-  const bar = STATE_BAR_KEYS.map((key, i) => "█".repeat(cells[i])).join("")
-    + "░".repeat(STATE_BAR_WIDTH - filled)
-  // The recent list is capped at five rows, so its merged count is only a
-  // window. The metric carries the real total and goes in the legend.
+  const segments = STATE_BAR_KEYS.map((key, i) => ({ text: "█".repeat(cells[i]), color: STATE_BAR_COLOR[key] }))
+  segments.push({ text: "░".repeat(STATE_BAR_WIDTH - filled), color: "muted" })
+  const bar = segments.map((s) => s.text).join("")
   const mergeTotal = view.metrics?.mergeCount ?? counts.merged
-  const legend = STATE_BAR_KEYS.map((key) =>
-    `${STATE_BAR_LETTER[key]}${key === "merged" ? mergeTotal : counts[key]}`).join(" ")
+  const legend = STATE_BAR_KEYS.map((key) => `${STATE_BAR_LETTER[key]}${key === "merged" ? mergeTotal : counts[key]}`).join(" ")
+  const parts = []
+  if (counts.running) parts.push(`${counts.running} running`)
+  if (counts.waiting_ci) parts.push(`${counts.waiting_ci} in CI`)
+  if (counts.blocked) parts.push(`${counts.blocked} blocked`)
+  const fixing = str(view.metrics?.rebaseCount) && Number(view.metrics.rebaseCount) + Number(view.metrics.fixCount) > 0
+    ? Number(view.metrics.rebaseCount) + Number(view.metrics.fixCount) : 0
+  if (fixing) parts.push(`${fixing} needs work`)
+  if (mergeTotal) parts.push(`${mergeTotal} done`)
+  const summary = parts.length ? parts.join(" · ") : "no runs"
   return {
+    segments, bar, counts, mergeTotal, total, filled, legend, summary,
     content: `states ${bar} ${legend}`,
     fg: counts.blocked > 0 ? "error" : "base",
-    counts, mergeTotal, total, filled, bar, legend,
   }
 }
 
-export function clockOf(view = EMPTY_SNAPSHOT) {
-  const stamps = [...view.active, ...view.recent].map((r) => timeOf(r.updatedAt)).filter(Boolean)
-  const at = timeOf(view.generatedAt) || Math.max(0, ...stamps)
-  if (!at) return "--:--:--"
-  const date = new Date(at)
-  return Number.isFinite(date.getTime()) ? date.toISOString().slice(11, 19) : "--:--:--"
-}
-export function snapshotLineItems(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now()) {
-  const view = normalizeSnapshot(snapshot)
-  const seen = new Set()
-  const active = view.active.filter((r) => keep(r, seen))
-  const activeTasks = new Set(active.map((r) => str(r.taskID)).filter(Boolean))
-  const repeated = new Set()
-  // A closed attempt is noise once the task is running again. Several closed
-  // attempts of the same task collapse into its newest terminal run.
-  const recent = view.recent.filter((r) => {
-    const task = str(r.taskID)
-    if (activeTasks.has(task) || repeated.has(task)) return false
-    if (task) repeated.add(task)
-    return true
-  }).filter((r) => keep(r, seen)).slice(0, RECENT_LIMIT)
-  const c = metricCounts(view)
-  const items = [{ marker: "", name: "Beacon", status: `A${c.active} B${c.blocked} R${c.rebase} F${c.fix} ${clockOf(view)}`, color: "action", bold: true }]
-  if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
-  items.push(countedSection("Active", active.length))
-  if (!active.length) items.push({ marker: "", name: "No active runs", status: "", color: "muted" })
-  else active.forEach((r) => items.push(...runLineItems(r, now)))
-  items.push(countedSection("Recent", recent.length))
-  if (!recent.length) items.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
-  else recent.forEach((r) => items.push(...runLineItems(r, now, true)))
-  return items
-}
-export function renderSnapshotLines(snapshot, error, now) {
-  return snapshotLineItems(snapshot, error, now).map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))
-}
-export function metricsLine(snapshot = EMPTY_SNAPSHOT) {
-  const view = normalizeSnapshot(snapshot)
-  const c = metricCounts(view)
-  return { marker: "", name: `Beacon active ${c.active} · blocked ${c.blocked} · rebase ${c.rebase} · fix ${c.fix} · updated ${clockOf(view)}`, status: "", color: "muted" }
-}
-export function detailLines(run, metrics, now = Date.now(), collapsed = {}) {
-  if (!run) return [{ text: "No run selected", color: "muted" }]
+// Two pooled line slots per run: identity on line one, reference and live
+// duration and cause on line two. No fixed title width: the name cell grows.
+export function runLineItems(run, now = Date.now(), recent = false) {
   const v = stateView(run.state)
-  const m = metrics ?? {}
-  const d = run.durations ?? {}
-  const field = (name, value, color = "muted", statusColor = "base") => ({
-    marker: "", name, status: truncate(value, VALUE_WIDTH), color, statusColor,
-  })
-  const note = (text, color = "muted") => ({ marker: "", name: text, status: "", color })
-  const out = []
-  // A section keeps its header and separator even when collapsed. Only the
-  // body rows are skipped, so the pooled slots below shift up with no gap.
-  const add = (label, rows, first = false) => {
-    if (!first) out.push({ marker: "", name: RULE, status: "", color: "muted" })
-    out.push(section(label, label, collapsed))
-    if (collapsed[label] !== false) rows.forEach((row) => out.push(row))
-  }
-  const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
-  add("Identity", [
-    field("State", `${v.marker} ${run.state} · ${v.label}`, v.color),
-    field("Run", run.id || "-"), field("Task", run.taskID || "-"),
-    field("Title", run.title || "-", "base"), field("PR", run.pr ? `#${run.pr}` : "-"),
-    field("Branch", run.branch || "-"), field("SHA", run.sha ? truncate(run.sha, 12) : "-"),
-  ], true)
-  add("Timing", [
-    field("Created", stamp(run.createdAt)), field("Updated", stamp(run.updatedAt)),
-    field("Age", ageOf(run, now)), field("Wait CI", elapsed(d.waitingCI * 1000)),
-    field("Running", elapsed(d.running * 1000)), field("Blocked", elapsed(d.blocked * 1000)),
-  ])
-  add("Attempts", [
-    field("Rebase", `${run.rebaseAttempts}/${run.maxAttempts || "?"}`),
-    field("Fix", `${run.fixAttempts}/${run.maxAttempts || "?"}`), field("Dispatch", m.dispatchCount ?? 0),
-    field("Rebases", m.rebaseCount ?? 0), field("Merges", m.mergeCount ?? 0),
-    field("CI wait", elapsed((m.ciWaitSeconds ?? 0) * 1000)),
-  ])
-  add("Reason", [note(run.reason || "-", run.state === "blocked" ? "error" : "base")])
-  const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
-  add("Timeline", timeline.length
-    ? timeline.map((e) => note(`${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`))
-    : [note("(none)")])
-  const allDecisions = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
-  const decisions = allDecisions.slice(-DECISION_LIMIT)
-  const earlier = allDecisions.length - decisions.length
-  const decisionRows = []
-  if (earlier > 0) decisionRows.push(note(`... ${earlier} earlier decisions`))
-  decisions.forEach((d) => decisionRows.push(note(`${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd())))
-  if (!decisions.length) decisionRows.push(note("(none)"))
-  add("Decisions", decisionRows)
-  return out
+  const state = str(run.state).toLowerCase()
+  const title = str(run.title) || shortTaskID(run.taskID)
+  const ref = run.pr ? `#${run.pr}` : shortTaskID(run.taskID)
+  const duration = recent ? tookOf(run) : phaseLabel(run, now)
+  const reason = state === "merged" ? "" : compactReason(run.reason)
+  return [
+    { marker: v.marker, name: title, status: v.label, color: v.color, bold: true, runID: run.id },
+    { marker: ref, name: duration, status: reason, color: "muted", runID: run.id },
+  ]
 }
+const sectionItem = (label, count, key, open) => ({
+  marker: open ? "▼" : "▶", name: label, status: String(count),
+  color: "action", bold: true, sectionKey: key,
+})
+
+export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN) {
+  const view = normalizeSnapshot(snapshot)
+  const bar = stateBarItem(view)
+  const active = activeRuns(view)
+  const recent = recentRuns(view)
+  const items = [
+    { marker: "", name: "Beacon", status: bar.summary, color: "action", bold: true },
+    { marker: "", name: bar.legend, status: "", color: "muted" },
+  ]
+  if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
+  const listItems = []
+  listItems.push(sectionItem("Active", active.length, "active", open.active !== false))
+  if (open.active !== false) {
+    if (!active.length) listItems.push({ marker: "", name: "No active runs", status: "", color: "muted" })
+    active.forEach((run) => listItems.push(...runLineItems(run, now)))
+    listItems.push({ marker: "▶", name: "Dispatch", status: "", color: "success", bold: true, action: "dispatch" })
+  }
+  listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
+  if (open.recent !== false) {
+    if (!recent.length) listItems.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
+    recent.forEach((run) => listItems.push(...runLineItems(run, now, true)))
+  }
+  return { ...bar, items: [...items, ...listItems], listItems, active, recent, view }
+}
+export const snapshotLineItems = (snapshot, error, now) => sidebarModel(snapshot, error, now).items
+export const renderSnapshotLines = (snapshot, error, now) => snapshotLineItems(snapshot, error, now)
+  .map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))
+export const metricsLine = (snapshot = EMPTY_SNAPSHOT) => {
+  const item = stateBarItem(snapshot)
+  return { marker: "", name: `Beacon ${item.summary}`, status: item.legend, color: "muted" }
+}
+
+const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
+export function detailActions(run) {
+  if (!run) return []
+  const state = str(run.state).toLowerCase()
+  const active = ["pending", "running", "waiting_ci", "needs_rebase", "needs_agent_fix"].includes(state)
+  const actions = []
+  if (state === "blocked") actions.push("retry")
+  if (state === "waiting_ci" || (run.pr && active)) actions.push("approve")
+  if (active) actions.push("cancel")
+  actions.push("copy")
+  return actions
+}
+function phaseSummary(run) {
+  const d = run.durations ?? {}
+  return `Run ${shortTaskID(run.id)} · Coding ${elapsed((d.running ?? 0) * 1000)} · CI ${elapsed((d.waitingCI ?? 0) * 1000)} · Blocked ${elapsed((d.blocked ?? 0) * 1000)}`
+}
+export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_OPEN) {
+  if (!run) return {
+    badge: "", pr: "", branch: "", title: "No run selected", task: "", phase: "",
+    actions: [], rows: [{ text: "No run selected", color: "muted" }],
+  }
+  const v = stateView(run.state)
+  const state = str(run.state).toLowerCase()
+  const rows = []
+  const isOpen = (key) => key === "technical" ? open.technical === true : open[key] !== false
+  const header = (label, key) => rows.push({
+    marker: isOpen(key) ? "▼" : "▶", name: label, status: "",
+    color: "action", bold: true, sectionKey: key,
+  })
+  const row = (name, status = "", color = "muted", marker = "") => rows.push({ marker, name, status, color })
+  header("Why / Blocker", "why")
+  if (isOpen("why")) {
+    const reason = state === "merged" ? mergedReason(run) : str(run.reason).trim()
+    row(reason || "No reason recorded", "", state === "blocked" || state === "closed" ? "error" : "base", "↳")
+  }
+  header("CI Checks", "checks")
+  if (isOpen("checks")) {
+    const checks = run.checks ?? []
+    if (!checks.length) row("(none)")
+    else checks.forEach((c) => row(`${c.name || "check"} ${c.state || "unknown"}`, c.durationSeconds ? elapsed(c.durationSeconds * 1000) : "", c.state === "failure" ? "error" : "muted"))
+  }
+  header("Timeline", "timeline")
+  if (isOpen("timeline")) {
+    const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
+    if (!timeline.length) row("(none)")
+    else timeline.forEach((e) => row(`${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`))
+  }
+  header("Technical", "technical")
+  if (isOpen("technical")) {
+    row(run.id || "-", "", "base", "Run ID")
+    row(run.sha || "-", "", "base", "SHA")
+    const attempts = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
+    row(attempts, "", "base", "Attempts")
+    const all = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
+    const decisions = all.slice(-DECISION_LIMIT)
+    if (all.length > decisions.length) row(`... ${all.length - decisions.length} earlier decisions`)
+    if (!decisions.length) row("(none)")
+    else decisions.forEach((d) => row(`${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd()))
+  }
+  return {
+    badge: `${v.marker} ${v.label} · ${ageOf(run, now)}`,
+    badgeColor: v.color,
+    pr: run.pr ? `PR #${run.pr}` : "No PR yet",
+    branch: run.branch || "-",
+    title: str(run.title) || str(run.taskID) || "-",
+    task: run.taskID || "-",
+    phase: phaseSummary(run),
+    actions: detailActions(run),
+    rows,
+  }
+}
+export const detailLines = (run, metrics, now, open) => detailModel(run, metrics, now, open).rows
 export function detailCommand(open) {
   return {
     id: "beacon.run.detail", title: "Beacon run detail", description: "Open the selected Beacon run",

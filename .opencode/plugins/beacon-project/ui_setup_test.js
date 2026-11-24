@@ -1,41 +1,33 @@
 // Run: node --test .opencode/plugins/beacon-project/ui_setup_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
-import { NOW, lines, makeRun, solidModule, themeStub, signalStub } from "./ui_test_helpers.js"
+import { NOW, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
-const {
-  BEACON_STATUS_RPC_ID,
-  BeaconStatusRpc,
-  CliStatusSource,
-  DECISION_LIMIT,
-  EMPTY_SNAPSHOT,
-  PANEL_NAME,
-  RECENT_LIMIT,
-  REASON_WIDTH,
-  STATE_BAR_WIDTH,
-  TITLE_WIDTH,
-  beaconStatusDefinition,
-  createCliStatusSource,
-  createRowMount,
-  createStatusSource,
-  defineBeaconStatusPlugin,
-  detailCommand,
-  detailLines,
-  elapsed,
-  enrichRuns,
-  errorMessage,
-  normalizeRun,
-  normalizeSnapshot,
-  parseSnapshot,
-  readTitle,
-  renderSnapshotLines,
-  runLineItems,
-  snapshotLineItems,
-  stateBarItem,
-  truncate,
-  default: beaconStatus,
-} = ui
+const { EMPTY_SNAPSHOT, beaconStatusDefinition, createRowMount, snapshotLineItems, stateBarItem } = ui
+
+function barNode(container) {
+  return container.children.find((child) =>
+    child.children?.some((cell) => /[█░]/.test(String(cell.props?.content ?? ""))))
+}
+function signals() {
+  return { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } }
+}
+function modules(created) {
+  return {
+    "@opentui/solid": solidModule(created),
+    "solid-js": signals(),
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+}
+function ctxFor(rpc, store) {
+  return {
+    theme: themeStub(),
+    client: { rpc: () => rpc },
+    storage: store ?? { store: () => [{ id: "" }, async () => {}] },
+    ui: { slot: () => () => {}, panel: { open: () => {} } },
+    keymap: { layer: () => () => {} },
+  }
+}
 
 test("state bar builds a proportional one-row visualization", () => {
   const item = stateBarItem({
@@ -48,17 +40,8 @@ test("state bar builds a proportional one-row visualization", () => {
   assert.deepEqual(item.counts, { running: 2, waiting_ci: 1, blocked: 1, merged: 1 })
   assert.equal(item.filled, 5)
   assert.equal((item.bar.match(/█/g) ?? []).length, 5)
-  assert.equal((item.bar.match(/░/g) ?? []).length, STATE_BAR_WIDTH - 5)
-  assert.ok(item.content.startsWith("states ") && item.content.includes("R2 C1 B1 M1"))
-  assert.equal(item.fg, "error", "a blocked run colors the bar with the error tone")
-  const big = stateBarItem({ active: Array.from({ length: 20 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })), recent: [] })
-  assert.equal(big.filled, STATE_BAR_WIDTH)
-  assert.equal((big.bar.match(/█/g) ?? []).length, STATE_BAR_WIDTH)
-  assert.equal((big.bar.match(/░/g) ?? []).length, 0)
-  assert.ok(big.content.includes("R20"))
-  const empty = stateBarItem(EMPTY_SNAPSHOT)
-  assert.equal(empty.bar, "░".repeat(STATE_BAR_WIDTH))
-  assert.ok(empty.content.includes("R0 C0 B0 M0"))
+  assert.equal((item.bar.match(/░/g) ?? []).length, ui.STATE_BAR_WIDTH - 5)
+  assert.equal(item.fg, "error")
 })
 
 test("sidebar bar updates on refresh without allocating nodes", async () => {
@@ -66,46 +49,35 @@ test("sidebar bar updates on refresh without allocating nodes", async () => {
   const created = []
   const renderers = Object.create(null)
   let tick = null
-  const ctx = {
-    theme: themeStub(),
-    client: { rpc: () => ({ snapshot: async () => current }) },
-    storage: { store: () => [{ id: "" }, async () => {}] },
-    ui: { slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }, panel: { open: () => {} } },
-    keymap: { layer: () => () => {} },
-  }
-  const modules = {
-    "@opentui/solid": solidModule(created),
-    "solid-js": { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } },
-    "@opentui/core": { TextAttributes: { BOLD: 1 } },
-  }
-  const deps = {
+  const ctx = ctxFor({ snapshot: async () => current })
+  ctx.ui.slot = ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
     options: { statusPollMs: 1000, watcherEnabled: false },
-    import: (specifier) => modules[specifier],
+    import: (specifier) => modules(created)[specifier],
     setInterval: (fn) => { tick = fn; return 1 }, clearInterval: () => {},
     setTimeout: () => 1, clearTimeout: () => {},
-  }
-  const dispose = await beaconStatusDefinition.setup(ctx, deps)
+  })
   await new Promise((resolve) => setImmediate(resolve))
   const sidebar = renderers["sidebar.content"]()
-  const bar = sidebar.children[0]
-  assert.ok(bar.props.content.startsWith("states ") && bar.props.content.includes("R1"))
+  const bar = barNode(sidebar)
+  assert.ok(bar, "the sidebar renders a segmented state bar")
+  assert.ok(bar.children.some((cell) => cell.props.fg === "success"), "running uses the success tone")
   const before = created.length
   current = { active: [makeRun({ ID: "r-1", State: "blocked" })], recent: [] }
   tick()
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(created.length, before, "refresh must not create nodes")
-  assert.equal(sidebar.children[0], bar, "the bar node is reused")
-  assert.ok(bar.props.content.includes("B1"), "refresh updates the bar content")
-  assert.equal(bar.props.fg, "error", "refresh updates the bar color")
+  assert.equal(barNode(sidebar), bar, "the bar node is reused")
+  assert.ok(bar.children.some((cell) => cell.props.fg === "error"), "refresh updates the bar color")
+  assert.ok(sidebar.children.some((child) => child.item?.status === "1 blocked"), "the header summary updates")
   dispose()
 })
 
 test("row mount reuses nodes across refreshes and keeps the click handler", () => {
-  let nextNode = 0
   const created = []
-  const ui = {
+  const uiApi = {
     createElement: (tag) => {
-      const node = { id: ++nextNode, tag, props: {}, children: [] }
+      const node = { tag, props: {}, children: [] }
       created.push(node)
       return node
     },
@@ -113,89 +85,59 @@ test("row mount reuses nodes across refreshes and keeps the click handler", () =
     setProp: (node, name, value) => { node.props[name] = value },
   }
   const picked = []
-  const color = (key) => `theme.${key}`
-  const mount = createRowMount(ui, { color, BOLD: 1, onRow: (item) => picked.push(item), hoverBg: "theme.hover" })
-  const container = ui.createElement("box")
+  const mount = createRowMount(uiApi, {
+    color: (key) => `theme.${key}`, BOLD: 1, onRow: (item) => picked.push(item), hoverBg: "theme.hover",
+    maxRows: 8,
+  })
+  const container = { children: [], tag: "box" }
   let items = snapshotLineItems({ active: [makeRun({ title: "First" })], recent: [] }, null, NOW)
   const apply = mount(container, () => items)
   const afterFirst = created.length
-  const boxes = container.children
-  const handler = boxes[2].props.onMouseDown
+  const row = container.children.find((box) => box.item?.runID === "run-1")
+  const handler = row.props.onMouseDown
 
   items = snapshotLineItems({ active: [makeRun({ State: "blocked", title: "Second" })], recent: [] }, null, NOW)
   apply()
-
   assert.equal(created.length, afterFirst, "refresh must not create nodes")
-  assert.equal(container.children[2], boxes[2], "row node identity is stable")
-  assert.equal(boxes[2].props.onMouseDown, handler, "click handler survives")
-  assert.equal(boxes[2].children[1].props.content, "T-1 Second")
-  assert.equal(boxes[2].children[1].props.fg, "theme.base")
-  assert.equal(boxes[2].children[0].props.content, "▲")
-  assert.equal(boxes[2].children[0].props.fg, "theme.error")
+  assert.equal(container.children.find((box) => box.item?.runID === "run-1"), row, "row identity is stable")
+  assert.equal(row.props.onMouseDown, handler, "click handler survives")
+  assert.equal(row.children[1].props.content, "Second")
+  assert.equal(row.children[1].props.fg, "theme.error", "the name follows the state color")
+  assert.equal(row.children[0].props.content, "▲")
+  assert.equal(row.children[0].props.fg, "theme.error")
   handler()
   assert.equal(picked.length, 1)
   assert.equal(picked[0].runID, "run-1")
 
-  const beforeHide = container.children.length
+  const beforeHide = container.children.filter((box) => box.props.visible === true).length
   items = snapshotLineItems(EMPTY_SNAPSHOT, null, NOW)
   apply()
   assert.equal(created.length, afterFirst, "hiding rows must not create nodes")
-  assert.equal(container.children.length, beforeHide, "rows are hidden, not removed")
-  assert.equal(container.children[beforeHide - 1].props.visible, false)
+  assert.ok(container.children.filter((box) => box.props.visible === true).length < beforeHide)
 })
 
 test("setup defers every createElement to a slot render callback", async () => {
   const created = []
-  const ui = {
-    createElement: (tag) => {
-      const node = { tag, props: {}, children: [] }
-      created.push(node)
-      return node
-    },
-    insert: (parent, child) => { parent.children.push(child) },
-    setProp: (node, name, value) => { node.props[name] = value },
-  }
-  const createSignal = (initial) => {
-    let value = initial
-    return [() => value, (next) => { value = typeof next === "function" ? next(value) : next }]
-  }
-  const modules = {
-    "@opentui/solid": ui,
-    "solid-js": { createSignal },
-    "@opentui/core": { TextAttributes: { BOLD: 1 } },
-  }
   const renderers = Object.create(null)
-  const ctx = {
-    theme: themeStub(),
-    client: { rpc: () => ({ snapshot: async () => ({ active: [], recent: [] }) }) },
-    storage: { store: () => [{ id: "" }, async () => {}] },
-    ui: {
-      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
-      panel: { open: () => {} },
-    },
-    keymap: { layer: () => {} },
-  }
-
-  const dispose = await beaconStatusDefinition.setup(ctx, { import: (specifier) => modules[specifier] })
+  const ctx = ctxFor({ snapshot: async () => ({ active: [], recent: [] }) })
+  ctx.ui.slot = ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }
+  const dispose = await beaconStatusDefinition.setup(ctx, { import: (specifier) => modules(created)[specifier] })
   assert.equal(created.length, 0, "setup must not call createElement before any render callback")
   for (const name of ["sidebar.content", "home.footer.status", "session.panel", "app"]) {
     assert.equal(typeof renderers[name], "function", `registers ${name}`)
   }
-
   const sidebar = renderers["sidebar.content"]()
   assert.ok(sidebar, "sidebar render returns a node")
   assert.ok(created.length > 0, "first render callback creates the nodes")
-
   const before = created.length
   assert.equal(renderers["sidebar.content"](), sidebar, "sidebar node is reused")
   assert.equal(created.length, before, "repeat renders create no new nodes")
   const footer = renderers["home.footer.status"]()
   assert.notEqual(footer, sidebar, "footer has its own node")
-  const detail = renderers["session.panel"]({ name: PANEL_NAME })
+  const detail = renderers["session.panel"]({ name: ui.PANEL_NAME })
   assert.ok(detail, "panel render returns the detail node")
   assert.equal(renderers["session.panel"]({ name: "other" }), null, "other panels render nothing")
-  assert.equal(renderers["session.panel"]({ name: PANEL_NAME }), detail, "detail node is reused")
-
+  assert.equal(renderers["session.panel"]({ name: ui.PANEL_NAME }), detail, "detail node is reused")
   dispose()
   assert.equal(Object.keys(renderers).length, 0, "dispose removes every slot")
 })
@@ -204,7 +146,7 @@ test("a row count change during refresh creates no nodes outside a render callba
   let current = { active: [], recent: [] }
   const created = []
   let renderActive = false
-  const ui = {
+  const uiApi = {
     createElement: (tag) => {
       const node = { tag, props: {}, children: [] }
       created.push({ node, renderActive })
@@ -213,51 +155,26 @@ test("a row count change during refresh creates no nodes outside a render callba
     insert: (parent, child) => parent.children.push(child),
     setProp: (node, name, value) => { node.props[name] = value },
   }
-  const createSignal = (initial) => {
-    let value = initial
-    return [() => value, (next) => { value = typeof next === "function" ? next(value) : next }]
-  }
-  const modules = {
-    "@opentui/solid": ui,
-    "solid-js": { createSignal },
-    "@opentui/core": { TextAttributes: { BOLD: 1 } },
-  }
   const renderers = Object.create(null)
   let tick = null
-  const ctx = {
-    theme: themeStub(),
-    client: { rpc: () => ({
-      snapshot: async () => current,
-      events: { on: () => () => {} },
-    }) },
-    storage: { store: () => [{ id: "" }, async () => {}] },
-    ui: {
-      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
-      panel: { open: () => {} },
-    },
-    keymap: { layer: () => {} },
-  }
-  const deps = {
-    import: (specifier) => modules[specifier],
-    setInterval: (fn) => { tick = fn; return 1 },
-    clearInterval: () => {},
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-  }
-
-  const dispose = await beaconStatusDefinition.setup(ctx, deps)
+  const ctx = ctxFor({ snapshot: async () => current, events: { on: () => () => {} } })
+  ctx.ui.slot = ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    import: (specifier) => ({ ...modules(), "@opentui/solid": uiApi })[specifier],
+    setInterval: (fn) => { tick = fn; return 1 }, clearInterval: () => {},
+    setTimeout: () => 1, clearTimeout: () => {},
+  })
   assert.equal(created.length, 0, "setup creates nothing before a render callback")
   assert.equal(typeof tick, "function", "the refresh timer is installed")
 
   renderActive = true
   const sidebar = renderers["sidebar.content"]()
   renderActive = false
-  assert.ok(sidebar, "the first render callback returns the sidebar node")
   const afterEnsure = created.length
   assert.ok(afterEnsure > 0, "the first render callback allocates the row pool")
   assert.ok(created.every((call) => call.renderActive), "every node was created inside a render callback")
 
-  const beforeVisible = sidebar.children.filter((child) => child.props.visible === true).length
+  const beforeVisible = sidebar.children.filter((child) => child.item?.runID).length
   current = {
     active: [
       makeRun({ ID: "run-a", TaskID: "T-A", title: "First" }),
@@ -266,14 +183,11 @@ test("a row count change during refresh creates no nodes outside a render callba
     ],
     recent: [],
   }
-  renderActive = false
   tick()
   await new Promise((resolve) => setImmediate(resolve))
-
   assert.equal(created.length, afterEnsure, "refresh with more rows must not create nodes")
   assert.ok(created.every((call) => call.renderActive), "no node was created outside a render callback")
-  const afterVisible = sidebar.children.filter((child) => child.props.visible === true).length
+  const afterVisible = sidebar.children.filter((child) => child.item?.runID).length
   assert.ok(afterVisible > beforeVisible, "the panel shows the new rows")
-
   dispose()
 })

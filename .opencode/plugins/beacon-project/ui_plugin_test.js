@@ -2,38 +2,8 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
-import { NOW, lines, makeRun, solidModule, themeStub, signalStub } from "./ui_test_helpers.js"
-import * as ui from "./ui.js"
-const {
-  BEACON_STATUS_RPC_ID,
-  BeaconStatusRpc,
-  CliStatusSource,
-  DECISION_LIMIT,
-  EMPTY_SNAPSHOT,
-  PANEL_NAME,
-  RECENT_LIMIT,
-  REASON_WIDTH,
-  TITLE_WIDTH,
-  beaconStatusDefinition,
-  createCliStatusSource,
-  createRowMount,
-  createStatusSource,
-  defineBeaconStatusPlugin,
-  detailCommand,
-  detailLines,
-  elapsed,
-  enrichRuns,
-  errorMessage,
-  normalizeRun,
-  normalizeSnapshot,
-  parseSnapshot,
-  readTitle,
-  renderSnapshotLines,
-  runLineItems,
-  snapshotLineItems,
-  truncate,
-  default: beaconStatus,
-} = ui
+import { solidModule, themeStub, signalStub } from "./ui_test_helpers.js"
+import { PANEL_NAME, beaconStatusDefinition, createCliStatusSource, createRowMount } from "./ui.js"
 
 test("CLI source forwards snapshot limits as flags", async () => {
   const calls = []
@@ -110,6 +80,7 @@ test("row mount accepts a per-slot row budget", () => {
   assert.ok(footer > 0 && footer < 20, `footer allocated ${footer} nodes`)
   assert.ok(detail > footer, `detail allocated ${detail} nodes`)
   const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
-  assert.ok(src.includes("mount(footer, footerItems, FOOTER_ROWS)"))
-  assert.ok(src.includes("mount(detail, detailItems, DETAIL_ROWS)"))
+  assert.ok(src.includes("maxLines: FOOTER_ROWS"), "the footer has a one-line budget")
+  assert.ok(src.includes("createDetailMount(ui,"), "the detail slot owns its own node budget")
+  assert.ok(readFileSync(new URL("./ui_detail_view.js", import.meta.url), "utf8").includes("DETAIL_LINES"))
 })
