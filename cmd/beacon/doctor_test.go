@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/infra/config"
 )
 
@@ -243,4 +246,58 @@ func (okTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func okClient() *http.Client {
 	return &http.Client{Transport: okTransport{}}
+}
+
+func TestDoctorHTTPCheckAuth(t *testing.T) {
+	cases := []struct {
+		name       string
+		token      string
+		auth       func(*http.Request, string)
+		wantUser   string
+		wantPass   string
+		wantBearer string
+	}{
+		{"opencode user password", "opencode:deadbeef", opencode.ApplyAuth, "opencode", "deadbeef", ""},
+		{"opencode plain", "plain-token", opencode.ApplyAuth, "", "", "plain-token"},
+		{"scm bearer", "ghp_secret", bearerAuth, "", "", "ghp_secret"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				auth := r.Header.Get("Authorization")
+				mu.Lock()
+				gotAuth = auth
+				mu.Unlock()
+				if tc.wantUser != "" {
+					user, pass, ok := r.BasicAuth()
+					if !ok || user != tc.wantUser || pass != tc.wantPass {
+						w.WriteHeader(http.StatusUnauthorized)
+						return
+					}
+				} else if auth != "Bearer "+tc.wantBearer {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			got := doctorHTTPCheck("endpoint", srv.URL, tc.token, tc.auth, &http.Client{})
+			if got.level != checkOK {
+				t.Fatalf("level = %v, detail = %q; want OK", got.level, got.detail)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if tc.wantUser != "" {
+				if !strings.HasPrefix(gotAuth, "Basic ") || strings.Contains(gotAuth, "Bearer") {
+					t.Fatalf("Authorization = %q, want Basic without Bearer", gotAuth)
+				}
+			} else if gotAuth != "Bearer "+tc.wantBearer {
+				t.Fatalf("Authorization = %q, want Bearer %q", gotAuth, tc.wantBearer)
+			}
+		})
+	}
 }

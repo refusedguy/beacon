@@ -182,6 +182,16 @@ func sessionIDFromJSON(data []byte) string {
 	return envelope.Data.ID
 }
 
+// ApplyAuth sets the Authorization header for an OpenCode request. Tokens of
+// the form user:pass use HTTP Basic; any other token uses a Bearer header.
+func ApplyAuth(req *http.Request, token string) {
+	if user, pass, ok := strings.Cut(token, ":"); ok {
+		req.SetBasicAuth(user, pass)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
 	h.init()
 	var reader io.Reader
@@ -200,11 +210,7 @@ func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if h.Token != "" {
-		if user, pass, ok := strings.Cut(h.Token, ":"); ok {
-			req.SetBasicAuth(user, pass)
-		} else {
-			req.Header.Set("Authorization", "Bearer "+h.Token)
-		}
+		ApplyAuth(req, h.Token)
 	}
 	resp, err := h.HTTP.Do(req)
 	if err != nil {

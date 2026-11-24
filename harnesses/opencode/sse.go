@@ -68,7 +68,7 @@ func (h *Harness) streamIdle(ctx context.Context) error {
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	if h.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+h.Token)
+		ApplyAuth(req, h.Token)
 	}
 	client := h.streamClient()
 	if client == nil {

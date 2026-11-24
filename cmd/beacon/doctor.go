@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 )
@@ -287,10 +288,14 @@ func doctorDaemonCheck(cfg config.Config) doctorCheck {
 func doctorNetworkChecks(cfg config.Config, client *http.Client) []doctorCheck {
 	return []doctorCheck{
 		doctorHTTPCheck("opencode endpoint", strings.TrimRight(cfg.Harness.Endpoint, "/")+"/api/project",
-			firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token), client),
+			firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token), opencode.ApplyAuth, client),
 		doctorHTTPCheck("scm base branch", scmBranchURL(cfg),
-			firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token), client),
+			firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token), bearerAuth, client),
 	}
+}
+
+func bearerAuth(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
 }
 
 func scmBranchURL(cfg config.Config) string {
@@ -310,7 +315,7 @@ func scmBranchURL(cfg config.Config) string {
 		url.PathEscape(cfg.SCM.Repo) + "/branches/" + base
 }
 
-func doctorHTTPCheck(name, endpoint, token string, client *http.Client) doctorCheck {
+func doctorHTTPCheck(name, endpoint, token string, auth func(*http.Request, string), client *http.Client) doctorCheck {
 	if endpoint == "" || endpoint == "/api/project" {
 		return doctorCheck{name, checkWarn, "not configured"}
 	}
@@ -319,7 +324,7 @@ func doctorHTTPCheck(name, endpoint, token string, client *http.Client) doctorCh
 		return doctorCheck{name, checkWarn, "invalid endpoint"}
 	}
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		auth(req, token)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

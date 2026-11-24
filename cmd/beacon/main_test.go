@@ -73,7 +73,7 @@ func TestLoadConfigPinsRelativePathsToProjectRoot(t *testing.T) {
 	}
 }
 
-func TestWireInfraRefreshesWorktreesAtStartup(t *testing.T) {
+func TestWireInfraDoesNotRefreshWorktreesAtStartup(t *testing.T) {
 	t.Setenv("BEACON_MODEL", "")
 	root := t.TempDir()
 	cmd := exec.Command("git", "-C", root, "init", "--initial-branch=main")
@@ -121,11 +121,11 @@ func TestWireInfraRefreshesWorktreesAtStartup(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if refreshes != 1 {
-		t.Fatalf("startup worktree refresh calls = %d, want 1", refreshes)
+	if refreshes != 0 {
+		t.Fatalf("startup worktree refresh calls = %d, want 0", refreshes)
 	}
-	if reloads != 1 {
-		t.Fatalf("startup location reloads = %d, want 1", reloads)
+	if reloads != 0 {
+		t.Fatalf("startup location reloads = %d, want 0", reloads)
 	}
 }
 
