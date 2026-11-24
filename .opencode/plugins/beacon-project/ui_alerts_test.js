@@ -121,7 +121,7 @@ test("three tasks sharing a blocker get one header and three title rows", () => 
   const headers = items.filter((i) => i.kind === "queue-blocker")
   assert.equal(headers.length, 1)
   assert.deepEqual([headers[0].name, headers[0].depID, headers[0].action],
-    ["blocked by 19651f36-01 · 3 tasks", blocker, `card:${blocker}`])
+    ["blocked by 19651f36-01 · 3 tasks", blocker, `blocked:${blocker}`])
   assert.deepEqual(items.filter((i) => i.kind === "queue-title").map((i) => i.name), ["Task A", "Task B", "Task C"])
   assert.equal(items.some((i) => i.kind === "queue-dep"), false, "dependencies are headers, not repeated rows")
   assert.equal(items.filter((i) => i.kind === "queue-title").every((i) => !i.name.includes("19651f36")), true)
@@ -300,4 +300,40 @@ test("launch source shows in the metrics line and the technical line", () => {
   const names = detailModel(run, {}, NOW, { technical: true }).rows.map((i) => i.name)
   assert.ok(names.includes("mcp · operator"))
   assert.equal(detailModel(normalizeRun(makeRun()), {}, NOW, { technical: true }).rows.some((i) => i.name === "mcp · operator"), false)
+})
+
+test("a blocked group click expands only that group and the Queue toggle expands all", async () => {
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      { id: "T-1", title: "Alpha one", status: "waiting_deps", priority: 5, depends_on: ["T-BLOCK-A"] },
+      { id: "T-2", title: "Alpha two", status: "waiting_deps", priority: 4, depends_on: ["T-BLOCK-A"] },
+      { id: "T-3", title: "Beta one", status: "waiting_deps", priority: 3, depends_on: ["T-BLOCK-B"] },
+    ],
+  }
+  const h = await makeSetup(snap, {
+    storage: { "beacon-sidebar-sections": { active: true, queue: true, recent: true } },
+  })
+  const sidebar = h.renderers["sidebar.content"]()
+  const headerA = h.findItem(sidebar, (i) => i.kind === "queue-blocker" && i.depID === "T-BLOCK-A")
+  assert.ok(headerA, "the blocked header is in the sidebar")
+  assert.equal(headerA.item.marker, "▶", "the group starts collapsed")
+  assert.equal(headerA.item.name, "blocked by T-BLOCK-A · 2 tasks", "the count stays in the header")
+  assert.equal(h.findItem(sidebar, (i) => i.kind === "queue-title"), null, "no task title shows at startup")
+
+  headerA.props.onMouseDown()
+  assert.equal(h.findItem(sidebar, (i) => i.kind === "queue-blocker" && i.depID === "T-BLOCK-A").item.marker, "▼")
+  assert.ok(h.findItem(sidebar, (i) => i.kind === "queue-title" && i.name === "Alpha one"))
+  assert.equal(h.findItem(sidebar, (i) => i.kind === "queue-title" && i.name === "Beta one"), null,
+    "expanding one group leaves the other collapsed")
+
+  const toggle = h.findItem(sidebar, (i) => i.kind === "queue-blocked-toggle")
+  assert.ok(toggle, "the Queue header carries one global toggle")
+  assert.equal(toggle.item.name, "Expand all blocked")
+  toggle.props.onMouseDown()
+  assert.ok(h.findItem(sidebar, (i) => i.kind === "queue-title" && i.name === "Beta one"))
+  assert.equal(h.findItem(sidebar, (i) => i.kind === "queue-blocked-toggle").item.name, "Collapse all blocked")
+  toggle.props.onMouseDown()
+  assert.equal(h.findItem(sidebar, (i) => i.kind === "queue-title"), null, "the global toggle collapses every group")
+  h.dispose()
 })
