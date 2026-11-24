@@ -151,23 +151,31 @@ type Durations struct {
 	Blocked   int64 `json:"blocked_seconds"`
 }
 
+// CheckSnapshot is the UI-facing view of one CI check.
+type CheckSnapshot struct {
+	Name            string `json:"name"`
+	State           string `json:"state"`
+	DurationSeconds int64  `json:"duration_seconds"`
+}
+
 // RunSnapshot carries a run, its history and its derived timings.
 type RunSnapshot struct {
-	ID             string     `json:"id"`
-	TaskID         string     `json:"task_id"`
-	State          string     `json:"state"`
-	PR             int        `json:"pr"`
-	HeadSHA        string     `json:"head_sha"`
-	Branch         string     `json:"branch"`
-	Reason         string     `json:"reason"`
-	RebaseAttempts int        `json:"rebase_attempts"`
-	FixAttempts    int        `json:"fix_attempts"`
-	MaxAttempts    int        `json:"max_attempts"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	Durations      Durations  `json:"durations"`
-	Timeline       []RunEvent `json:"timeline"`
-	Decisions      []Decision `json:"decisions"`
+	ID             string          `json:"id"`
+	TaskID         string          `json:"task_id"`
+	State          string          `json:"state"`
+	PR             int             `json:"pr"`
+	HeadSHA        string          `json:"head_sha"`
+	Branch         string          `json:"branch"`
+	Reason         string          `json:"reason"`
+	RebaseAttempts int             `json:"rebase_attempts"`
+	FixAttempts    int             `json:"fix_attempts"`
+	MaxAttempts    int             `json:"max_attempts"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+	Durations      Durations       `json:"durations"`
+	Timeline       []RunEvent      `json:"timeline"`
+	Decisions      []Decision      `json:"decisions"`
+	Checks         []CheckSnapshot `json:"checks"`
 }
 
 // Metrics are numeric totals for the whole snapshot.
@@ -307,7 +315,20 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		RebaseAttempts: run.RebaseAttempts, FixAttempts: run.FixAttempts,
 		MaxAttempts: run.MaxAttempts, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 		Durations: deriveDurations(run, events, now), Timeline: events, Decisions: decisions,
+		Checks: checkSnapshots(run.Checks),
 	}
+}
+
+// checkSnapshots maps stored checks to the UI contract without any SCM call.
+// A run with no observed checks returns an empty array, never null.
+func checkSnapshots(checks []core.CheckResult) []CheckSnapshot {
+	out := make([]CheckSnapshot, 0, len(checks))
+	for _, c := range checks {
+		out = append(out, CheckSnapshot{
+			Name: c.Name, State: string(c.State), DurationSeconds: c.DurationSeconds(),
+		})
+	}
+	return out
 }
 
 // deriveDurations measures each state interval. A live run has no closing

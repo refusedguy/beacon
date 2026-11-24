@@ -44,6 +44,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		return core.MergeDecision{}, err
 	}
 	obs.PRNumber = pr
+	run.Checks = obs.Checks
+	if err := r.Store.Save(ctx, run); err != nil {
+		return core.MergeDecision{}, err
+	}
 	defer logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
 	if closed := closedPRVerdict(obs.PRState); closed != nil {
 		return *closed, r.finalizeExternal(ctx, run, obs)
@@ -104,7 +108,10 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 		return nil
 	}
 	logTransitionDeliveryClaim(ctx, run.ID, obs.PRNumber, true)
-	if err := run.Apply(core.Event{Kind: core.EvMerged, HeadSHA: obs.HeadSHA}); err != nil {
+	if err := run.Apply(core.Event{
+		Kind: core.EvMerged, HeadSHA: obs.HeadSHA,
+		Reason: fmt.Sprintf("merged PR #%d via squash", obs.PRNumber),
+	}); err != nil {
 		return err
 	}
 	if err := r.Store.Save(ctx, run); err != nil {

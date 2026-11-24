@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 type CheckState string
 
@@ -11,10 +14,23 @@ const (
 	CheckSkipped CheckState = "skipped"
 )
 
+// CheckResult is one CI check. StartedAt and CompletedAt are zero when the
+// provider does not report timing, so callers can derive a duration safely.
 type CheckResult struct {
-	Name   string
-	State  CheckState
-	Output string
+	Name        string
+	State       CheckState
+	Output      string
+	StartedAt   time.Time
+	CompletedAt time.Time
+}
+
+// DurationSeconds is the check's wall-clock time. It is zero when either
+// endpoint is missing or the completed time precedes the start.
+func (c CheckResult) DurationSeconds() int64 {
+	if c.StartedAt.IsZero() || c.CompletedAt.IsZero() || c.CompletedAt.Before(c.StartedAt) {
+		return 0
+	}
+	return int64(c.CompletedAt.Sub(c.StartedAt).Seconds())
 }
 
 type Observation struct {
