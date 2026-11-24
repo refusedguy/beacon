@@ -1,17 +1,70 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/pkg/core"
 )
+
+type bareHarness struct{}
+
+func (bareHarness) Spawn(context.Context, core.SpawnRequest) (core.Session, error) {
+	return core.Session{}, nil
+}
+func (bareHarness) Wake(context.Context, string, core.WakeContext) error { return nil }
+func (bareHarness) Stop(context.Context, string) error                   { return nil }
+func (bareHarness) IsAlive(context.Context, string) (bool, error)        { return false, nil }
+func (bareHarness) NotifyParent(context.Context, string, string) error   { return nil }
+func (bareHarness) Events() <-chan core.HarnessEvent                     { return nil }
+
+type portHarness struct {
+	bareHarness
+	repo   string
+	models map[string]string
+}
+
+func (h *portHarness) SetRepo(root string) { h.repo = root }
+
+func (h *portHarness) ResolveModel(parent string) map[string]string {
+	return map[string]string{"parent": parent, "id": h.models["id"]}
+}
+
+func (h *portHarness) WatchIdle(context.Context) {}
+
+func TestSetHarnessRepoUsesPort(t *testing.T) {
+	h := &portHarness{}
+	setHarnessRepo(h, "/workspace/repo")
+	if h.repo != "/workspace/repo" {
+		t.Fatalf("repo = %q, want /workspace/repo", h.repo)
+	}
+	setHarnessRepo(bareHarness{}, "/workspace/repo")
+}
+
+func TestModelResolverFromUsesPort(t *testing.T) {
+	if got := modelResolverFrom(bareHarness{}); got != nil {
+		t.Fatalf("resolver for a plain harness = %v, want nil", got)
+	}
+	h := &portHarness{models: map[string]string{"id": "free"}}
+	resolver := modelResolverFrom(h)
+	if resolver == nil {
+		t.Fatal("no resolver for a capable harness")
+	}
+	got := resolver("ses_parent")
+	want := map[string]string{"parent": "ses_parent", "id": "free"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved model = %v, want %v", got, want)
+	}
+}
 
 func TestProjectRootPrefersEnvironment(t *testing.T) {
 	want := t.TempDir()

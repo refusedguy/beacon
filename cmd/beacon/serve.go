@@ -13,7 +13,8 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-type idleWatcher interface{ WatchIdle(ctx context.Context) }
+// idleWatcher is an alias kept for config_watch.go. New code uses the port.
+type idleWatcher = core.IdleWatcher
 
 func newServeCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
@@ -49,7 +50,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 
 			ctx, stop := signalContext(cmd.Context())
 			defer stop()
-			if watcher, ok := w.harness.(idleWatcher); ok {
+			if watcher, ok := w.harness.(core.IdleWatcher); ok {
 				go watcher.WatchIdle(ctx)
 			}
 			events := fanout(ctx, w.harness.Events(), 2)
