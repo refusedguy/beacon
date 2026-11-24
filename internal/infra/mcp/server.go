@@ -22,11 +22,9 @@ func NewServer(sv Services) *msdk.Server {
 	for _, register := range toolRegistrations {
 		register(s, sv)
 	}
-	// The catalog holds the plain mutations. Replace all three with wrappers
-	// that journal operation ids, so an interrupted call can be retried without
+	// Journal operation ids so an interrupted call can be retried without
 	// writing the same cards twice. The create wrapper also accepts epic fields.
 	journal := newOpJournal()
-	s.RemoveTools(taskCreateTool.Name, taskUpdateTool.Name, taskDeleteTool.Name)
 	msdk.AddTool(s, taskCreateTool, func(ctx context.Context, _ *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
 		if sv.TaskCreator == nil {
 			return nil, nil, core.Errorf(core.CodeUnavailable, "task creator is not configured")
@@ -318,23 +316,6 @@ var taskUpdateTool = &msdk.Tool{
 	Description: "Update task cards in one commit and push. Orchestrator only.",
 }
 
-func registerTaskUpdate(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, taskUpdateTool, func(ctx context.Context, _ *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
-		if sv.TaskUpdater == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "task updater is not configured")
-		}
-		updates := make([]app.UpdateInput, 0, len(a.Updates))
-		for _, item := range a.Updates {
-			updates = append(updates, updateInput(item))
-		}
-		updated, err := sv.TaskUpdater.Update(ctx, updates)
-		if err != nil {
-			return nil, nil, err
-		}
-		return jsonResult(updated), nil, nil
-	})
-}
-
 func updateInput(a updateOneArgs) app.UpdateInput {
 	out := app.UpdateInput{
 		ID: a.ID, Title: a.Title, Body: a.Body, Scope: a.Scope, Depends: a.Depends,
@@ -362,19 +343,6 @@ type deleteTaskArgs struct {
 var taskDeleteTool = &msdk.Tool{
 	Name:        "beacon_task_delete",
 	Description: "Delete task cards in one commit and push. Orchestrator only.",
-}
-
-func registerTaskDelete(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, taskDeleteTool, func(ctx context.Context, _ *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
-		if sv.TaskDeleter == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "task deleter is not configured")
-		}
-		deleted, err := sv.TaskDeleter.Delete(ctx, a.IDs)
-		if err != nil {
-			return nil, nil, err
-		}
-		return jsonResult(deleted), nil, nil
-	})
 }
 
 // reconcileArgs is the input schema of beacon_reconcile.
