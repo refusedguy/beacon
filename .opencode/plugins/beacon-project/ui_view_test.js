@@ -1,42 +1,13 @@
 // Run: node --test .opencode/plugins/beacon-project/ui_view_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
-import { NOW, lines, makeRun, solidModule, themeStub, signalStub } from "./ui_test_helpers.js"
+import { NOW, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
-  BEACON_STATUS_RPC_ID,
-  BeaconStatusRpc,
-  CliStatusSource,
-  DECISION_LIMIT,
-  EMPTY_SNAPSHOT,
-  PANEL_NAME,
-  RECENT_LIMIT,
-  REASON_WIDTH,
-  RULE,
-  TITLE_WIDTH,
-  beaconStatusDefinition,
-  compactReason,
-  createCliStatusSource,
-  createRowMount,
-  createStatusSource,
-  defineBeaconStatusPlugin,
-  detailCommand,
-  detailLines,
-  elapsed,
-  enrichRuns,
-  errorMessage,
-  normalizeRun,
-  normalizeSnapshot,
-  parseSnapshot,
-  phaseLabel,
-  readTitle,
-  renderSnapshotLines,
-  runLineItems,
-  snapshotLineItems,
-  stateBarItem,
-  truncate,
-  default: beaconStatus,
+  DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
+  SIDEBAR_OPEN, STATE_BAR_WIDTH, compactReason, detailActions, detailCommand,
+  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel,
+  recentRuns, runLineItems, sidebarModel, stateBarItem, truncate,
 } = ui
 
 test("elapsed formats seconds, minutes, hours and days", () => {
@@ -48,12 +19,31 @@ test("elapsed formats seconds, minutes, hours and days", () => {
   assert.equal(elapsed(-1), "")
 })
 
-test("row items carry stable cells and colors by theme key", () => {
-  const [head, detail] = runLineItems(normalizeRun(makeRun({ State: "blocked", title: "Blocked work" })), NOW)
-  assert.deepEqual(head, {
-    marker: "▲", name: "T-1 Blocked work", status: "BLOCK", color: "error", bold: true, runID: "run-1",
+test("state bar builds proportional colored segments and a human summary", () => {
+  const item = stateBarItem({
+    active: [
+      makeRun({ ID: "a", State: "running" }), makeRun({ ID: "b", State: "running" }),
+      makeRun({ ID: "c", State: "waiting_ci" }), makeRun({ ID: "d", State: "blocked" }),
+    ],
+    recent: [makeRun({ ID: "e", State: "merged" })],
+    metrics: { merge_count: 51, rebase_count: 2, fix_count: 1 },
   })
-  assert.deepEqual(detail, { marker: "", name: "#42 3m", status: "waiting CI", color: "muted", runID: "run-1" })
+  assert.deepEqual(item.counts, { running: 2, waiting_ci: 1, blocked: 1, merged: 1 })
+  assert.equal(item.filled, 5)
+  assert.equal(item.bar.length, STATE_BAR_WIDTH)
+  assert.equal(item.segments.reduce((n, s) => n + s.text.length, 0), STATE_BAR_WIDTH)
+  assert.deepEqual(item.segments.map((s) => s.color), ["success", "info", "error", "success", "muted"])
+  assert.equal(item.legend, "R2 C1 B1 M51")
+  assert.equal(item.summary, "2 running · 1 in CI · 1 blocked · 3 needs work · 51 done")
+  assert.equal(item.fg, "error", "a blocked run colors the bar with the error tone")
+  const big = stateBarItem({ active: Array.from({ length: 20 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })), recent: [] })
+  assert.equal(big.filled, STATE_BAR_WIDTH)
+  assert.equal(big.segments.at(-1).text, "", "a full bar leaves no muted remainder")
+  assert.ok(big.content.includes("R20"))
+  const empty = stateBarItem(EMPTY_SNAPSHOT)
+  assert.equal(empty.segments[0].text, "")
+  assert.equal(empty.segments.at(-1).text, "░".repeat(STATE_BAR_WIDTH))
+  assert.ok(empty.content.includes("R0 C0 B0 M0"))
 })
 
 test("compactReason turns noisy failures into readable causes", () => {
@@ -71,7 +61,20 @@ test("phaseLabel follows the live phase and merged rows drop the reason", () => 
   const merged = normalizeRun(makeRun({ State: "merged", Reason: "automatic rebase" }))
   const [, detail] = runLineItems(merged, NOW, true)
   assert.equal(detail.status, "")
-  assert.ok(detail.name.startsWith("#42"))
+  assert.ok(detail.marker.startsWith("#42"))
+  assert.equal(mergedReason(merged), "automatic rebase")
+  assert.equal(mergedReason(normalizeRun(makeRun({ State: "merged", Reason: "", PRNumber: 42 }))), "merged PR #42")
+})
+
+test("run rows keep the full title and put PR, duration and cause on line two", () => {
+  const title = "Make worktree registration refresh reliable at every exit"
+  const [first, second] = runLineItems(normalizeRun(makeRun({ State: "blocked", title })), NOW)
+  assert.deepEqual(first, {
+    marker: "▲", name: title, status: "BLK", color: "error", bold: true, runID: "run-1",
+  })
+  assert.deepEqual(second, {
+    marker: "#42", name: "3m", status: "waiting CI", color: "muted", runID: "run-1",
+  })
 })
 
 test("recent shows one terminal run per task and skips tasks active again", () => {
@@ -84,122 +87,120 @@ test("recent shows one terminal run per task and skips tasks active again", () =
       makeRun({ ID: "r4", TaskID: "T-C", State: "merged", Reason: "automatic rebase" }),
     ],
   }
-  const rendered = lines(snapshot, null, NOW)
-  assert.equal(rendered.filter((line) => line.includes("T-ACTIVE")).length, 1)
-  assert.equal(rendered.filter((line) => line.includes("T-B")).length, 1)
-  assert.ok(rendered.some((line) => line.includes("dirty worktree")), "the newest cause survives")
-  assert.ok(rendered.some((line) => line.includes("T-C")))
+  const recent = recentRuns(snapshot)
+  assert.deepEqual(recent.map((r) => r.id), ["r2", "r4"], "the newest cause survives and active tasks are hidden")
+  const items = sidebarModel(snapshot, null, NOW).items
+  assert.ok(items.some((i) => i.status === "dirty worktree"))
+  assert.equal(items.some((i) => i.status === "old attempt"), false)
 })
 
-test("state bar legend uses the merge metric instead of the capped recent window", () => {
-  const item = stateBarItem({
-    active: [makeRun({ ID: "r1", State: "running" })],
-    recent: [makeRun({ ID: "r2", State: "merged" })],
-    metrics: { merge_count: 37 },
-  })
-  assert.equal(item.counts.merged, 1)
-  assert.equal(item.mergeTotal, 37)
-  assert.ok(item.content.includes("M37"))
+test("sidebar sections collapse without losing the dispatcher", () => {
+  const snapshot = { active: [makeRun()], recent: [makeRun({ ID: "r2", State: "closed" })] }
+  const open = sidebarModel(snapshot, null, NOW).items
+  assert.ok(open.some((i) => i.action === "dispatch"))
+  const closed = sidebarModel(snapshot, null, NOW, { active: false, recent: false }).items
+  assert.equal(closed.some((i) => i.action === "dispatch"), false)
+  assert.equal(closed.find((i) => i.sectionKey === "active").marker, "▶")
+  assert.equal(closed.find((i) => i.sectionKey === "recent").marker, "▶")
+  assert.equal(closed.some((i) => i.runID), false)
+  assert.deepEqual(SIDEBAR_OPEN, { active: true, recent: true })
 })
 
 test("a stale transport error keeps the snapshot and clips the marker", () => {
   const snapshot = { active: [makeRun({ title: "Still here" })], recent: [] }
-  const result = lines(snapshot, "rpc.unavailable", NOW)
-  assert.ok(result.some((line) => line.includes("[stale] rpc.unavailable")))
-  assert.ok(result.some((line) => line.includes("Still here")))
-  const items = snapshotLineItems(snapshot, "x".repeat(200), NOW)
-  assert.ok(items.find((item) => item.name.startsWith("[stale]")).name.length <= 9 + REASON_WIDTH)
+  const items = sidebarModel(snapshot, "x".repeat(200), NOW).items
+  const stale = items.find((i) => i.name.startsWith("[stale]"))
+  assert.ok(stale)
+  assert.ok(stale.name.length <= 9 + REASON_WIDTH)
+  assert.ok(items.some((i) => i.name === "Still here"))
 })
 
 test("empty snapshot still renders both sections behind a counted header", () => {
-  assert.deepEqual(lines(EMPTY_SNAPSHOT), [
-    "Beacon A0 B0 R0 F0 --:--:--", "▼ Active 0", "No active runs", "▼ Recent 0", "No recent runs",
+  const items = sidebarModel(EMPTY_SNAPSHOT, null, NOW).items
+  assert.deepEqual(items.map((i) => i.name), [
+    "Beacon", "R0 C0 B0 M0", "Active", "No active runs", "Dispatch", "Recent", "No recent runs",
   ])
+  assert.deepEqual(items.filter((i) => i.sectionKey).map((i) => i.status), ["0", "0"])
 })
 
-test("detail groups fields into six sections with dim separators", () => {
+test("detail model uses four sections with full wrapping text", () => {
+  const longTitle = "Working collapsible sections and honest close hint in detail panel"
+  const longReason = "workspace: conflict: refusing to remove dirty worktree at /mnt/projects/beacon-handoff/beacon-impl/.beacon/worktrees/T-1"
   const run = normalizeRun(makeRun({
-    title: "Fix TUI plugin shape",
+    title: longTitle, State: "blocked", Reason: longReason,
+    Checks: [{ name: "ci", state: "success", duration_seconds: 28 }],
     Timeline: [
       { at: "2026-11-23T10:06:00Z", kind: "merge_checks", state: "waiting_ci" },
       { at: "2026-11-23T10:01:00Z", kind: "created", state: "running" },
     ],
   }))
-  const metrics = { dispatchCount: 25, rebaseCount: 2, fixCount: 1, mergeCount: 3, ciWaitSeconds: 90 }
-  const detail = detailLines(run, metrics, NOW)
-  const name = (item) => item.name ?? item.text
-  assert.deepEqual(detail.filter((i) => i.bold && i.marker === "▼").map(name),
-    ["Identity", "Timing", "Attempts", "Reason", "Timeline", "Decisions"])
-  assert.equal(detail.filter((i) => i.name === RULE).length, 5)
-  const field = (label) => detail.find((i) => i.name === label)?.status
-  assert.equal(field("State"), "● running · RUN")
-  assert.equal(field("PR"), "#42")
-  assert.equal(field("Branch"), "beacon/T-1")
-  assert.equal(field("SHA"), "abcdef12345…")
-  assert.equal(field("Created"), "10:00:00")
-  assert.equal(field("Updated"), "10:07:00")
-  assert.equal(field("Age"), "3m")
-  assert.equal(field("Wait CI"), "1m")
-  assert.equal(field("Running"), "5s")
-  assert.equal(field("Rebase"), "2/3")
-  assert.equal(field("Fix"), "1/3")
-  assert.equal(field("Dispatch"), "25")
-  assert.equal(field("Merges"), "3")
-  const notes = detail.filter((i) => i.name && i.name !== RULE && !i.status && i.color === "muted").map(name)
-  assert.deepEqual(notes.filter((n) => n.includes("→")), [
-    "10:01:00 created → running", "10:06:00 merge_checks → waiting_ci",
-  ])
-  assert.ok(notes.includes("10:06:00 reconcile.decision merge"))
+  const metrics = { dispatchCount: 25, rebaseCount: 2, fixCount: 1, mergeCount: 3 }
+  const model = detailModel(run, metrics, NOW, { ...DETAIL_OPEN, technical: true })
+  assert.equal(model.title, longTitle, "the hero uses the full title")
+  assert.equal(model.badge, "▲ BLK · 3m")
+  assert.equal(model.pr, "PR #42")
+  assert.equal(model.branch, "beacon/T-1")
+  assert.equal(model.task, "T-1")
+  assert.ok(model.phase.includes("Coding 5s") && model.phase.includes("CI 1m"))
+  assert.deepEqual(model.rows.filter((i) => i.sectionKey).map((i) => i.sectionKey), ["why", "checks", "timeline", "technical"])
+  const names = model.rows.map((i) => i.name ?? i.text)
+  assert.ok(names.includes(longReason), "the reason is not cut to a fixed width")
+  assert.ok(names.includes("ci success"), "CI checks come from run.checks")
+  assert.ok(names.some((n) => n.includes("10:01:00 created → running")))
+  assert.ok(names.some((n) => n.includes("reconcile.decision merge")))
+  assert.deepEqual(detailActions(run), ["retry", "copy"])
 })
 
-test("collapsed detail sections show ▶ and drop their body rows", () => {
+test("detail sections collapse to ▶ and Technical defaults to collapsed", () => {
   const run = normalizeRun(makeRun())
-  const metrics = { dispatchCount: 25 }
-  const collapsed = { Timing: false, Decisions: false }
-  const detail = detailLines(run, metrics, NOW, collapsed)
-  const headers = detail.filter((i) => i.sectionKey)
-  assert.deepEqual(headers.map((i) => [i.sectionKey, i.marker, i.name, i.bold]), [
-    ["Identity", "▼", "Identity", true],
-    ["Timing", "▶", "Timing", true],
-    ["Attempts", "▼", "Attempts", true],
-    ["Reason", "▼", "Reason", true],
-    ["Timeline", "▼", "Timeline", true],
-    ["Decisions", "▶", "Decisions", true],
+  const open = detailModel(run, {}, NOW, {})
+  assert.deepEqual(open.rows.filter((i) => i.sectionKey).map((i) => [i.sectionKey, i.marker]), [
+    ["why", "▼"], ["checks", "▼"], ["timeline", "▼"], ["technical", "▶"],
   ])
-  const names = detail.map((i) => i.name ?? i.text)
-  for (const omitted of ["Created", "Updated", "Age", "Wait CI", "Running", "Blocked"]) {
-    assert.equal(names.includes(omitted), false, `collapsed Timing omits ${omitted}`)
-  }
-  assert.equal(names.some((n) => n.includes("reconcile.decision")), false, "collapsed Decisions omits its rows")
-  assert.equal(names.includes("State"), true, "Identity stays open")
-  assert.equal(names.includes("Rebase"), true, "Attempts stays open")
-  assert.equal(detail.filter((i) => i.name === RULE).length, 5, "separators stay put")
-  const expanded = detailLines(run, metrics, NOW, {})
-  assert.ok(expanded.some((i) => i.name === "Created"), "an unset flag shows the body")
-  assert.ok(expanded.every((i) => !i.sectionKey || i.marker === "▼"), "unset flags show ▼")
+  assert.equal(open.rows.some((i) => i.name === "waiting CI"), true)
+  assert.equal(open.rows.some((i) => i.sectionKey === "technical"), true)
+  const collapsed = detailModel(run, {}, NOW, { why: false, checks: false, timeline: false, technical: false })
+  const names = collapsed.rows.map((i) => i.name)
+  assert.equal(names.some((n) => n.includes("created")), false)
+  assert.equal(names.some((n) => n.includes("reconcile.decision")), false)
+  assert.equal(names.includes("ci success"), false)
+  assert.equal(collapsed.rows.filter((i) => i.sectionKey).every((i) => i.marker === "▶"), true)
+  assert.deepEqual(DETAIL_OPEN, { why: true, checks: true, timeline: true, technical: false })
+})
+
+test("empty CI checks show (none), and merged runs never show a dash reason", () => {
+  const run = normalizeRun(makeRun({ State: "merged", Reason: "" }))
+  const names = detailModel(run, {}, NOW, {}).rows.map((i) => i.name)
+  assert.ok(names.includes("(none)"), "no checks means a readable placeholder")
+  assert.ok(names.includes("merged PR #42"))
+  assert.equal(names.includes("-"), false)
 })
 
 test("detail caps decisions to the most recent 20 and marks the rest", () => {
   const decisions = Array.from({ length: 25 }, (_, i) => ({
     at: `2026-11-23T10:${String(i).padStart(2, "0")}:00Z`,
-    kind: "reconcile.decision",
-    verdict: `verdict-${i}`,
+    kind: "reconcile.decision", verdict: `verdict-${i}`,
   }))
-  const names = detailLines(normalizeRun(makeRun({ Decisions: decisions })), {}, NOW).map((i) => i.name ?? i.text)
-  const rendered = names.filter((line) => line.includes("reconcile.decision"))
+  const rows = detailLines(normalizeRun(makeRun({ Decisions: decisions })), {}, NOW, { technical: true })
+  const rendered = rows.filter((i) => i.name.includes("reconcile.decision")).map((i) => i.name)
   assert.equal(rendered.length, DECISION_LIMIT)
-  assert.ok(rendered[0].includes("verdict-5"), "drops the oldest five")
-  assert.ok(rendered.at(-1).includes("verdict-24"), "keeps the newest decision")
-  const marker = "... 5 earlier decisions"
-  assert.ok(names.includes(marker), "marker carries the hidden count")
-  assert.ok(names.indexOf(marker) < names.indexOf(rendered[0]), "marker precedes the shown decisions")
+  assert.ok(rendered[0].includes("verdict-5"))
+  assert.ok(rendered.at(-1).includes("verdict-24"))
+  assert.ok(rows.some((i) => i.name === "... 5 earlier decisions"))
+})
 
-  const twenty = detailLines(normalizeRun(makeRun({ Decisions: decisions.slice(0, 20) })), {}, NOW).map((i) => i.name ?? i.text)
-  assert.equal(twenty.filter((line) => line.includes("reconcile.decision")).length, 20)
-  assert.equal(twenty.some((line) => line.includes("earlier decisions")), false)
+test("detailActions follows the run state", () => {
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "running" }))), ["approve", "cancel", "copy"])
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "waiting_ci" }))), ["approve", "cancel", "copy"])
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "blocked" }))), ["retry", "copy"])
+  assert.deepEqual(detailActions(normalizeRun(makeRun({ State: "merged" }))), ["copy"])
+  assert.deepEqual(detailActions(null), [])
 })
 
 test("detail with no run is explicit", () => {
+  const model = detailModel(null)
+  assert.equal(model.title, "No run selected")
+  assert.deepEqual(model.actions, [])
   assert.deepEqual(detailLines(null), [{ text: "No run selected", color: "muted" }])
 })
 
@@ -213,4 +214,9 @@ test("detail command binds ctrl+g, exposes a slash command and opens the panel",
   assert.equal(cmd.palette, true)
   cmd.run()
   assert.deepEqual(opened, [PANEL_NAME])
+})
+
+test("truncate keeps short text unchanged and clips long text", () => {
+  assert.equal(truncate("short", 10), "short")
+  assert.equal(truncate("abcdefghijklmnopqrstuvwxyz0123456789", 10), "abcdefghi…")
 })

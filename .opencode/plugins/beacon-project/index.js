@@ -235,6 +235,8 @@ export const beaconProject = Plugin.define({
       try {
         statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
           snapshot: async (input) => normalizeSnapshot(await statusSource.snapshot(input ?? limits)),
+          control: async (input) => statusSource.control(input ?? {}),
+          dispatch: async (input) => statusSource.dispatch(input ?? {}),
         })
       } catch (error) {
         console.warn(`beacon status panel: RPC registration failed: ${error.message}`)

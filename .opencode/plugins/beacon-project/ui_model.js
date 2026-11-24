@@ -1,5 +1,5 @@
-// Beacon status panel and run detail for the OpenCode TUI. Sources import
-// lazily in setup so `node --test` can load this module without TUI peers.
+// Data model, CLI transport and RPC schema for the Beacon panels. Sources load
+// TUI peers lazily in setup so `node --test` can import this module alone.
 import { execFile as nodeExecFile } from "node:child_process"
 import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
 import { join, resolve } from "node:path"
@@ -16,14 +16,11 @@ export const RUN_CHANGED_EVENT = "runChanged"
 export const EVENT_IDLE_MS = 30000
 export const RESUBSCRIBE_MIN_MS = 1000
 export const RESUBSCRIBE_MAX_MS = 30000
-export const TITLE_WIDTH = 22
-export const REASON_WIDTH = 24
-export const VALUE_WIDTH = 22
+export const REASON_WIDTH = 40
 export const RECENT_LIMIT = 5
-// Detail sections share one dim rule so groups read as blocks, not a wall.
-export const RULE = "─".repeat(30)
-export const MAX_ROWS = 64
 export const DECISION_LIMIT = 20
+export const SIDEBAR_SECTIONS = Object.freeze(["active", "recent"])
+export const DETAIL_SECTIONS = Object.freeze(["why", "checks", "timeline", "technical"])
 export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [] })
 
 export const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v))
@@ -53,6 +50,10 @@ const DURATION_SPEC = [
   ["running", ["running_seconds", "runningSeconds", "running"], num],
   ["blocked", ["blocked_seconds", "blockedSeconds", "blocked"], num],
 ]
+const CHECK_SPEC = [
+  ["name", ["Name", "name"]], ["state", ["State", "state"]],
+  ["durationSeconds", ["duration_seconds", "durationSeconds"], num],
+]
 const RUN_SPEC = [
   ["id", ["ID", "id"]], ["taskID", ["TaskID", "task_id", "taskID", "taskId"]],
   ["state", ["State", "state"], (v) => str(v) || "unknown"], ["title", ["title", "Title"]],
@@ -67,6 +68,7 @@ const RUN_SPEC = [
   ["durations", ["Durations", "durations"], (v) => normalize(v, DURATION_SPEC)],
   ["timeline", ["Timeline", "timeline"], (v) => list(v, (e) => normalize(e, EVENT_SPEC))],
   ["decisions", ["Decisions", "decisions"], (v) => list(v, (d) => normalize(d, DECISION_SPEC))],
+  ["checks", ["Checks", "checks"], (v) => list(v, (c) => normalize(c, CHECK_SPEC))],
 ]
 const METRIC_KEYS = {
   dispatchCount: "dispatch_count", dispatchCycles: "dispatch_cycles", skipCount: "skip_count",
@@ -99,8 +101,6 @@ export function parseSnapshot(text) {
   if (text == null || String(text).trim() === "") return {}
   try { const v = JSON.parse(String(text)); return v && typeof v === "object" && !Array.isArray(v) ? v : {} } catch { return {} }
 }
-// Identity includes the SHA and state, since a run often changes state without
-// receiving a new commit. The key dedupes repeated emissions of the same state.
 export const runSignature = (run) => [str(run.id), str(run.sha), str(run.state), str(run.updatedAt)].join("|")
 export const runChangedPayload = (run) => Object.freeze({
   id: str(run.id), sha: str(run.sha), state: str(run.state), at: str(run.updatedAt), key: runSignature(run),
@@ -172,11 +172,21 @@ export class CliStatusSource {
     if (limits?.decisionsLimit) args.push("--decisions-limit", String(limits.decisionsLimit))
     return args
   }
+  #command() {
+    return typeof this.deps.command === "function" ? this.deps.command() : this.#base()
+  }
   async snapshot(limits = this.limits) {
-    const base = this.deps.command ? this.deps.command() : this.#base()
-    const args = this.#statusArgs(limits)
-    const snap = normalizeSnapshot(parseSnapshot((await this.#exec(base, args)).stdout))
+    const snap = normalizeSnapshot(parseSnapshot((await this.#exec(this.#command(), this.#statusArgs(limits))).stdout))
     return { ...snap, active: enrichRuns(this.root, snap.active, this.deps), recent: enrichRuns(this.root, snap.recent, this.deps) }
+  }
+  async control({ action, runID, sha } = {}) {
+    const args = ["control", "--action", str(action), "--run-id", str(runID), "--json"]
+    if (sha) args.push("--sha", str(sha))
+    return parseSnapshot((await this.#exec(this.#command(), args)).stdout)
+  }
+  async dispatch({ n = 1 } = {}) {
+    const count = num(n) > 0 ? Math.floor(num(n)) : 1
+    return parseSnapshot((await this.#exec(this.#command(), ["dispatch", String(count)])).stdout)
   }
   #base() {
     const parts = beaconCommand(this.root)
@@ -189,6 +199,11 @@ const schema = (check) => ({ "~standard": { version: 1, vendor: "beacon", valida
   const issue = check(v)
   return issue ? { issues: [{ message: issue }] } : { value: v }
 } } })
+const objectInput = (check) => schema((v) => {
+  if (v == null) return null
+  if (typeof v !== "object" || Array.isArray(v)) return "input must be an object"
+  return check ? check(v) : null
+})
 export const RunChangedEvent = Object.freeze({
   schema: schema((v) => {
     if (!v || typeof v !== "object" || Array.isArray(v)) return "event must be an object"
@@ -196,43 +211,66 @@ export const RunChangedEvent = Object.freeze({
     return null
   }),
 })
+export const CONTROL_ACTIONS = Object.freeze(["approve", "unblock", "cancel", "retry"])
 export const BeaconStatusRpc = Object.freeze({
   id: BEACON_STATUS_RPC_ID,
   events: Object.freeze({ [RUN_CHANGED_EVENT]: RunChangedEvent }),
-  methods: Object.freeze({ snapshot: Object.freeze({
-    input: schema((v) => {
-      if (v == null) return null
-      if (typeof v !== "object" || Array.isArray(v)) return "input must be an object"
-      return null
+  methods: Object.freeze({
+    snapshot: Object.freeze({
+      input: objectInput(),
+      output: schema((v) => {
+        if (!v || typeof v !== "object" || Array.isArray(v)) return "output must be an object"
+        if (!Array.isArray(v.active) || !Array.isArray(v.recent)) return "output must carry active and recent runs"
+        const m = v.metrics
+        if (m === undefined) return null
+        if (!m || typeof m !== "object" || Array.isArray(m)) return "metrics must be an object"
+        for (const [key, name] of Object.entries(METRIC_KEYS)) for (const f of [name, key]) if (m[f] !== undefined && !Number.isFinite(Number(m[f]))) return `metrics.${f} must be numeric`
+        return null
+      }),
     }),
-    output: schema((v) => {
-      if (!v || typeof v !== "object" || Array.isArray(v)) return "output must be an object"
-      if (!Array.isArray(v.active) || !Array.isArray(v.recent)) return "output must carry active and recent runs"
-      const m = v.metrics
-      if (m === undefined) return null
-      if (!m || typeof m !== "object" || Array.isArray(m)) return "metrics must be an object"
-      for (const [key, name] of Object.entries(METRIC_KEYS)) for (const f of [name, key]) if (m[f] !== undefined && !Number.isFinite(Number(m[f]))) return `metrics.${f} must be numeric`
-      return null
+    control: Object.freeze({
+      input: objectInput((v) => {
+        if (!CONTROL_ACTIONS.includes(str(v.action))) return "action must be approve, unblock, cancel or retry"
+        if (!str(v.runID)) return "runID must be a non-empty string"
+        if (v.sha !== undefined && typeof v.sha !== "string") return "sha must be a string"
+        return null
+      }),
+      output: schema((v) => (!v || typeof v !== "object" || Array.isArray(v) ? "output must be an object" : null)),
     }),
-  }) }),
+    dispatch: Object.freeze({
+      input: objectInput((v) => (v.n !== undefined && (!Number.isFinite(Number(v.n)) || Number(v.n) < 1) ? "n must be a positive number" : null)),
+      output: schema((v) => (!v || typeof v !== "object" || Array.isArray(v) ? "output must be an object" : null)),
+    }),
+  }),
 })
 export class RpcStatusSource {
   constructor(ctx, { timeout = RPC_TIMEOUT_MS, limits = {} } = {}) {
     this.ctx = ctx; this.timeout = timeout; this.limits = limits
   }
+  #rpc() { return this.ctx.client.rpc(BeaconStatusRpc) }
   async snapshot(limits = this.limits) {
-    const rpc = this.ctx.client.rpc(BeaconStatusRpc)
-    const location = tuiLocation(this.ctx)
-    return normalizeSnapshot(await rpc.snapshot(limits ?? {}, { location, signal: AbortSignal.timeout(this.timeout) }))
+    return normalizeSnapshot(await this.#rpc().snapshot(limits ?? {}, {
+      location: tuiLocation(this.ctx), signal: AbortSignal.timeout(this.timeout),
+    }))
+  }
+  async control(input) {
+    return this.#rpc().control(input, { signal: AbortSignal.timeout(this.timeout) })
+  }
+  async dispatch(input) {
+    return this.#rpc().dispatch(input, { signal: AbortSignal.timeout(this.timeout) })
   }
 }
 export function createStatusSource(ctx, { root, deps = {}, limits = {} } = {}) {
   const cli = new CliStatusSource({ root: root ?? projectRoot(ctx) ?? process.cwd(), deps, limits })
   const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits }) : null
-  return { async snapshot(input = limits) {
-    if (rpc) { try { return await rpc.snapshot(input) } catch {} }
-    return cli.snapshot(input)
-  } }
+  const fallback = async (name, input) => {
+    if (rpc) { try { return await rpc[name](input) } catch {} }
+    return cli[name](input)
+  }
+  return {
+    snapshot: (input = limits) => fallback("snapshot", input),
+    control: (input) => fallback("control", input),
+    dispatch: (input) => fallback("dispatch", input),
+  }
 }
 export const errorMessage = (error) => (error && typeof error.message === "string" ? error.message : String(error))
-

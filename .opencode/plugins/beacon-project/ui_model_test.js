@@ -1,38 +1,14 @@
 // Run: node --test .opencode/plugins/beacon-project/ui_model_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
-import { NOW, lines, makeRun, solidModule, themeStub, signalStub } from "./ui_test_helpers.js"
+import { NOW, lines, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
-  BEACON_STATUS_RPC_ID,
-  BeaconStatusRpc,
-  CliStatusSource,
-  DECISION_LIMIT,
-  EMPTY_SNAPSHOT,
-  PANEL_NAME,
-  RECENT_LIMIT,
-  REASON_WIDTH,
-  TITLE_WIDTH,
+  BeaconStatusRpc, CliStatusSource, EMPTY_SNAPSHOT, RECENT_LIMIT,
+  createCliStatusSource, createStatusSource,
+  defineBeaconStatusPlugin, errorMessage, normalizeRun, normalizeSnapshot,
+  parseSnapshot, renderSnapshotLines, default: beaconStatus,
   beaconStatusDefinition,
-  createCliStatusSource,
-  createRowMount,
-  createStatusSource,
-  defineBeaconStatusPlugin,
-  detailCommand,
-  detailLines,
-  elapsed,
-  enrichRuns,
-  errorMessage,
-  normalizeRun,
-  normalizeSnapshot,
-  parseSnapshot,
-  readTitle,
-  renderSnapshotLines,
-  runLineItems,
-  snapshotLineItems,
-  truncate,
-  default: beaconStatus,
 } = ui
 
 test("default export is a Plugin.define definition", () => {
@@ -46,77 +22,83 @@ test("default export is a Plugin.define definition", () => {
   assert.equal(beaconStatus.setup, beaconStatusDefinition.setup)
 })
 
-test("compact list renders two lines per run with no rule and no repeated title", () => {
-  assert.deepEqual(lines({
-    active: [makeRun({ title: "Fix TUI plugin shape so Beacon panel renders in the OpenCode sidebar" })],
-    recent: [],
-  }), [
-    "Beacon A1 B0 R0 F0 10:07:00",
-    "▼ Active 1",
-    "● T-1 Fix TUI plugin shape … RUN",
-    "#42 run 5s waiting CI",
-    "▼ Recent 0",
-    "No recent runs",
-  ])
-  assert.equal(truncate("abcdefghijklmnopqrstuvwxyz0123456789", TITLE_WIDTH).length, TITLE_WIDTH)
-})
-
-test("normalizeRun leaves title empty instead of copying the task ID", () => {
-  const run = normalizeRun(makeRun())
+test("normalizeRun keeps a missing title empty and reads CI checks", () => {
+  const run = normalizeRun(makeRun({
+    title: "",
+    Checks: [{ name: "ci", state: "success", duration_seconds: 28 }],
+  }))
   assert.equal(run.title, "")
   assert.equal(run.state, "running")
   assert.equal(run.durations.waitingCI, 60)
-  assert.equal(run.timeline[0].state, "waiting_ci")
-  assert.equal(run.decisions[0].verdict, "merge")
+  assert.deepEqual(run.checks, [{ name: "ci", state: "success", durationSeconds: 28 }])
   assert.equal(normalizeRun({ State: "" }).state, "unknown")
 })
 
-test("compact list does not repeat the task ID when no title exists", () => {
-  const result = lines({ active: [makeRun({ title: "" })], recent: [] })
-  assert.equal(result[2], "● T-1 RUN")
+test("sidebar renders a flat header, state bar legend and two lines per run", () => {
+  const result = lines({
+    active: [makeRun({ State: "blocked", Reason: "workspace: conflict: refusing to remove dirty worktree at /tmp/wt" })],
+    recent: [],
+  }, null, NOW)
+  assert.equal(result[0], "Beacon 1 blocked")
+  assert.equal(result[1], "R0 C0 B1 M0")
+  assert.equal(result[2], "▼ Active 1")
+  assert.equal(result[3], "▲ T-1 BLK")
+  assert.equal(result[4], "#42 3m dirty worktree")
+  assert.equal(result[5], "▶ Dispatch")
+  assert.equal(result[6], "▼ Recent 0")
+  assert.equal(result[7], "No recent runs")
+})
+
+test("a long full title is not cut to a fixed width", () => {
+  const title = "Fix TUI plugin shape so Beacon panel renders in the OpenCode sidebar"
+  const result = lines({ active: [makeRun({ title })], recent: [] }, null, NOW)
+  assert.ok(result.some((line) => line.includes(title)), "the whole title is present")
+})
+
+test("a task with no title shows only its short ID once", () => {
+  const result = lines({ active: [makeRun({ title: "" })], recent: [] }, null, NOW)
+  assert.equal(result[3], "● T-1 RUN")
   assert.equal(result.filter((line) => line.includes("T-1")).length, 1)
 })
 
-test("shortens a long task ID once", () => {
-  const result = lines({ active: [makeRun({ TaskID: "T-20261123-613986e5", title: "Short" })], recent: [] })
-  assert.equal(result[2], "● 613986e5 Short RUN")
-  assert.equal(result.filter((line) => line.includes("613986e5")).length, 1)
-})
-
-test("recent caps at five, dedupes by run ID and keeps only failure codes", () => {
+test("recent dedupes by task, hides active tasks and caps at five", () => {
   const recent = Array.from({ length: 8 }, (_, i) => makeRun({
-    ID: `old-${i}`, TaskID: `T-${i}`, State: "merged", Reason: "verbose prose reason",
-    title: `Finished ${i}`,
+    ID: `old-${i}`, TaskID: `T-${i}`, State: "closed", Reason: "verbose prose reason", title: `Finished ${i}`,
   }))
   const result = lines({
-    active: [makeRun({ ID: "run-1", title: "Active" })],
-    recent: [makeRun({ ID: "run-1", title: "Duplicate" }), ...recent],
-  })
-  assert.equal(result[2], "● T-1 Active RUN")
-  assert.equal(result[4], `▼ Recent ${RECENT_LIMIT}`)
-  assert.equal(result.filter((line) => line.includes("Duplicate")).length, 0)
-  assert.equal(result.filter((line) => line.includes("verbose prose")).length, 0)
-  assert.equal(result.length, 5 + RECENT_LIMIT * 2)
+    active: [makeRun({ ID: "active-1", TaskID: "T-ACTIVE", title: "Active" })],
+    recent: [
+      makeRun({ ID: "old-active", TaskID: "T-ACTIVE", State: "closed", Reason: "stale attempt" }),
+      ...recent,
+    ],
+  }, null, NOW)
+  assert.equal(result.filter((line) => line.includes("T-ACTIVE")).length, 0, "the old attempt is hidden")
+  assert.equal(result.filter((line) => line.includes("Finished")).length, RECENT_LIMIT)
+  assert.equal(result.filter((line) => line.includes("stale attempt")).length, 0)
+  assert.equal(result.filter((line) => line.includes("verbose prose")).length, RECENT_LIMIT)
 })
 
-test("recent shows a failure code when the reason is one", () => {
-  const result = lines({ active: [], recent: [makeRun({
-    ID: "old", State: "blocked", Reason: "ci_timeout", title: "Failed",
-  })] })
-  assert.ok(result[4].includes("BLOCK"))
-  assert.ok(result[5].includes("ci_timeout"))
+test("a merged run drops the reason and shows the real merge total", () => {
+  const result = lines({
+    active: [],
+    recent: [makeRun({ ID: "r2", State: "merged", Reason: "automatic rebase" })],
+    metrics: { merge_count: 37 },
+  }, null, NOW)
+  assert.ok(result.some((line) => line.includes("M37")), "the legend uses metrics.mergeCount")
+  assert.equal(result.filter((line) => line.includes("automatic rebase")).length, 0)
+  assert.ok(result.some((line) => line.includes("✔ T-1 MERGED")))
+  assert.ok(result.some((line) => line.includes("#42")))
 })
+
 test("readTitle uses frontmatter and falls back to the task ID", () => {
   const files = {
     "/p/docs/tasks/T-1.md": "---\nid: T-1\ntitle: \"Human readable title\"\nstatus: done\n---\n",
     "/p/docs/tasks/T-2.md": "---\nid: T-2\nstatus: done\n---\n",
   }
   const deps = { existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p] }
-  assert.equal(readTitle("/p", "T-1", deps), "Human readable title")
-  assert.equal(readTitle("/p", "T-2", deps), "T-2")
-  assert.equal(readTitle("/p", "T-3", deps), "T-3")
-  const enriched = enrichRuns("/p", [makeRun({ TaskID: "T-1" }), makeRun({ TaskID: "T-3" })], deps)
-  assert.deepEqual(enriched.map((r) => r.title), ["Human readable title", "T-3"])
+  assert.equal(ui.readTitle("/p", "T-1", deps), "Human readable title")
+  assert.equal(ui.readTitle("/p", "T-2", deps), "T-2")
+  assert.equal(ui.readTitle("/p", "T-3", deps), "T-3")
 })
 
 test("parseSnapshot tolerates null, empty and malformed output", () => {
@@ -152,8 +134,6 @@ test("CLI source makes one batched call and keeps numeric metrics", async () => 
   assert.deepEqual(snapshot.recent, [])
   assert.equal(snapshot.metrics.dispatchCount, 4)
   assert.equal(snapshot.metrics.skips.scope_overlap, 2)
-  assert.equal(snapshot.metrics.ciWaitSeconds, 90)
-  assert.equal(snapshot.generatedAt, "2026-11-23T10:00:00Z")
   assert.deepEqual(calls, [["/bin/beacon", "status", "--snapshot"]])
 })
 
@@ -166,28 +146,53 @@ test("CLI source raises maxBuffer so multi-megabyte snapshots fit", async () => 
   const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
   await source.snapshot()
   assert.ok(options, "execFile receives an options object")
-  assert.ok(Number.isFinite(options.maxBuffer), "maxBuffer is set to a finite number")
-  assert.ok(options.maxBuffer >= 4 * 1024 * 1024,
-    `maxBuffer ${options.maxBuffer} must hold a multi-megabyte snapshot`)
+  assert.ok(Number.isFinite(options.maxBuffer), "maxBuffer is finite")
+  assert.ok(options.maxBuffer >= 4 * 1024 * 1024)
   assert.equal(options.cwd, "/p")
   assert.equal(options.encoding, "utf8")
 })
 
-test("status source uses the RPC when it works and falls back when it throws", async () => {
-  let calls = 0
-  const ctx = { client: { rpc: () => ({ snapshot: async () => {
-    calls += 1
-    return { active: [makeRun({ title: "From RPC" })], recent: [] }
-  } }), }, location: { project: { canonical: "/p" } } }
-  const good = await createStatusSource(ctx, { deps: { command: () => { throw new Error("CLI must not run") } } }).snapshot()
-  assert.equal(calls, 1)
-  assert.equal(good.active[0].title, "From RPC")
+test("CLI control sends the action, run ID, optional SHA and --json", async () => {
+  const calls = []
+  const execFile = async (program, args) => {
+    calls.push([program, ...args])
+    return { stdout: '{"ok":true,"action":"approve","run_id":"run-1"}' }
+  }
+  const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
+  const result = await source.control({ action: "approve", runID: "run-1", sha: "abc123" })
+  assert.deepEqual(calls, [["/bin/beacon", "control", "--action", "approve", "--run-id", "run-1", "--json", "--sha", "abc123"]])
+  assert.equal(result.ok, true)
+  await source.control({ action: "retry", runID: "run-2" })
+  assert.equal(calls[1].includes("--sha"), false)
+})
+
+test("CLI dispatch runs beacon dispatch 1 through the same resolver", async () => {
+  const calls = []
+  const execFile = async (program, args) => {
+    calls.push([program, ...args])
+    return { stdout: '{"started":1,"task_ids":["T-1"]}' }
+  }
+  const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
+  const result = await source.dispatch({ n: 1 })
+  assert.deepEqual(calls, [["/bin/beacon", "dispatch", "1"]])
+  assert.equal(result.started, 1)
+})
+
+test("status source uses RPC for snapshot, control and dispatch and falls back when it throws", async () => {
+  const calls = []
+  const rpc = {
+    snapshot: async () => ({ active: [makeRun({ title: "From RPC" })], recent: [] }),
+    control: async (input) => { calls.push(["control", input]); return { ok: true } },
+    dispatch: async (input) => { calls.push(["dispatch", input]); return { started: 1 } },
+  }
+  const good = createStatusSource({ client: { rpc: () => rpc }, location: { project: { canonical: "/p" } } })
+  assert.equal((await good.snapshot()).active[0].title, "From RPC")
+  assert.deepEqual(await good.control({ action: "retry", runID: "run-1" }), { ok: true })
+  assert.deepEqual(await good.dispatch({ n: 1 }), { started: 1 })
+  assert.deepEqual(calls, [["control", { action: "retry", runID: "run-1" }], ["dispatch", { n: 1 }]])
 
   const cliCalls = []
-  const bad = {
-    client: { rpc: () => { throw new Error("no rpc") } },
-    location: { project: { canonical: "/p" } },
-  }
+  const bad = { client: { rpc: () => { throw new Error("no rpc") } }, location: { project: { canonical: "/p" } } }
   const deps = {
     command: () => ["/bin/beacon"],
     execFile: async (program, args) => {
@@ -201,14 +206,21 @@ test("status source uses the RPC when it works and falls back when it throws", a
   assert.deepEqual(cliCalls, [["/bin/beacon", "status", "--snapshot"]])
 })
 
-test("RPC definition validates the snapshot output", () => {
-  const method = BeaconStatusRpc.methods.snapshot
-  assert.equal(BeaconStatusRpc.id, BEACON_STATUS_RPC_ID)
-  assert.ok(method.input["~standard"].validate({}).value !== undefined)
-  assert.ok(method.output["~standard"].validate({ active: [], recent: [] }).value !== undefined)
-  assert.ok("issues" in method.output["~standard"].validate(null))
-  assert.ok("issues" in method.output["~standard"].validate([]))
-  assert.ok("issues" in method.output["~standard"].validate({ active: [], recent: [], metrics: { merge_count: "three" } }))
+test("RPC definition validates snapshot, control and dispatch shapes", () => {
+  const { snapshot, control, dispatch } = BeaconStatusRpc.methods
+  assert.equal(BeaconStatusRpc.id, "beacon.project.status")
+  assert.ok(snapshot.input["~standard"].validate({}).value !== undefined)
+  assert.ok(snapshot.output["~standard"].validate({ active: [], recent: [] }).value !== undefined)
+  assert.ok("issues" in snapshot.output["~standard"].validate(null))
+  assert.ok("issues" in snapshot.output["~standard"].validate({ active: [], recent: [], metrics: { merge_count: "three" } }))
+  assert.ok(control.input["~standard"].validate({ action: "retry", runID: "run-1" }).value !== undefined)
+  assert.ok("issues" in control.input["~standard"].validate({ action: "nope", runID: "run-1" }))
+  assert.ok("issues" in control.input["~standard"].validate({ action: "retry" }))
+  assert.ok("issues" in control.input["~standard"].validate({ action: "retry", runID: "run-1", sha: 4 }))
+  assert.ok(control.output["~standard"].validate({ ok: true }).value !== undefined)
+  assert.ok(dispatch.input["~standard"].validate({ n: 1 }).value !== undefined)
+  assert.ok("issues" in dispatch.input["~standard"].validate({ n: 0 }))
+  assert.ok(dispatch.output["~standard"].validate({ started: 1 }).value !== undefined)
 })
 
 test("adding runs does not add CLI calls", async () => {
@@ -226,4 +238,10 @@ test("errorMessage handles Error, plain object and string", () => {
   assert.equal(errorMessage(new Error("boom")), "boom")
   assert.equal(errorMessage({ message: "rpc failed" }), "rpc failed")
   assert.equal(errorMessage("down"), "down")
+})
+
+test("empty snapshot renders both sections with a dispatch button", () => {
+  assert.deepEqual(renderSnapshotLines(EMPTY_SNAPSHOT), [
+    "Beacon no runs", "R0 C0 B0 M0", "▼ Active 0", "No active runs", "▶ Dispatch", "▼ Recent 0", "No recent runs",
+  ])
 })

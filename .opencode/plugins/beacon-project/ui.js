@@ -1,77 +1,34 @@
-// Beacon status panel and run detail for the OpenCode TUI. The view model and
-// the event bridge live in sibling files so every module stays under 350 lines.
+// Beacon status panel and run detail for the OpenCode TUI. The view model,
+// node pools and action handlers live in sibling files so each stays small.
 export * from "./ui_model.js"
 export * from "./ui_view.js"
 export * from "./ui_bridge.js"
+export * from "./ui_nodes.js"
+export * from "./ui_sidebar.js"
+export * from "./ui_detail_view.js"
+export * from "./ui_actions.js"
 
 import {
-  EVENT_IDLE_MS, MAX_ROWS, PANEL_NAME, REFRESH_MS, BeaconStatusRpc, EMPTY_SNAPSHOT,
-  createStatusSource, errorMessage, normalizeSnapshot, str, tuiLocation,
+  EVENT_IDLE_MS, PANEL_NAME, BeaconStatusRpc, EMPTY_SNAPSHOT,
+  createStatusSource, errorMessage, tuiLocation,
 } from "./ui_model.js"
-import { detailCommand, detailLines, metricsLine, snapshotLineItems, stateBarItem } from "./ui_view.js"
+import {
+  DETAIL_OPEN, SIDEBAR_OPEN, detailCommand, detailModel, metricsLine, sidebarModel,
+} from "./ui_view.js"
+import { createBox, createLineMount } from "./ui_nodes.js"
+import { createSidebarMount } from "./ui_sidebar.js"
+import { createDetailMount } from "./ui_detail_view.js"
+import { createActionRunner } from "./ui_actions.js"
 import { createRunChangeBridge } from "./ui_bridge.js"
 import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
 
-// The footer always renders one line. The detail panel needs more than the
-// sidebar pool, so each slot gets its own fixed node budget.
 export const FOOTER_ROWS = 1
-export const DETAIL_ROWS = 120
-// Builds a fixed pool of row nodes once, while the caller is inside a slot
-// render callback. Every later apply() only changes props on those nodes: it
-// never calls createElement or insert. That keeps repeated calls from refresh()
-// (a setInterval timer with no renderer context) from throwing
-// "No renderer found" whenever the run count changes. Kept free of Solid so
-// tests can drive it.
-export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg, maxRows = MAX_ROWS }) {
-  const { createElement, insert, setProp } = ui
-  const cell = (grow = false) => {
-    const t = createElement("text")
-    setProp(t, "wrapMode", "none")
-    setProp(t, "selectable", false)
-    setProp(t, "truncate", true)
-    setProp(t, "flexShrink", grow ? 1 : 0)
-    if (grow) { setProp(t, "flexGrow", 1); setProp(t, "minWidth", 0) }
-    return t
-  }
+// Compatibility adapter for tests and callers that drive one pooled row list.
+export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg, maxRows }) {
   return (container, items, rowLimit = maxRows) => {
-    const slots = []
-    for (let i = 0; i < rowLimit; i++) {
-      const box = createElement("box")
-      setProp(box, "flexDirection", "row")
-      setProp(box, "gap", 1)
-      setProp(box, "minWidth", 0)
-      const dot = cell()
-      const name = cell(true)
-      const status = cell()
-      insert(box, dot); insert(box, name); insert(box, status)
-      insert(container, box)
-      const s = { box, dot, name, status }
-      if (onRow) {
-        setProp(box, "onMouseDown", () => { if (s.item?.runID || s.item?.sectionKey) onRow(s.item) })
-        setProp(box, "onMouseOver", () => setProp(box, "backgroundColor", hoverBg))
-        setProp(box, "onMouseOut", () => setProp(box, "backgroundColor", undefined))
-      }
-      setProp(box, "visible", false)
-      slots.push(s)
-    }
-    const apply = () => {
-      const rows = items()
-      rows.forEach((item, i) => {
-        const s = slots[i]
-        if (!s) return
-        const isLine = item.text !== undefined
-        s.item = item
-        setProp(s.dot, "content", isLine ? "" : str(item.marker))
-        setProp(s.dot, "fg", color(item.color))
-        setProp(s.name, "content", isLine ? str(item.text) : str(item.name))
-        setProp(s.name, "fg", item.color === "muted" ? color("muted") : color("base"))
-        setProp(s.name, "attributes", item.bold ? BOLD : 0)
-        setProp(s.status, "content", isLine ? "" : str(item.status))
-        setProp(s.status, "fg", color(item.statusColor ?? "muted"))
-        setProp(s.box, "visible", true)
-      })
-      slots.slice(rows.length).forEach((s) => { s.item = undefined; setProp(s.box, "visible", false) })
-    }
+    const mount = createLineMount(ui, { color, BOLD, onItem: onRow, hoverBg, maxLines: rowLimit })
+    mount.node.forEach((node) => ui.insert(container, node))
+    const apply = () => mount.apply(items())
     apply()
     return apply
   }
@@ -106,141 +63,100 @@ async function setup(ctx, deps = {}) {
   }
   const [snapshot, setSnapshot] = createSignal(EMPTY_SNAPSHOT)
   const [error, setError] = createSignal(null)
-  const [detailItems, setDetailItems] = createSignal(detailLines(null))
-  const [footerItems, setFooterItems] = createSignal([metricsLine(EMPTY_SNAPSHOT)])
   const store = typeof ctx.storage?.store === "function"
     ? ctx.storage.store("beacon-selected-run", { initial: { id: "" } }) : [{ id: "" }, () => {}]
-  const sectionStore = typeof ctx.storage?.store === "function"
-    ? ctx.storage.store("beacon-detail-sections", { initial: {
-      Identity: false, Timing: false, Attempts: false, Reason: false, Timeline: false, Decisions: false,
-    } }) : [{}, () => {}]
-  const collapsed = { ...sectionStore[0] }
+  const sidebarStore = typeof ctx.storage?.store === "function"
+    ? ctx.storage.store("beacon-sidebar-sections", { initial: { ...SIDEBAR_OPEN } }) : [{ ...SIDEBAR_OPEN }, () => {}]
+  const detailStore = typeof ctx.storage?.store === "function"
+    ? ctx.storage.store("beacon-detail-sections", { initial: { ...DETAIL_OPEN } }) : [{ ...DETAIL_OPEN }, () => {}]
   const [selectedID, setSelectedID] = createSignal(store[0].id || "")
+  const sidebarOpen = { ...SIDEBAR_OPEN, ...(sidebarStore[0] ?? {}) }
+  const detailSections = { ...DETAIL_OPEN, ...(detailStore[0] ?? {}) }
+  const color = (key) => key === "base" ? theme.text.base
+    : key === "muted" ? theme.text.muted
+      : key === "action" ? theme.text.action.primary.base
+        : theme.text.feedback[key]?.base ?? theme.text.muted
+  let detailOpen = false
   let stopped = false
   let pollTimer
   let inFlight = false
-  // The detail header ✕ releases the panel. Swallow one row click after that
-  // so the same pointer gesture cannot reopen it immediately.
-  let suppressNextRowClick = false
   let panelClose = null
-  const pollMs = pollIntervalMs(options.statusPollMs)
-  const color = (key) => key === "base" ? theme.text.base
-    : key === "muted" ? theme.text.muted
-    : key === "action" ? theme.text.action.primary.base
-    : theme.text.feedback[key]?.base ?? theme.text.muted
-  const mount = createRowMount({ createElement, insert, setProp }, {
-    color, BOLD, onRow: (item) => {
-      if (typeof item.sectionKey === "string") toggleSection(item.sectionKey)
-      else select(item.runID)
-    },
-    hoverBg: theme.background.raised.high,
-  })
-  const rows = () => snapshotLineItems(snapshot(), error())
+  const ui = { createElement, insert, setProp }
+  const m = () => snapshot()
+  const selectedRun = () => [...m().active, ...m().recent].find((r) => r.id === selectedID()) ?? null
 
-  // Section clicks reuse the pooled detail rows. Toggling the flag and
-  // re-applying the one slot changes props and `visible` only, never the tree.
-  function toggleSection(key) {
-    collapsed[key] = !collapsed[key]
-    void sectionStore[1]((draft) => { draft[key] = collapsed[key] }).catch(() => {})
-    sync()
-    const slot = slots.detail
-    if (slot && !slot.node.isDestroyed) slot.apply()
+  function applySlot(key) {
+    const slot = slots[key]
+    if (!slot || slot.node.isDestroyed) return
+    if (key === "sidebar") slot.apply(sidebarModel(m(), error(), timers.now(), sidebarOpen), error())
+    else if (key === "footer") slot.apply([metricsLine(m())])
+    else slot.apply(detailModel(selectedRun(), m().metrics, timers.now(), detailSections), selectedRun())
   }
-  function select(id) {
-    if (!id) return
-    setSelectedID(id)
-    void store[1]((draft) => { draft.id = id }).catch(() => {})
-    if (suppressNextRowClick) { suppressNextRowClick = false; return }
-    ctx.ui.panel.open(PANEL_NAME)
+  function applyAll() { for (const key of SLOT_KEYS) applySlot(key) }
+  function toggleSection(scope, key) {
+    const flags = scope === "sidebar" ? sidebarOpen : detailSections
+    const persist = scope === "sidebar" ? sidebarStore : detailStore
+    flags[key] = !flags[key]
+    void persist[1]((draft) => { draft[key] = flags[key] }).catch(() => {})
+    applySlot(scope === "sidebar" ? "sidebar" : "detail")
+  }
+  function panelIsOpen() {
+    const current = typeof ctx.ui.panel?.current === "function" ? ctx.ui.panel.current() : null
+    if (current && typeof current === "object") return current.name === PANEL_NAME
+    return detailOpen
   }
   function closeDetail() {
-    suppressNextRowClick = true
+    detailOpen = false
     if (typeof panelClose === "function") panelClose()
     else if (typeof ctx.ui.panel?.close === "function") ctx.ui.panel.close()
   }
-  function sync() {
-    const snap = snapshot()
-    setFooterItems([metricsLine(snap)])
-    const run = [...snap.active, ...snap.recent].find((r) => r.id === selectedID())
-    setDetailItems(detailLines(run, snap.metrics, timers.now(), collapsed))
+  function openDetail() {
+    detailOpen = true
+    ctx.ui.panel.open(PANEL_NAME)
+  }
+  function select(id) {
+    if (!id) return
+    if (selectedID() === id && panelIsOpen()) { closeDetail(); return }
+    setSelectedID(id)
+    void store[1]((draft) => { draft.id = id }).catch(() => {})
+    openDetail()
+  }
+  const runAction = createActionRunner(ctx, source, { refresh: () => refresh() })
+  const handleSidebarItem = (item) => {
+    if (item.sectionKey) toggleSection("sidebar", item.sectionKey)
+    else if (item.action === "dispatch") void runAction("dispatch")
+    else select(item.runID)
   }
 
-  // The reconciler's renderer is only active inside a slot render callback.
-  // Creating nodes here reaches it before any renderer exists and throws
-  // "No renderer found", so the first render callback builds every node once.
-  // OpenCode unmounts sidebar.content when a panel opens and destroys those
-  // nodes. Each slot owns its node and is rebuilt only when that node reports
-  // isDestroyed, so an undestroyed slot keeps its cache and its row pool.
+  // Every node is allocated on the first render callback for its slot. OpenCode
+  // unmounts slot trees when a panel opens, so each slot rebuilds only when its
+  // own node reports isDestroyed.
   const slots = Object.create(null)
   const SLOT_KEYS = ["sidebar", "footer", "detail"]
-  const listBox = () => {
-    const box = createElement("box")
-    setProp(box, "flexDirection", "column")
-    return box
-  }
-  const text = (content, fg, onMouseUp, grow = false) => {
-    const node = createElement("text")
-    setProp(node, "content", content)
-    setProp(node, "fg", fg)
-    setProp(node, "wrapMode", "none")
-    setProp(node, "selectable", false)
-    if (onMouseUp) setProp(node, "onMouseUp", onMouseUp)
-    if (grow) { setProp(node, "flexGrow", 1); setProp(node, "minWidth", 0) }
-    return node
-  }
-  function makeDetail() {
-    const box = listBox()
-    setProp(box, "flexGrow", 1)
-    const header = createElement("box")
-    setProp(header, "flexDirection", "row")
-    setProp(header, "justifyContent", "space-between")
-    setProp(header, "minWidth", 0)
-    const title = text("Beacon run detail", color("base"), null, true)
-    setProp(title, "attributes", BOLD)
-    insert(header, title)
-    // A styled ✕ plus the real ctrl+g binding reads as a control. Escape is
-    // owned by the global session interrupt, so it is not advertised here.
-    const hint = createElement("box")
-    setProp(hint, "flexDirection", "row")
-    setProp(hint, "gap", 1)
-    setProp(hint, "minWidth", 0)
-    insert(hint, text("ctrl+g", color("action")))
-    const close = text("✕", color("error"), closeDetail)
-    setProp(close, "padding", 1)
-    insert(hint, close)
-    insert(header, hint)
-    const list = listBox()
-    insert(box, header)
-    insert(box, list)
-    return { node: box, list }
-  }
   function ensureSlot(key) {
     const slot = slots[key]
     if (slot && !slot.node.isDestroyed) return slot
     let entry
     if (key === "sidebar") {
-      const sidebar = listBox()
-      // One fixed text node, built inside the first render callback like the
-      // row pool. Later applies only set content and fg, never insert.
-      const bar = text("", color("base"), null, true)
-      insert(sidebar, bar)
-      const applyRows = mount(sidebar, rows, MAX_ROWS)
-      const applyBar = () => {
-        const item = stateBarItem(snapshot())
-        setProp(bar, "content", item.content)
-        setProp(bar, "fg", color(item.fg))
-      }
-      entry = { node: sidebar, apply: () => { applyRows(); applyBar() } }
+      entry = createSidebarMount(ui, {
+        color, BOLD, onItem: handleSidebarItem, hoverBg: theme.background.raised.high,
+      })
     } else if (key === "footer") {
-      const footer = listBox()
-      entry = { node: footer, apply: mount(footer, footerItems, FOOTER_ROWS) }
+      const footer = createBox(ui, { flexDirection: "column", minWidth: 0 })
+      const mount = createLineMount(ui, { color, BOLD, maxLines: FOOTER_ROWS })
+      mount.node.forEach((node) => insert(footer, node))
+      entry = { node: footer, apply: (items) => mount.apply(items) }
     } else {
-      const { node: detailBox, list: detail } = makeDetail()
-      entry = { node: detailBox, apply: mount(detail, detailItems, DETAIL_ROWS) }
-      sync()
+      entry = createDetailMount(ui, {
+        setProp, color, BOLD,
+        onItem: (item) => { if (item.sectionKey) toggleSection("detail", item.sectionKey) },
+        onAction: (name) => void runAction(name, selectedRun()),
+        onToggle: () => { if (panelIsOpen()) closeDetail(); else openDetail() },
+        onClose: closeDetail,
+      })
     }
     slots[key] = entry
-    entry.apply()
+    applySlot(key)
     return entry
   }
 
@@ -256,23 +172,15 @@ async function setup(ctx, deps = {}) {
       setError(null)
     } catch (cause) { if (!stopped) setError(errorMessage(cause)) }
     finally { inFlight = false }
-    if (!stopped) {
-      sync()
-      for (const key of SLOT_KEYS) {
-        const slot = slots[key]
-        if (slot && !slot.node.isDestroyed) slot.apply()
-      }
-    }
-    if (pending && !stopped) {
-      pending = false
-      void refresh()
-    }
+    if (!stopped) applyAll()
+    if (pending && !stopped) { pending = false; void refresh() }
   }
   let rpc = null
   try { rpc = typeof ctx?.client?.rpc === "function" ? ctx.client.rpc(BeaconStatusRpc) : null } catch {}
   const bridge = rpc?.events && watcherEnabled(options)
     ? createRunChangeBridge(rpc, tuiLocation(ctx), () => void refresh(), timers) : null
   void refresh()
+  const pollMs = pollIntervalMs(options.statusPollMs)
   if (pollMs > 0) {
     pollTimer = timers.setInterval(() => {
       if (stopped) return
@@ -281,9 +189,9 @@ async function setup(ctx, deps = {}) {
     }, pollMs)
   }
   const removeKeymap = typeof ctx.keymap?.layer === "function"
-    ? ctx.keymap.layer(() => ({ mode: "global", commands: [detailCommand((name) => {
-      if (ctx.ui.panel.current?.()?.name === PANEL_NAME) closeDetail()
-      else { suppressNextRowClick = false; ctx.ui.panel.open(name) }
+    ? ctx.keymap.layer(() => ({ mode: "global", commands: [detailCommand(() => {
+      if (panelIsOpen()) closeDetail()
+      else openDetail()
     })] }))
     : null
   const disposers = [
@@ -293,12 +201,10 @@ async function setup(ctx, deps = {}) {
       if (input.name !== PANEL_NAME) return null
       if (typeof input?.close === "function") panelClose = input.close
       const slot = ensureSlot("detail")
-      sync()
-      slot.apply()
+      detailOpen = true
+      applySlot("detail")
       return slot.node
     } }),
-    // Keymap registration happens once in setup; this slot only keeps the
-    // registration point stable for the operator's layout.
     ctx.ui.slot({ append: "app", render: () => null }),
   ]
   return () => {
