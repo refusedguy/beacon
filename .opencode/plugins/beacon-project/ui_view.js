@@ -6,7 +6,7 @@ import {
 } from "./ui_model.js"
 import {
   baseIncidentItem, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, nextStepLine, queueLineItems, readyCount, shortTaskID, timelineText, truncate,
+  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, timelineText, truncate,
 } from "./ui_alerts.js"
 export { shortTaskID }
 
@@ -180,35 +180,11 @@ const sectionItem = (label, count, key, open) => ({
   color: "action", bold: true, statusColor: "muted", sectionKey: key,
 })
 
-// A null map keeps flat legacy rows; the real panel stores the open epics.
-export function queueRows(queue = [], epicOpen = null) {
-  const list = Array.isArray(queue) ? queue : []
-  const rows = queueLineItems(list)
-  if (!epicOpen) return rows
-  const ids = list.map((item) => str(item?.id))
-  const parentOf = (id) => ids.filter((p) => p && p !== id && id.startsWith(`${p}-`))
-    .sort((a, b) => b.length - a.length)[0] || ""
-  const counts = new Map()
-  for (const id of ids) {
-    const parent = parentOf(id)
-    if (parent) counts.set(parent, (counts.get(parent) ?? 0) + 1)
-  }
-  const isEpic = (id) => counts.has(id)
-    || list.some((i) => str(i?.id) === id && str(i?.kind).toLowerCase() === "epic")
-  const hidden = new Set()
-  for (const id of ids) {
-    let parent = parentOf(id)
-    while (parent) {
-      if (isEpic(parent) && epicOpen[parent] !== true) { hidden.add(id); break }
-      parent = parentOf(parent)
-    }
-  }
-  return rows.filter((row) => !hidden.has(row.cardID)).map((row) => {
-    if (row.kind !== "queue-title" || !isEpic(row.cardID)) return row
-    const chevron = epicOpen[row.cardID] === true ? "▼" : "▶"
-    return { ...row, marker: chevron, status: String(counts.get(row.cardID) ?? 0),
-      statusColor: "muted", epicKey: row.cardID, action: `epic:${row.cardID}` }
-  })
+// Expanded epic IDs in storage belong to an earlier session. Discard them at
+// startup so every epic starts collapsed; a click in this session adds an ID.
+export function discardStoredEpicOpen(epic) {
+  for (const id of Object.keys(epic.open ?? {})) delete epic.open[id]
+  return epic
 }
 
 export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null) {

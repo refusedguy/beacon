@@ -15,7 +15,7 @@ import {
   cleanErrorMessage, createStatusSource, readCard, str, tuiLocation,
 } from "./ui_model.js"
 import {
-  DETAIL_OPEN, SIDEBAR_OPEN, detailCommand, detailModel,
+  DETAIL_OPEN, SIDEBAR_OPEN, detailCommand, detailModel, discardStoredEpicOpen,
   metricsLine, sidebarModel,
 } from "./ui_view.js"
 import { compactReason } from "./ui_alerts.js"
@@ -101,7 +101,7 @@ async function setup(ctx, deps = {}) {
     ? ctx.storage.store("beacon-sidebar-sections", { initial: { ...SIDEBAR_OPEN } }) : [{ ...SIDEBAR_OPEN }, () => {}]
   const detailStore = typeof ctx.storage?.store === "function"
     ? ctx.storage.store("beacon-detail-sections", { initial: { ...DETAIL_OPEN } }) : [{ ...DETAIL_OPEN }, () => {}]
-  const epic = createEpicState(ctx, () => applyAll())
+  const epic = discardStoredEpicOpen(createEpicState(ctx, () => applyAll()))
   const [selectedID, setSelectedID] = createSignal(store[0].id || "")
   const sidebarOpen = { ...SIDEBAR_OPEN, ...(sidebarStore[0] ?? {}) }
   // A stale stored object must never reopen Technical on load. The other
