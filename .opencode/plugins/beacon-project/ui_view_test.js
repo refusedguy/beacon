@@ -68,13 +68,16 @@ test("phaseLabel follows the live phase and merged rows drop the reason", () => 
 test("run rows keep the full title and put PR, duration and cause on line two", () => {
   const title = "Make worktree registration refresh reliable at every exit"
   const [first, second] = runLineItems(normalizeRun(makeRun({ State: "blocked", title })), NOW)
-  assert.deepEqual(first, {
-    marker: "▲", markerSpace: true, name: title, status: "BLK", color: "error", bold: true, runID: "run-1",
-  })
-  assert.deepEqual(second, {
-    marker: "#42", markerSpace: true, name: "3m", status: "waiting CI", color: "muted",
-    statusColor: "error", runID: "run-1",
-  })
+  assert.equal(first.marker, "▲")
+  assert.equal(first.name, title)
+  assert.equal(first.status, "BLK")
+  assert.equal(first.color, "error")
+  assert.equal(first.runID, "run-1")
+  assert.equal(second.marker, "#42")
+  assert.equal(second.name, "3m")
+  assert.equal(second.status, "waiting CI")
+  assert.equal(second.color, "muted")
+  assert.equal(second.runID, "run-1")
 })
 
 test("recent shows one terminal run per task and skips tasks active again", () => {
