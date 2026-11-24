@@ -50,6 +50,7 @@ type wiring struct {
 	taskUpdater *app.TaskUpdater
 	recon       *app.Reconciler
 	reconcile   *app.ReconcileService
+	watcher     *configWatcher
 }
 
 // wiredInfra holds the adapters shared by every application service.
@@ -104,6 +105,18 @@ func loadConfig(path string) (config.Config, string, error) {
 	return cfg, root, nil
 }
 
+// resolvedConfigPath returns the file the watcher must observe. The empty
+// flag means the default config under the pinned project root.
+func resolvedConfigPath(path, root string) string {
+	if path == "" {
+		return filepath.Join(root, ".beacon", "config.yaml")
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
+}
+
 func wire(path, parentSession string) (*wiring, error) {
 	cfg, root, err := loadConfig(path)
 	if err != nil {
@@ -113,7 +126,26 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
-	return wireServices(cfg, root, parentSession, infra), nil
+	w := wireServices(cfg, root, parentSession, infra)
+	cw := newConfigWatcher(resolvedConfigPath(path, root), root, parentSession,
+		newLiveState(cfg, infra.harness), configWatchInterval)
+	w.watcher = cw
+	installLiveState(w, cw)
+	return w, nil
+}
+
+// installLiveState puts stable wrappers between the MCP services and the
+// config-backed adapters. Tool handlers keep the same pointers across reloads.
+func installLiveState(w *wiring, cw *configWatcher) {
+	initial := cw.live.Load().harness
+	h := &reloadableHarness{live: &cw.live, events: initial.Events()}
+	w.harness = h
+	w.dispatcher.Harness = h
+	w.control.Harness = h
+	w.recon.Harness = h
+	w.workspace.Refresher = h
+	w.dispatcher.ResolveModel = cw.modelResolver
+	w.recon.Policy = &reloadablePolicy{live: &cw.live}
 }
 
 // wireInfra builds the adapters. It has no dependency on the service layer.
@@ -205,6 +237,13 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 	}
 }
 
+func mergePolicy(cfg config.Config) core.MergePolicy {
+	return policy.New(policy.Config{
+		RequiredChecks: cfg.Merge.RequiredChecks, RequiredApprovals: cfg.Merge.RequiredApprovals,
+		Labels: cfg.Merge.Labels, CommandGate: cfg.Merge.CommandGate,
+	})
+}
+
 func newReconciler(
 	cfg config.Config,
 	store *sqlite.Store,
@@ -217,10 +256,7 @@ func newReconciler(
 	parentSession string,
 ) *app.Reconciler {
 	return &app.Reconciler{
-		Store: store, SCM: scmGW, Policy: policy.New(policy.Config{
-			RequiredChecks: cfg.Merge.RequiredChecks, RequiredApprovals: cfg.Merge.RequiredApprovals,
-			Labels: cfg.Merge.Labels, CommandGate: cfg.Merge.CommandGate,
-		}), Harness: h,
+		Store: store, SCM: scmGW, Policy: mergePolicy(cfg), Harness: h,
 		Source: source, Workspace: wt,
 		Notifier:   notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
 		Dispatcher: disp, Changes: changes, Repo: cfg.SCM.Owner + "/" + cfg.SCM.Repo,
