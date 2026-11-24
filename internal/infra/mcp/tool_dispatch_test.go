@@ -3,12 +3,14 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -47,6 +49,26 @@ func (dispatchWorkspace) HasChanges(context.Context, core.Workspace, string) (bo
 func (dispatchWorkspace) CommitPath(context.Context, core.Workspace, string, string) error {
 	return nil
 }
+
+type failingDispatchWorkspace struct{ dispatchWorkspace }
+
+func (failingDispatchWorkspace) Create(_ context.Context, t core.Task) (core.Workspace, error) {
+	if t.ID == "T-BAD" {
+		return core.Workspace{}, errors.New("workspace: conflict: refusing to remove dirty worktree")
+	}
+	return dispatchWorkspace{}.Create(context.Background(), t)
+}
+
+type stubDispatchHarness struct{}
+
+func (stubDispatchHarness) Spawn(_ context.Context, req core.SpawnRequest) (core.Session, error) {
+	return core.Session{ID: "ses-" + string(req.RunID)}, nil
+}
+func (stubDispatchHarness) Wake(context.Context, string, core.WakeContext) error { return nil }
+func (stubDispatchHarness) Stop(context.Context, string) error                   { return nil }
+func (stubDispatchHarness) IsAlive(context.Context, string) (bool, error)        { return false, nil }
+func (stubDispatchHarness) NotifyParent(context.Context, string, string) error   { return nil }
+func (stubDispatchHarness) Events() <-chan core.HarnessEvent                     { return nil }
 
 func decodeDispatchBody(r *http.Request) map[string]any {
 	body := map[string]any{}
@@ -161,6 +183,22 @@ func TestDispatchToolResolvesParentModel(t *testing.T) {
 	if len(res.Content) == 0 {
 		t.Fatal("empty tool result")
 	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatal("unexpected tool content")
+	}
+	var payload struct {
+		Summary []struct {
+			Launch   string `json:"launch_source"`
+			Identity string `json:"agent_identity"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(text.Text), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Summary) != 1 || payload.Summary[0].Launch != "mcp" || payload.Summary[0].Identity != "" {
+		t.Fatalf("summary = %+v", payload.Summary)
+	}
 
 	want := map[string]any{"id": "hy4-flash-free", "providerID": "opencode", "variant": "default"}
 	mu.Lock()
@@ -176,5 +214,97 @@ func TestDispatchToolResolvesParentModel(t *testing.T) {
 	}
 	if len(models) != 1 || !reflect.DeepEqual(models[0]["model"], want) {
 		t.Fatalf("model switches = %v, want one with %v", models, want)
+	}
+}
+
+func TestDispatchToolReportsStartedAndFailedRunsInSummary(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	d := &app.Dispatcher{
+		Source: &dispatchSource{tasks: []core.Task{
+			{ID: "T-OK", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("ok.go")}},
+			{ID: "T-BAD", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("bad.go")}},
+		}},
+		Planner: planner.New(planner.Options{}), Workspace: failingDispatchWorkspace{},
+		Harness: stubDispatchHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
+	}
+	server := NewServer(Services{Dispatcher: d})
+	clientTransport, serverTransport := msdk.NewInMemoryTransports()
+	ss, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
+	cs, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_dispatch", Arguments: DispatchArgs{N: 2},
+		Meta: msdk.Meta{"beacon/launchSource": "cli", "beacon/agent": "operator"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatal("unexpected tool content")
+	}
+	var payload struct {
+		Runs []struct {
+			ID            string `json:"ID"`
+			LaunchSource  string `json:"LaunchSource"`
+			AgentIdentity string `json:"AgentIdentity"`
+		} `json:"runs"`
+		Failures []struct {
+			TaskID string `json:"TaskID"`
+			Err    string `json:"Err"`
+		} `json:"failures"`
+		Summary []struct {
+			ID       string `json:"id"`
+			TaskID   string `json:"task_id"`
+			State    string `json:"state"`
+			Reason   string `json:"reason"`
+			Launch   string `json:"launch_source"`
+			Identity string `json:"agent_identity"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(text.Text), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Failures) != 1 || payload.Failures[0].TaskID != "T-BAD" {
+		t.Fatalf("failures = %+v", payload.Failures)
+	}
+	if len(payload.Runs) != 2 {
+		t.Fatalf("runs = %+v, want the started and the failed run", payload.Runs)
+	}
+	if len(payload.Summary) != 2 {
+		t.Fatalf("summary = %+v, want two outcomes", payload.Summary)
+	}
+	byTask := map[string]struct{ id, state, reason string }{}
+	for _, outcome := range payload.Summary {
+		if outcome.ID == "" || outcome.State == "" || outcome.Reason == "" {
+			t.Fatalf("incomplete outcome = %+v", outcome)
+		}
+		if outcome.Launch != "cli" || outcome.Identity != "operator" {
+			t.Fatalf("outcome launch = %q, agent = %q", outcome.Launch, outcome.Identity)
+		}
+		byTask[outcome.TaskID] = struct{ id, state, reason string }{outcome.ID, outcome.State, outcome.Reason}
+	}
+	if byTask["T-OK"].state != "running" || byTask["T-BAD"].state != "closed" {
+		t.Fatalf("outcomes = %+v, want running and closed", byTask)
+	}
+	if !strings.Contains(byTask["T-BAD"].reason, "dirty worktree") {
+		t.Fatalf("failure reason = %q", byTask["T-BAD"].reason)
+	}
+	if byTask["T-OK"].id == byTask["T-BAD"].id || !strings.HasPrefix(byTask["T-BAD"].id, "run-") {
+		t.Fatalf("run ids = %q and %q", byTask["T-OK"].id, byTask["T-BAD"].id)
 	}
 }

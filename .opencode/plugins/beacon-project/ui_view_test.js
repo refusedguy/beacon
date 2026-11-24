@@ -6,8 +6,8 @@ import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
   SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
-  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel,
-  recentRuns, runLineItems, sidebarModel, stateBarItem, truncate,
+  detailLines, detailModel, elapsed, launchSourceText, mergedReason, metricsLine,
+  normalizeRun, phaseLabel, recentRuns, runLineItems, sidebarModel, stateBarItem, truncate,
 } = ui
 
 test("elapsed formats seconds, minutes, hours and days", () => {
@@ -347,4 +347,14 @@ test("epic state reads only true IDs from storage and persists toggles", () => {
   assert.equal(saved.at(-1)["T-NEW"], false)
   epic.toggle()
   assert.equal(changes, 2, "an empty ID does not toggle")
+})
+
+test("launch source shows in the metrics line and the technical line", () => {
+  const line = metricsLine({ active: [], recent: [], metrics: { launch_sources: { mcp: 2, cli: 1 } } })
+  assert.deepEqual([line.marker, line.status], ["", "R0 C0 B0 M0 · mcp:2 cli:1"])
+  assert.equal(launchSourceText({ launchSources: { ui: 3 } }), "ui:3")
+  const run = Object.assign(normalizeRun(makeRun()), { launchSource: "mcp", agentIdentity: "operator" })
+  const names = detailModel(run, {}, NOW, { technical: true }).rows.map((i) => i.name)
+  assert.ok(names.includes("mcp · operator"))
+  assert.equal(detailModel(normalizeRun(makeRun()), {}, NOW, { technical: true }).rows.some((i) => i.name === "mcp · operator"), false)
 })

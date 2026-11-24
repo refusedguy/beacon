@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -371,5 +372,75 @@ func TestRunSnapshotJSONChecksContract(t *testing.T) {
 	if len(decoded.Checks) != 1 || decoded.Checks[0].Name != "ci" ||
 		decoded.Checks[0].State != "failure" || decoded.Checks[0].DurationSeconds != 0 {
 		t.Fatalf("json checks = %+v", decoded.Checks)
+	}
+}
+
+func TestLaunchSourceCoversMCPCLIUIAndDaemon(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want core.LaunchSource
+	}{
+		{"mcp", core.LaunchMCP}, {"opencode", core.LaunchMCP},
+		{"cli", core.LaunchCLI}, {"ui", core.LaunchUI}, {"tui", core.LaunchUI},
+		{"daemon", core.LaunchDaemon}, {"", core.LaunchDaemon}, {"token-abc", core.LaunchDaemon},
+	}
+	for _, tc := range cases {
+		if got := core.ParseLaunchSource(tc.raw); got != tc.want {
+			t.Fatalf("ParseLaunchSource(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+	run := core.NewRun("run-launch", "T-LAUNCH", time.Now().UTC())
+	run.RecordLaunch(core.LaunchUI, " operator ")
+	if run.LaunchSource != core.LaunchUI || run.AgentIdentity != "operator" {
+		t.Fatalf("launch = %q, agent = %q", run.LaunchSource, run.AgentIdentity)
+	}
+	if run.ParentSessionID != "" {
+		t.Fatalf("parent session changed: %q", run.ParentSessionID)
+	}
+}
+
+func TestSnapshotSerializesLaunchSourceAndMetrics(t *testing.T) {
+	now := time.Now().UTC()
+	mcpRun := core.NewRun("run-mcp", "T-MCP", now)
+	mcpRun.RecordLaunch(core.LaunchMCP, "orchestrator")
+	cliRun := core.NewRun("run-cli", "T-CLI", now)
+	cliRun.RecordLaunch(core.LaunchCLI, "")
+	store := &snapshotStubStore{active: []*core.Run{mcpRun, cliRun, core.NewRun("run-old", "T-OLD", now)}}
+	snap, err := (SnapshotService{Store: store}).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Active[0].LaunchSource != "mcp" || snap.Active[0].AgentIdentity != "orchestrator" {
+		t.Fatalf("mcp snapshot = %+v", snap.Active[0])
+	}
+	if snap.Active[1].LaunchSource != "cli" || snap.Active[1].AgentIdentity != "" {
+		t.Fatalf("cli snapshot = %+v", snap.Active[1])
+	}
+	want := map[string]int{"mcp": 1, "cli": 1, "daemon": 1}
+	if !reflect.DeepEqual(snap.Metrics.LaunchSources, want) {
+		t.Fatalf("launch sources = %+v, want %+v", snap.Metrics.LaunchSources, want)
+	}
+
+	b, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Active []struct {
+			LaunchSource  string `json:"launch_source"`
+			AgentIdentity string `json:"agent_identity"`
+		} `json:"active"`
+		Metrics struct {
+			LaunchSources map[string]int `json:"launch_sources"`
+		} `json:"metrics"`
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Active[0].LaunchSource != "mcp" || decoded.Active[0].AgentIdentity != "orchestrator" {
+		t.Fatalf("json launch = %+v", decoded.Active[0])
+	}
+	if !reflect.DeepEqual(decoded.Metrics.LaunchSources, want) {
+		t.Fatalf("json launch sources = %+v, want %+v", decoded.Metrics.LaunchSources, want)
 	}
 }
