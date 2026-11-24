@@ -7,18 +7,18 @@ try {
   Plugin = { define: (definition) => definition }
 }
 
-import { projectRoot } from "./location.js"
-import { noopMcpRegistration, registerBeaconMcp } from "./mcp.js"
-import { installProjectContext } from "./context.js"
-import { sessionIdentity } from "./session_identity.js"
+import { projectRoot } from "./state/location.js"
+import { noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
+import { installProjectContext } from "./rules/context.js"
+import { sessionIdentity } from "./state/session_identity.js"
 import {
   pluginOptions, pollIntervalMs, snapshotLimits,
   statusPanelEnabled, watcherEnabled,
-} from "./options.js"
+} from "./state/options.js"
 import {
   BeaconStatusRpc, REFRESH_MS, RUN_CHANGED_EVENT, changedRuns,
   createCliStatusSource, normalizeSnapshot,
-} from "./ui.js"
+} from "./ui/ui.js"
 
 export const SHELL_GUARD_RULES = Object.freeze([
   {
@@ -321,5 +321,5 @@ export const beaconProject = Plugin.define({
   },
 })
 
-export { pluginOptions, pollIntervalMs, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
+export { pluginOptions, pollIntervalMs, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./state/options.js"
 export default beaconProject
