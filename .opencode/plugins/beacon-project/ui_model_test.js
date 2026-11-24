@@ -51,7 +51,7 @@ test("compact list renders two lines per run with no rule and no repeated title"
     active: [makeRun({ title: "Fix TUI plugin shape so Beacon panel renders in the OpenCode sidebar" })],
     recent: [],
   }), [
-    "Beacon",
+    "Beacon A1 B0 R0 F0 10:07:00",
     "▼ Active 1",
     "● T-1 Fix TUI plugin sh… RUN",
     "#42 3m waiting CI",

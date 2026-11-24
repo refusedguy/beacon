@@ -1,8 +1,8 @@
 // Presentation helpers for the Beacon status panel. Kept apart from the data
 // model so both files stay small and easy to test.
 import {
-  DECISION_LIMIT, EMPTY_SNAPSHOT, PANEL_NAME, RECENT_LIMIT, REASON_WIDTH, TITLE_WIDTH,
-  normalizeSnapshot, str,
+  DECISION_LIMIT, EMPTY_SNAPSHOT, PANEL_NAME, RECENT_LIMIT, REASON_WIDTH,
+  RULE, TITLE_WIDTH, VALUE_WIDTH, normalizeSnapshot, str,
 } from "./ui_model.js"
 
 const STATE_VIEW = Object.freeze({
@@ -62,13 +62,30 @@ export function runLineItems(run, now = Date.now(), recent = false) {
     { marker: "", name: meta, status: reason, color: "muted", runID: run.id },
   ]
 }
-const section = (label, count) => ({ marker: "▼", name: label, status: String(count), color: "action", bold: true })
+const section = (label, count) => ({ marker: "▼", name: label, status: count == null ? "" : String(count), color: "action", bold: true })
+export function metricCounts(view = EMPTY_SNAPSHOT) {
+  const m = view.metrics ?? {}
+  return {
+    active: view.active.length,
+    blocked: m.blockedCount ?? view.active.filter((r) => r.state === "blocked").length,
+    rebase: m.rebaseCount ?? 0,
+    fix: m.fixCount ?? 0,
+  }
+}
+export function clockOf(view = EMPTY_SNAPSHOT) {
+  const stamps = [...view.active, ...view.recent].map((r) => timeOf(r.updatedAt)).filter(Boolean)
+  const at = timeOf(view.generatedAt) || Math.max(0, ...stamps)
+  if (!at) return "--:--:--"
+  const date = new Date(at)
+  return Number.isFinite(date.getTime()) ? date.toISOString().slice(11, 19) : "--:--:--"
+}
 export function snapshotLineItems(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now()) {
   const view = normalizeSnapshot(snapshot)
   const seen = new Set()
   const active = view.active.filter((r) => keep(r, seen))
   const recent = view.recent.filter((r) => keep(r, seen)).slice(0, RECENT_LIMIT)
-  const items = [{ marker: "", name: "Beacon", status: "", color: "action", bold: true }]
+  const c = metricCounts(view)
+  const items = [{ marker: "", name: "Beacon", status: `A${c.active} B${c.blocked} R${c.rebase} F${c.fix} ${clockOf(view)}`, color: "action", bold: true }]
   if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
   items.push(section("Active", active.length))
   if (!active.length) items.push({ marker: "", name: "No active runs", status: "", color: "muted" })
@@ -83,43 +100,48 @@ export function renderSnapshotLines(snapshot, error, now) {
 }
 export function metricsLine(snapshot = EMPTY_SNAPSHOT) {
   const view = normalizeSnapshot(snapshot)
-  const m = view.metrics ?? {}
-  const blocked = m.blockedCount ?? view.active.filter((r) => r.state === "blocked").length
-  const stamps = [...view.active, ...view.recent].map((r) => timeOf(r.updatedAt)).filter(Boolean)
-  const at = timeOf(view.generatedAt) || Math.max(0, ...stamps)
-  const date = at ? new Date(at) : null
-  const clock = date && Number.isFinite(date.getTime()) ? date.toISOString().slice(11, 19) : "--:--:--"
-  const name = `Beacon active ${view.active.length} · blocked ${blocked} · rebase ${m.rebaseCount ?? 0} · fix ${m.fixCount ?? 0} · updated ${clock}`
-  return { marker: "", name, status: "", color: "muted" }
+  const c = metricCounts(view)
+  return { marker: "", name: `Beacon active ${c.active} · blocked ${c.blocked} · rebase ${c.rebase} · fix ${c.fix} · updated ${clockOf(view)}`, status: "", color: "muted" }
 }
 export function detailLines(run, metrics, now = Date.now()) {
   if (!run) return [{ text: "No run selected", color: "muted" }]
   const v = stateView(run.state)
-  const line = (text, color = "base", bold = false) => ({ text, color, bold })
-  const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
-  const d = run.durations ?? {}
   const m = metrics ?? {}
-  const out = [
-    line("Run detail", "base", true),
-    line(`Metrics dispatch ${m.dispatchCount ?? 0} · rebase ${m.rebaseCount ?? 0} · fix ${m.fixCount ?? 0} · merge ${m.mergeCount ?? 0} · ci_wait ${elapsed((m.ciWaitSeconds ?? 0) * 1000)}`, "muted"),
-    line(`ID ${run.id || "-"} · task ${run.taskID || "-"}`, "base", true),
-    line(`${v.marker} ${run.title || run.taskID || "-"}`, v.color, true),
-    line(`State ${run.state} · PR ${run.pr ? `#${run.pr}` : "-"} · ${v.label}`),
-    line(`Branch ${run.branch || "-"} · SHA ${run.sha ? truncate(run.sha, 12) : "-"}`, "muted"),
-    line(`Created ${stamp(run.createdAt)} · Updated ${stamp(run.updatedAt)} · ${ageOf(run, now)}`, "muted"),
-    line(`Durations wait_ci ${elapsed(d.waitingCI * 1000)} · running ${elapsed(d.running * 1000)} · blocked ${elapsed(d.blocked * 1000)}`, "muted"),
-    line(`Attempts ${run.rebaseAttempts}/${run.maxAttempts || "?"} rebase · ${run.fixAttempts}/${run.maxAttempts || "?"} fix`, "muted"),
-    line(`Reason ${run.reason || "-"}`, run.state === "blocked" ? "error" : "base"),
-    line("Timeline", "base", true),
-  ]
+  const d = run.durations ?? {}
+  const field = (name, value, color = "muted", statusColor = "base") => ({
+    marker: "", name, status: truncate(value, VALUE_WIDTH), color, statusColor,
+  })
+  const note = (text, color = "muted") => ({ marker: "", name: text, status: "", color })
+  const out = []
+  out.push(section("Identity"), field("State", `${v.marker} ${run.state} · ${v.label}`, v.color),
+    field("Run", run.id || "-"), field("Task", run.taskID || "-"),
+    field("Title", run.title || "-", "base"), field("PR", run.pr ? `#${run.pr}` : "-"),
+    field("Branch", run.branch || "-"), field("SHA", run.sha ? truncate(run.sha, 12) : "-"))
+  out.push({ marker: "", name: RULE, status: "", color: "muted" })
+  const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
+  out.push(section("Timing"), field("Created", stamp(run.createdAt)), field("Updated", stamp(run.updatedAt)),
+    field("Age", ageOf(run, now)), field("Wait CI", elapsed(d.waitingCI * 1000)),
+    field("Running", elapsed(d.running * 1000)), field("Blocked", elapsed(d.blocked * 1000)))
+  out.push({ marker: "", name: RULE, status: "", color: "muted" })
+  out.push(section("Attempts"), field("Rebase", `${run.rebaseAttempts}/${run.maxAttempts || "?"}`),
+    field("Fix", `${run.fixAttempts}/${run.maxAttempts || "?"}`), field("Dispatch", m.dispatchCount ?? 0),
+    field("Rebases", m.rebaseCount ?? 0), field("Merges", m.mergeCount ?? 0),
+    field("CI wait", elapsed((m.ciWaitSeconds ?? 0) * 1000)))
+  out.push({ marker: "", name: RULE, status: "", color: "muted" })
+  out.push(section("Reason"), note(run.reason || "-", run.state === "blocked" ? "error" : "base"))
+  out.push({ marker: "", name: RULE, status: "", color: "muted" })
+  out.push(section("Timeline"))
   const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
-  timeline.length ? timeline.forEach((e) => out.push(line(`  ${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`, "muted"))) : out.push(line("  (none)", "muted"))
-  out.push(line("Decisions", "base", true))
+  timeline.length ? timeline.forEach((e) => out.push(note(`${stamp(e.at)} ${e.kind || "event"}${e.state ? ` → ${e.state}` : ""}`)))
+    : out.push(note("(none)"))
+  out.push({ marker: "", name: RULE, status: "", color: "muted" })
+  out.push(section("Decisions"))
   const allDecisions = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
   const decisions = allDecisions.slice(-DECISION_LIMIT)
   const earlier = allDecisions.length - decisions.length
-  if (earlier > 0) out.push(line(`  ... ${earlier} earlier decisions`, "muted"))
-  decisions.length ? decisions.forEach((d) => out.push(line(`  ${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd(), "muted"))) : out.push(line("  (none)", "muted"))
+  if (earlier > 0) out.push(note(`... ${earlier} earlier decisions`))
+  decisions.length ? decisions.forEach((d) => out.push(note(`${stamp(d.at)} ${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd())))
+    : out.push(note("(none)"))
   return out
 }
 export function detailCommand(open) {
@@ -129,5 +151,3 @@ export function detailCommand(open) {
     run: () => open(PANEL_NAME),
   }
 }
-
-
