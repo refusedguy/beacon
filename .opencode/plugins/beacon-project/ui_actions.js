@@ -3,17 +3,10 @@
 // transport is injected so the same code path is testable in plain Node.
 import { errorMessage, str } from "./ui_model.js"
 
-export function createActionRunner(ctx, source, { refresh = async () => {}, toast, confirm } = {}) {
+// Shared OSC52 copier. The toast reports the clipboard result, never a guess.
+export function clipboardCopier(ctx, toast) {
   const show = toast ?? ((message, variant = "info") => ctx.ui?.toast?.show?.({ message, variant }))
-  const ask = confirm ?? (async (run) => {
-    if (typeof ctx.ui?.dialog?.confirm !== "function") return undefined
-    return ctx.ui.dialog.confirm({
-      title: "Cancel run",
-      message: `Cancel run ${run.id}? This cannot be undone.`,
-      label: { confirm: "Cancel run", cancel: "Keep run" },
-    })
-  })
-  const copyText = (text) => {
+  return (text, label = text) => {
     if (!text) return false
     const method = ctx.renderer?.copyToClipboardOSC52
     if (typeof method !== "function") {
@@ -22,9 +15,22 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
     }
     let copied = false
     try { copied = method.call(ctx.renderer, text) === true } catch { copied = false }
-    show(copied ? `Copied ${text}` : "Clipboard copy was refused", copied ? "success" : "warning")
+    show(copied ? `Copied ${label}` : "Clipboard copy was refused", copied ? "success" : "warning")
     return copied
   }
+}
+
+export function createActionRunner(ctx, source, { refresh = async () => {}, toast, confirm } = {}) {
+  const show = toast ?? ((message, variant = "info") => ctx.ui?.toast?.show?.({ message, variant }))
+  const copyText = clipboardCopier(ctx, show)
+  const ask = confirm ?? (async (run) => {
+    if (typeof ctx.ui?.dialog?.confirm !== "function") return undefined
+    return ctx.ui.dialog.confirm({
+      title: "Cancel run",
+      message: `Cancel run ${run.id}? This cannot be undone.`,
+      label: { confirm: "Cancel run", cancel: "Keep run" },
+    })
+  })
   const copyID = (run) => copyText([str(run.id), str(run.branch)].filter(Boolean).join(" · "))
   const copyPR = (run) => {
     const url = str(run.prURL)

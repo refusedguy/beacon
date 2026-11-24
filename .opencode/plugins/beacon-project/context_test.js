@@ -2,12 +2,24 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
-  ORCHESTRATOR_KEY, ORCHESTRATOR_RULES, SURVIVAL_KEY, SURVIVAL_RULES,
+  BUILD_REMINDER, ORCHESTRATOR_KEY, ORCHESTRATOR_RULES, SURVIVAL_KEY, SURVIVAL_RULES,
   ensureSurvivalRules, installProjectContext, roleFor, sessionInstructions,
 } from "./context.js"
 
 const SESSION = "ses_current"
+
+function projectRoot(withBuildScript = false) {
+  const root = mkdtempSync(join(tmpdir(), "beacon-context-"))
+  if (withBuildScript) {
+    mkdirSync(join(root, "scripts"))
+    writeFileSync(join(root, "scripts", "build-beacon.sh"), "")
+  }
+  return root
+}
 
 function fakeCtx() {
   const entries = []
@@ -120,10 +132,57 @@ test("read-only and unknown agents get no commit or card rules", async () => {
 test("orchestrator rules warn against duplicate cards and dispatch loops", () => {
   for (const text of [
     "git log -n 10 --oneline", "beacon_recent", "narrow, disjoint Scope",
-    "scripts/build-beacon.sh", "restart the MCP daemon",
+    "Never dispatch blindly",
   ]) {
     assert.ok(ORCHESTRATOR_RULES.includes(text), `orchestrator rules missing ${text}`)
   }
+  assert.ok(!ORCHESTRATOR_RULES.includes("scripts/build-beacon.sh"), "the build reminder is project-specific")
+})
+
+test("worker rules are formatter and package agnostic", () => {
+  for (const text of ["gofmt", "go test", "go vet", "npm ci"]) {
+    assert.ok(!SURVIVAL_RULES.includes(text), `worker rules still assume a stack: ${text}`)
+  }
+  assert.ok(SURVIVAL_RULES.includes("project formatter"))
+  assert.ok(SURVIVAL_RULES.includes("targeted tests for changed packages"))
+  assert.ok(SURVIVAL_RULES.includes("repo-wide linters to CI"))
+})
+
+test("an ordinary project gets no build reminder", async (t) => {
+  const root = projectRoot(false)
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const ctx = fakeCtx()
+  const wanted = await sessionInstructions(ctx, { sessionID: SESSION, agent: "orchestrator" }, {}, root)
+  assert.equal(wanted.value, ORCHESTRATOR_RULES)
+  assert.ok(!wanted.value.includes(BUILD_REMINDER))
+})
+
+test("a Beacon repo gets the conditional build reminder", async (t) => {
+  const root = projectRoot(true)
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const ctx = fakeCtx()
+  const wanted = await sessionInstructions(ctx, { sessionID: SESSION, agent: "orchestrator" }, {}, root)
+  assert.equal(wanted.value, `${ORCHESTRATOR_RULES}\n${BUILD_REMINDER}`)
+  assert.ok(wanted.value.includes("scripts/build-beacon.sh"))
+  assert.ok(wanted.value.includes("restart the MCP daemon"))
+
+  const worker = await sessionInstructions(ctx, { sessionID: SESSION, agent: "worker" }, {}, root)
+  assert.equal(worker.value, SURVIVAL_RULES, "workers never get the build reminder")
+})
+
+test("installProjectContext passes the root to the compaction hook too", async (t) => {
+  const root = projectRoot(true)
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const ctx = fakeCtx()
+  const callbacks = {}
+  ctx.session.hook = async (name, callback) => {
+    callbacks[name] = callback
+    return { dispose() {} }
+  }
+  await installProjectContext(ctx, root)
+  const event = { sessionID: SESSION, agent: "build", system: [] }
+  await callbacks.compaction(event)
+  assert.equal(ctx.puts[0], `${ORCHESTRATOR_RULES}\n${BUILD_REMINDER}`)
 })
 
 test("orchestrator rules ask for status checks before acting on a complaint", () => {

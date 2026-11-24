@@ -173,17 +173,42 @@ export function eventMatchesLocation(eventLocation, ownLocation) {
   return Boolean(left && right && resolve(left) === resolve(right))
 }
 export const tuiLocation = (ctx) => ctx?.location ?? ctx?.data?.location?.default?.() ?? null
-export function readTitle(root, taskID, deps = {}) {
-  const id = str(taskID)
-  if (!id) return ""
-  const path = join(root, "docs", "tasks", `${id}.md`)
+export const CARD_BODY_LINES = 80
+const unquote = (v) => v.trim().replace(/^(["'])(.*)\1$/, "$2").trim()
+
+// Read a card from docs/tasks. A missing or unreadable file returns null so
+// the caller fails closed instead of showing a stale SQLite queue row.
+export function readCard(root, id, deps = {}) {
+  const cardID = str(id)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(cardID)) return null
+  const path = join(root, "docs", "tasks", `${cardID}.md`)
+  let body
   try {
-    if (!(deps.existsSync ?? fsExistsSync)(path)) return id
-    const body = String((deps.readFileSync ?? fsReadFileSync)(path, "utf8"))
-    const front = /^---\s*\r?\n([\s\S]*?)\r?\n---/.exec(body)
-    const m = front && /^title:\s*(.+?)\s*$/m.exec(front[1])
-    return m ? m[1].trim().replace(/^(["'])(.*)\1$/, "$2").trim() || id : id
-  } catch { return id }
+    if (!(deps.existsSync ?? fsExistsSync)(path)) return null
+    body = String((deps.readFileSync ?? fsReadFileSync)(path, "utf8"))
+  } catch { return null }
+  const match = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n?/.exec(body)
+  const meta = Object.create(null)
+  let key = ""
+  for (const line of (match?.[1] ?? "").split(/\r?\n/)) {
+    const item = /^\s+-\s+(.+?)\s*$/.exec(line)
+    if (item && key) { (Array.isArray(meta[key]) ? meta[key] : (meta[key] = [])).push(unquote(item[1])); continue }
+    const field = /^([A-Za-z_][\w-]*):\s*(.*?)\s*$/.exec(line)
+    if (field) { key = field[1].toLowerCase(); meta[key] = field[2] ? unquote(field[2]) : [] }
+  }
+  const text = (name) => { const v = meta[name]; return Array.isArray(v) ? v.join(", ") : str(v) }
+  const rest = match ? body.slice(match[0].length) : body
+  const field = (name) => text(name) || new RegExp(`^${name}:\\s*(.+?)\\s*$`, "im").exec(rest)?.[1] || ""
+  return {
+    id: cardID, title: text("title") || cardID, priority: text("priority"),
+    status: text("status"), scope: field("scope"), depends: field("depends") || field("depends_on"),
+    path, body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
+  }
+}
+export const readTitle = (root, taskID, deps = {}) => readCard(root, taskID, deps)?.title || str(taskID)
+export const cardIsPending = (root, id, deps = {}) => {
+  const card = readCard(root, id, deps)
+  return Boolean(card) && !["done", "dropped"].includes(str(card.status).toLowerCase())
 }
 export function enrichRuns(root, runs, deps = {}) {
   return list(runs, (run) => {
@@ -304,11 +329,17 @@ export class RpcStatusSource {
   }
 }
 export function createStatusSource(ctx, { root, deps = {}, limits = {} } = {}) {
-  const cli = new CliStatusSource({ root: root ?? projectRoot(ctx) ?? process.cwd(), deps, limits })
+  const project = root ?? projectRoot(ctx) ?? process.cwd()
+  const cli = new CliStatusSource({ root: project, deps, limits })
   const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits }) : null
   const fallback = async (name, input) => {
-    if (rpc) { try { return await rpc[name](input) } catch {} }
-    return cli[name](input)
+    let value
+    let usedRPC = false
+    if (rpc) { try { value = await rpc[name](input); usedRPC = true } catch {} }
+    if (!usedRPC) value = await cli[name](input)
+    if (name !== "snapshot") return value
+    const view = normalizeSnapshot(value)
+    return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
   }
   return {
     snapshot: (input = limits) => fallback("snapshot", input),

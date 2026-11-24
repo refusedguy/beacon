@@ -43,11 +43,19 @@ export function daemonAlertItem(daemon) {
 
 export function baseIncidentItem(incident) {
   if (!incident || typeof incident !== "object") return null
+  const id = str(incident.id)
+  const baseBranch = str(incident.baseBranch)
+  const fixerRunID = str(incident.fixerRunID)
+  const failed = failedCheckCount(incident.failedChecks)
+  const hasFailed = typeof failed === "number" ? failed > 0 : Boolean(failed) && failed !== "?"
+  // Go sends a stable zero-value incident when nothing is open. It must not
+  // fabricate a "main RED" banner from that empty object.
+  if (!id && !baseBranch && !fixerRunID && !hasFailed) return null
   return {
     marker: "",
-    name: `🔥 ${str(incident.baseBranch) || "main"} RED (${failedCheckCount(incident.failedChecks)}) · Fixer`,
+    name: `🔥 ${baseBranch || "main"} RED (${failed}) · Fixer`,
     status: "", color: "error", bold: true, banner: true,
-    runID: str(incident.fixerRunID) || undefined,
+    runID: fixerRunID || undefined,
   }
 }
 
@@ -55,11 +63,14 @@ export function queueLineItems(queue = []) {
   return (Array.isArray(queue) ? queue : []).map((item) => {
     const waiting = str(item?.status).toLowerCase() === "waiting_deps"
     const deps = (Array.isArray(item?.dependsOn) ? item.dependsOn : []).map(str).filter(Boolean).join(", ")
+    const cardID = str(item?.id)
     return {
       marker: waiting ? "◌" : "○",
-      name: str(item?.title) || str(item?.id) || "-",
+      name: str(item?.title) || cardID || "-",
       status: `${waiting ? `blocked by ${deps || "deps"}` : "ready"} · P${str(item?.priority) || "?"}`,
       color: "muted",
+      cardID,
+      action: cardID ? `card:${cardID}` : undefined,
     }
   })
 }
