@@ -193,14 +193,32 @@ func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 		t.Fatalf("agent file removed by Remove(): %v", err)
 	}
 
-	// A retry with a dirty stale path force-removes it and recreates the
-	// worktree, so the next dispatch is not blocked by a leftover conflict.
+	// A stale path holding real agent code is never discarded on retry.
+	if _, err := wt.Create(ctx, core.Task{ID: "T-CLEAN"}); core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("Create() with agent code = %v, want CodeConflict", err)
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Fatalf("agent file removed by Create(): %v", err)
+	}
+
+	// A stale path holding only Beacon's card status marker is safe to replace.
+	if err := os.Remove(dirty); err != nil {
+		t.Fatal(err)
+	}
+	cardDir := filepath.Join(ws.Path, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	card := filepath.Join(cardDir, "T-CLEAN.md")
+	if err := os.WriteFile(card, []byte("status: in_progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	recreated, err := wt.Create(ctx, core.Task{ID: "T-CLEAN"})
 	if err != nil {
-		t.Fatalf("Create() with dirty stale path error = %v", err)
+		t.Fatalf("Create() with card-only dirt error = %v", err)
 	}
-	if _, err := os.Stat(dirty); !os.IsNotExist(err) {
-		t.Fatalf("dirty file survived Create(): %v", err)
+	if _, err := os.Stat(card); !os.IsNotExist(err) {
+		t.Fatalf("card-only dirt survived Create(): %v", err)
 	}
 	if clean, err := wt.Clean(ctx, recreated); err != nil || !clean {
 		t.Fatalf("recreated worktree Clean() = %v, %v; want true, nil", clean, err)
@@ -226,6 +244,39 @@ func TestGitWorktreeRemoveCleanWorktreeAndRecreate(t *testing.T) {
 	}
 	if _, err := wt.Create(ctx, task); err != nil {
 		t.Fatalf("Create() after Remove() error = %v", err)
+	}
+}
+
+func TestGitWorktreeRebaseBaseKeepsDirtyCard(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-REBASE-CARD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cardDir := filepath.Join(ws.Path, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	card := filepath.Join(cardDir, "T-NEW.md")
+	if err := os.WriteFile(card, []byte("status: available\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "base2.txt"), []byte("advanced\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo, "add", "base2.txt")
+	gitCmd(t, repo, "commit", "-m", "advance base")
+	gitCmd(t, repo, "push", "origin", "main")
+
+	if err := wt.RebaseBase(ctx, ws, "main"); err != nil {
+		t.Fatalf("RebaseBase() error = %v", err)
+	}
+	if _, err := os.Stat(card); err != nil {
+		t.Fatalf("uncommitted card lost during rebase: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(ws.Path, "base2.txt")); err != nil {
+		t.Fatalf("worktree did not pick up the new base: %v", err)
 	}
 }
 

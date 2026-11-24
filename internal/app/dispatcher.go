@@ -187,9 +187,10 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 		return fmt.Errorf("save: %w", err)
 	}
 	logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
-	if err := d.Source.Claim(ctx, task.ID); err != nil {
-		return err
-	}
+	// MarkInWorkspace already sets in_progress inside the worker branch, and
+	// FindActiveByTask blocks a second run. Claiming through the root source
+	// would only rewrite the card on the operator's main checkout, leaving it
+	// dirty for the next rebase. SQLite is the authoritative claim here.
 	return d.Store.SetTaskStatus(ctx, task.ID, "claimed")
 }
 

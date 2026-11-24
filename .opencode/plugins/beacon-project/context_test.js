@@ -4,7 +4,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   ORCHESTRATOR_KEY, ORCHESTRATOR_RULES, SURVIVAL_KEY, SURVIVAL_RULES,
-  ensureSurvivalRules, installProjectContext, sessionInstructions,
+  ensureSurvivalRules, installProjectContext, roleFor, sessionInstructions,
 } from "./context.js"
 
 const SESSION = "ses_current"
@@ -24,7 +24,7 @@ function fakeCtx() {
           },
           async put({ sessionID, key, value }) {
             assert.equal(sessionID, SESSION)
-            assert.equal(key, SURVIVAL_KEY)
+            assert.ok(key === SURVIVAL_KEY || key === ORCHESTRATOR_KEY)
             puts.push(value)
             const found = entries.find((item) => item.key === key)
             if (found) found.value = value
@@ -62,12 +62,13 @@ test("installProjectContext writes rules only for the current session", async ()
 
   await installProjectContext(ctx, "/project")
 
-  const event = { sessionID: SESSION, system: [], prompt: {} }
+  const event = { sessionID: SESSION, agent: "build", system: [], prompt: {} }
   await callbacks.context(event)
   await callbacks.compaction(event)
   await callbacks.context(event)
 
   assert.equal(ctx.puts.length, 1)
+  assert.equal(ctx.puts[0], ORCHESTRATOR_RULES)
   assert.equal(event.system[0].text, "beacon project root=/project")
 })
 
@@ -75,7 +76,7 @@ test("worker rules list the real Beacon tools", async () => {
   for (const name of [
     "beacon_dispatch", "beacon_watch_pr", "beacon_status", "beacon_recent",
     "beacon_wait", "beacon_control", "beacon_task_create", "beacon_task_delete",
-    "beacon_task_update",
+    "beacon_task_update", "beacon_reconcile",
   ]) {
     assert.ok(SURVIVAL_RULES.includes(name), `worker rules missing ${name}`)
   }
@@ -96,6 +97,33 @@ test("session.get fallback resolves the agent when the event omits it", async ()
   const wanted = await sessionInstructions(ctx, { sessionID: SESSION })
   assert.equal(wanted.key, SURVIVAL_KEY)
   assert.equal(wanted.value, SURVIVAL_RULES)
+})
+
+test("build is the operator's orchestration agent, not a worker", async () => {
+  assert.equal(roleFor("build"), "orchestrator")
+  const ctx = fakeCtx()
+  const wanted = await sessionInstructions(ctx, { sessionID: SESSION, agent: "build" })
+  assert.equal(wanted.key, ORCHESTRATOR_KEY)
+  assert.equal(wanted.value, ORCHESTRATOR_RULES)
+})
+
+test("read-only and unknown agents get no commit or card rules", async () => {
+  assert.equal(roleFor("issue-scout"), "none")
+  assert.equal(roleFor("explore"), null)
+  assert.equal(roleFor(null), null)
+  const ctx = fakeCtx()
+  assert.equal(await sessionInstructions(ctx, { sessionID: SESSION, agent: "issue-scout" }), null)
+  assert.equal(await sessionInstructions(ctx, { sessionID: SESSION, agent: "unknown" }), null)
+  assert.equal(await sessionInstructions(ctx, { sessionID: SESSION }), null)
+})
+
+test("orchestrator rules warn against duplicate cards and dispatch loops", () => {
+  for (const text of [
+    "git log -n 10 --oneline", "beacon_recent", "narrow, disjoint Scope",
+    "scripts/build-beacon.sh", "restart the MCP daemon",
+  ]) {
+    assert.ok(ORCHESTRATOR_RULES.includes(text), `orchestrator rules missing ${text}`)
+  }
 })
 
 test("survivalRulesEnabled false disables role instruction injection", async () => {

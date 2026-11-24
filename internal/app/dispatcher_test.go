@@ -242,13 +242,6 @@ func (f failingHarness) Spawn(context.Context, core.SpawnRequest) (core.Session,
 	return core.Session{}, f.err
 }
 
-type claimFailingSource struct {
-	*fakeSource
-	err error
-}
-
-func (f claimFailingSource) Claim(context.Context, core.TaskID) error { return f.err }
-
 type livenessHarness struct {
 	*fakeHarness
 	alive bool
@@ -292,13 +285,11 @@ func TestDispatchFailureJSONIncludesWorkspaceConflict(t *testing.T) {
 	assertFailureJSON(t, res.Failures, want)
 }
 
-func TestDispatchKeepsRunWithLiveWorkerAfterClaimFailure(t *testing.T) {
+func TestDispatchKeepsRunWithLiveWorkerAfterStatusFailure(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()
-	src := &claimFailingSource{
-		fakeSource: &fakeSource{tasks: []core.Task{{ID: "T-LIVE", Status: core.TaskAvailable}}},
-		err:        errors.New("claim rejected"),
-	}
+	store.taskStatusErr = errors.New("status rejected")
+	src := &fakeSource{tasks: []core.Task{{ID: "T-LIVE", Status: core.TaskAvailable}}}
 	h := &livenessHarness{fakeHarness: &fakeHarness{}, alive: true}
 	ws := &fakeWorkspace{}
 	d := &Dispatcher{
@@ -337,10 +328,8 @@ func TestDispatchKeepsRunWithLiveWorkerAfterClaimFailure(t *testing.T) {
 func TestDispatchClosesRunWhenWorkerIsGone(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()
-	src := &claimFailingSource{
-		fakeSource: &fakeSource{tasks: []core.Task{{ID: "T-DEAD", Status: core.TaskAvailable}}},
-		err:        errors.New("claim rejected"),
-	}
+	store.taskStatusErr = errors.New("status rejected")
+	src := &fakeSource{tasks: []core.Task{{ID: "T-DEAD", Status: core.TaskAvailable}}}
 	h := &livenessHarness{fakeHarness: &fakeHarness{}, alive: false}
 	ws := &fakeWorkspace{}
 	d := &Dispatcher{
@@ -355,7 +344,7 @@ func TestDispatchClosesRunWhenWorkerIsGone(t *testing.T) {
 		t.Fatalf("recent runs = %d, err=%v, want 1", len(recent), err)
 	}
 	saved := store.runs[recent[0].ID]
-	if saved.State != core.RunClosed || saved.Reason != "claim rejected" {
+	if saved.State != core.RunClosed || saved.Reason != "status rejected" {
 		t.Fatalf("state=%s reason=%q, want closed with cause", saved.State, saved.Reason)
 	}
 	if h.stops != 1 || ws.forcedRemoves != 1 || ws.removed != 0 {
@@ -387,6 +376,44 @@ func TestDispatchSpawnFailureForceRemovesDirtyWorktree(t *testing.T) {
 	}
 	if ws.forcedRemoves != 1 || ws.removed != 0 {
 		t.Fatalf("forcedRemoves = %d, removed = %d; want 1 and 0", ws.forcedRemoves, ws.removed)
+	}
+}
+
+func TestDispatchRetriesTaskAfterSpawnFailureForceRemoval(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	ws := &fakeWorkspace{dirty: true}
+	src := &fakeSource{tasks: []core.Task{{ID: "T-RETRY", Status: core.TaskAvailable}}}
+	d := &Dispatcher{
+		Source: src, Planner: NewPlanner(nil), Workspace: ws, Store: store,
+		Harness:     failingHarness{fakeHarness: &fakeHarness{}, err: errors.New("spawn exploded")},
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	first, err := d.Dispatch(ctx, 1)
+	if err != nil || len(first.Failures) != 1 {
+		t.Fatalf("first dispatch: %+v, err=%v", first, err)
+	}
+	if ws.forcedRemoves != 1 || ws.removed != 0 {
+		t.Fatalf("first cleanup: force=%d remove=%d, want 1/0", ws.forcedRemoves, ws.removed)
+	}
+
+	d.Harness = &fakeHarness{}
+	second, err := d.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Failures) != 0 || len(second.Runs) != 1 {
+		t.Fatalf("second dispatch: %+v, want one started run", second)
+	}
+	active, err := store.ListActive(ctx)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("active runs = %d, err=%v, want 1", len(active), err)
+	}
+	if len(src.marked) != 2 || src.marked[1].status != "in_progress" {
+		t.Fatalf("MarkInWorkspace calls = %+v", src.marked)
+	}
+	if len(src.claimed) != 0 {
+		t.Fatalf("root source was claimed %d times, want 0", len(src.claimed))
 	}
 }
 

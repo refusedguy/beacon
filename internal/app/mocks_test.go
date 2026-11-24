@@ -62,13 +62,14 @@ func (f *fakeSource) Remove(_ context.Context, id core.TaskID) error {
 }
 
 type fakeStore struct {
-	runs       map[core.RunID]*core.Run
-	deliveries map[string]bool
-	approvals  map[string]bool
-	tasks      []core.Task
-	ready      []core.Task
-	taskStatus map[string]string
-	incidents  map[string]*core.BaseIncident
+	runs          map[core.RunID]*core.Run
+	deliveries    map[string]bool
+	approvals     map[string]bool
+	tasks         []core.Task
+	ready         []core.Task
+	taskStatus    map[string]string
+	taskStatusErr error
+	incidents     map[string]*core.BaseIncident
 }
 
 func newFakeStore() *fakeStore {
@@ -167,6 +168,9 @@ func (f *fakeStore) ListReadyTasks(context.Context) ([]core.Task, error) {
 	return f.tasks, nil
 }
 func (f *fakeStore) SetTaskStatus(_ context.Context, taskID core.TaskID, status string) error {
+	if f.taskStatusErr != nil {
+		return f.taskStatusErr
+	}
 	f.taskStatus[string(taskID)] = status
 	return nil
 }
@@ -217,9 +221,15 @@ type fakeWorkspace struct {
 	rebases       []string
 	rejectFirst   bool
 	rebaseBaseErr error
+	createErrOnce error
+	creates       int
 }
 
 func (f *fakeWorkspace) Create(_ context.Context, t core.Task) (core.Workspace, error) {
+	f.creates++
+	if f.creates == 1 && f.createErrOnce != nil {
+		return core.Workspace{}, f.createErrOnce
+	}
 	return core.Workspace{Path: "/ws/" + string(t.ID), Branch: "beacon/" + string(t.ID)}, nil
 }
 func (f *fakeWorkspace) Clean(context.Context, core.Workspace) (bool, error) { return !f.dirty, nil }

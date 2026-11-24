@@ -82,6 +82,42 @@ func (g *GitWorktree) status(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(out) == "", nil
 }
 
+// statusCount counts dirty paths, optionally restricted to one pathspec.
+func (g *GitWorktree) statusCount(ctx context.Context, path string, pathspec ...string) (int, error) {
+	args := []string{"status", "--porcelain", "--untracked-files=all"}
+	if len(pathspec) > 0 {
+		args = append(args, "--")
+		args = append(args, pathspec...)
+	}
+	out, err := g.runInDir(ctx, path, args...)
+	if err != nil {
+		return 0, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return 0, nil
+	}
+	return len(strings.Split(out, "\n")), nil
+}
+
+// cardOnlyDirt reports whether a workspace is dirty and whether every dirty
+// path sits under docs/tasks. A Beacon status marker is safe to discard. Agent
+// code outside docs/tasks is not.
+func (g *GitWorktree) cardOnlyDirt(ctx context.Context, path string) (dirty, onlyCards bool, err error) {
+	all, err := g.statusCount(ctx, path)
+	if err != nil {
+		return false, false, err
+	}
+	if all == 0 {
+		return false, true, nil
+	}
+	inside, err := g.statusCount(ctx, path, "docs/tasks")
+	if err != nil {
+		return false, false, err
+	}
+	return true, all == inside, nil
+}
+
 func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspace, error) {
 	branch := branchName(task.ID)
 	path := filepath.Join(g.Dir, unsafeBranchChars.ReplaceAllString(string(task.ID), "-"))
@@ -95,13 +131,25 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	if err := os.MkdirAll(g.Dir, 0o755); err != nil {
 		return core.Workspace{}, err
 	}
+	// A directory removed outside this process can leave a dead administrative
+	// entry. Pruning keeps the later branch and worktree-add steps usable.
+	if _, err := g.run(ctx, "worktree", "prune"); err != nil {
+		slog.Warn("worktree prune failed", "error", err)
+	}
 	if _, err := g.run(ctx, "fetch", "origin", base); err != nil {
 		return core.Workspace{}, err
 	}
 	if _, err := os.Stat(path); err == nil {
-		// A previous dispatch may have left a dirty worktree behind after a
-		// failed spawn. Force-remove it so the task can be dispatched again
-		// instead of failing with a stale-path conflict on every retry.
+		// A failed spawn can leave only the card status marker behind. That
+		// dirt belongs to Beacon and must not block the next dispatch. Real
+		// agent code still stops the create with a conflict.
+		dirty, onlyCards, err := g.cardOnlyDirt(ctx, path)
+		if err != nil {
+			return core.Workspace{}, err
+		}
+		if dirty && !onlyCards {
+			return core.Workspace{}, core.Errorf(core.CodeConflict, "refusing to remove dirty worktree %s", path)
+		}
 		if err := g.ForceRemove(ctx, core.Workspace{Path: path}); err != nil {
 			return core.Workspace{}, err
 		}
@@ -149,7 +197,14 @@ func (g *GitWorktree) RebaseBase(ctx context.Context, ws core.Workspace, base st
 	if _, err := g.runInDir(ctx, ws.Path, "fetch", "origin", base); err != nil {
 		return err
 	}
-	if _, err := g.runInDir(ctx, ws.Path, "rebase", "origin/"+base); err != nil {
+	args := []string{"rebase"}
+	// A card write that lost a race with a merge must not stop a rebase. The
+	// stash is restored afterwards, so an uncommitted new card stays untouched.
+	if dirty, onlyCards, err := g.cardOnlyDirt(ctx, ws.Path); err == nil && dirty && onlyCards {
+		args = append(args, "--autostash")
+	}
+	args = append(args, "origin/"+base)
+	if _, err := g.runInDir(ctx, ws.Path, args...); err != nil {
 		_, _ = g.runInDir(ctx, ws.Path, "rebase", "--abort")
 		return err
 	}

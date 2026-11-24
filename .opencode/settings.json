@@ -1,15 +1,3 @@
 {
-  "$comment": "Keep only settings that map to files in this repository. The removed PreToolUse hook pointed at tests/adapter/new-fact-check.test.js, which does not exist here.",
-  "hookFailureContract": {
-    "$comment": "T3.50 / ADR 0037 п4. Failure contract вызова hook адаптера пробуждения в Go-ядре. Отказ адаптера: код 0 и пустой stdout, причина пишется в лог. Сломанный адаптер не роняет сервер и остальные ожидания. Это контракт вызова hook, а не fail-open JS-плагина из ADR 0006 / T3.5.",
-    "scope": "hook-call",
-    "onError": {
-      "exitCode": 0,
-      "stdout": "",
-      "logReason": true
-    },
-    "isolateWaits": true,
-    "waits": 15,
-    "distinctFrom": ["ADR 0006 plugin fail-open", "T3.5"]
-  }
+  "$comment": "No active OpenCode settings hooks. Beacon project rules live in .opencode/plugins/beacon-project/context.js."
 }

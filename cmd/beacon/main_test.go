@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
@@ -36,6 +37,39 @@ func TestProjectRootFallsBackToWorkingDirectory(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("projectRoot() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadConfigPinsRelativePathsToProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, ".beacon")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "state_db: .beacon/state.db\nworkspace_dir: .beacon/worktrees\n" +
+		"task_source:\n  provider: markdown\n  dir: docs/tasks\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEACON_PROJECT_ROOT", root)
+	t.Chdir(t.TempDir())
+
+	cfg, gotRoot, err := loadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRoot != root {
+		t.Fatalf("root = %q, want %q", gotRoot, root)
+	}
+	for name, got := range map[string]string{
+		"state_db": cfg.StateDB, "workspace_dir": cfg.WorkspaceDir, "task dir": cfg.TaskSource.Dir,
+	} {
+		want := filepath.Join(root, map[string]string{
+			"state_db": ".beacon/state.db", "workspace_dir": ".beacon/worktrees", "task dir": "docs/tasks",
+		}[name])
+		if got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
 	}
 }
 

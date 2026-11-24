@@ -16,6 +16,7 @@ const {
   RULE,
   TITLE_WIDTH,
   beaconStatusDefinition,
+  compactReason,
   createCliStatusSource,
   createRowMount,
   createStatusSource,
@@ -28,10 +29,12 @@ const {
   normalizeRun,
   normalizeSnapshot,
   parseSnapshot,
+  phaseLabel,
   readTitle,
   renderSnapshotLines,
   runLineItems,
   snapshotLineItems,
+  stateBarItem,
   truncate,
   default: beaconStatus,
 } = ui
@@ -51,6 +54,52 @@ test("row items carry stable cells and colors by theme key", () => {
     marker: "▲", name: "T-1 Blocked work", status: "BLOCK", color: "error", bold: true, runID: "run-1",
   })
   assert.deepEqual(detail, { marker: "", name: "#42 3m", status: "waiting CI", color: "muted", runID: "run-1" })
+})
+
+test("compactReason turns noisy failures into readable causes", () => {
+  assert.equal(compactReason("workspace: conflict: refusing to remove dirty worktree at /tmp/wt"), "dirty worktree")
+  assert.equal(compactReason("pull request closed"), "PR closed")
+  assert.equal(compactReason("reconciler: required checks failed"), "required checks failed")
+  assert.equal(compactReason("   "), "")
+})
+
+test("phaseLabel follows the live phase and merged rows drop the reason", () => {
+  const waiting = normalizeRun(makeRun({
+    State: "waiting_ci", Durations: { waiting_ci_seconds: 120, running_seconds: 5, blocked_seconds: 0 },
+  }))
+  assert.equal(phaseLabel(waiting, NOW), "ci 2m")
+  const merged = normalizeRun(makeRun({ State: "merged", Reason: "automatic rebase" }))
+  const [, detail] = runLineItems(merged, NOW, true)
+  assert.equal(detail.status, "")
+  assert.ok(detail.name.startsWith("#42"))
+})
+
+test("recent shows one terminal run per task and skips tasks active again", () => {
+  const snapshot = {
+    active: [makeRun({ ID: "a1", TaskID: "T-ACTIVE", State: "running" })],
+    recent: [
+      makeRun({ ID: "r1", TaskID: "T-ACTIVE", State: "closed", Reason: "PR closed" }),
+      makeRun({ ID: "r2", TaskID: "T-B", State: "closed", Reason: "dirty worktree" }),
+      makeRun({ ID: "r3", TaskID: "T-B", State: "closed", Reason: "old attempt" }),
+      makeRun({ ID: "r4", TaskID: "T-C", State: "merged", Reason: "automatic rebase" }),
+    ],
+  }
+  const rendered = lines(snapshot, null, NOW)
+  assert.equal(rendered.filter((line) => line.includes("T-ACTIVE")).length, 1)
+  assert.equal(rendered.filter((line) => line.includes("T-B")).length, 1)
+  assert.ok(rendered.some((line) => line.includes("dirty worktree")), "the newest cause survives")
+  assert.ok(rendered.some((line) => line.includes("T-C")))
+})
+
+test("state bar legend uses the merge metric instead of the capped recent window", () => {
+  const item = stateBarItem({
+    active: [makeRun({ ID: "r1", State: "running" })],
+    recent: [makeRun({ ID: "r2", State: "merged" })],
+    metrics: { merge_count: 37 },
+  })
+  assert.equal(item.counts.merged, 1)
+  assert.equal(item.mergeTotal, 37)
+  assert.ok(item.content.includes("M37"))
 })
 
 test("a stale transport error keeps the snapshot and clips the marker", () => {
