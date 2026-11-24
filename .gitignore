@@ -13,6 +13,7 @@ bin/
 .beacon/state.db*
 .beacon/worktrees/
 .beacon/connection.json
+.beacon/daemon*
 .beacon/*.lock
 
 # Caches and logs
