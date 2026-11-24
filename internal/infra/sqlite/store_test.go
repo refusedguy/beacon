@@ -568,6 +568,93 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 	}
 }
 
+func TestSnapshotIncludesLocalQueueAndBaseIncident(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	tasks := []core.Task{
+		{ID: "T-1", Title: "ready card", Priority: 5, Status: core.TaskAvailable},
+		{ID: "T-2", Title: "blocked card", Priority: 3, Status: core.TaskAvailable, DependsOn: []core.TaskID{"T-1"}},
+		{ID: "T-3", Title: "done card", Priority: 9, Status: core.TaskDone},
+	}
+	if err := store.SyncTasks(ctx, tasks); err != nil {
+		t.Fatal(err)
+	}
+	incident, err := store.CreateIncident(ctx, &core.BaseIncident{
+		Repo: "owner/repo", BaseBranch: "main", Signature: "sig-1",
+		FailedChecksJSON: `[{"name":"build"}]`, FixerRunID: "r-fixer", Attempts: 2,
+	})
+	if err != nil || incident == nil {
+		t.Fatalf("incident = %+v err=%v", incident, err)
+	}
+	run := core.NewRun("r-snap", "T-1", time.Now().UTC())
+	run.State = core.RunWaitingCI
+	run.PRNumber = 42
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := (app.SnapshotService{Store: store, Repo: "owner/repo"}).Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Queue) != 2 {
+		t.Fatalf("queue = %+v, want two open cards", snap.Queue)
+	}
+	if snap.Queue[0].ID != "T-1" || snap.Queue[0].Status != "ready" || snap.Queue[0].DependsOn == nil {
+		t.Fatalf("first queue item = %+v", snap.Queue[0])
+	}
+	if snap.Queue[1].ID != "T-2" || snap.Queue[1].Status != "waiting_deps" ||
+		len(snap.Queue[1].DependsOn) != 1 || snap.Queue[1].DependsOn[0] != "T-1" {
+		t.Fatalf("second queue item = %+v", snap.Queue[1])
+	}
+	if snap.BaseIncident == nil || snap.BaseIncident.ID != incident.ID ||
+		snap.BaseIncident.BaseBranch != "main" || len(snap.BaseIncident.FailedChecks) != 1 ||
+		snap.BaseIncident.FailedChecks[0] != "build" || snap.BaseIncident.Attempts != 2 {
+		t.Fatalf("base incident = %+v", snap.BaseIncident)
+	}
+	if snap.Daemon == nil || snap.Daemon.State == "" {
+		t.Fatalf("daemon = %+v, want non-null", snap.Daemon)
+	}
+	if len(snap.Active) != 1 || snap.Active[0].PRURL != "https://github.com/owner/repo/pull/42" {
+		t.Fatalf("active = %+v", snap.Active)
+	}
+}
+
+func TestLastDecisionReturnsNewestForRun(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if last, err := store.LastDecision(ctx, "r-none"); err != nil || last != nil {
+		t.Fatalf("missing decision = %+v err=%v", last, err)
+	}
+	base := time.Now().UTC().Add(-time.Minute)
+	for i, tc := range []struct{ reason, sha string }{{"first", "sha0"}, {"second", "sha1"}} {
+		if err := store.RecordDecision(ctx, app.Decision{
+			Kind: "reconcile.decision", RunID: "r1", Verdict: "wait",
+			Reason: tc.reason, At: base.Add(time.Duration(i) * time.Second),
+			Fields: map[string]any{"head_sha": tc.sha, "state": "waiting_ci"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last, err := store.LastDecision(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last == nil || last.Reason != "second" || last.Fields["head_sha"] != "sha1" {
+		t.Fatalf("last decision = %+v", last)
+	}
+}
+
 func TestRunEventMigrationBackfillsExistingRuns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	legacy, err := sql.Open("sqlite", "file:"+path)

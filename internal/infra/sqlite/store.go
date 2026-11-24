@@ -361,6 +361,97 @@ WHERE run_id IN (%s) OR run_id = '' GROUP BY kind, verdict, action`, runIDs)
 	return out, rows.Err()
 }
 
+// LastDecision returns the newest stored decision for a run. It implements
+// app.DecisionLookup so unchanged reconcile decisions can be skipped.
+func (s *Store) LastDecision(ctx context.Context, runID string) (*app.Decision, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+decisionColumns+`
+FROM decisions WHERE run_id=? ORDER BY at DESC, id DESC LIMIT 1`, runID)
+	var d app.Decision
+	var at int64
+	var fields string
+	err := row.Scan(&d.ID, &at, &d.CycleID, &d.Kind, &d.RunID, &d.TaskID,
+		&d.PRNumber, &d.Verdict, &d.Action, &d.Reason, &fields)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.At = time.Unix(0, at).UTC()
+	if err := json.Unmarshal([]byte(fields), &d.Fields); err != nil {
+		return nil, fmt.Errorf("fields_json: %w", err)
+	}
+	return &d, nil
+}
+
+// ListQueueTasks reads local task cards and their unresolved dependencies
+// straight from SQLite. It makes no SCM or task-source calls, so a snapshot
+// stays safe for both markdown and remote task sources.
+func (s *Store) ListQueueTasks(ctx context.Context) ([]app.QueueTask, error) {
+	if err := s.ensureTaskColumns(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, title, priority FROM tasks
+WHERE status NOT IN ('done', 'dropped') ORDER BY priority DESC, id`)
+	if err != nil {
+		return nil, err
+	}
+	queue := []app.QueueTask{}
+	byID := make(map[string]int)
+	for rows.Next() {
+		var task app.QueueTask
+		if err := rows.Scan(&task.ID, &task.Title, &task.Priority); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		task.DependsOn = []string{}
+		queue = append(queue, task)
+		byID[task.ID] = len(queue) - 1
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	deps, err := s.db.QueryContext(ctx, `
+SELECT d.task_id, d.depends_on FROM task_deps d
+LEFT JOIN tasks t ON t.id = d.depends_on
+WHERE t.status NOT IN ('done', 'dropped') OR t.id IS NULL
+ORDER BY d.task_id, d.depends_on`)
+	if err != nil {
+		return nil, err
+	}
+	defer deps.Close()
+	for deps.Next() {
+		var taskID, dependsOn string
+		if err := deps.Scan(&taskID, &dependsOn); err != nil {
+			return nil, err
+		}
+		if i, ok := byID[taskID]; ok {
+			queue[i].DependsOn = append(queue[i].DependsOn, dependsOn)
+			queue[i].Waiting = true
+		}
+	}
+	return queue, deps.Err()
+}
+
+// CurrentIncident returns the newest open base-branch incident, if any.
+func (s *Store) CurrentIncident(ctx context.Context) (*core.BaseIncident, error) {
+	incidents, err := s.ListOpenIncidents(ctx)
+	if err != nil || len(incidents) == 0 {
+		return nil, err
+	}
+	current := incidents[0]
+	for _, in := range incidents[1:] {
+		if in.CreatedAt > current.CreatedAt || (in.CreatedAt == current.CreatedAt && in.ID > current.ID) {
+			current = in
+		}
+	}
+	return current, nil
+}
+
 func inQuery(template string, ids []string) (string, []any) {
 	args := make([]any, len(ids))
 	for i, id := range ids {
@@ -371,4 +462,7 @@ func inQuery(template string, ids []string) (string, []any) {
 
 var _ core.RunStore = (*Store)(nil)
 var _ app.DecisionSink = (*Store)(nil)
+var _ app.DecisionLookup = (*Store)(nil)
 var _ app.SnapshotStore = (*Store)(nil)
+var _ app.QueueStore = (*Store)(nil)
+var _ app.IncidentStore = (*Store)(nil)

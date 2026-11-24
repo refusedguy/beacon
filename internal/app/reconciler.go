@@ -10,6 +10,10 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// defaultOrphanTimeout is how long a running run without a PR may go stale
+// before its worker session is checked for liveness.
+const defaultOrphanTimeout = 90 * time.Second
+
 type Reconciler struct {
 	Store           core.RunStore
 	SCM             core.ScmGateway
@@ -26,6 +30,7 @@ type Reconciler struct {
 	BaseRedMode     string
 	MaxFixTries     int
 	Interval        time.Duration
+	OrphanTimeout   time.Duration
 	Events          <-chan core.HarnessEvent
 	AutoRebase      bool
 }
@@ -238,6 +243,7 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 				slog.Error("list runs", "error", err)
 				continue
 			}
+			r.reconcileOrphanRunning(ctx, runs)
 			for _, run := range runs {
 				if run.PRNumber > 0 {
 					r.safeReconcile(ctx, run.PRNumber)

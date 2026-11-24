@@ -59,10 +59,11 @@ func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Action string `json:"action"`
-		RunID  string `json:"run_id"`
-		SHA    string `json:"sha"`
-		PR     int    `json:"pr"`
+		Action  string `json:"action"`
+		RunID   string `json:"run_id"`
+		SHA     string `json:"sha"`
+		PR      int    `json:"pr"`
+		Message string `json:"message"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 1<<16)).Decode(&in); err != nil {
 		http.Error(rw, "bad json", http.StatusBadRequest)
@@ -81,6 +82,8 @@ func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
 		err = a.wiring.control.Cancel(r.Context(), id)
 	case "retry":
 		err = a.wiring.control.Retry(r.Context(), id)
+	case "nudge":
+		err = a.wiring.control.Nudge(r.Context(), id, in.Message)
 	default:
 		http.Error(rw, "unknown action", http.StatusBadRequest)
 		return
