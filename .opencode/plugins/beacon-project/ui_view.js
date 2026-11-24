@@ -5,11 +5,15 @@ import {
   normalizeSnapshot, str,
 } from "./ui_model.js"
 import {
-  baseIncidentItem, daemonAlertItem, dispatchItem, nextStepLine,
-  queueLineItems, readyCount, timelineText,
+  baseIncidentItem, checkRow, checksSummary, compactReason, daemonAlertItem,
+  dispatchItem, nextStepLine, queueLineItems, readyCount, timelineText, truncate,
 } from "./ui_alerts.js"
 
-export const STATE_BAR_WIDTH = 38
+export const STATE_BAR_WIDTH = 30
+// If the host font lacks U+2501, switch FILLED to █ here. Nothing else needs
+// to change because every filled segment reads this constant.
+export const STATE_BAR_FILLED = "━"
+export const STATE_BAR_EMPTY = "─"
 export const STATE_BAR_KEYS = Object.freeze(["running", "waiting_ci", "blocked", "merged"])
 const STATE_BAR_COLOR = Object.freeze({ running: "success", waiting_ci: "info", blocked: "error", merged: "success" })
 const STATE_BAR_LETTER = Object.freeze({ running: "R", waiting_ci: "C", blocked: "B", merged: "M" })
@@ -40,10 +44,6 @@ export const SIDEBAR_OPEN = Object.freeze({ active: true, queue: false, recent: 
 export const DETAIL_OPEN = Object.freeze({ why: true, checks: true, timeline: true, technical: false })
 export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "pr", "help", "copy"])
 
-export function truncate(value, width) {
-  const text = str(value)
-  return text.length <= width ? text : width <= 1 ? text.slice(0, width) : `${text.slice(0, width - 1)}…`
-}
 // The host truncates from the middle, so sidebar names are clipped here from
 // the end with an explicit ellipsis. Detail text keeps its full width.
 export const SIDEBAR_TITLE_WIDTH = 29
@@ -71,27 +71,6 @@ function timeOf(v) {
 }
 export const ageOf = (run, now) => { const t = Math.max(timeOf(run?.updatedAt), timeOf(run?.createdAt)); return t ? elapsed(now - t) : "" }
 export const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(run?.updatedAt); return a && b ? elapsed(b - a) : "" }
-const REASON_RULES = [
-  [/^workspace:\s*conflict:\s*refusing to remove dirty worktree\b.*/i, "dirty worktree"],
-  [/^workspace:\s*conflict:\s*/i, ""],
-  [/^workspace:\s*/i, ""],
-  [/^conflict:\s*/i, ""],
-  [/^pull request closed\b.*/i, "PR closed"],
-  [/pull request closed/i, "PR closed"],
-  [/^reconciler:\s*/i, ""],
-  [/^harness:\s*/i, ""],
-  [/^mark in workspace:\s*/i, ""],
-  [/^spawn:\s*/i, "spawn: "],
-  [/^status:\s*/i, ""],
-]
-export function compactReason(reason) {
-  let text = str(reason).replace(/\s+/g, " ").trim()
-  if (!text) return ""
-  for (const [pattern, replacement] of REASON_RULES) {
-    if (pattern.test(text)) { text = text.replace(pattern, replacement); break }
-  }
-  return truncate(text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim(), REASON_WIDTH)
-}
 export function phaseLabel(run, now = Date.now()) {
   const d = run.durations ?? {}
   const state = str(run.state).toLowerCase()
@@ -155,8 +134,8 @@ export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
   let spare = filled - cells.reduce((sum, n) => sum + n, 0)
   const byFraction = exact.map((value, i) => ({ i, fraction: value - cells[i] })).sort((a, b) => b.fraction - a.fraction)
   for (let i = 0; spare > 0; i += 1, spare -= 1) cells[byFraction[i].i] += 1
-  const segments = STATE_BAR_KEYS.map((key, i) => ({ text: "█".repeat(cells[i]), color: STATE_BAR_COLOR[key] }))
-  segments.push({ text: "░".repeat(STATE_BAR_WIDTH - filled), color: "muted" })
+  const segments = STATE_BAR_KEYS.map((key, i) => ({ text: STATE_BAR_FILLED.repeat(cells[i]), color: STATE_BAR_COLOR[key] }))
+  segments.push({ text: STATE_BAR_EMPTY.repeat(STATE_BAR_WIDTH - filled), color: "muted" })
   const bar = segments.map((s) => s.text).join("")
   const mergeTotal = view.metrics?.mergeCount ?? counts.merged
   const legend = STATE_BAR_KEYS.map((key) => `${STATE_BAR_LETTER[key]}${key === "merged" ? mergeTotal : counts[key]}`).join(" ")
@@ -186,11 +165,16 @@ export function runLineItems(run, now = Date.now(), recent = false) {
   const errorReason = state === "blocked" || state === "closed" || state === "needs_agent_fix"
   const secondLine = { marker: ref, markerSpace: true, name: duration, status: reason,
     color: "muted", statusColor: errorReason ? "error" : "muted", runID: run.id }
-  if (recent) return [
-    { marker: v.marker, markerSpace: true, name: title, status: recentBadge(run), color: "muted",
-      bold: false, recent: true, runID: run.id },
-    { ...secondLine, recent: true },
-  ]
+  if (recent) {
+    const badge = recentBadge(run)
+    const tone = badge === "DUP" ? "muted" : badge === "ERR" ? "error" : "success"
+    return [
+      { marker: badge === "OK" ? "✔" : "✖", markerSpace: true, name: title, status: badge,
+        color: tone, markerColor: tone, nameColor: "muted", nameBold: false, statusColor: tone,
+        recent: true, runID: run.id },
+      { ...secondLine, markerSpace: 2, recent: true, markerColor: "muted" },
+    ]
+  }
   return [
     { marker: v.marker, markerSpace: true, name: title, status: v.label, color: v.color, bold: true, runID: run.id },
     secondLine,
@@ -218,14 +202,15 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   const ready = readyCount(view.queue)
   listItems.push(sectionItem("Active", active.length, "active", open.active !== false))
   if (open.active !== false) {
-    if (!active.length) listItems.push({ marker: "", name: "No active runs", status: "", color: "muted" })
-    active.forEach((run) => listItems.push(...runLineItems(run, now)))
-    listItems.push(dispatchItem(ready))
+    if (!active.length && ready === 0) {
+      listItems.push({ marker: "", name: "Idle · no ready tasks", status: "", color: "muted" })
+    } else {
+      if (!active.length) listItems.push({ marker: "", name: "No active runs", status: "", color: "muted" })
+      active.forEach((run) => listItems.push(...runLineItems(run, now)))
+      listItems.push(dispatchItem(ready))
+    }
   }
-  listItems.push({
-    ...sectionItem("Queue", view.queue.length, "queue", open.queue === true),
-    name: `Queue (${view.queue.length})`, status: "",
-  })
+  listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
   if (open.queue === true) listItems.push(...queueLineItems(view.queue))
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
   if (open.recent !== false) {
@@ -268,9 +253,11 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
   const v = stateView(run.state)
   const state = str(run.state).toLowerCase()
   const rows = []
-  const isOpen = (key) => key === "technical" ? open.technical === true : open[key] !== false
-  const header = (label, key) => rows.push({
-    marker: isOpen(key) ? "▼" : "▶", name: label, status: "",
+  const problem = state === "blocked" || state === "closed" || state === "needs_agent_fix"
+  const isOpen = (key) => key === "why" && problem ? true
+    : key === "technical" ? open.technical === true : open[key] !== false
+  const header = (label, key, status = "") => rows.push({
+    marker: isOpen(key) ? "▼" : "▶", name: label, status,
     color: "action", bold: true, statusColor: "muted", sectionKey: key, kind: "section",
   })
   const row = (item) => rows.push(item)
@@ -279,26 +266,21 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
   if (isOpen("why")) {
     const reason = state === "merged" ? mergedReason(run) : str(run.reason).trim()
     row({ marker: "", name: reason || "No reason recorded", status: "", kind: "reason",
-      color: state === "blocked" || state === "closed" || state === "needs_agent_fix" ? "error" : "base" })
+      color: problem ? "error" : "base" })
   }
-  header("CI Checks", "checks")
+  const checks = run.checks ?? []
+  header("CI Checks", "checks", checksSummary(checks))
   if (isOpen("checks")) {
-    const checks = run.checks ?? []
     if (!checks.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "check" })
-    else checks.forEach((c) => {
-      const failed = c.state === "failure"
-      row({ marker: failed ? "✖" : c.state === "success" ? "✔" : "◐",
-        name: `${c.name || "check"} ${c.state || "unknown"}`,
-        status: c.durationSeconds ? elapsed(c.durationSeconds * 1000) : "",
-        color: failed ? "error" : "muted", kind: "check" })
-    })
+    else checks.forEach((c) => row(checkRow(c)))
   }
   header("Timeline", "timeline")
   if (isOpen("timeline")) {
     const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
     if (!timeline.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "timeline" })
     else timeline.forEach((e) => row({
-      marker: key(stamp(e.at)), name: timelineText(e), status: "", color: "muted", kind: "timeline",
+      marker: key(stamp(e.at)), name: timelineText(e), status: "", color: "muted",
+      markerColor: "muted", nameColor: "base", kind: "timeline",
     }))
   }
   header("Technical", "technical")

@@ -49,7 +49,9 @@ export function createLineMount(ui, {
       const nameFG = color(item.nameColor ?? item.color ?? "base")
       // The host does not apply the box gap between text cells. Run markers
       // carry markerSpace so "✔" never runs into the title as "✔Hotfix".
-      setProp(marker, "content", item.markerSpace && item.marker ? `${item.marker} ` : item.marker ?? "")
+      // A numeric markerSpace aligns a second line under its title.
+      const gap = item.markerSpace === true ? 1 : Number(item.markerSpace) || 0
+      setProp(marker, "content", gap && item.marker ? `${item.marker}${" ".repeat(gap)}` : item.marker ?? "")
       setProp(marker, "fg", markerFG)
       setProp(name, "content", item.text ?? item.name ?? "")
       setProp(name, "fg", nameFG)
@@ -73,7 +75,9 @@ export function createSegmentBar(ui, color) {
     const node = createElement("text")
     setProp(node, "wrapMode", "none")
     setProp(node, "selectable", false)
-    setProp(node, "truncate", true)
+    setProp(node, "truncate", false)
+    setProp(node, "flexShrink", 0)
+    setProp(node, "visible", false)
     insert(box, node)
     return node
   })
@@ -81,6 +85,8 @@ export function createSegmentBar(ui, color) {
     const segment = segments[i]
     setProp(node, "content", segment?.text ?? "")
     setProp(node, "fg", color(segment?.color ?? "muted"))
+    // An empty segment stays hidden so it takes no width and leaves no indent.
+    setProp(node, "visible", Boolean(segment?.text))
   })
   return { node: box, apply }
 }

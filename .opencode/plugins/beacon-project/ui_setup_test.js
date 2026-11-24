@@ -7,7 +7,7 @@ const { EMPTY_SNAPSHOT, beaconStatusDefinition, createRowMount, snapshotLineItem
 
 function barNode(container) {
   return container.children.find((child) =>
-    child.children?.some((cell) => /[█░]/.test(String(cell.props?.content ?? ""))))
+    child.children?.some((cell) => /[━─]/.test(String(cell.props?.content ?? ""))))
 }
 function signals() {
   return { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } }
@@ -39,8 +39,8 @@ test("state bar builds a proportional one-row visualization", () => {
   })
   assert.deepEqual(item.counts, { running: 2, waiting_ci: 1, blocked: 1, merged: 1 })
   assert.equal(item.filled, 5)
-  assert.equal((item.bar.match(/█/g) ?? []).length, 5)
-  assert.equal((item.bar.match(/░/g) ?? []).length, ui.STATE_BAR_WIDTH - 5)
+  assert.equal((item.bar.match(/━/g) ?? []).length, 5)
+  assert.equal((item.bar.match(/─/g) ?? []).length, ui.STATE_BAR_WIDTH - 5)
   assert.equal(item.fg, "error")
 })
 

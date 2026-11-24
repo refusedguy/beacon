@@ -36,7 +36,7 @@ export function sidebarPresentation(items = []) {
       name: truncateSidebarTitle(item.name),
       nameColor: recent ? "muted" : "base",
       nameBold: recent ? false : attention,
-      markerColor: recent ? "muted" : item.color ?? "muted",
+      markerColor: item.markerColor ?? (recent ? "muted" : item.color ?? "muted"),
       statusColor: item.statusColor ?? (recent || isRef ? "muted" : item.color ?? "muted"),
     }
   })
@@ -61,7 +61,12 @@ export function createSidebarMount(ui, deps) {
   const bar = createSegmentBar(ui, color)
   insert(container, bar.node)
 
-  const meta = createLineMount(ui, { ...deps, maxLines: 2 })
+  // The legend is a plain text node at column 0, not a pooled marker cell.
+  const legend = createText(ui, { content: "", fg: color("muted") })
+  set(legend, "flexShrink", 0)
+  insert(container, legend)
+
+  const meta = createLineMount(ui, { ...deps, maxLines: 1 })
   meta.node.forEach((node) => insert(container, node))
 
   const list = createLineMount(ui, { ...deps, maxLines: SIDEBAR_LINES })
@@ -91,11 +96,12 @@ export function createSidebarMount(ui, deps) {
     set(headerName, "content", "Beacon")
     set(headerSummary, "content", model.summary ?? "")
     bar.apply(model.segments)
-    const metaItems = [{ marker: "", name: model.legend, status: "", color: "muted" }]
+    set(legend, "content", model.legend ?? "")
+    const metaItems = []
     if (error) metaItems.push({ marker: "", name: `[stale] ${error}`, status: "", color: "warning" })
     meta.apply(metaItems)
     list.apply(sidebarPresentation(model.listItems))
     decorateRows()
   }
-  return { node: container, apply, header, headerName, headerSummary, bar: bar.node }
+  return { node: container, apply, header, headerName, headerSummary, legend, bar: bar.node }
 }

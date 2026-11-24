@@ -45,7 +45,7 @@ test("sidebar renders a flat header, state bar legend and two lines per run", ()
   assert.equal(result[3], "▲ T-1 BLK")
   assert.equal(result[4], "#42 3m dirty worktree")
   assert.equal(result[5], "No tasks ready")
-  assert.equal(result[6], "▶ Queue (0)")
+  assert.equal(result[6], "▶ Queue 0")
   assert.equal(result[7], "▼ Recent 0")
   assert.equal(result[8], "No recent runs")
 })
@@ -297,7 +297,7 @@ test("errorMessage handles Error, plain object and string", () => {
 
 test("empty snapshot renders both sections with an honest dispatch label", () => {
   assert.deepEqual(renderSnapshotLines(EMPTY_SNAPSHOT), [
-    "Beacon 0 active", "R0 C0 B0 M0", "▼ Active 0", "No active runs",
-    "No tasks ready", "▶ Queue (0)", "▼ Recent 0", "No recent runs",
+    "Beacon 0 active", "R0 C0 B0 M0", "▼ Active 0", "Idle · no ready tasks",
+    "▶ Queue 0", "▼ Recent 0", "No recent runs",
   ])
 })

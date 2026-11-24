@@ -1,6 +1,7 @@
-// Presentation helpers for daemon and incident alerts, the task queue and
-// human timeline copy. This module keeps ui_view.js under the 350-line limit.
-import { failedCheckCount, str } from "./ui_model.js"
+// Presentation helpers for daemon and incident alerts, the queue, compact
+// reasons, CI checks and human timeline copy. This module keeps ui_view.js
+// under the 350-line limit.
+import { failedCheckCount, REASON_WIDTH, str } from "./ui_model.js"
 
 const ALERT_STATES = Object.freeze(["dead", "stale"])
 const TIMELINE_TEXT = Object.freeze({
@@ -84,3 +85,71 @@ const NEXT_STEPS = Object.freeze({
 })
 
 export const nextStepLine = (run) => run ? (NEXT_STEPS[str(run.state).toLowerCase()] ?? "") : ""
+
+// The host truncates from the middle, so clipped text is cut here from the end.
+// No ellipsis ever appears in the middle of a rendered string.
+export function truncate(value, width) {
+  const text = str(value)
+  return text.length <= width ? text : width <= 1 ? text.slice(0, width) : `${text.slice(0, width - 1)}…`
+}
+
+const REASON_RULES = [
+  [/^workspace:\s*conflict:\s*refusing to remove dirty worktree\b.*/i, "dirty worktree"],
+  [/^workspace:\s*conflict:\s*/i, ""],
+  [/^workspace:\s*/i, ""],
+  [/^conflict:\s*/i, ""],
+  [/^pull request closed\b.*/i, "PR closed"],
+  [/pull request closed/i, "PR closed"],
+  [/^reconciler:\s*/i, ""],
+  [/^harness:\s*/i, ""],
+  [/^mark in workspace:\s*/i, ""],
+  [/^spawn:\s*/i, "spawn: "],
+  [/^status:\s*/i, ""],
+]
+export function compactReason(reason) {
+  let text = str(reason).replace(/\s+/g, " ").trim()
+  if (!text) return ""
+  for (const [pattern, replacement] of REASON_RULES) {
+    if (pattern.test(text)) { text = text.replace(pattern, replacement); break }
+  }
+  return truncate(text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim(), REASON_WIDTH)
+}
+
+export function clockDuration(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m${s % 60 ? `${s % 60}s` : ""}`
+  return `${Math.floor(m / 60)}h${m % 60 ? `${m % 60}m` : ""}`
+}
+
+const CHECK_STATE = Object.freeze({
+  failure: "failed", failed: "failed", error: "failed",
+  pending: "pending", in_progress: "pending", queued: "pending",
+  skipped: "skipped", neutral: "skipped",
+})
+export function checkRow(check) {
+  const state = str(check?.state).toLowerCase()
+  const failed = state === "failure" || state === "failed" || state === "error"
+  const short = CHECK_STATE[state] ?? ""
+  const name = str(check?.name) || "check"
+  return {
+    marker: failed ? "✖" : state === "success" ? "✔" : "◐",
+    markerSpace: true,
+    name: short && state !== "success" ? `${name} ${short}` : name,
+    status: check?.durationSeconds ? clockDuration(check.durationSeconds) : "",
+    statusColor: "muted",
+    color: failed ? "error" : "muted",
+    kind: "check",
+  }
+}
+
+export function checksSummary(checks = []) {
+  const list = Array.isArray(checks) ? checks : []
+  if (!list.length) return ""
+  const passed = list.filter((c) => str(c?.state).toLowerCase() === "success").length
+  const failed = list.length - passed
+  const total = list.reduce((n, c) => n + (Number(c?.durationSeconds) || 0), 0)
+  const duration = total > 0 ? ` · ${clockDuration(total)}` : ""
+  return failed ? `${failed} failed · ${passed}/${list.length}` : `${passed}/${list.length}${duration}`
+}

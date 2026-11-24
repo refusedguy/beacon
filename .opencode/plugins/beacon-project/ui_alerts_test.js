@@ -119,7 +119,7 @@ test("queue lists ready and waiting tasks and Dispatch counts the ready ones", (
   }
   const open = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true })
   const lines = open.listItems.map((i) => [i.marker, i.name, i.status].filter(Boolean).join(" "))
-  assert.ok(lines.includes("▼ Queue (2)"))
+  assert.ok(lines.includes("▼ Queue 2"))
   assert.ok(lines.includes("○ Ready task ready · P9"))
   assert.ok(lines.includes("◌ Blocked task blocked by T-2 · P2"))
   assert.ok(lines.includes("▶ Dispatch (1 ready)"))

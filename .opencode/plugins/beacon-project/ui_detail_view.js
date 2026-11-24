@@ -9,6 +9,11 @@ const ACTION_LABEL = Object.freeze({
   retry: "↻ Retry", approve: "✔ Approve", cancel: "✖ Cancel",
   pr: "⧉ PR URL", help: "💬 Help", copy: "⧉ Copy ID",
 })
+// Cancel is error text on a raised plate, never error text on an error plate.
+const BUTTON_FG = Object.freeze({
+  retry: "success", approve: "success", cancel: "error",
+  pr: "base", help: "action", copy: "base",
+})
 const fieldKey = (text) => text.padEnd(8, " ")
 
 export function createDetailMount(ui, deps) {
@@ -17,11 +22,13 @@ export function createDetailMount(ui, deps) {
   const set = setProp ?? ((node, key, value) => { node.props[key] = value })
   const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
 
-  const header = createBox(ui, { flexDirection: "row", justifyContent: "space-between", minWidth: 0 })
+  const header = createBox(ui, {
+    flexDirection: "row", justifyContent: "space-between", minWidth: 0, flexShrink: 0,
+  })
   const title = createText(ui, { content: "Beacon", fg: color("base"), bold: true })
   set(title, "attributes", BOLD)
   insert(header, title)
-  const controls = createBox(ui, { flexDirection: "row", minWidth: 0 })
+  const controls = createBox(ui, { flexDirection: "row", minWidth: 0, flexShrink: 0 })
   const hint = createText(ui, { content: "ctrl+g", fg: color("action"), onMouseUp: onToggle })
   set(hint, "paddingLeft", 1); set(hint, "paddingRight", 1)
   const gap = createText(ui, { content: " ", fg: color("muted") })
@@ -31,13 +38,16 @@ export function createDetailMount(ui, deps) {
   insert(header, controls)
   insert(container, header)
 
+  // The hero uses the darker panel token so the raised button plates stand out.
   const heroCard = createBox(ui, {
     border: true, borderStyle: "rounded", borderColor: color("action"),
-    backgroundColor: color("raised"), paddingLeft: 1, paddingRight: 1,
-    paddingTop: 1, paddingBottom: 1, marginTop: 1,
+    backgroundColor: color("panel"), paddingLeft: 1, paddingRight: 1,
+    paddingTop: 1, paddingBottom: 1, marginTop: 1, flexShrink: 0,
     flexDirection: "column", minWidth: 0,
   })
-  const badgeRow = createBox(ui, { flexDirection: "row", justifyContent: "space-between", minWidth: 0 })
+  const badgeRow = createBox(ui, {
+    flexDirection: "row", justifyContent: "space-between", minWidth: 0, flexShrink: 0,
+  })
   const badge = createText(ui, { content: "", fg: color("base"), bold: true })
   set(badge, "attributes", BOLD)
   const pr = createText(ui, { content: "", fg: color("info") })
@@ -52,9 +62,9 @@ export function createDetailMount(ui, deps) {
   set(heroTitle, "attributes", BOLD)
   insert(heroCard, heroTitle)
 
-  const fields = createBox(ui, { flexDirection: "column", minWidth: 0, marginTop: 1 })
+  const fields = createBox(ui, { flexDirection: "column", minWidth: 0, marginTop: 1, flexShrink: 0 })
   const kvRow = (name) => {
-    const row = createBox(ui, { flexDirection: "row", minWidth: 0 })
+    const row = createBox(ui, { flexDirection: "row", minWidth: 0, flexShrink: 0 })
     const key = createText(ui, { content: fieldKey(name), fg: color("muted") })
     const spacer = createText(ui, { content: " ", fg: color("muted") })
     const value = createText(ui, { content: "", fg: color("base"), wrap: true, grow: true })
@@ -68,24 +78,25 @@ export function createDetailMount(ui, deps) {
   insert(heroCard, fields)
 
   const nextStep = createText(ui, { content: "", fg: color("warning"), wrap: true })
+  set(nextStep, "flexShrink", 0)
   insert(heroCard, nextStep)
 
-  // Each action is a padded box. Copy ID stays mounted and visible so merged
-  // and closed runs can still be copied. Cancel shows an inline confirmation.
+  // Each action is a padded raised plate. Copy ID stays mounted so merged and
+  // closed runs can still be copied. Cancel shows an inline confirmation.
   const showConfirm = (visible) => set(confirmBox, "visible", visible)
-  const actions = createBox(ui, { flexDirection: "row", minWidth: 0, marginTop: 1 })
+  const actions = createBox(ui, { flexDirection: "row", minWidth: 0, marginTop: 1, flexShrink: 0 })
   const buttons = Object.create(null)
   const buttonBoxes = Object.create(null)
   for (const name of ACTION_NAMES) {
-    const baseBg = color(name === "cancel" ? "error" : name === "retry" ? "warning" : "raised")
+    const baseBg = color("raised")
     const box = createBox(ui, {
-      flexDirection: "row", paddingLeft: 1, paddingRight: 1,
+      flexDirection: "row", flexShrink: 0, paddingLeft: 1, paddingRight: 1,
       marginRight: name === "copy" ? 0 : 1, backgroundColor: baseBg,
-      onMouseOver: () => set(box, "backgroundColor", color("raised")),
+      onMouseOver: () => set(box, "backgroundColor", color("panel")),
       onMouseOut: () => set(box, "backgroundColor", baseBg),
     })
     const text = createText(ui, {
-      content: ACTION_LABEL[name], fg: color(name === "cancel" ? "error" : "action"),
+      content: ACTION_LABEL[name], fg: color(BUTTON_FG[name]),
       name: `beacon-action-${name}`,
       onMouseUp: () => (name === "cancel" ? showConfirm(true) : onAction(name)),
     })
@@ -102,16 +113,31 @@ export function createDetailMount(ui, deps) {
   const confirmBox = createBox(ui, {
     border: true, borderStyle: "rounded", borderColor: color("error"),
     backgroundColor: color("raised"), paddingLeft: 1, paddingRight: 1,
-    paddingTop: 1, paddingBottom: 1, marginTop: 1,
+    paddingTop: 1, paddingBottom: 1, marginTop: 1, flexShrink: 0,
     flexDirection: "column", minWidth: 0, visible: false,
   })
-  const confirmText = createText(ui, { content: "Отменить этот ран?", fg: color("error"), bold: true })
+  const confirmText = createText(ui, { content: "Cancel this run?", fg: color("error"), bold: true })
   set(confirmText, "attributes", BOLD)
-  const confirmActions = createBox(ui, { flexDirection: "row", minWidth: 0, marginTop: 1 })
-  const yes = createText(ui, { content: "Да, отменить", fg: color("error"),
+  const confirmActions = createBox(ui, {
+    flexDirection: "row", minWidth: 0, marginTop: 1, flexShrink: 0,
+  })
+  const yesBox = createBox(ui, {
+    flexDirection: "row", flexShrink: 0, paddingLeft: 1, paddingRight: 1,
+    marginRight: 1, backgroundColor: color("raised"),
+  })
+  const confirmYes = createText(ui, { content: "[ Confirm Cancel ]", fg: color("error"),
     onMouseUp: () => { showConfirm(false); onAction("cancel", { confirmed: true }) } })
-  const no = createText(ui, { content: "Нет", fg: color("muted"), onMouseUp: () => showConfirm(false) })
-  insert(confirmActions, yes); insert(confirmActions, no)
+  insert(yesBox, confirmYes)
+  const confirmSpacer = createText(ui, { content: " ", fg: color("muted") })
+  set(confirmSpacer, "flexShrink", 0)
+  const noBox = createBox(ui, {
+    flexDirection: "row", flexShrink: 0, paddingLeft: 1, paddingRight: 1,
+    backgroundColor: color("raised"),
+  })
+  const confirmNo = createText(ui, { content: "[ Keep ]", fg: color("muted"),
+    onMouseUp: () => showConfirm(false) })
+  insert(noBox, confirmNo)
+  insert(confirmActions, yesBox); insert(confirmActions, confirmSpacer); insert(confirmActions, noBox)
   insert(confirmBox, confirmText); insert(confirmBox, confirmActions)
   insert(heroCard, confirmBox)
   insert(container, heroCard)
@@ -135,6 +161,8 @@ export function createDetailMount(ui, deps) {
       set(box, "backgroundColor", color("raised"))
       set(box, "paddingLeft", 1)
       set(box, "paddingRight", 1)
+      set(box, "paddingTop", 1)
+      set(box, "paddingBottom", 1)
       set(box, "marginTop", 1)
     }
   }
@@ -165,7 +193,7 @@ export function createDetailMount(ui, deps) {
     body.node.forEach((box, i) => decorate(box, rows[i]))
   }
   return {
-    node: container, apply, buttons, buttonBoxes, heroCard, confirmBox, body,
-    fixer, nextStep, open: DETAIL_OPEN,
+    node: container, apply, buttons, buttonBoxes, heroCard, confirmBox,
+    confirmYes, confirmNo, confirmSpacer, body, fixer, nextStep, open: DETAIL_OPEN,
   }
 }
