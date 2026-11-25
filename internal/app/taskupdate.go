@@ -173,10 +173,10 @@ func applyGraphUpdate(task core.Task, in UpdateInput) core.Task {
 		task.Priority = *in.Priority
 	}
 	if in.Kind != nil {
-		task.Kind = normalizeKind(core.TaskKind(*in.Kind))
+		task.Kind = core.NormalizeTaskKind(core.TaskKind(*in.Kind))
 	}
 	if in.RequireReview != nil {
-		task.RequireReview = normalizeReview(core.ReviewMode(*in.RequireReview))
+		task.RequireReview = core.NormalizeReviewMode(core.ReviewMode(*in.RequireReview))
 	}
 	if in.BaseBranch != nil {
 		task.BaseBranch = strings.TrimSpace(*in.BaseBranch)
@@ -324,11 +324,11 @@ func applyFrontmatter(doc *cardDoc, in UpdateInput) bool {
 		mark(doc.setCanonical("base_branch", []string{"base_branch: " + fieldValue(strings.TrimSpace(*in.BaseBranch))}))
 	}
 	if in.Kind != nil {
-		kind := string(normalizeKind(core.TaskKind(*in.Kind)))
+		kind := string(core.NormalizeTaskKind(core.TaskKind(*in.Kind)))
 		mark(doc.setCanonical("kind", []string{"kind: " + kind}))
 	}
 	if in.RequireReview != nil {
-		review := string(normalizeReview(core.ReviewMode(*in.RequireReview)))
+		review := string(core.NormalizeReviewMode(core.ReviewMode(*in.RequireReview)))
 		mark(doc.setCanonical("require_review", []string{"require_review: " + review}))
 	}
 	if in.Priority != nil {

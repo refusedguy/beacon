@@ -125,7 +125,7 @@ func (w *Webhook) Handler() http.Handler {
 
 func (w *Webhook) valid(r *http.Request, body []byte) bool {
 	if w.Secret == "" {
-		return true
+		return false
 	}
 	if sig := r.Header.Get("X-Hub-Signature-256"); sig != "" {
 		if !strings.HasPrefix(sig, "sha256=") {

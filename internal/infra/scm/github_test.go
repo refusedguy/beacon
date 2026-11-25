@@ -105,6 +105,34 @@ func TestGitHubObserveDoesNotMarkCodeChangeAsSkipped(t *testing.T) {
 	}
 }
 
+func TestGitHubObserveDoesNotMarkBlockedCleanPRAsConflict(t *testing.T) {
+	base := ghObserveHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"filename":"internal/app/a.go"}]`))
+	})
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/pulls/42") {
+			_, _ = w.Write([]byte(`{"number":42,"state":"open","mergeable":false,"mergeable_state":"clean","head":{"sha":"abc"}}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/check-runs") {
+			_, _ = w.Write([]byte(`{"total_count":1,"check_runs":[{"name":"ci","status":"completed","conclusion":"failure","output":{"title":"check failed","text":"details"}}]}`))
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+	obs, err := g.Observe(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Conflict {
+		t.Fatal("Conflict = true for a clean PR blocked by checks")
+	}
+	if obs.FailureExcerpt == "" {
+		t.Fatal("FailureExcerpt is empty, want the failed check output for the policy rule")
+	}
+}
+
 func TestGitHubObserveChecksEveryChangedFilePage(t *testing.T) {
 	calls := 0
 	g := ghObserveGitHub(t, ghObserveHandler(t, func(w http.ResponseWriter, r *http.Request) {

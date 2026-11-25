@@ -139,6 +139,9 @@ func Load(path string) (Config, error) {
 	}
 	expandNonSecrets(&c)
 	c.Webhook.Secret = literalOrEnv(c.Webhook.Secret, c.Webhook.SecretEnv)
+	if c.Webhook.Enabled && c.Webhook.Secret == "" {
+		return c, fmt.Errorf("config %s: webhook.enabled requires webhook.secret or webhook.secret_env", path)
+	}
 	c.Notify.TelegramToken = literalOrEnv(c.Notify.TelegramToken, c.Notify.TelegramTokenEnv)
 	c.SCM.Token = literalOrEnv(c.SCM.Token, c.SCM.TokenEnv)
 	if c.StateDB == "" {

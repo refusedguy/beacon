@@ -7,6 +7,7 @@ import { delimiter, join } from "node:path"
 import {
   beaconCommand,
   beaconServerConfig,
+  createMcpRegistrar,
   noopMcpRegistration,
   registeredBeaconConfig,
   registerBeaconMcp,
@@ -344,4 +345,37 @@ test("a no-op registration disposes once and registers no config", async () => {
   await registration.dispose()
   assert.equal(registration.disposed, true)
   assert.equal(registeredBeaconConfig(ROOT), null)
+})
+
+test("two registrars keep registration state separate", async (t) => {
+  const registrarA = createMcpRegistrar({ beaconCommand: () => ["/bin/a", "mcp"] })
+  const registrarB = createMcpRegistrar({ beaconCommand: () => ["/bin/b", "mcp"] })
+  const a = await registrarA.registerBeaconMcp(fakeCtx(), ROOT)
+  const b = await registrarB.registerBeaconMcp(fakeCtx(), ROOT)
+  t.after(async () => {
+    await a.dispose()
+    await b.dispose()
+  })
+
+  assert.deepEqual(a.config.command, ["/bin/a", "mcp"])
+  assert.deepEqual(b.config.command, ["/bin/b", "mcp"])
+  assert.equal(registrarA.registeredBeaconConfig(ROOT), a.config)
+  assert.equal(registrarB.registeredBeaconConfig(ROOT), b.config)
+
+  await a.dispose()
+  assert.equal(registrarA.registeredBeaconConfig(ROOT), null)
+  assert.equal(registrarB.registeredBeaconConfig(ROOT), b.config)
+})
+
+test("two registrars do not share rebuild decisions", () => {
+  const { deps } = sourceTreeDeps(BINARY_MTIME + 1)
+  const registrarA = createMcpRegistrar()
+  const registrarB = createMcpRegistrar()
+
+  registrarA.beaconCommand(ROOT, deps)
+  registrarA.beaconCommand(ROOT, deps)
+  registrarB.beaconCommand(ROOT, deps)
+  registrarB.beaconCommand(ROOT, deps)
+
+  assert.equal(buildCalls(deps).length, 2)
 })

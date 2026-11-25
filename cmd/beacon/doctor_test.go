@@ -119,6 +119,75 @@ func TestDoctorReportsHealthyProjectWithoutLeakingToken(t *testing.T) {
 	}
 }
 
+func TestDoctorRejectsEnabledWebhookWithoutSecret(t *testing.T) {
+	dir := initProject(t, "go.mod")
+	writeDoctorProjectWithWebhook(t, dir,
+		config.Harness{Provider: "opencode", Endpoint: "http://127.0.0.1:9999", Command: "worker"},
+		config.Webhook{Enabled: true})
+	t.Setenv("BEACON_PROJECT_ROOT", dir)
+	t.Chdir(dir)
+
+	var out bytes.Buffer
+	code := runDoctor(&out, "", okClient())
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, out.String())
+	}
+	text := out.String()
+	if !strings.Contains(text, "[FAIL] config:") {
+		t.Fatalf("missing secret was not reported: %s", text)
+	}
+	if !strings.Contains(text, "webhook.secret") {
+		t.Fatalf("error does not name the missing setting: %s", text)
+	}
+}
+
+func TestDoctorAcceptsEnabledWebhookWithSecret(t *testing.T) {
+	const secret = "doctor-webhook-secret-67890"
+	dir := initProject(t, "go.mod")
+	writeDoctorProjectWithWebhook(t, dir,
+		config.Harness{Provider: "opencode", Endpoint: "http://127.0.0.1:9999", Command: "worker"},
+		config.Webhook{Enabled: true, Secret: secret})
+	t.Setenv("BEACON_PROJECT_ROOT", dir)
+	t.Chdir(dir)
+	if err := mergeOpenCodeConfig(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	code := runDoctor(&out, "", okClient())
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out.String())
+	}
+	text := out.String()
+	if strings.Contains(text, secret) {
+		t.Fatalf("doctor printed the webhook secret: %s", text)
+	}
+	if !strings.Contains(text, "[OK] webhook: enabled with a secret") {
+		t.Fatalf("webhook check missing from output: %s", text)
+	}
+}
+
+func TestDoctorWebhookCheck(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfg    config.Config
+		level  checkLevel
+		detail string
+	}{
+		{"disabled", config.Config{}, checkOK, "disabled"},
+		{"enabled with secret", config.Config{Webhook: config.Webhook{Enabled: true, Secret: "s"}}, checkOK, "enabled with a secret"},
+		{"enabled without secret", config.Config{Webhook: config.Webhook{Enabled: true}}, checkFail, "enabled without a secret; set webhook.secret or webhook.secret_env"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := doctorWebhookCheck(tc.cfg)
+			if got.level != tc.level || got.detail != tc.detail {
+				t.Fatalf("check = %v %q, want %v %q", got.level, got.detail, tc.level, tc.detail)
+			}
+		})
+	}
+}
+
 func TestDoctorFileShapeCheckMCPShapes(t *testing.T) {
 	agents := map[string]any{
 		"orchestrator": map[string]any{},
@@ -214,6 +283,11 @@ func writeDoctorJSON(t *testing.T, path string, v any) {
 
 func writeDoctorProject(t *testing.T, dir string, harness config.Harness) {
 	t.Helper()
+	writeDoctorProjectWithWebhook(t, dir, harness, config.Webhook{})
+}
+
+func writeDoctorProjectWithWebhook(t *testing.T, dir string, harness config.Harness, webhook config.Webhook) {
+	t.Helper()
 	cfg := config.Config{
 		StateDB:      ".beacon/state.db",
 		WorkspaceDir: ".beacon/worktrees",
@@ -225,6 +299,7 @@ func writeDoctorProject(t *testing.T, dir string, harness config.Harness) {
 		Harness:      harness,
 		Merge:        config.Merge{RequiredChecks: []string{"test"}, MaxAttempts: 12, AutoRebase: true},
 		OnBaseRed:    config.OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
+		Webhook:      webhook,
 	}
 	path := filepath.Join(dir, ".beacon", "config.yaml")
 	if err := config.WriteDefault(path, cfg, false); err != nil {
