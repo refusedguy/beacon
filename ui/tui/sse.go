@@ -30,13 +30,14 @@ const (
 )
 
 func (c *Client) streamHTTPClient() *http.Client {
-	base := c.HTTP
-	if base == nil {
-		return &http.Client{}
+	// SSE streams are long-lived, so this client must have no request timeout.
+	// Build a fresh client rather than copying c.HTTP: copying a client after
+	// use is unsafe and would carry its timeout into the stream.
+	streamClient := &http.Client{}
+	if base := c.HTTP; base != nil {
+		streamClient.Transport = base.Transport
 	}
-	copy := *base
-	copy.Timeout = 0
-	return &copy
+	return streamClient
 }
 
 func (c *Client) Stream(ctx context.Context, onEvent func(Event)) error {
