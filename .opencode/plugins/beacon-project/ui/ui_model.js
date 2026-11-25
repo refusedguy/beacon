@@ -268,7 +268,9 @@ export const RunChangedEvent = Object.freeze({
     return null
   }),
 })
-export const CONTROL_ACTIONS = Object.freeze(["approve", "unblock", "cancel", "retry", "nudge"])
+// One vocabulary for the RPC schema, the CLI bridge and the panel. It mirrors
+// core.ControlActions; changing it must change the Go vocabulary too.
+export const CONTROL_ACTIONS = Object.freeze(["approve", "unblock", "cancel", "retry", "nudge", "watch"])
 export const BeaconStatusRpc = Object.freeze({
   id: BEACON_STATUS_RPC_ID,
   events: Object.freeze({ [RUN_CHANGED_EVENT]: RunChangedEvent }),
@@ -287,7 +289,7 @@ export const BeaconStatusRpc = Object.freeze({
     }),
     control: Object.freeze({
       input: objectInput((v) => {
-        if (!CONTROL_ACTIONS.includes(str(v.action))) return "action must be approve, unblock, cancel, retry or nudge"
+        if (!CONTROL_ACTIONS.includes(str(v.action))) return `action must be one of ${CONTROL_ACTIONS.join(", ")}`
         if (!str(v.runID)) return "runID must be a non-empty string"
         if (v.sha !== undefined && typeof v.sha !== "string") return "sha must be a string"
         if (v.message !== undefined && typeof v.message !== "string") return "message must be a string"

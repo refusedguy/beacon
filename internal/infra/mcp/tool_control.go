@@ -54,20 +54,22 @@ func applyControl(ctx context.Context, sv Services, action, id string, pr int, s
 	if sv.Remote != nil {
 		return sv.Remote(ctx, action, id, pr, sha)
 	}
-	return applyLocal(ctx, sv.Control, action, id, sha)
+	return applyLocal(ctx, sv.Control, action, id, sha, pr)
 }
 
-func applyLocal(ctx context.Context, control *app.Control, action, id, sha string) error {
+func applyLocal(ctx context.Context, control *app.Control, action, id, sha string, pr int) error {
 	runID := core.RunID(id)
-	switch action {
-	case "approve":
+	switch core.ParseControlAction(action) {
+	case core.ControlApprove:
 		return control.Approve(ctx, runID, sha)
-	case "unblock":
+	case core.ControlUnblock:
 		return control.Unblock(ctx, runID)
-	case "cancel":
+	case core.ControlCancel:
 		return control.Cancel(ctx, runID)
-	case "retry":
+	case core.ControlRetry:
 		return control.Retry(ctx, runID)
+	case core.ControlWatch:
+		return control.WatchPR(ctx, runID, pr)
 	default:
 		return core.Errorf(core.CodeInvalidInput, "unknown action %q", action)
 	}
@@ -77,7 +79,7 @@ func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToo
 	if len(a.RunIDs) == 0 {
 		return nil, nil, core.Errorf(core.CodeInvalidInput, "run_ids must not be empty")
 	}
-	if !validControlAction(a.Action) {
+	if !core.ParseControlAction(a.Action).Valid() {
 		return nil, nil, core.Errorf(core.CodeInvalidInput, "unknown action %q", a.Action)
 	}
 	results := make([]controlItem, 0, len(a.RunIDs))
@@ -90,13 +92,4 @@ func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToo
 		results = append(results, item)
 	}
 	return jsonResult(controlBatch{Action: a.Action, Results: results}), nil, nil
-}
-
-func validControlAction(action string) bool {
-	switch action {
-	case "approve", "unblock", "cancel", "retry":
-		return true
-	default:
-		return false
-	}
 }

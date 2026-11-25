@@ -1,7 +1,7 @@
 // Control and dispatch actions from the panel. Every action reports its result
 // through ctx.ui.toast.show and then refreshes the snapshot. The RPC/CLI
 // transport is injected so the same code path is testable in plain Node.
-import { errorMessage, str } from "./ui_model.js"
+import { CONTROL_ACTIONS, errorMessage, str } from "./ui_model.js"
 
 // Shared OSC52 copier. The toast reports the clipboard result, never a guess.
 export function clipboardCopier(ctx, toast) {
@@ -96,7 +96,7 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
         return null
       }
     }
-    if (["retry", "approve", "cancel", "nudge"].includes(name)) return control(name, run, opts.message)
+    if (CONTROL_ACTIONS.includes(name)) return control(name, run, opts.message)
     return null
   }
 }
