@@ -91,12 +91,13 @@ func buildGenerated(specs []mcp.ToolSpec) generated {
 		if !spec.OrchestratorOnly {
 			continue
 		}
-		for _, name := range []string{"beacon_" + spec.Name, spec.Name} {
-			g.actions[name] = true
-			g.global = append(g.global, permission(name, "deny"))
-			g.allow = append(g.allow, permission(name, "allow"))
-			g.worker = append(g.worker, permission(name, "deny"))
-		}
+		g.actions[spec.Name] = true
+		// The old generator emitted a second beacon_ prefix. Keep it in the
+		// owned set so an existing config loses that stale entry on rewrite.
+		g.actions["beacon_"+spec.Name] = true
+		g.global = append(g.global, permission(spec.Name, "deny"))
+		g.allow = append(g.allow, permission(spec.Name, "allow"))
+		g.worker = append(g.worker, permission(spec.Name, "deny"))
 	}
 	return g
 }

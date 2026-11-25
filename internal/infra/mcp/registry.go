@@ -22,7 +22,7 @@ func ToolCatalog() []ToolSpec {
 		{Name: "beacon_status", Description: "List active runs, PRs and blockers."},
 		{Name: "beacon_recent", Description: "List the most recently finished runs."},
 		{Name: "beacon_wait", Description: "Wait for a run to reach an active verdict or a terminal state."},
-		{Name: "beacon_control", Description: "Control a run: approve, unblock, cancel, retry or bind a PR."},
+		{Name: "beacon_control", Description: "Control a run: approve, unblock, cancel, retry or watch."},
 		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true},
 		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
 		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
@@ -47,8 +47,8 @@ type PermissionSet struct {
 }
 
 // GeneratedPermissions derives the permission entries beacon-gen owns from the
-// tool catalog. It uses both the prefixed and unprefixed action name for every
-// orchestrator-only tool, matching the generator's contract.
+// tool catalog. Catalog names already carry their prefix, so each
+// orchestrator-only tool contributes exactly one real action name.
 func GeneratedPermissions(specs []ToolSpec) PermissionSet {
 	set := PermissionSet{}
 	sorted := append([]ToolSpec(nil), specs...)
@@ -57,11 +57,9 @@ func GeneratedPermissions(specs []ToolSpec) PermissionSet {
 		if !spec.OrchestratorOnly {
 			continue
 		}
-		for _, name := range []string{"beacon_" + spec.Name, spec.Name} {
-			set.Global = append(set.Global, permission(name, "deny"))
-			set.Allow = append(set.Allow, permission(name, "allow"))
-			set.Deny = append(set.Deny, permission(name, "deny"))
-		}
+		set.Global = append(set.Global, permission(spec.Name, "deny"))
+		set.Allow = append(set.Allow, permission(spec.Name, "allow"))
+		set.Deny = append(set.Deny, permission(spec.Name, "deny"))
 	}
 	return set
 }
@@ -73,9 +71,12 @@ func permission(action, effect string) Permission {
 // MergePermissions drops every entry owned by the catalog, then prepends a
 // fresh ordered set. Entries the catalog does not own keep their value.
 func MergePermissions(value any, want []Permission) []any {
-	owned := make(map[string]bool, len(want))
+	owned := make(map[string]bool, len(want)*2)
 	for _, p := range want {
 		owned[p.Action] = true
+		// Older generators prefixed catalog names a second time. Drop those
+		// stale entries as well so a rewrite converges on the current names.
+		owned["beacon_"+p.Action] = true
 	}
 	out := make([]any, 0, len(want))
 	for _, p := range want {

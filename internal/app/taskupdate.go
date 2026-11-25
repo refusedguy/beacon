@@ -33,11 +33,16 @@ type UpdatedTask struct {
 
 // UpdateResult reports every id; Refused lists ids with an active run.
 type UpdateResult struct {
-	Results     []UpdatedTask `json:"results"`
-	Refused     []string      `json:"refused,omitempty"`
-	Pushed      bool          `json:"pushed"`
-	Status      string        `json:"status,omitempty"`
-	OperationID string        `json:"operation_id,omitempty"`
+	Results []UpdatedTask `json:"results"`
+	Refused []string      `json:"refused,omitempty"`
+	Pushed  bool          `json:"pushed"`
+	OperationMeta
+}
+
+// WithMeta returns a copy of r carrying the operation id and status.
+func (r UpdateResult) WithMeta(id, status string) any {
+	r.Status, r.OperationID = status, id
+	return r
 }
 
 // TaskUpdater edits several task cards in one commit and push. Source is
