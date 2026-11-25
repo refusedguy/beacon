@@ -3,6 +3,7 @@ package tasksource
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,13 +27,18 @@ func (m *Markdown) parser() core.EpicParser {
 }
 
 func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
-	_ = ctx
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	paths, err := CardStore{Dir: m.Dir}.cards()
 	if err != nil {
 		return nil, err
 	}
 	var out []core.Task
 	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
@@ -85,6 +91,7 @@ func parseCard(content, path string) (core.Task, bool) {
 	if hasFM {
 		var fm frontmatter
 		if err := yaml.Unmarshal([]byte(fmText), &fm); err != nil {
+			slog.Warn("tasksource: malformed card frontmatter", "path", path, "error", err)
 			return t, false
 		}
 		t.ID = core.TaskID(strings.TrimSpace(fm.ID))
@@ -164,7 +171,9 @@ func parseLegacy(content, dir string) core.Task {
 // Children returns the child tasks declared in an epic card's plan. A card
 // that is not an epic has no children and returns an empty slice.
 func (m *Markdown) Children(ctx context.Context, id core.TaskID) ([]core.Task, error) {
-	_ = ctx
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c, err := CardStore{Dir: m.Dir}.find(id)
 	if err != nil {
 		return nil, err
@@ -238,7 +247,9 @@ func (m *Markdown) MarkInWorkspace(ctx context.Context, id core.TaskID, workspac
 // Create writes a new card with available status. It refuses to overwrite an
 // existing card with the same ID.
 func (m *Markdown) Create(ctx context.Context, task core.Task) (core.Task, error) {
-	_ = ctx
+	if err := ctx.Err(); err != nil {
+		return core.Task{}, err
+	}
 	fields, err := marshalFields(cardFields{
 		ID:       string(task.ID),
 		Title:    task.Title,
@@ -272,6 +283,9 @@ func (m *Markdown) Create(ctx context.Context, task core.Task) (core.Task, error
 		content.WriteString("\n")
 	}
 	path := filepath.Join(m.Dir, string(task.ID)+".md")
+	if err := ctx.Err(); err != nil {
+		return core.Task{}, err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return core.Task{}, err
 	}

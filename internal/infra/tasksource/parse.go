@@ -3,6 +3,7 @@ package tasksource
 import (
 	"context"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -209,7 +210,9 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 	var out taskFields
 	var yf yamlFields
 	if block, ok := yamlBlock(body); ok {
-		if err := yaml.Unmarshal([]byte(block), &yf); err == nil {
+		if err := yaml.Unmarshal([]byte(block), &yf); err != nil {
+			slog.Warn("tasksource: malformed YAML field block", "error", err)
+		} else {
 			out.ID = firstNonEmpty(yf.TaskID, yf.ID)
 			out.Scope = append(out.Scope, yf.Scope...)
 			out.Scope = append(out.Scope, yf.OwnerFiles...)
