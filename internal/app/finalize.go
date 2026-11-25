@@ -128,20 +128,30 @@ func (r *Reconciler) reconcileEpics(ctx context.Context) error {
 }
 
 // openEpicPR publishes the epic branch against the main line. The delivery
-// key makes repeated reconcile ticks harmless.
+// key makes repeated reconcile ticks harmless. Every path that does not finish
+// binding the PR releases the key so a later tick can retry instead of stranding
+// the epic behind a permanent claim.
 func (r *Reconciler) openEpicPR(ctx context.Context, epic core.Task) error {
 	key := "epic-pr:" + string(epic.ID)
 	ok, err := r.Store.ClaimDelivery(ctx, key)
 	if err != nil || !ok {
 		return err
 	}
+	bound := false
+	defer func() {
+		if bound {
+			return
+		}
+		if err := r.Store.ReleaseDelivery(ctx, key); err != nil {
+			slog.Error("release epic PR delivery", "task", epic.ID, "error", err)
+		}
+	}()
 	base := epic.BaseBranch
 	if base == "" {
 		base = r.BaseBranch
 	}
 	pr, err := r.SCM.OpenPR(ctx, epicBranch(epic.ID), base, epic.Title)
 	if err != nil {
-		_ = r.Store.ReleaseDelivery(ctx, key)
 		return err
 	}
 	if pr <= 0 {
@@ -156,7 +166,11 @@ func (r *Reconciler) openEpicPR(ctx context.Context, epic core.Task) error {
 		if run.Branch == "" {
 			run.Branch = epicBranch(epic.ID)
 		}
-		return r.Store.Save(ctx, run)
+		if err := r.Store.Save(ctx, run); err != nil {
+			return err
+		}
+		bound = true
+		return nil
 	}
 	run := core.NewRun(core.RunID("epic-"+string(epic.ID)), epic.ID, time.Now().UTC())
 	run.MaxAttempts = r.maxAttempts()
@@ -171,6 +185,7 @@ func (r *Reconciler) openEpicPR(ctx context.Context, epic core.Task) error {
 		return err
 	}
 	r.signal(pr)
+	bound = true
 	return nil
 }
 
@@ -216,7 +231,9 @@ func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs 
 		Prompt: prompt, ParentSessionID: run.ParentSessionID,
 	}
 	if _, err := r.Harness.Spawn(ctx, req); err != nil {
-		_ = r.Store.ReleaseDelivery(ctx, key)
+		if releaseErr := r.Store.ReleaseDelivery(ctx, key); releaseErr != nil {
+			slog.Error("release reviewer delivery", "run", run.ID, "error", releaseErr)
+		}
 		slog.Error("spawn epic reviewer", "run", run.ID, "error", err)
 	}
 }
@@ -254,7 +271,11 @@ func (r *Reconciler) finalizeExternal(ctx context.Context, run *core.Run, obs co
 
 func (r *Reconciler) cleanupRun(ctx context.Context, run *core.Run) error {
 	if run.SessionID != "" {
-		_ = r.Harness.Stop(ctx, run.SessionID)
+		// The run is already finalized. A failed stop leaves a session that the
+		// next orphan sweep can close, so cleanup stays best effort.
+		if err := r.Harness.Stop(ctx, run.SessionID); err != nil {
+			slog.Error("cleanup session stop", "run", run.ID, "task", run.TaskID, "error", err)
+		}
 	}
 	if run.WorkspacePath == "" {
 		return nil

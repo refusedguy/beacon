@@ -86,6 +86,7 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 			continue
 		}
 		if err := other.Apply(core.Event{Kind: core.EvBlock, Reason: "base_red"}); err != nil {
+			slog.Error("block run on red base", "run", other.ID, "task", other.TaskID, "incident", in.ID, "error", err)
 			continue
 		}
 		other.BlockedIncidentID = in.ID
@@ -109,6 +110,9 @@ func sqliteChecks(names []string) string {
 	}
 	b, err := json.Marshal(names)
 	if err != nil {
+		// A []string cannot fail to marshal. Keep the incident record usable
+		// rather than losing it to a silent serialization fallback.
+		slog.Error("encode failed check names", "error", err)
 		return "[]"
 	}
 	return string(b)
@@ -150,7 +154,11 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 		ParentSessionID: run.ParentSessionID, IsFixer: true,
 	})
 	if err != nil {
-		_ = r.Workspace.Remove(ctx, ws)
+		// The fixer never started. A failed workspace cleanup is logged with the
+		// run and task IDs so the next reconcile can still retry.
+		if cleanupErr := r.Workspace.Remove(ctx, ws); cleanupErr != nil {
+			slog.Error("remove fixer workspace", "run", id, "task", task.ID, "error", cleanupErr)
+		}
 		return err
 	}
 	run.SessionID = session.ID
@@ -247,12 +255,21 @@ func (r *Reconciler) unblockWithRebase(ctx context.Context, run *core.Run) error
 	if run.PRNumber > 0 {
 		newSHA, err := r.SCM.UpdateBranch(ctx, run.PRNumber, run.HeadSHA)
 		if err != nil {
-			_ = run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"})
-			_ = run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()})
+			// The rebase failed. These events roll the run back to needs_agent_fix;
+			// the run is already unblocked, so a rejected transition is best effort
+			// but must be logged with the affected run and task.
+			if applyErr := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); applyErr != nil {
+				slog.Error("rebase rollback behind", "run", run.ID, "task", run.TaskID, "error", applyErr)
+			}
+			if applyErr := run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}); applyErr != nil {
+				slog.Error("rebase rollback failure", "run", run.ID, "task", run.TaskID, "error", applyErr)
+			}
 			return r.Store.Save(ctx, run)
 		}
-		if err := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); err == nil {
-			_ = run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "base recovered"})
+		if err := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); err != nil {
+			slog.Error("rebase behind", "run", run.ID, "task", run.TaskID, "error", err)
+		} else if err := run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "base recovered"}); err != nil {
+			slog.Error("rebase success transition", "run", run.ID, "task", run.TaskID, "error", err)
 		}
 	}
 	return r.Store.Save(ctx, run)
