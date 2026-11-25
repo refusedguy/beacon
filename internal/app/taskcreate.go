@@ -42,12 +42,18 @@ type BaseRebaser interface {
 type BranchEnsurer interface {
 	EnsureBranch(ctx context.Context, branch, base string) error
 }
+
+// TaskGraphStore is the store capability TaskCreator uses to sync the task graph.
 type TaskGraphStore interface {
 	SyncTasks(ctx context.Context, tasks []core.Task) error
 }
+
+// TaskRemover is the optional source capability that deletes one card by ID.
 type TaskRemover interface {
 	Remove(ctx context.Context, id core.TaskID) error
 }
+
+// TaskBatchCreator is the optional source capability that writes several cards in one call.
 type TaskBatchCreator interface {
 	CreateMany(ctx context.Context, tasks []core.Task) ([]core.Task, error)
 }
@@ -65,10 +71,12 @@ type CardWriter interface {
 // not hide the original create error.
 type sourceCardWriter struct{ Source core.TaskSource }
 
+// Available returns the cards the source lists as available.
 func (w sourceCardWriter) Available(ctx context.Context) ([]core.Task, error) {
 	return w.Source.ListAvailable(ctx)
 }
 
+// Write creates the cards through the source's batch capability, or one by one.
 func (w sourceCardWriter) Write(ctx context.Context, tasks []core.Task) ([]core.Task, error) {
 	if batch, ok := w.Source.(TaskBatchCreator); ok {
 		return batch.CreateMany(ctx, tasks)
@@ -84,6 +92,7 @@ func (w sourceCardWriter) Write(ctx context.Context, tasks []core.Task) ([]core.
 	return out, nil
 }
 
+// Remove deletes each card through the source's remove capability when it has one.
 func (w sourceCardWriter) Remove(ctx context.Context, ids ...core.TaskID) {
 	remover, ok := w.Source.(TaskRemover)
 	if !ok {
@@ -105,6 +114,7 @@ type pathCardPublisher struct {
 	root core.Workspace
 }
 
+// Publish commits pathspec in the bound workspace using the given message.
 func (p pathCardPublisher) Publish(ctx context.Context, pathspec, message string) error {
 	return publishPath(ctx, p.ws, p.root, pathspec, message)
 }
@@ -123,12 +133,15 @@ type IDFactory interface {
 // means today. Derived IDs ignore it.
 type defaultIDFactory struct{ Date string }
 
+// New returns a random task ID dated with f.Date, or today's date when it is empty.
 func (f defaultIDFactory) New() (core.TaskID, error) { return newTaskID(f.Date) }
 
+// ForEpic derives an epic ID from the title and the planned children.
 func (defaultIDFactory) ForEpic(title string, plan []core.ChildSpec) core.TaskID {
 	return epicTaskID(title, plan)
 }
 
+// ForBatch derives a card ID from the batch seed and the card's index.
 func (defaultIDFactory) ForBatch(seed string, index int) core.TaskID {
 	return batchTaskID(seed, index)
 }
@@ -141,6 +154,7 @@ type IdempotencyCache struct {
 	batch   map[core.TaskID]CreatedTask
 }
 
+// Created returns the cards remembered for key and whether the key was present.
 func (c *IdempotencyCache) Created(key string) ([]core.Task, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -148,6 +162,7 @@ func (c *IdempotencyCache) Created(key string) ([]core.Task, bool) {
 	return tasks, ok
 }
 
+// RememberCreated stores the cards produced for key.
 func (c *IdempotencyCache) RememberCreated(key string, tasks []core.Task) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -157,6 +172,7 @@ func (c *IdempotencyCache) RememberCreated(key string, tasks []core.Task) {
 	c.created[key] = tasks
 }
 
+// Batch returns the remembered results for the given card IDs.
 func (c *IdempotencyCache) Batch(ids []core.TaskID) map[core.TaskID]CreatedTask {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -169,6 +185,7 @@ func (c *IdempotencyCache) Batch(ids []core.TaskID) map[core.TaskID]CreatedTask 
 	return out
 }
 
+// RememberBatch stores one result per ID and ignores extra results.
 func (c *IdempotencyCache) RememberBatch(ids []core.TaskID, results []CreatedTask) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -187,6 +204,7 @@ func (c *IdempotencyCache) RememberBatch(ids []core.TaskID, results []CreatedTas
 // A caller retries the publish once after rebasing on the latest origin base.
 type NonFastForwardError struct{ Err error }
 
+// Error returns the rejection message, including the wrapped push error when set.
 func (e *NonFastForwardError) Error() string {
 	if e.Err == nil {
 		return "push rejected as non-fast-forward"
@@ -194,8 +212,10 @@ func (e *NonFastForwardError) Error() string {
 	return "push rejected as non-fast-forward: " + e.Err.Error()
 }
 
+// Unwrap returns the underlying push error.
 func (e *NonFastForwardError) Unwrap() error { return e.Err }
 
+// CreateTaskInput is the JSON body accepted by the task-create operation.
 type CreateTaskInput struct {
 	Title         string           `json:"title"`
 	Body          string           `json:"body"`
@@ -224,6 +244,7 @@ type OperationResult interface {
 	WithMeta(id, status string) any
 }
 
+// CreatedTask is the response for one created card, with children for an epic.
 type CreatedTask struct {
 	ID       string        `json:"id"`
 	Path     string        `json:"path"`
@@ -300,6 +321,9 @@ func (c *TaskCreator) ids() IDFactory {
 	return defaultIDFactory{Date: c.Date}
 }
 
+// Create writes one card, or an epic with its planned children, syncs the task
+// graph and publishes the cards in one commit. An epic call with a known ID
+// returns the cached result instead of writing the cards again.
 func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTask, error) {
 	var out CreatedTask
 	title := strings.TrimSpace(in.Title)

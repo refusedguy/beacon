@@ -1,3 +1,5 @@
+// Package app implements task creation, dispatch, run control, reconciliation
+// and status reporting. It composes the ports declared in pkg/core.
 package app
 
 import (
