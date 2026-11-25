@@ -33,6 +33,8 @@ type ReconcilerStore interface {
 	UpdateIncident(ctx context.Context, in *core.BaseIncident) error
 }
 
+// Reconciler observes pull requests, applies merge policy to their runs and
+// drains the harness and timer events that drive the daemon loop.
 type Reconciler struct {
 	Store           ReconcilerStore
 	SCM             core.ScmGateway
@@ -56,6 +58,8 @@ type Reconciler struct {
 	Decisions       DecisionLogger
 }
 
+// Reconcile observes pr once, evaluates the merge policy and applies the
+// verdict to the run bound to that pull request.
 func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.MergeDecision, err error) {
 	run, err := r.Store.FindByPR(ctx, pr)
 	if err != nil {

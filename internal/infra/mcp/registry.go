@@ -1,6 +1,11 @@
 package mcp
 
-import "sort"
+import (
+	"sort"
+	"strings"
+
+	"github.com/refusedguy/beacon/pkg/core"
+)
 
 // ToolCatalog is the single declarative source for the tool permissions in
 // opencode.json. Running go generate rewrites those permissions from it.
@@ -22,11 +27,25 @@ func ToolCatalog() []ToolSpec {
 		{Name: "beacon_status", Description: "List active runs, PRs and blockers."},
 		{Name: "beacon_recent", Description: "List the most recently finished runs."},
 		{Name: "beacon_wait", Description: "Wait for a run to reach an active verdict or a terminal state."},
-		{Name: "beacon_control", Description: "Control a run: approve, unblock, cancel, retry or watch."},
+		{Name: "beacon_control", Description: controlDescription()},
 		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true},
 		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
 		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
 		{Name: "beacon_reconcile", Description: "Force one reconciler tick for a PR and report its decision. Orchestrator only.", OrchestratorOnly: true},
+	}
+}
+
+// controlDescription spells out the verbs from core, so the advertised
+// vocabulary cannot lose a verb when the core list changes.
+func controlDescription() string {
+	verbs := core.ControlActionNames()
+	switch len(verbs) {
+	case 0:
+		return "Control a run."
+	case 1:
+		return "Control a run: " + verbs[0] + "."
+	default:
+		return "Control a run: " + strings.Join(verbs[:len(verbs)-1], ", ") + " or " + verbs[len(verbs)-1] + "."
 	}
 }
 

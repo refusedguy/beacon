@@ -10,11 +10,16 @@ import (
 type SkipCode string
 
 const (
-	SkipActiveRun            SkipCode = "active_run"
-	SkipActiveScopeOverlap   SkipCode = "active_scope_overlap"
+	// SkipActiveRun means the task already has an active run.
+	SkipActiveRun SkipCode = "active_run"
+	// SkipActiveScopeOverlap means the task scope overlaps a live run's scope.
+	SkipActiveScopeOverlap SkipCode = "active_scope_overlap"
+	// SkipSelectedScopeOverlap means the task scope overlaps another task selected in this cycle.
 	SkipSelectedScopeOverlap SkipCode = "selected_scope_overlap"
-	SkipNoScope              SkipCode = "no_scope"
-	SkipBadStatus            SkipCode = "bad_status"
+	// SkipNoScope means the task has no scope while strict scope checking is enabled.
+	SkipNoScope SkipCode = "no_scope"
+	// SkipBadStatus means the task status is not available.
+	SkipBadStatus SkipCode = "bad_status"
 )
 
 // SkippedTask explains why a candidate was not dispatched. Overlap holds the
@@ -28,16 +33,20 @@ type SkippedTask struct {
 	Overlap      []core.ScopePath `json:"overlap,omitempty"`
 }
 
+// ConflictPlanner selects tasks that can run alongside active runs and each other.
 type ConflictPlanner interface {
 	Select(candidates []core.Task, active []*core.Run, limit int, strict bool) ([]core.Task, []SkippedTask, error)
 }
 
+// GreedyPlanner selects tasks in candidate order using an injected overlap checker.
 type GreedyPlanner struct {
 	Overlap core.OverlapChecker
 }
 
 var _ func(core.OverlapChecker) ConflictPlanner = NewPlanner
 
+// NewPlanner returns a ConflictPlanner that uses checker to detect scope overlap.
+// A nil checker uses core.PathsAndDependencies.
 func NewPlanner(checker core.OverlapChecker) ConflictPlanner {
 	if checker == nil {
 		checker = core.PathsAndDependencies
@@ -45,6 +54,9 @@ func NewPlanner(checker core.OverlapChecker) ConflictPlanner {
 	return GreedyPlanner{Overlap: checker}
 }
 
+// Select returns up to limit candidates that are available and free of scope
+// conflicts with active runs or earlier selections. It reports a reason for
+// each candidate it skips.
 func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit int, strict bool) ([]core.Task, []SkippedTask, error) {
 	var selected []core.Task
 	var skipped []SkippedTask
