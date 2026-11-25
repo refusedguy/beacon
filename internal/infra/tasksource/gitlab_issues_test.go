@@ -115,3 +115,40 @@ func TestGitLabIssuesInvalidID(t *testing.T) {
 		t.Fatalf("complete error = %v", err)
 	}
 }
+
+func TestGitLabIssuesListAvailablePaginates(t *testing.T) {
+	pages := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/issues") {
+			http.NotFound(w, r)
+			return
+		}
+		pages++
+		page := r.URL.Query().Get("page")
+		var issues []map[string]any
+		switch page {
+		case "1":
+			for i := 1; i <= 100; i++ {
+				issues = append(issues, map[string]any{"iid": i, "title": "Task"})
+			}
+		case "2":
+			issues = append(issues, map[string]any{"iid": 101, "title": "Last"})
+		default:
+			issues = []map[string]any{}
+		}
+		glIssueWriteJSON(t, w, issues)
+	}))
+	defer srv.Close()
+
+	s := NewGitLabIssues(srv.URL+"/api/v4/", "tok", "o", "r")
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 101 {
+		t.Fatalf("tasks = %d, want 101 across two pages", len(tasks))
+	}
+	if pages != 2 {
+		t.Fatalf("pages = %d, want 2", pages)
+	}
+}

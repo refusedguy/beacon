@@ -127,10 +127,20 @@ func (g *GitLabIssues) getJSON(ctx context.Context, path string, query url.Value
 
 func (g *GitLabIssues) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	path := "/projects/" + g.project() + "/issues"
+	const perPage, maxPages = 100, 100
 	var issues []glIssue
-	query := url.Values{"state": {"opened"}, "per_page": {"100"}}
-	if err := g.getJSON(ctx, path, query, &issues); err != nil {
-		return nil, err
+	for page := 1; page <= maxPages; page++ {
+		query := url.Values{
+			"state": {"opened"}, "per_page": {strconv.Itoa(perPage)}, "page": {strconv.Itoa(page)},
+		}
+		var batch []glIssue
+		if err := g.getJSON(ctx, path, query, &batch); err != nil {
+			return nil, err
+		}
+		issues = append(issues, batch...)
+		if len(batch) < perPage {
+			break
+		}
 	}
 	var out []core.Task
 	for _, issue := range issues {

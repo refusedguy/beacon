@@ -21,6 +21,8 @@ type glMR struct {
 	TargetBranch                string   `json:"target_branch"`
 	Labels                      []string `json:"labels"`
 	ApprovedBy                  []glUser `json:"approved_by"`
+	DivergedCommitsCount        int      `json:"diverged_commits_count"`
+	DetailedMergeStatus         string   `json:"detailed_merge_status"`
 	DiffRefs                    struct {
 		BaseSHA string `json:"base_sha"`
 		HeadSHA string `json:"head_sha"`
@@ -48,7 +50,8 @@ type glThread struct {
 
 func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, error) {
 	var mr glMR
-	if err := g.getJSON(ctx, g.mrPath(mrIID), nil, &mr); err != nil {
+	query := url.Values{"include_diverged_commits_count": {"true"}}
+	if err := g.getJSON(ctx, g.mrPath(mrIID), query, &mr); err != nil {
 		return core.Observation{}, err
 	}
 	headSHA := mr.SHA
@@ -84,7 +87,7 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 	}
 	g.observeChecks(ctx, &o, o.HeadSHA, &failed)
 	behind, baseSHA, err := g.behind(ctx, mr)
-	failed.add("compare", err)
+	failed.add("base branch", err)
 	if err == nil {
 		o.Behind = behind
 		o.BaseSHA = baseSHA
@@ -145,29 +148,36 @@ func (g *GitLab) approvals(ctx context.Context, mrIID int, mr glMR) (int, error)
 	return len(seen), nil
 }
 
+// behind reports whether the MR head lacks commits from the target branch and
+// returns the current target head. GitLab's compare endpoint has no behind
+// count; the MR response carries diverged_commits_count when requested, and
+// the target branch endpoint supplies the base SHA used to detect base moves.
 func (g *GitLab) behind(ctx context.Context, mr glMR) (bool, string, error) {
-	from, to := mr.TargetBranch, mr.SHA
-	if from == "" {
-		from = mr.DiffRefs.BaseSHA
-	}
-	if to == "" {
-		to = mr.DiffRefs.HeadSHA
-	}
-	if from == "" || to == "" {
+	if mr.TargetBranch == "" {
 		return false, "", nil
 	}
-	path := "/projects/" + g.project() + "/repository/compare"
-	var cmp struct {
-		BehindBy   int `json:"behind_by"`
-		BaseCommit struct {
-			ID string `json:"id"`
-		} `json:"base_commit"`
-	}
-	query := url.Values{"from": {from}, "to": {to}}
-	if err := g.getJSON(ctx, path, query, &cmp); err != nil {
+	baseSHA, err := g.branchHead(ctx, mr.TargetBranch)
+	if err != nil {
 		return false, "", err
 	}
-	return cmp.BehindBy > 0, cmp.BaseCommit.ID, nil
+	behind := mr.DivergedCommitsCount > 0 || mr.DetailedMergeStatus == "need_rebase"
+	return behind, baseSHA, nil
+}
+
+func (g *GitLab) branchHead(ctx context.Context, branch string) (string, error) {
+	path := "/projects/" + g.project() + "/repository/branches/" + url.PathEscape(branch)
+	var result struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	if err := g.getJSON(ctx, path, nil, &result); err != nil {
+		return "", err
+	}
+	if result.Commit.ID == "" {
+		return "", core.Errorf(core.CodeUnavailable, "branch %s has no head commit", branch)
+	}
+	return result.Commit.ID, nil
 }
 
 func (g *GitLab) UpdateBranch(ctx context.Context, mrIID int, expectedSHA string) (string, error) {

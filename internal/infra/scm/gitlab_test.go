@@ -38,7 +38,8 @@ func TestGitLabObserveUnresolvedThreads(t *testing.T) {
 			glWriteJSON(t, w, map[string]any{
 				"iid": 7, "state": "opened", "sha": "head1", "has_conflicts": false,
 				"blocking_discussions_resolved": false, "target_branch": "main", "labels": []string{"ready"},
-				"approved_by": []map[string]any{{"user": map[string]string{"username": "fallback"}}},
+				"diverged_commits_count": 2,
+				"approved_by":            []map[string]any{{"user": map[string]string{"username": "fallback"}}},
 			})
 		case strings.HasSuffix(p, "/merge_requests/7/threads"):
 			if r.Method != http.MethodGet {
@@ -65,11 +66,8 @@ func TestGitLabObserveUnresolvedThreads(t *testing.T) {
 				{"user": map[string]string{"username": "alice"}},
 				{"user": map[string]string{"username": "bob"}},
 			}})
-		case strings.HasSuffix(p, "/repository/compare"):
-			if r.URL.Query().Get("from") != "main" || r.URL.Query().Get("to") != "head1" {
-				t.Errorf("compare query = %v", r.URL.Query())
-			}
-			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		case strings.HasSuffix(p, "/repository/branches/main"):
+			glWriteJSON(t, w, map[string]any{"name": "main", "commit": map[string]any{"id": "base1"}})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, p)
 			http.NotFound(w, r)
@@ -85,6 +83,9 @@ func TestGitLabObserveUnresolvedThreads(t *testing.T) {
 	}
 	if len(o.Labels) != 1 || o.Labels[0] != "ready" {
 		t.Fatalf("bad labels: %v", o.Labels)
+	}
+	if !o.Behind || o.BaseSHA != "base1" {
+		t.Fatalf("behind = %t base = %q, want true/base1", o.Behind, o.BaseSHA)
 	}
 	if o.Approvals != 2 {
 		t.Fatalf("approvals = %d", o.Approvals)
@@ -125,8 +126,8 @@ func TestGitLabObserveFailedPipelineRedaction(t *testing.T) {
 			_, _ = w.Write([]byte(strings.Repeat("x", 1400) + " token = " + secret))
 		case strings.HasSuffix(p, "/approvals"):
 			glWriteJSON(t, w, map[string]any{})
-		case strings.HasSuffix(p, "/repository/compare"):
-			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		case strings.HasSuffix(p, "/repository/branches/main"):
+			glWriteJSON(t, w, map[string]any{"name": "main", "commit": map[string]any{"id": "base2"}})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, p)
 			http.NotFound(w, r)
@@ -291,8 +292,8 @@ func glObserveHandler(t *testing.T, fail string) http.Handler {
 			part = "pipelines"
 		case strings.HasSuffix(p, "/jobs"):
 			part = "jobs"
-		case strings.HasSuffix(p, "/repository/compare"):
-			part = "compare"
+		case strings.HasSuffix(p, "/repository/branches/main"):
+			part = "base"
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, p)
 			http.NotFound(w, r)
@@ -306,6 +307,7 @@ func glObserveHandler(t *testing.T, fail string) http.Handler {
 		case "mr":
 			glWriteJSON(t, w, map[string]any{
 				"iid": 7, "state": "opened", "sha": "head1", "target_branch": "main",
+				"diverged_commits_count": 0,
 			})
 		case "threads":
 			glWriteJSON(t, w, []any{})
@@ -317,8 +319,8 @@ func glObserveHandler(t *testing.T, fail string) http.Handler {
 			glWriteJSON(t, w, []map[string]any{{"id": 11, "sha": "head1", "status": "success"}})
 		case "jobs":
 			glWriteJSON(t, w, []map[string]any{{"id": 110, "name": "build", "status": "success"}})
-		case "compare":
-			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		case "base":
+			glWriteJSON(t, w, map[string]any{"name": "main", "commit": map[string]any{"id": "base1"}})
 		}
 	})
 }
@@ -338,7 +340,7 @@ func TestGitLabObserveCompleteObservationMerges(t *testing.T) {
 }
 
 func TestGitLabObserveProviderFailureWaits(t *testing.T) {
-	for _, part := range []string{"threads", "approvals", "pipelines", "jobs", "compare"} {
+	for _, part := range []string{"threads", "approvals", "pipelines", "jobs", "base"} {
 		t.Run(part, func(t *testing.T) {
 			g := glTestServer(t, glObserveHandler(t, part))
 			o, err := g.Observe(context.Background(), 7)
