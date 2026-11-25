@@ -18,6 +18,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	_ "modernc.org/sqlite" // register the "sqlite" driver for the store adapter
+
 	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
