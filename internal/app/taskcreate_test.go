@@ -15,6 +15,10 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// stableIDPattern matches an ID derived from content. It carries no date, so
+// the same content gets the same ID regardless of when it is created.
+var stableIDPattern = regexp.MustCompile(`^T-[0-9a-f]{8}$`)
+
 // core.TaskSource now requires Create, so the shared fake defines it here.
 func (f *fakeSource) Create(_ context.Context, task core.Task) (core.Task, error) {
 	created := task
@@ -480,7 +484,7 @@ func TestTaskCreatorDerivesStableEpicID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.ID != second.ID || !regexp.MustCompile(`^T-[0-9]{8}-[0-9a-f]{8}$`).MatchString(first.ID) {
+	if first.ID != second.ID || !stableIDPattern.MatchString(first.ID) {
 		t.Fatalf("first = %q, second = %q", first.ID, second.ID)
 	}
 }
@@ -505,7 +509,7 @@ func TestTaskCreatorCreateBatch(t *testing.T) {
 		t.Fatalf("created = %d, commits = %d", len(src.created), len(ws.commits))
 	}
 	for i, item := range got {
-		if !regexp.MustCompile(`^T-[0-9]{8}-[0-9a-f]{8}$`).MatchString(item.ID) ||
+		if !stableIDPattern.MatchString(item.ID) ||
 			item.Path != "docs/tasks/"+item.ID+".md" || !item.Pushed {
 			t.Fatalf("result %d = %+v", i, item)
 		}
@@ -552,6 +556,97 @@ func TestTaskCreatorCreateBatchIsIdempotent(t *testing.T) {
 	if len(src.created) != 3 || len(src.log.items) != 3 || len(ws.commits) != 1 {
 		t.Fatalf("repeated batch wrote cards = %d, creates = %d, commits = %d",
 			len(src.created), len(src.log.items), len(ws.commits))
+	}
+}
+
+func TestTaskCreatorCreateBatchStableAcrossDays(t *testing.T) {
+	in := []CreateTaskInput{
+		{Title: "Alpha", Body: "One", Priority: 3},
+		{Title: "Beta", Depends: []string{"@1"}},
+		{Title: "Epic", Kind: core.TaskKindEpic, Plan: epicPlan()},
+	}
+
+	// Each call uses a fresh creator, so the cache cannot hide a changed ID.
+	// The explicit dates simulate running the same batch on different days.
+	create := func(date string) ([]CreatedTask, *recordingEpicSource) {
+		src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+		creator := &TaskCreator{
+			Source: src, Workspace: &fakeWorkspace{log: &callLog{}},
+			Root: core.Workspace{Path: "/root", Branch: "main"}, Date: date,
+		}
+		got, err := creator.CreateBatch(context.Background(), in)
+		if err != nil {
+			t.Fatalf("date %s: %v", date, err)
+		}
+		return got, src
+	}
+
+	dayOne, srcOne := create("20260101")
+	dayTwo, srcTwo := create("20260102")
+	if len(dayOne) != len(in) || len(dayTwo) != len(in) {
+		t.Fatalf("day one = %d cards, day two = %d, want %d", len(dayOne), len(dayTwo), len(in))
+	}
+	for i := range dayOne {
+		if dayTwo[i].ID != dayOne[i].ID || dayTwo[i].Path != dayOne[i].Path {
+			t.Fatalf("card %d changed across days: %+v vs %+v", i, dayOne[i], dayTwo[i])
+		}
+		if !stableIDPattern.MatchString(dayOne[i].ID) {
+			t.Fatalf("card %d has date-shaped id %q", i, dayOne[i].ID)
+		}
+	}
+	// Two plain cards plus the epic and its two children.
+	if len(srcOne.created) != 5 || len(srcTwo.created) != 5 {
+		t.Fatalf("day one wrote %d cards, day two wrote %d", len(srcOne.created), len(srcTwo.created))
+	}
+
+	// A later-day process whose source already lists the cards must return
+	// them without writing a second set.
+	repeatSrc := &recordingEpicSource{fakeSource: &fakeSource{
+		log: &callLog{}, tasks: srcOne.created,
+	}}
+	repeat := &TaskCreator{
+		Source: repeatSrc, Workspace: &fakeWorkspace{log: &callLog{}},
+		Root: core.Workspace{Path: "/root", Branch: "main"}, Date: "20260104",
+	}
+	repeated, err := repeat.CreateBatch(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range repeated {
+		if repeated[i].ID != dayOne[i].ID {
+			t.Fatalf("repeat card %d = %q, want %q", i, repeated[i].ID, dayOne[i].ID)
+		}
+	}
+	if len(repeatSrc.created) != 0 {
+		t.Fatalf("later day wrote %d duplicate cards", len(repeatSrc.created))
+	}
+
+	// An epic in a batch and the same epic alone get the same ID on any day.
+	aloneSrc := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	alone := &TaskCreator{
+		Source: aloneSrc, Workspace: &fakeWorkspace{log: &callLog{}},
+		Root: core.Workspace{Path: "/root", Branch: "main"}, Date: "20260103",
+	}
+	got, err := alone.Create(context.Background(), in[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != dayOne[2].ID {
+		t.Fatalf("standalone epic = %q, batch epic = %q", got.ID, dayOne[2].ID)
+	}
+}
+
+func TestTaskCreatorExplicitDateAppliesToGeneratedIDs(t *testing.T) {
+	creator := &TaskCreator{
+		Source: &fakeSource{log: &callLog{}}, Workspace: &fakeWorkspace{log: &callLog{}},
+		Date: "20200102",
+	}
+	got, err := creator.Create(context.Background(), CreateTaskInput{Title: "Random"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got.ID, "T-20200102-") {
+		t.Fatalf("id = %q, want explicit date prefix", got.ID)
 	}
 }
 
