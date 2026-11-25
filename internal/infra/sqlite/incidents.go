@@ -13,6 +13,7 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// newIncidentID generates a random base incident identifier.
 func newIncidentID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -21,6 +22,7 @@ func newIncidentID() string {
 	return "inc-" + hex.EncodeToString(b[:])
 }
 
+// CreateIncident stores in or returns the open incident with the same signature.
 func (s *Store) CreateIncident(ctx context.Context, in *core.BaseIncident) (*core.BaseIncident, error) {
 	if existing, err := s.FindOpenIncident(ctx, in.Repo, in.BaseBranch, in.Signature); err != nil {
 		return nil, err
@@ -53,16 +55,19 @@ WHERE base_incidents.status != 'open'`,
 	return s.FindOpenIncident(ctx, in.Repo, in.BaseBranch, in.Signature)
 }
 
+// GetIncident returns the incident with id, or nil when it does not exist.
 func (s *Store) GetIncident(ctx context.Context, id string) (*core.BaseIncident, error) {
 	return s.scanIncident(s.db.QueryRowContext(ctx, `SELECT `+incidentColumns+` FROM base_incidents WHERE id=?`, id))
 }
 
+// FindOpenIncident returns the open incident matching repo, base and signature.
 func (s *Store) FindOpenIncident(ctx context.Context, repo, base, signature string) (*core.BaseIncident, error) {
 	return s.scanIncident(s.db.QueryRowContext(ctx,
 		`SELECT `+incidentColumns+` FROM base_incidents WHERE repo=? AND base_branch=? AND signature=? AND status='open'`,
 		repo, base, signature))
 }
 
+// ListOpenIncidents returns every incident that is still open.
 func (s *Store) ListOpenIncidents(ctx context.Context) ([]*core.BaseIncident, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+incidentColumns+` FROM base_incidents WHERE status='open'`)
 	if err != nil {
@@ -80,9 +85,11 @@ func (s *Store) ListOpenIncidents(ctx context.Context) ([]*core.BaseIncident, er
 	return out, rows.Err()
 }
 
+// incidentColumns lists the base incident fields stored in one row.
 const incidentColumns = `id, repo, base_branch, signature, failed_checks_json,
  fixer_run_id, status, attempts, created_at, resolved_at`
 
+// scanIncident decodes one database row into a base incident.
 func (s *Store) scanIncident(row scanner) (*core.BaseIncident, error) {
 	var in core.BaseIncident
 	var fixer string
@@ -98,6 +105,7 @@ func (s *Store) scanIncident(row scanner) (*core.BaseIncident, error) {
 	return &in, nil
 }
 
+// UpdateIncident writes the mutable fields of in back to the database.
 func (s *Store) UpdateIncident(ctx context.Context, in *core.BaseIncident) error {
 	if in.Status == "resolved" && in.ResolvedAt == 0 {
 		in.ResolvedAt = nowUnix()
