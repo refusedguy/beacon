@@ -114,6 +114,76 @@ type Run struct {
 	UpdatedAt         time.Time
 }
 
+// WireRun is the loopback view of a run. The HTTP API and the status tools
+// both emit it, so a monitor decodes one field set from either source.
+type WireRun struct {
+	ID        string `json:"id"`
+	TaskID    string `json:"task_id"`
+	State     string `json:"state"`
+	PR        int    `json:"pr"`
+	HeadSHA   string `json:"head_sha"`
+	Branch    string `json:"branch"`
+	Reason    string `json:"reason"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// NewWireRun maps a run into the loopback wire shape.
+func NewWireRun(r *Run) WireRun {
+	if r == nil {
+		return WireRun{}
+	}
+	return WireRun{
+		ID:        string(r.ID),
+		TaskID:    string(r.TaskID),
+		State:     string(r.State),
+		PR:        r.PRNumber,
+		HeadSHA:   r.HeadSHA,
+		Branch:    r.Branch,
+		Reason:    r.Reason,
+		UpdatedAt: r.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+// NewWireRuns maps runs in order. An empty input becomes an empty array, not
+// null, so the monitor can always iterate the result.
+func NewWireRuns(runs []*Run) []WireRun {
+	out := make([]WireRun, 0, len(runs))
+	for _, r := range runs {
+		out = append(out, NewWireRun(r))
+	}
+	return out
+}
+
+// WireEvent is one loopback notification. An event tells the monitor to
+// re-read runs; it is not a source of run state.
+type WireEvent struct {
+	ID    int64  `json:"id"`
+	Type  string `json:"type"`
+	RunID string `json:"run_id"`
+	At    string `json:"at"`
+}
+
+// NewWireEvent maps a harness event into the loopback wire shape. Harness
+// events carry neither a sequence number nor a timestamp, so id and at stay
+// empty. The client reads the event name from type.
+func NewWireEvent(ev HarnessEvent) WireEvent {
+	return WireEvent{Type: ev.Kind, RunID: string(ev.RunID)}
+}
+
+// WireControlResult is the loopback answer to a control request. Applied is
+// true when the action was accepted by the daemon.
+type WireControlResult struct {
+	OK      bool   `json:"ok"`
+	Action  string `json:"action"`
+	RunID   string `json:"run_id"`
+	Applied bool   `json:"applied"`
+}
+
+// NewWireControlResult reports an applied control action.
+func NewWireControlResult(action ControlAction, id RunID) WireControlResult {
+	return WireControlResult{OK: true, Action: action.String(), RunID: string(id), Applied: true}
+}
+
 func NewRun(id RunID, task TaskID, now time.Time) *Run {
 	return &Run{ID: id, TaskID: task, State: RunPending, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
 }

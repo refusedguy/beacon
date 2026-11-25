@@ -4,6 +4,8 @@ import (
 	"context"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 // StatusArgs is the input schema for beacon_status.
@@ -20,7 +22,7 @@ func registerStatus(s *msdk.Server, sv Services) {
 		if err != nil {
 			return nil, nil, err
 		}
-		return jsonResult(runs), nil, nil
+		return jsonResult(core.NewWireRuns(runs)), nil, nil
 	})
 }
 
@@ -40,6 +42,6 @@ func registerRecent(s *msdk.Server, sv Services) {
 		if err != nil {
 			return nil, nil, err
 		}
-		return jsonResult(runs), nil, nil
+		return jsonResult(core.NewWireRuns(runs)), nil, nil
 	})
 }

@@ -117,11 +117,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case msg.err != nil:
 			m.status = string(msg.action) + " " + msg.runID + ": " + msg.err.Error()
-		case !msg.result.OK:
+		case !msg.result.OK || !msg.result.Applied:
 			m.failed = true
 			m.status = string(msg.action) + " " + msg.runID + ": refused"
 		default:
-			m.status = string(msg.action) + " " + msg.runID + ": ok"
+			m.status = string(msg.action) + " " + msg.runID + ": applied"
 			return m, m.reload()
 		}
 		return m, nil
