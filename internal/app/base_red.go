@@ -67,31 +67,8 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 	if in == nil {
 		return nil
 	}
-	active, err := r.Store.ListActive(ctx)
-	if err != nil {
+	if err := r.blockRunsOnRedBase(ctx, in, baseBranch, base.FailedChecks); err != nil {
 		return err
-	}
-	for _, other := range active {
-		if other.IsFixer || other.PRNumber == 0 {
-			continue
-		}
-		if other.State != core.RunWaitingCI && other.State != core.RunNeedsAgentFix {
-			continue
-		}
-		if r.baseBranchFor(ctx, other) != baseBranch {
-			continue
-		}
-		otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
-		if err != nil || !intersects(failedNames(otherObs.Checks), failedNames(base.FailedChecks)) {
-			continue
-		}
-		if err := other.Apply(core.Event{Kind: core.EvBlock, Reason: "base_red"}); err != nil {
-			continue
-		}
-		other.BlockedIncidentID = in.ID
-		if err := r.Store.Save(ctx, other); err != nil {
-			slog.Error("block run on red base", "run", other.ID, "incident", in.ID, "error", err)
-		}
 	}
 	if strings.EqualFold(r.BaseRedMode, "notify_orchestrator") {
 		if err := r.notify(run, "base_red", "base branch is red: "+reason); err != nil {
@@ -103,12 +80,49 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 	return r.ensureFixer(ctx, in, base, run)
 }
 
+// blockRunsOnRedBase moves every run sharing a red base into blocked state.
+// Each failure is logged with the run and incident IDs so no block is silent.
+func (r *Reconciler) blockRunsOnRedBase(ctx context.Context, in *core.BaseIncident, baseBranch string, failed []core.CheckResult) error {
+	active, err := r.Store.ListActive(ctx)
+	if err != nil {
+		return err
+	}
+	baseFailed := failedNames(failed)
+	for _, other := range active {
+		if other.IsFixer || other.PRNumber == 0 {
+			continue
+		}
+		if other.State != core.RunWaitingCI && other.State != core.RunNeedsAgentFix {
+			continue
+		}
+		if r.baseBranchFor(ctx, other) != baseBranch {
+			continue
+		}
+		otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
+		if err != nil || !intersects(failedNames(otherObs.Checks), baseFailed) {
+			continue
+		}
+		if err := other.Apply(core.Event{Kind: core.EvBlock, Reason: "base_red"}); err != nil {
+			slog.Error("block run on red base", "run", other.ID, "task", other.TaskID, "incident", in.ID, "error", err)
+			continue
+		}
+		other.BlockedIncidentID = in.ID
+		if err := r.Store.Save(ctx, other); err != nil {
+			slog.Error("block run on red base", "run", other.ID, "incident", in.ID, "error", err)
+		}
+	}
+	return nil
+}
+
 func sqliteChecks(names []string) string {
 	if names == nil {
 		names = []string{}
 	}
 	b, err := json.Marshal(names)
 	if err != nil {
+		// A []string cannot fail to marshal. Keep the incident record usable
+		// rather than losing it to a silent serialization fallback.
+		slog.Error("encode failed check names", "error", err)
 		return "[]"
 	}
 	return string(b)
@@ -150,7 +164,11 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 		ParentSessionID: run.ParentSessionID, IsFixer: true,
 	})
 	if err != nil {
-		_ = r.Workspace.Remove(ctx, ws)
+		// The fixer never started. A failed workspace cleanup is logged with the
+		// run and task IDs so the next reconcile can still retry.
+		if cleanupErr := r.Workspace.Remove(ctx, ws); cleanupErr != nil {
+			slog.Error("remove fixer workspace", "run", id, "task", task.ID, "error", cleanupErr)
+		}
 		return err
 	}
 	run.SessionID = session.ID
@@ -247,12 +265,21 @@ func (r *Reconciler) unblockWithRebase(ctx context.Context, run *core.Run) error
 	if run.PRNumber > 0 {
 		newSHA, err := r.SCM.UpdateBranch(ctx, run.PRNumber, run.HeadSHA)
 		if err != nil {
-			_ = run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"})
-			_ = run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()})
+			// The rebase failed. These events roll the run back to needs_agent_fix;
+			// the run is already unblocked, so a rejected transition is best effort
+			// but must be logged with the affected run and task.
+			if applyErr := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); applyErr != nil {
+				slog.Error("rebase rollback behind", "run", run.ID, "task", run.TaskID, "error", applyErr)
+			}
+			if applyErr := run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}); applyErr != nil {
+				slog.Error("rebase rollback failure", "run", run.ID, "task", run.TaskID, "error", applyErr)
+			}
 			return r.Store.Save(ctx, run)
 		}
-		if err := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); err == nil {
-			_ = run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "base recovered"})
+		if err := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); err != nil {
+			slog.Error("rebase behind", "run", run.ID, "task", run.TaskID, "error", err)
+		} else if err := run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "base recovered"}); err != nil {
+			slog.Error("rebase success transition", "run", run.ID, "task", run.TaskID, "error", err)
 		}
 	}
 	return r.Store.Save(ctx, run)

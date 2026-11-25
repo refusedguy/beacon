@@ -29,8 +29,8 @@ func acquireLock(dir string) (*os.File, error) {
 		return nil, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("beacon is already running: %w", err)
+		// Keep the lock conflict primary and surface a close failure too.
+		return nil, fmt.Errorf("beacon is already running: %w", errors.Join(err, f.Close()))
 	}
 	return f, nil
 }
@@ -66,7 +66,12 @@ func readConnection(dir string) (*connectionInfo, error) {
 }
 
 func removeConnection(dir string) {
-	_ = os.Remove(filepath.Join(dir, "connection.json"))
+	path := filepath.Join(dir, "connection.json")
+	// Shutdown cleanup is best effort: the lock is already released and the
+	// next start overwrites a stale record.
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Error("remove connection record", "path", path, "error", err)
+	}
 }
 
 const (
@@ -122,7 +127,10 @@ func startDaemonState(dir string) (*daemonTracker, error) {
 	if err := t.write(); err != nil {
 		return nil, err
 	}
-	_ = os.Remove(filepath.Join(dir, daemonErrorFile))
+	// A stale error record is cleared best effort; the first new error replaces it.
+	if err := os.Remove(filepath.Join(dir, daemonErrorFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Error("clear daemon error record", "dir", dir, "error", err)
+	}
 	go t.loop()
 	return t, nil
 }
@@ -161,7 +169,12 @@ func (t *daemonTracker) write() error {
 func (t *daemonTracker) Close() {
 	close(t.stop)
 	<-t.done
-	_ = os.Remove(filepath.Join(t.dir, daemonStateFile))
+	path := filepath.Join(t.dir, daemonStateFile)
+	// Best effort shutdown cleanup: a leftover state file is replaced on the
+	// next start and the heartbeat loop has already stopped.
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Error("remove daemon state", "path", path, "error", err)
+	}
 }
 
 func writeDaemonError(dir, kind string, err error) {
@@ -222,14 +235,18 @@ func writeJSONAtomic(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
+	defer func() {
+		// The rename consumes the temp file. A leftover on an earlier failure is
+		// never read and uses a fresh name next time, so removal stays best effort.
+		if err := os.Remove(f.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Error("remove temp state", "path", f.Name(), "error", err)
+		}
+	}()
 	if err := json.NewEncoder(f).Encode(v); err != nil {
-		f.Close()
-		return err
+		return errors.Join(err, f.Close())
 	}
 	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
+		return errors.Join(err, f.Close())
 	}
 	if err := f.Close(); err != nil {
 		return err
