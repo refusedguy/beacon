@@ -12,6 +12,7 @@ import (
 // schema file stays unchanged so existing state databases keep their data.
 var taskColumns = []struct{ name, ddl string }{
 	{"kind", "kind TEXT NOT NULL DEFAULT 'task'"},
+	{"parent", "parent TEXT NOT NULL DEFAULT ''"},
 	{"base_branch", "base_branch TEXT NOT NULL DEFAULT ''"},
 	{"require_review", "require_review TEXT NOT NULL DEFAULT ''"},
 	{"plan_json", "plan_json TEXT NOT NULL DEFAULT '[]'"},
@@ -19,6 +20,7 @@ var taskColumns = []struct{ name, ddl string }{
 	{"worker_prompt", "worker_prompt TEXT NOT NULL DEFAULT ''"},
 }
 
+// ensureTaskColumns adds epic columns to an older tasks table.
 func (s *Store) ensureTaskColumns(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(tasks)`)
 	if err != nil {
@@ -51,6 +53,7 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 	return nil
 }
 
+// SyncTasks replaces the stored cards and dependencies with tasks.
 func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return err
@@ -84,9 +87,9 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 			kind = "task"
 		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, base_branch, require_review, plan_json, worker_agent, worker_prompt)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
-			kind, t.BaseBranch, string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
+INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
+			kind, string(t.Parent), t.BaseBranch, string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
 			return err
 		}
 		for _, dep := range t.DependsOn {
@@ -98,6 +101,7 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, t.
 	return tx.Commit()
 }
 
+// readyTasksQuery selects tasks with no unresolved dependencies.
 const readyTasksQuery = `
 WITH RECURSIVE blocked_chain(task_id, origin, depth) AS (
   SELECT d.task_id, d.depends_on, 1
@@ -111,17 +115,19 @@ WITH RECURSIVE blocked_chain(task_id, origin, depth) AS (
   JOIN tasks t ON t.id = d.depends_on
   WHERE t.status NOT IN ('done', 'dropped') AND b.depth < 64
 )
-SELECT id, title, body, priority, scope_json, source_ref, kind, base_branch, require_review, plan_json, worker_agent, worker_prompt
+SELECT id, title, body, priority, scope_json, source_ref, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt
 FROM tasks
 WHERE status IN ('available', 'todo')
   AND id NOT IN (SELECT task_id FROM blocked_chain)
 ORDER BY priority DESC, id`
 
+// SetTaskStatus sets the status of taskID.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
 	return err
 }
 
+// ListReadyTasks returns the available tasks whose dependencies are resolved.
 func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return nil, err
@@ -135,15 +141,16 @@ func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
 	for rows.Next() {
 		var t core.Task
 		var id, scopeJSON, source, kind, review, planJSON, workerAgent, workerPrompt string
-		var base sql.NullString
+		var base, parent sql.NullString
 		if err := rows.Scan(&id, &t.Title, &t.Body, &t.Priority, &scopeJSON, &source,
-			&kind, &base, &review, &planJSON, &workerAgent, &workerPrompt); err != nil {
+			&kind, &parent, &base, &review, &planJSON, &workerAgent, &workerPrompt); err != nil {
 			return nil, err
 		}
 		t.ID = core.TaskID(id)
 		t.Status = core.TaskAvailable
 		t.SourceRef = source
 		t.Kind = core.TaskKind(kind)
+		t.Parent = core.TaskID(parent.String)
 		t.BaseBranch = base.String
 		t.RequireReview = core.ReviewMode(review)
 		t.WorkerAgent = workerAgent

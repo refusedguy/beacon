@@ -23,7 +23,7 @@ func redReconciler(t *testing.T) (*Reconciler, *fakeStore, *fakeSCM, *fakeHarnes
 	store := newFakeStore()
 	run := makeRun("r1", 42, core.RunWaitingCI)
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	changes := make(chan int, 4)
 	scm := &fakeSCM{
@@ -43,7 +43,7 @@ func TestRedBaseSpawnsOneFixerAndRecovers(t *testing.T) {
 	r, store, scm, h, _ := redReconciler(t)
 	ctx := context.Background()
 	if _, err := r.Reconcile(ctx, 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 	}
 	if store.runs["r1"].State != core.RunBlocked {
 		t.Fatalf("run not blocked: %s", store.runs["r1"].State)
@@ -61,7 +61,7 @@ func TestRedBaseSpawnsOneFixerAndRecovers(t *testing.T) {
 		t.Fatalf("workers should not be woken on a red base: %d", len(h.wakes))
 	}
 	if _, err := r.Reconcile(ctx, 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 	}
 	fixers = 0
 	for _, run := range store.runs {
@@ -75,7 +75,7 @@ func TestRedBaseSpawnsOneFixerAndRecovers(t *testing.T) {
 
 	scm.base = core.BaseStatus{BaseBranch: "main", HeadSHA: "base2"}
 	if err := r.checkBaseRecovery(ctx); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.checkBaseRecovery(ctx): %v`, err)
 	}
 	if store.runs["r1"].State != core.RunWaitingCI {
 		t.Fatalf("run not recovered: %s", store.runs["r1"].State)
@@ -94,7 +94,7 @@ func TestRedBaseDefaultSpawnsFixer(t *testing.T) {
 	r.BaseRedMode = "" // unset config resolves to spawn_fixer
 	ctx := context.Background()
 	if _, err := r.Reconcile(ctx, 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 	}
 	if store.runs["r1"].State != core.RunBlocked {
 		t.Fatalf("run not blocked: %s", store.runs["r1"].State)
@@ -110,7 +110,7 @@ func TestRedBaseDefaultSpawnsFixer(t *testing.T) {
 	}
 	incidents, err := store.ListOpenIncidents(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.ListOpenIncidents(ctx): %v`, err)
 	}
 	if len(incidents) != 1 || incidents[0].FixerRunID == "" {
 		t.Fatalf("incident missing fixer run ID: %+v", incidents)
@@ -138,7 +138,7 @@ func TestRedBaseNotifyOrchestratorNotifiesAndDoesNotSpawn(t *testing.T) {
 	r.Notifier = n
 	store.runs["r1"].ParentSessionID = "ses_parent"
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if n.count != 1 {
 		t.Fatalf("notifier calls = %d, want 1", n.count)
@@ -166,7 +166,7 @@ func TestRedBaseNoNotifierStillNotifiesParent(t *testing.T) {
 		t.Fatal("expected no notifier")
 	}
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if store.runs["r1"].State != core.RunBlocked {
 		t.Fatalf("run not blocked: %s", store.runs["r1"].State)
@@ -180,7 +180,7 @@ func TestRedBaseParentNoticeCarriesReason(t *testing.T) {
 	r.Notifier = &fakeNotifier{}
 	store.runs["r1"].ParentSessionID = "ses_parent"
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	assertBaseRedParentNotified(t, h)
 	if got := h.notifications[0].text; !strings.Contains(got, "ci failed") {
@@ -193,7 +193,7 @@ func TestFixerInheritsDispatcherMaxAttempts(t *testing.T) {
 	r.Dispatcher = &Dispatcher{MaxAttempts: 17}
 	ctx := context.Background()
 	if _, err := r.Reconcile(ctx, 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 	}
 	for _, run := range store.runs {
 		if run.IsFixer && run.MaxAttempts != 17 {
@@ -209,7 +209,7 @@ func TestRedEpicBranchBlocksChildrenAndSpawnsFixer(t *testing.T) {
 	child.TaskID = "T-EPIC-01"
 	child.Branch = "beacon/T-EPIC-01"
 	if err := store.Save(ctx, child); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, child): %v`, err)
 	}
 	scm := &fakeSCM{
 		obs: core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open",
@@ -228,11 +228,11 @@ func TestRedEpicBranchBlocksChildrenAndSpawnsFixer(t *testing.T) {
 	}
 
 	if _, err := r.Reconcile(ctx, 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 	}
 	incidents, err := store.ListOpenIncidents(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.ListOpenIncidents(ctx): %v`, err)
 	}
 	if len(incidents) != 1 {
 		t.Fatalf("incidents = %d, want 1", len(incidents))
@@ -305,7 +305,7 @@ func TestIdleAutoAttachesPRByBranch(t *testing.T) {
 	run := makeRun("r1", 0, core.RunRunning)
 	run.Branch = "beacon/T-1"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	changes := make(chan int, 4)
 	r := &Reconciler{

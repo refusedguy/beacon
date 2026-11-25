@@ -1,3 +1,4 @@
+// Command beacon-tui monitors Beacon runs over the loopback API.
 package main
 
 import (
@@ -11,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// main parses flags, validates the endpoint and runs the monitor.
 func main() {
 	endpoint := flag.String("endpoint", "http://127.0.0.1:7432", "loopback daemon endpoint")
 	token := flag.String("token", os.Getenv("BEACON_API_TOKEN"), "bearer token (default BEACON_API_TOKEN)")

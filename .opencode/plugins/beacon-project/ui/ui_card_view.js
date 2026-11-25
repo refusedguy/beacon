@@ -2,6 +2,7 @@
 // the render callback that opens the panel. apply() changes props in place.
 import { CARD_BODY_LINES, str } from "./ui_model.js"
 import { createBox, createLineMount, createText } from "./ui_nodes.js"
+import { taskTree } from "./ui_alerts.js"
 
 export const CARD_PANEL_NAME = "beacon.card"
 export const CARD_LINES = CARD_BODY_LINES + 8
@@ -16,20 +17,21 @@ export function fixPrompt(card) {
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 const values = (v) => (Array.isArray(v) ? v : v ? [v] : []).map(str).filter((id) => ID_RE.test(id))
 
-// An epic's depends list names its generated children. A child's base_branch
-// names the epic branch. The queue supplies titles and states for both.
+// The card owns its parent field. The queue index supplies the children so
+// the panel and the sidebar draw the same family from one relation.
 export function cardFamily(card, queue = []) {
   const id = str(card?.id)
   const meta = card?.meta ?? {}
   const deps = [...new Set([
     ...values(meta.depends), ...values(meta.depends_on), ...values(str(card?.depends).split(/[\s,]+/)),
   ])]
-  const parent = str(card?.parent) === id ? "" : str(card?.parent)
-  const fromQueue = (Array.isArray(queue) ? queue : [])
-    .map((item) => str(item?.id))
-    .filter((child) => ID_RE.test(child) && child.startsWith(`${id}-`))
+  const explicit = str(card?.parent) === id ? "" : str(card?.parent)
+  const tree = taskTree([...(Array.isArray(queue) ? queue : []), { id, parent: explicit }])
+  const parent = tree.parent.get(id) || ""
   const children = [...new Set([
-    ...values(meta.children), ...deps.filter((dep) => dep.startsWith(`${id}-`)), ...fromQueue,
+    ...values(meta.children),
+    ...(tree.children.get(id) ?? []),
+    ...deps.filter((dep) => tree.parent.get(dep) === id),
   ])]
   return { deps, parent, children }
 }

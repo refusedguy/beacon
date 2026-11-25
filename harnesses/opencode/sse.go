@@ -13,32 +13,40 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// sseFrame is one parsed server-sent event from the OpenCode event stream.
 type sseFrame struct {
 	event string
 	data  string
 }
 
+// WatchIdle starts the idle stream watcher in the background.
 func (h *Harness) WatchIdle(ctx context.Context) {
 	h.init()
 	h.watchOnce.Do(func() { go h.watchLoop(ctx) })
 }
 
+// RunIdleWatch runs the idle stream watcher until ctx is cancelled.
 func (h *Harness) RunIdleWatch(ctx context.Context) {
 	h.init()
 	h.watchLoop(ctx)
 }
 
+// watchLoop reconnects to the idle stream with exponential backoff.
 func (h *Harness) watchLoop(ctx context.Context) {
 	delay := h.ReconnectMin
+	timer := time.NewTimer(delay)
+	timer.Stop()
+	defer timer.Stop()
 	for ctx.Err() == nil {
 		_ = h.streamIdle(ctx)
 		if ctx.Err() != nil {
 			return
 		}
+		timer.Reset(delay)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-timer.C:
 		}
 		if delay < h.ReconnectMax {
 			delay *= 2
@@ -49,6 +57,7 @@ func (h *Harness) watchLoop(ctx context.Context) {
 	}
 }
 
+// streamClient returns a client without a request timeout for long-lived streams.
 func (h *Harness) streamClient() *http.Client {
 	if h.HTTP == nil || h.HTTP.Timeout == 0 {
 		return h.HTTP
@@ -60,6 +69,7 @@ func (h *Harness) streamClient() *http.Client {
 	}
 }
 
+// streamIdle reads the OpenCode event stream and emits idle events per session.
 func (h *Harness) streamIdle(ctx context.Context) error {
 	h.init()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.Endpoint+"/api/event", nil)
@@ -101,6 +111,7 @@ func (h *Harness) streamIdle(ctx context.Context) error {
 	})
 }
 
+// readSSE parses server-sent event frames from r and calls onFrame for each.
 func readSSE(r io.Reader, onFrame func(sseFrame)) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
@@ -137,6 +148,7 @@ func readSSE(r io.Reader, onFrame func(sseFrame)) error {
 	return scanner.Err()
 }
 
+// sessionIDFromData extracts a session id from an event payload.
 func sessionIDFromData(data string) string {
 	data = strings.TrimSpace(data)
 	if data == "" {
@@ -188,6 +200,7 @@ func sessionIDFromData(data string) string {
 	return found
 }
 
+// findAnyID searches a decoded payload for the first string id field.
 func findAnyID(v any) string {
 	switch t := v.(type) {
 	case map[string]any:

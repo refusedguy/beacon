@@ -60,7 +60,7 @@ func TestTaskCreatorCreatesAndCommits(t *testing.T) {
 		Priority: 11,
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: " Add orchestrator tool ", Body: "Create cards in one call.", Scope: []string{"internal/app/", "internal/**/*.go", ""}, Depends: []string{" E2E-03 ", ""}, Priority: 11, }): %v`, err)
 	}
 	if !regexp.MustCompile(`^T-[0-9]{8}-[0-9a-f]{8}$`).MatchString(got.ID) {
 		t.Fatalf("id = %q, want date plus short hex", got.ID)
@@ -98,7 +98,7 @@ func TestTaskCreatorRebasesBeforePublishing(t *testing.T) {
 	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
 
 	if _, err := creator.Create(context.Background(), CreateTaskInput{Title: "Card"}); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{Title: "Card"}): %v`, err)
 	}
 	if len(ws.rebases) != 1 || ws.rebases[0] != "main" {
 		t.Fatalf("rebases = %v, want one rebase onto main", ws.rebases)
@@ -118,7 +118,7 @@ func TestTaskCreatorRetriesPushAfterNonFastForward(t *testing.T) {
 
 	got, err := creator.Create(context.Background(), CreateTaskInput{Title: "Retry card"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{Title: "Retry card"}): %v`, err)
 	}
 	if !got.Pushed {
 		t.Fatalf("result = %+v, want pushed", got)
@@ -242,7 +242,7 @@ func TestTaskCreatorExpandsEpic(t *testing.T) {
 		RequireReview: core.ReviewModeHuman, Plan: epicPlan(),
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, RequireReview: core.ReviewModeHuman, Plan: epicPlan(), }): %v`, err)
 	}
 	if len(src.created) != 3 {
 		t.Fatalf("created cards = %d, want epic plus two children", len(src.created))
@@ -287,7 +287,7 @@ func TestTaskCreatorCopiesChildBodies(t *testing.T) {
 	if _, err := creator.Create(context.Background(), CreateTaskInput{
 		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: plan,
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: plan, }): %v`, err)
 	}
 	if len(src.created) != 3 {
 		t.Fatalf("created cards = %d, want epic plus two children", len(src.created))
@@ -312,12 +312,12 @@ func TestTaskCreatorChildBodyDoesNotChangeIDs(t *testing.T) {
 
 	first, err := creator.Create(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), in): %v`, err)
 	}
 	in.Plan[0].Body = "Changed instruction."
 	second, err := creator.Create(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), in): %v`, err)
 	}
 
 	if second.ID != first.ID || len(second.IDs) != len(first.IDs) || len(second.Children) != len(first.Children) {
@@ -346,7 +346,7 @@ func TestTaskCreatorSyncsFullAvailableSet(t *testing.T) {
 		Root: core.Workspace{Path: "/root", Branch: "main"}}
 
 	if _, err := creator.Create(context.Background(), CreateTaskInput{Title: "New card"}); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{Title: "New card"}): %v`, err)
 	}
 	seen := make(map[core.TaskID]bool, len(store.tasks))
 	for _, task := range store.tasks {
@@ -366,11 +366,11 @@ func TestTaskCreatorEpicIsIdempotent(t *testing.T) {
 
 	first, err := creator.Create(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), in): %v`, err)
 	}
 	second, err := creator.Create(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), in): %v`, err)
 	}
 	if len(src.created) != 3 {
 		t.Fatalf("created cards = %d, want 3 after a repeated create", len(src.created))
@@ -404,7 +404,7 @@ func TestTaskCreatorFindsExistingEpicFromSource(t *testing.T) {
 		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: plan,
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: plan, }): %v`, err)
 	}
 	if len(src.created) != 0 || len(ws.commits) != 0 {
 		t.Fatal("an existing epic still wrote cards or committed")
@@ -460,7 +460,7 @@ func TestTaskCreatorCreatesChildrenInOneOperation(t *testing.T) {
 	if _, err := creator.Create(context.Background(), CreateTaskInput{
 		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: epicPlan(),
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: epicPlan(), }): %v`, err)
 	}
 	if src.calls != 1 {
 		t.Fatalf("batch calls = %d, want one call for the whole graph", src.calls)
@@ -475,14 +475,14 @@ func TestTaskCreatorDerivesStableEpicID(t *testing.T) {
 
 	first, err := creator.Create(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), in): %v`, err)
 	}
 	src2 := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
 	creator2 := &TaskCreator{Source: src2, Workspace: &fakeWorkspace{log: &callLog{}},
 		Root: core.Workspace{Path: "/root", Branch: "main"}}
 	second, err := creator2.Create(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator2.Create(context.Background(), in): %v`, err)
 	}
 	if first.ID != second.ID || !stableIDPattern.MatchString(first.ID) {
 		t.Fatalf("first = %q, second = %q", first.ID, second.ID)
@@ -500,7 +500,7 @@ func TestTaskCreatorCreateBatch(t *testing.T) {
 		{Title: "Third", Depends: []string{"@1", "@2"}},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.CreateBatch(context.Background(), []CreateTaskInput{ {Title: "First", Body: "One", Scope: []string{"a.go"}, Priority: 3}, {Title: "Second", Depends: []string{"@1", "EXT-9"}}, {Title: "Third", Depends: []string{"@1", "@2"}}, }): %v`, err)
 	}
 	if len(got) != 3 {
 		t.Fatalf("results = %d, want 3", len(got))
@@ -539,11 +539,11 @@ func TestTaskCreatorCreateBatchIsIdempotent(t *testing.T) {
 
 	first, err := creator.CreateBatch(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.CreateBatch(context.Background(), in): %v`, err)
 	}
 	second, err := creator.CreateBatch(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.CreateBatch(context.Background(), in): %v`, err)
 	}
 	if len(second) != len(first) {
 		t.Fatalf("second = %d cards, first = %d", len(second), len(first))
@@ -610,7 +610,7 @@ func TestTaskCreatorCreateBatchStableAcrossDays(t *testing.T) {
 	}
 	repeated, err := repeat.CreateBatch(context.Background(), in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`repeat.CreateBatch(context.Background(), in): %v`, err)
 	}
 	for i := range repeated {
 		if repeated[i].ID != dayOne[i].ID {
@@ -629,7 +629,7 @@ func TestTaskCreatorCreateBatchStableAcrossDays(t *testing.T) {
 	}
 	got, err := alone.Create(context.Background(), in[2])
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`alone.Create(context.Background(), in[2]): %v`, err)
 	}
 	if got.ID != dayOne[2].ID {
 		t.Fatalf("standalone epic = %q, batch epic = %q", got.ID, dayOne[2].ID)
@@ -643,7 +643,7 @@ func TestTaskCreatorExplicitDateAppliesToGeneratedIDs(t *testing.T) {
 	}
 	got, err := creator.Create(context.Background(), CreateTaskInput{Title: "Random"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{Title: "Random"}): %v`, err)
 	}
 	if !strings.HasPrefix(got.ID, "T-20200102-") {
 		t.Fatalf("id = %q, want explicit date prefix", got.ID)
@@ -787,7 +787,7 @@ func TestTaskCreatorCancelBeforeCommitLeavesNoFiles(t *testing.T) {
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`os.ReadDir(dir): %v`, err)
 	}
 	if len(entries) != 0 {
 		t.Fatalf("cancelled batch left files: %v", entries)
@@ -809,7 +809,7 @@ func TestTaskCreatorFinishesPushWhenCancelledAfterCommit(t *testing.T) {
 
 	got, err := creator.Create(ctx, CreateTaskInput{ID: "T-INTERRUPT", Title: "Card"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(ctx, CreateTaskInput{ID: "T-INTERRUPT", Title: "Card"}): %v`, err)
 	}
 	if !got.Pushed || ws.commits != 1 || ws.pushes != 1 {
 		t.Fatalf("result = %+v, commits = %d, pushes = %d", got, ws.commits, ws.pushes)
@@ -831,7 +831,7 @@ func TestTaskCreatorRetrySurvivesCancellationDuringPush(t *testing.T) {
 
 	got, err := creator.Create(ctx, CreateTaskInput{Title: "Retry card"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(ctx, CreateTaskInput{Title: "Retry card"}): %v`, err)
 	}
 	if !got.Pushed || ws.pushes != 2 {
 		t.Fatalf("result = %+v, pushes = %d, want pushed with two attempts", got, ws.pushes)
@@ -898,7 +898,7 @@ func TestTaskCreatorPublishesEpicBranchBeforeChildren(t *testing.T) {
 		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: epicPlan(),
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: epicPlan(), }): %v`, err)
 	}
 	if len(ws.branches) != 1 || ws.branches[0] != "beacon/T-EPIC" {
 		t.Fatalf("branches = %v, want beacon/T-EPIC", ws.branches)
@@ -931,7 +931,7 @@ func TestTaskCreatorDoesNotRepublishEpicBranch(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if _, err := creator.Create(context.Background(), in); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`creator.Create(context.Background(), in): %v`, err)
 		}
 	}
 	if len(ws.branches) != 1 || len(ws.commits) != 1 {
@@ -967,7 +967,7 @@ func TestTaskCreatorIgnoresNonEpicBaseBranch(t *testing.T) {
 	if _, err := creator.Create(context.Background(), CreateTaskInput{
 		Title: "Card", ID: "T-CARD", BaseBranch: "main",
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: "Card", ID: "T-CARD", BaseBranch: "main", }): %v`, err)
 	}
 	if len(ws.branches) != 0 || len(ws.commits) != 1 {
 		t.Fatalf("branches = %v, commits = %d, want no branch work", ws.branches, len(ws.commits))
@@ -1003,7 +1003,7 @@ func TestTaskCreatorCreateBatchTwentyCardsPublishesOnce(t *testing.T) {
 	got, err := creator.CreateBatch(context.Background(), inputs)
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.CreateBatch(context.Background(), inputs): %v`, err)
 	}
 	t.Logf("created %d cards in %s", len(got), elapsed)
 	if len(got) != 20 || len(src.created) != 20 {
@@ -1047,7 +1047,7 @@ func TestReviewModeMapsIdenticallyOnCreateUpdateAndRead(t *testing.T) {
 		if _, err := creator.Create(context.Background(), CreateTaskInput{
 			ID: "T-REVIEW", Title: "Card", RequireReview: core.ReviewMode(tc.in),
 		}); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ ID: "T-REVIEW", Title: "Card", RequireReview: core.ReviewMode(tc.in), }): %v`, err)
 		}
 		if got := src.created.RequireReview; got != tc.want {
 			t.Errorf("create %q = %q, want %q", tc.in, got, tc.want)
@@ -1069,7 +1069,7 @@ func TestReviewModeMapsIdenticallyOnCreateUpdateAndRead(t *testing.T) {
 func TestEpicChildrenUseCoreExpansion(t *testing.T) {
 	epic := core.Task{ID: "T-CORE", Plan: epicPlan()}
 	got := epicChildren(epic.ID, epic.Plan)
-	want := core.ExpandChildren(epic, epicBranch(epic.ID))
+	want := core.SetParent(core.ExpandChildren(epic, epicBranch(epic.ID)), epic.ID)
 	if len(got) != len(want) {
 		t.Fatalf("children = %+v, want %+v", got, want)
 	}
@@ -1130,7 +1130,7 @@ func TestTaskCreatorUsesInjectedRoles(t *testing.T) {
 
 	got, err := creator.Create(context.Background(), CreateTaskInput{Title: "Injected card"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{Title: "Injected card"}): %v`, err)
 	}
 	if got.ID != "T-INJECTED" || !got.Pushed {
 		t.Fatalf("result = %+v", got)

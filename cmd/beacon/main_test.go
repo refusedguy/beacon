@@ -36,7 +36,7 @@ func TestProjectRootPrefersEnvironment(t *testing.T) {
 	t.Setenv("BEACON_PROJECT_ROOT", want)
 	got, err := projectRoot()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("projectRoot(): %v", err)
 	}
 	if got != want {
 		t.Fatalf("projectRoot() = %q, want %q", got, want)
@@ -47,11 +47,11 @@ func TestProjectRootFallsBackToWorkingDirectory(t *testing.T) {
 	t.Setenv("BEACON_PROJECT_ROOT", "")
 	want, err := filepath.Abs(".")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("filepath.Abs(\".\"): %v", err)
 	}
 	got, err := projectRoot()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("projectRoot(): %v", err)
 	}
 	if got != want {
 		t.Fatalf("projectRoot() = %q, want %q", got, want)
@@ -62,19 +62,19 @@ func TestLoadConfigPinsRelativePathsToProjectRoot(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, ".beacon")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(configDir, 0o755): %v", err)
 	}
 	body := "state_db: .beacon/state.db\nworkspace_dir: .beacon/worktrees\n" +
 		"task_source:\n  provider: markdown\n  dir: docs/tasks\n"
 	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(configDir, \"config.yaml\"), []byte(body), 0o644): %v", err)
 	}
 	t.Setenv("BEACON_PROJECT_ROOT", root)
 	t.Chdir(t.TempDir())
 
 	cfg, gotRoot, err := loadConfig("")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("loadConfig(\"\"): %v", err)
 	}
 	if gotRoot != root {
 		t.Fatalf("root = %q, want %q", gotRoot, root)
@@ -97,7 +97,7 @@ func TestNewHarnessBuildsACPProvider(t *testing.T) {
 	}}
 	h, err := newHarness(cfg, "", "ses_parent", "")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("newHarness(cfg, \"\", \"ses_parent\", \"\"): %v", err)
 	}
 	ah, ok := h.(*acp.Harness)
 	if !ok {
@@ -216,7 +216,7 @@ func TestWireInfraDoesNotRefreshWorktreesAtStartup(t *testing.T) {
 	}
 	infra, err := wireInfra(cfg, root, "")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wireInfra(cfg, root, \"\"): %v", err)
 	}
 	defer infra.store.Close()
 
@@ -234,7 +234,7 @@ func TestWireServicesInjectsDecisionSink(t *testing.T) {
 	cfg := config.Config{BaseBranch: "main"}
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("sqlite.Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	infra := &wiredInfra{
@@ -298,7 +298,7 @@ func TestWireInjectsReloadableWrappersAtConstruction(t *testing.T) {
 	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
 	w, err := wire(path, "")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wire(path, \"\"): %v", err)
 	}
 	defer w.close()
 
@@ -331,7 +331,7 @@ func TestWireInjectsReloadableWrappersAtConstruction(t *testing.T) {
 
 	body, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(path): %v", err)
 	}
 	writeWatchFile(t, path, strings.Replace(string(body), "model: model-a", "model: model-b", 1))
 	if !w.watcher.reload() {

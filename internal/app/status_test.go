@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -71,7 +72,7 @@ func TestDeriveDurationsFreezesTerminalRunAtUpdatedAt(t *testing.T) {
 func TestReconcileServiceTickReturnsDecisionAndState(t *testing.T) {
 	store := newFakeStore()
 	if err := store.Save(context.Background(), waitingRun(42)); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), waitingRun(42)): %v`, err)
 	}
 	ticker := &stubTickReconciler{decision: core.MergeDecision{
 		Verdict:   core.VerdictWait,
@@ -181,13 +182,13 @@ func TestRunSnapshotCarriesCIWallSeconds(t *testing.T) {
 
 	b, err := json.Marshal(got)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Marshal(got): %v`, err)
 	}
 	var decoded struct {
 		CIWallSeconds int64 `json:"ci_wall_seconds"`
 	}
 	if err := json.Unmarshal(b, &decoded); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Unmarshal(b, &decoded): %v`, err)
 	}
 	if decoded.CIWallSeconds != 60 {
 		t.Fatalf("json ci_wall_seconds = %d, want 60", decoded.CIWallSeconds)
@@ -266,7 +267,7 @@ func TestSnapshotCarriesQueueIncidentAndDaemon(t *testing.T) {
 
 	snap, err := svc.Snapshot(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`svc.Snapshot(ctx): %v`, err)
 	}
 	if snap.Queue == nil || len(snap.Queue) != 2 {
 		t.Fatalf("queue = %+v, want two items", snap.Queue)
@@ -294,7 +295,7 @@ func TestSnapshotWithoutOptionalStoresStillHasNonNullCollections(t *testing.T) {
 	store := &snapshotStubStore{}
 	snap, err := (SnapshotService{Store: store}).Snapshot(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`(SnapshotService{Store: store}).Snapshot(context.Background()): %v`, err)
 	}
 	if snap.Queue == nil || len(snap.Queue) != 0 {
 		t.Fatalf("queue = %+v, want empty array", snap.Queue)
@@ -308,11 +309,11 @@ func TestSnapshotWithoutOptionalStoresStillHasNonNullCollections(t *testing.T) {
 
 	b, err := json.Marshal(snap)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Marshal(snap): %v`, err)
 	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Unmarshal(b, &raw): %v`, err)
 	}
 	for _, key := range []string{"active", "recent", "queue", "daemon", "base_incident"} {
 		if _, ok := raw[key]; !ok {
@@ -341,7 +342,7 @@ func TestRunSnapshotJSONChecksContract(t *testing.T) {
 
 	b, err := json.Marshal(got)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Marshal(got): %v`, err)
 	}
 	var decoded struct {
 		Checks []struct {
@@ -352,7 +353,7 @@ func TestRunSnapshotJSONChecksContract(t *testing.T) {
 		CIWallSeconds int64 `json:"ci_wall_seconds"`
 	}
 	if err := json.Unmarshal(b, &decoded); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Unmarshal(b, &decoded): %v`, err)
 	}
 	if decoded.Checks == nil || len(decoded.Checks) != 0 {
 		t.Fatalf("json checks = %+v, want []", decoded.Checks)
@@ -364,10 +365,10 @@ func TestRunSnapshotJSONChecksContract(t *testing.T) {
 	run.Checks = []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
 	b, err = json.Marshal(makeRunSnapshot(run, nil, nil, now))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Marshal(makeRunSnapshot(run, nil, nil, now)): %v`, err)
 	}
 	if err := json.Unmarshal(b, &decoded); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Unmarshal(b, &decoded): %v`, err)
 	}
 	if len(decoded.Checks) != 1 || decoded.Checks[0].Name != "ci" ||
 		decoded.Checks[0].State != "failure" || decoded.Checks[0].DurationSeconds != 0 {
@@ -408,6 +409,56 @@ func TestLaunchSourceCoversMCPCLIUIAndDaemon(t *testing.T) {
 	}
 }
 
+func TestBlockedMetricMapStaysBoundedWithDistinctReasons(t *testing.T) {
+	now := time.Now().UTC()
+	reasons := []string{
+		"gate failed: provider error at sha 0123456789abcdef",
+		"gate failed: provider error at sha abcdef0123456789",
+		"gate failed: provider error at sha deadbeefdeadbeef",
+		"base_red on main at sha 1111111111111111",
+		"base_red on main at sha 2222222222222222",
+		"rebase attempts exhausted on 3333333333333333",
+		"fix attempts exhausted on 4444444444444444",
+		"idle without PR or changes 5555555555555555",
+	}
+	var active []*core.Run
+	histories := map[string][]Decision{}
+	for i, reason := range reasons {
+		run := core.NewRun(core.RunID(fmt.Sprintf("run-%d", i)), core.TaskID(fmt.Sprintf("T-%d", i)), now)
+		run.State = core.RunBlocked
+		run.Reason = reason
+		active = append(active, run)
+
+		id := fmt.Sprintf("decision-run-%d", i)
+		histories[id] = []Decision{{
+			Kind:    "reconcile.decision",
+			RunID:   id,
+			Verdict: string(core.VerdictBlocked),
+			Reason:  fmt.Sprintf("gate failed: provider error %d at sha %x", i, i),
+		}}
+	}
+
+	m := makeMetrics(active, nil, nil, histories, nil, now)
+	if len(m.Blocked) > 6 {
+		t.Fatalf("blocked keys = %d, want at most 6: %+v", len(m.Blocked), m.Blocked)
+	}
+	for key := range m.Blocked {
+		if strings.Contains(strings.ToLower(key), "sha") || len(key) > 20 {
+			t.Fatalf("blocked key %q carries reason detail", key)
+		}
+	}
+	if got := m.Blocked["gate failed"]; got != 11 {
+		t.Fatalf("gate failed count = %d, want 11: %+v", got, m.Blocked)
+	}
+	sum := 0
+	for _, n := range m.Blocked {
+		sum += n
+	}
+	if sum != m.BlockedCount || m.BlockedCount != len(reasons)*2 {
+		t.Fatalf("blocked sum = %d, count = %d, want %d", sum, m.BlockedCount, len(reasons)*2)
+	}
+}
+
 func TestSnapshotSerializesLaunchSourceAndMetrics(t *testing.T) {
 	now := time.Now().UTC()
 	mcpRun := core.NewRun("run-mcp", "T-MCP", now)
@@ -417,7 +468,7 @@ func TestSnapshotSerializesLaunchSourceAndMetrics(t *testing.T) {
 	store := &snapshotStubStore{active: []*core.Run{mcpRun, cliRun, core.NewRun("run-old", "T-OLD", now)}}
 	snap, err := (SnapshotService{Store: store}).Snapshot(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`(SnapshotService{Store: store}).Snapshot(context.Background()): %v`, err)
 	}
 	if snap.Active[0].LaunchSource != "mcp" || snap.Active[0].AgentIdentity != "orchestrator" {
 		t.Fatalf("mcp snapshot = %+v", snap.Active[0])
@@ -432,7 +483,7 @@ func TestSnapshotSerializesLaunchSourceAndMetrics(t *testing.T) {
 
 	b, err := json.Marshal(snap)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Marshal(snap): %v`, err)
 	}
 	var decoded struct {
 		Active []struct {
@@ -444,7 +495,7 @@ func TestSnapshotSerializesLaunchSourceAndMetrics(t *testing.T) {
 		} `json:"metrics"`
 	}
 	if err := json.Unmarshal(b, &decoded); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Unmarshal(b, &decoded): %v`, err)
 	}
 	if decoded.Active[0].LaunchSource != "mcp" || decoded.Active[0].AgentIdentity != "orchestrator" {
 		t.Fatalf("json launch = %+v", decoded.Active[0])

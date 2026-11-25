@@ -98,3 +98,40 @@ func TestScopeOverlapAuthority(t *testing.T) {
 		t.Fatal("scope src must not overlap docs/readme.md")
 	}
 }
+
+func TestTaskTreeUsesParentField(t *testing.T) {
+	tasks := []Task{
+		{ID: "T-EPIC", Kind: TaskKindEpic},
+		{ID: "child-a", Parent: "T-EPIC"},
+		{ID: "child-b", Parent: "T-EPIC"},
+		{ID: "standalone"},
+	}
+	tree := NewTaskTree(tasks)
+
+	children := tree.Children("T-EPIC")
+	if len(children) != 2 || children[0].ID != "child-a" || children[1].ID != "child-b" {
+		t.Fatalf("children = %+v", children)
+	}
+	parent, ok := tree.Parent("child-b")
+	if !ok || parent.ID != "T-EPIC" {
+		t.Fatalf("parent = %+v, ok = %v", parent, ok)
+	}
+	if _, ok := tree.Parent("standalone"); ok {
+		t.Fatal("standalone task must have no parent")
+	}
+	if got := tree.Children("standalone"); len(got) != 0 {
+		t.Fatalf("standalone children = %+v", got)
+	}
+	if _, ok := tree.Task("missing"); ok {
+		t.Fatal("missing task must not be found")
+	}
+}
+
+func TestSetParentStampsEveryChild(t *testing.T) {
+	children := SetParent([]Task{{ID: "one"}, {ID: "two"}}, "T-EPIC")
+	for _, child := range children {
+		if child.Parent != "T-EPIC" {
+			t.Fatalf("child %q parent = %q", child.ID, child.Parent)
+		}
+	}
+}

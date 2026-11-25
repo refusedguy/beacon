@@ -5,7 +5,7 @@ import assert from "node:assert/strict"
 import {
   PANEL_NAME, beaconStatusDefinition, collectTransitionToasts,
   createDetailMount, createSidebarMount, detailModel, launchSourceText,
-  metricsLine, normalizeRun, shortTaskID, sidebarModel,
+  metricsLine, normalizeRun, shortTaskID, sidebarModel, taskTree,
 } from "./ui.js"
 import { NOW, hostModule, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -336,4 +336,16 @@ test("a blocked group click expands only that group and the Queue toggle expands
   toggle.props.onMouseDown()
   assert.equal(h.findItem(sidebar, (i) => i.kind === "queue-title"), null, "the global toggle collapses every group")
   h.dispose()
+})
+
+test("task tree reads the parent field before the generated ID shape", () => {
+  const tree = taskTree([
+    { id: "T-EPIC", kind: "epic" },
+    { id: "T-OTHER", kind: "epic" },
+    { id: "T-EPIC-01", parent: "T-OTHER" },
+    { id: "T-EPIC-02" },
+  ])
+  assert.equal(tree.parent.get("T-EPIC-01"), "T-OTHER")
+  assert.deepEqual(tree.children.get("T-OTHER"), ["T-EPIC-01"])
+  assert.deepEqual(tree.children.get("T-EPIC"), ["T-EPIC-02"])
 })

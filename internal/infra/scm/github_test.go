@@ -17,7 +17,7 @@ func ghObserveGitHub(t *testing.T, handler http.Handler) *GitHub {
 	t.Cleanup(srv.Close)
 	client, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithEnterpriseURLs(srv.URL+"/", srv.URL+"/"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("github.NewClient(github.WithHTTPClient(srv.Client()), github.WithEnterpriseURLs(srv.URL+\"/\", srv.URL+\"/\")): %v", err)
 	}
 	return NewGitHub(client, "o", "r", "main")
 }
@@ -82,7 +82,7 @@ func TestGitHubObserveMarksDocsOnlySkip(t *testing.T) {
 	}))
 	obs, err := g.Observe(context.Background(), 42)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("g.Observe(context.Background(), 42): %v", err)
 	}
 	if !obs.WorkflowSkipped {
 		t.Fatal("WorkflowSkipped = false, want true for a docs-only diff with no checks")
@@ -98,7 +98,7 @@ func TestGitHubObserveDoesNotMarkCodeChangeAsSkipped(t *testing.T) {
 	}))
 	obs, err := g.Observe(context.Background(), 42)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("g.Observe(context.Background(), 42): %v", err)
 	}
 	if obs.WorkflowSkipped {
 		t.Fatal("WorkflowSkipped = true, want false when code changed")
@@ -123,7 +123,7 @@ func TestGitHubObserveDoesNotMarkBlockedCleanPRAsConflict(t *testing.T) {
 	}))
 	obs, err := g.Observe(context.Background(), 42)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("g.Observe(context.Background(), 42): %v", err)
 	}
 	if obs.Conflict {
 		t.Fatal("Conflict = true for a clean PR blocked by checks")
@@ -146,7 +146,7 @@ func TestGitHubObserveChecksEveryChangedFilePage(t *testing.T) {
 	}))
 	obs, err := g.Observe(context.Background(), 42)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("g.Observe(context.Background(), 42): %v", err)
 	}
 	if calls != 2 {
 		t.Fatalf("changed-files calls = %d, want 2", calls)
@@ -175,7 +175,7 @@ func TestGitHubObserveChecksEveryCheckRunPage(t *testing.T) {
 	}))
 	obs, err := g.Observe(context.Background(), 42)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("g.Observe(context.Background(), 42): %v", err)
 	}
 	if len(obs.Checks) != 2 {
 		t.Fatalf("checks = %+v, want two entries", obs.Checks)
@@ -204,7 +204,7 @@ func TestGitHubObserveCountsApprovalsOnEveryReviewsPage(t *testing.T) {
 	}))
 	obs, err := g.Observe(context.Background(), 42)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("g.Observe(context.Background(), 42): %v", err)
 	}
 	if obs.Approvals != 1 {
 		t.Fatalf("Approvals = %d, want 1 from page two", obs.Approvals)
@@ -220,7 +220,7 @@ func TestChecksStopsAtPageCap(t *testing.T) {
 		_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
 	}))
 	if _, err := g.checks(context.Background(), "abc"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("g.checks(context.Background(), \"abc\"): %v", err)
 	}
 	if calls != maxGitHubPages {
 		t.Fatalf("check-runs calls = %d, want %d", calls, maxGitHubPages)

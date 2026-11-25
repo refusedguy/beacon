@@ -60,10 +60,10 @@ type CardWriter interface {
 	Remove(ctx context.Context, ids ...core.TaskID)
 }
 
-// sourceCardWriter adapts TaskSource and its optional batch and remove
+// sourceCardWriter adapts core.TaskSource and its optional batch and remove
 // capabilities to CardWriter. Removal is best effort: a failed rollback must
 // not hide the original create error.
-type sourceCardWriter struct{ Source TaskSource }
+type sourceCardWriter struct{ Source core.TaskSource }
 
 func (w sourceCardWriter) Available(ctx context.Context) ([]core.Task, error) {
 	return w.Source.ListAvailable(ctx)
@@ -265,7 +265,7 @@ const detachedPushTimeout = 30 * time.Second
 // TaskCreator writes cards through the source, then commits and pushes them.
 // An epic with a plan expands into deterministic child cards before the epic.
 type TaskCreator struct {
-	Source    TaskSource
+	Source    core.TaskSource
 	Workspace PathCommitter
 	Root      core.Workspace
 	Store     TaskGraphStore
@@ -705,7 +705,7 @@ func lookupCreated(ctx context.Context, writer CardWriter, cache *IdempotencyCac
 		}
 		out := make([]core.Task, 0, len(children)+1)
 		for _, child := range children {
-			out = append(out, core.Task{ID: child.ID, SourceRef: cardPath(child.ID)})
+			out = append(out, core.Task{ID: child.ID, Parent: id, SourceRef: cardPath(child.ID)})
 		}
 		return append(out, core.Task{ID: id, SourceRef: cardPath(id)}), true
 	}
@@ -809,7 +809,7 @@ func ensureBranch(ctx context.Context, ws any, branch, base string) error {
 // epicChildren gives an epic's plan the branch that its children branch from.
 // The expansion itself lives in core and is shared with the card parser.
 func epicChildren(id core.TaskID, plan []core.ChildSpec) []core.Task {
-	return core.ExpandChildren(core.Task{ID: id, Plan: plan}, epicBranch(id))
+	return core.SetParent(core.ExpandChildren(core.Task{ID: id, Plan: plan}, epicBranch(id)), id)
 }
 
 // idempotencyKey keys the created cache by epic ID and content. The derived

@@ -32,6 +32,7 @@ type card struct {
 	hasFM   bool
 }
 
+// cards returns the markdown paths under the store directory.
 func (s CardStore) cards() ([]string, error) {
 	var paths []string
 	err := filepath.WalkDir(s.Dir, func(path string, d fs.DirEntry, err error) error {
@@ -92,8 +93,10 @@ func (s CardStore) PatchStatus(ctx context.Context, id core.TaskID, status strin
 	return os.WriteFile(c.path, []byte(updated), 0o644)
 }
 
+// stringList decodes YAML scalars and sequences into a string slice.
 type stringList []string
 
+// UnmarshalYAML decodes a scalar or sequence into a stringList.
 func (l *stringList) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
 		var s string
@@ -115,9 +118,11 @@ func (l *stringList) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
+// yamlFields is the wire shape of a legacy YAML field block.
 type yamlFields struct {
 	ID            string     `yaml:"id"`
 	TaskID        string     `yaml:"task_id"`
+	Parent        string     `yaml:"parent"`
 	Scope         stringList `yaml:"scope"`
 	OwnerFiles    stringList `yaml:"owner_files"`
 	Depends       stringList `yaml:"depends"`
@@ -146,8 +151,10 @@ type epicFields struct {
 	Plan          []planSpec `yaml:"plan,omitempty"`
 }
 
+// taskFields holds the normalized fields parsed from a task body.
 type taskFields struct {
 	ID            string
+	Parent        string
 	Scope         []string
 	Depends       []string
 	Priority      int
@@ -157,6 +164,7 @@ type taskFields struct {
 	Plan          []core.ChildSpec
 }
 
+// childSpecs converts plan specs into core child specs.
 func childSpecs(specs []planSpec, dir string) []core.ChildSpec {
 	out := make([]core.ChildSpec, 0, len(specs))
 	for _, spec := range specs {
@@ -174,6 +182,7 @@ func childSpecs(specs []planSpec, dir string) []core.ChildSpec {
 	return out
 }
 
+// planSpecs converts core child specs into their wire shape.
 func planSpecs(specs []core.ChildSpec) []planSpec {
 	out := make([]planSpec, 0, len(specs))
 	for _, spec := range specs {
@@ -188,10 +197,12 @@ func planSpecs(specs []core.ChildSpec) []planSpec {
 	return out
 }
 
+// normalizeKind maps s to a known task kind.
 func normalizeKind(s string) core.TaskKind {
 	return core.NormalizeTaskKind(core.TaskKind(s))
 }
 
+// normalizeReview maps s to a known review mode.
 func normalizeReview(s string) core.ReviewMode {
 	return core.NormalizeReviewMode(core.ReviewMode(s))
 }
@@ -201,8 +212,9 @@ type PlanParser struct{}
 
 var _ core.EpicParser = PlanParser{}
 
+// Children expands the epic's plan into numbered child tasks.
 func (PlanParser) Children(epic core.Task) []core.Task {
-	return core.ExpandChildren(epic, "")
+	return core.SetParent(core.ExpandChildren(epic, ""), epic.ID)
 }
 
 // ParseTaskFields reads a fenced YAML block and flat Scope/Depends/Priority lines.
@@ -214,6 +226,7 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			slog.Warn("tasksource: malformed YAML field block", "error", err)
 		} else {
 			out.ID = firstNonEmpty(yf.TaskID, yf.ID)
+			out.Parent = strings.TrimSpace(yf.Parent)
 			out.Scope = append(out.Scope, yf.Scope...)
 			out.Scope = append(out.Scope, yf.OwnerFiles...)
 			out.Depends = append(out.Depends, yf.Depends...)
@@ -244,6 +257,8 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			out.RequireReview = normalizeReview(afterColon(line))
 		case strings.HasPrefix(line, "TaskID:"):
 			out.ID = afterColon(line)
+		case strings.HasPrefix(line, "Parent:"), strings.HasPrefix(line, "ParentTask:"):
+			out.Parent = afterColon(line)
 		}
 	}
 	out.Scope = unique(out.Scope)
@@ -256,6 +271,7 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 	return out
 }
 
+// Scopes resolves the parsed scope strings against dir.
 func (t taskFields) Scopes(dir string) []core.ScopePath {
 	var out []core.ScopePath
 	for _, p := range t.Scope {
@@ -264,6 +280,13 @@ func (t taskFields) Scopes(dir string) []core.ScopePath {
 	return out
 }
 
+// ParentID returns the parsed parent as a task ID. It is empty when the source
+// card has no epic relation.
+func (t taskFields) ParentID() core.TaskID {
+	return core.TaskID(strings.TrimSpace(t.Parent))
+}
+
+// Dependencies returns the parsed dependency ids.
 func (t taskFields) Dependencies() []core.TaskID {
 	var out []core.TaskID
 	for _, d := range t.Depends {
@@ -274,6 +297,7 @@ func (t taskFields) Dependencies() []core.TaskID {
 	return out
 }
 
+// normalizeDep adds prefix to a bare numeric dependency id.
 func normalizeDep(d, prefix string) string {
 	d = strings.TrimSpace(strings.Trim(d, "` "))
 	if d == "" || strings.Contains(d, "-") {
@@ -282,6 +306,7 @@ func normalizeDep(d, prefix string) string {
 	return prefix + "-" + d
 }
 
+// unique trims values and drops empty or repeated entries.
 func unique(values []string) []string {
 	seen := make(map[string]bool, len(values))
 	var out []string
@@ -295,6 +320,7 @@ func unique(values []string) []string {
 	return out
 }
 
+// firstNonEmpty returns the first non-empty, trimmed value.
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -304,6 +330,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// afterColon returns the trimmed text after the first colon.
 func afterColon(line string) string {
 	if i := strings.Index(line, ":"); i >= 0 {
 		return strings.TrimSpace(line[i+1:])
@@ -311,6 +338,7 @@ func afterColon(line string) string {
 	return ""
 }
 
+// yamlBlock returns the contents of the first fenced YAML block.
 func yamlBlock(body string) (string, bool) {
 	lines := strings.Split(strings.ReplaceAll(body, "\r", ""), "\n")
 	var out []string
@@ -331,6 +359,7 @@ func yamlBlock(body string) (string, bool) {
 	return strings.Join(out, "\n"), len(out) > 0
 }
 
+// splitList splits a comma or semicolon separated list into sorted items.
 func splitList(s string) []string {
 	var out []string
 	for _, p := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' }) {
@@ -343,6 +372,7 @@ func splitList(s string) []string {
 	return out
 }
 
+// scopeForPath classifies p as a pattern, directory or file scope.
 func scopeForPath(p, dir string) core.ScopePath {
 	p = strings.TrimSpace(strings.Trim(p, "` "))
 	if strings.Contains(p, "*") {
@@ -359,6 +389,7 @@ func scopeForPath(p, dir string) core.ScopePath {
 	return core.ScopeFile(p)
 }
 
+// normalizeStatus maps s to a known task status.
 func normalizeStatus(s string) core.TaskStatus {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "done", "готово", "closed", "merged", "выполнено":

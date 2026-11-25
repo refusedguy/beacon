@@ -33,7 +33,7 @@ func TestPlannerSelectsTwentyNonOverlappingTasks(t *testing.T) {
 	}
 	chosen, skipped, err := NewPlanner(nil).Select(tasks, nil, 20, false)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`NewPlanner(nil).Select(tasks, nil, 20, false): %v`, err)
 	}
 	if len(chosen) != 20 || len(skipped) != 0 {
 		t.Fatalf("selected %d, skipped %d", len(chosen), len(skipped))
@@ -56,7 +56,7 @@ func TestPlannerSkipsOverlappingAndBusyScopes(t *testing.T) {
 	active := []*core.Run{{ID: "r1", TaskID: "Z", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("e.go")}}}
 	chosen, skipped, err := NewPlanner(nil).Select(tasks, active, 5, false)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`NewPlanner(nil).Select(tasks, active, 5, false): %v`, err)
 	}
 	if len(chosen) != 1 || chosen[0].ID != "A" {
 		t.Fatalf("unexpected selection: %+v", chosen)
@@ -118,7 +118,7 @@ func TestPlannerReportsStatusScopeAndActiveRunCodes(t *testing.T) {
 
 	_, skipped, err := NewPlanner(nil).Select([]core.Task{done, unscoped, busy}, active, 5, true)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`NewPlanner(nil).Select([]core.Task{done, unscoped, busy}, active, 5, true): %v`, err)
 	}
 	byID := map[core.TaskID]SkippedTask{}
 	for _, s := range skipped {
@@ -152,7 +152,7 @@ func TestSkippedTaskJSONExposesStructuredFields(t *testing.T) {
 	}
 	data, err := json.Marshal(s)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Marshal(s): %v`, err)
 	}
 	got := string(data)
 	for _, want := range []string{
@@ -204,7 +204,7 @@ func TestPlannerUsesSharedOverlapAuthority(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			chosen, skipped, err := p.Select(tasks, nil, 4, false)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf(`p.Select(tasks, nil, 4, false): %v`, err)
 			}
 			ids := taskIDs(chosen)
 			if len(ids) != 2 || ids[0] != "dir" || ids[1] != "docs" {
@@ -224,6 +224,55 @@ func TestPlannerUsesSharedOverlapAuthority(t *testing.T) {
 				t.Errorf("nested skip = %+v, want selected scope overlap", byID["nested"])
 			}
 		})
+	}
+}
+
+func TestActiveConflictDoesNotMatchCardNamedLikeSyntheticID(t *testing.T) {
+	active := []*core.Run{{
+		ID: "r1", TaskID: "run-card", State: core.RunRunning,
+		Scope: []core.ScopePath{core.ScopeFile("active.go")},
+	}}
+	tasks := []core.Task{
+		{ID: "__active__", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("free.go")}},
+		{ID: "clash", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("active.go")}},
+	}
+	// This checker matches by ID as well as by scope, so a synthetic card
+	// named __active__ would block the real card with that ID.
+	chosen, skipped, err := NewPlanner(core.Task.Overlaps).Select(tasks, active, 2, false)
+	if err != nil {
+		t.Fatalf(`Select(tasks, active, 2, false): %v`, err)
+	}
+	if ids := taskIDs(chosen); len(ids) != 1 || ids[0] != "__active__" {
+		t.Fatalf("chosen = %v, want [__active__]", ids)
+	}
+	byID := map[core.TaskID]SkippedTask{}
+	for _, s := range skipped {
+		byID[s.TaskID] = s
+	}
+	if len(byID) != 1 {
+		t.Fatalf("expected 1 skipped, got %+v", skipped)
+	}
+	if byID["clash"].Code != SkipActiveScopeOverlap {
+		t.Errorf("clash skip = %+v, want active scope overlap", byID["clash"])
+	}
+}
+
+func TestActiveConflictDoesNotMatchSyntheticIDAsDependency(t *testing.T) {
+	active := []*core.Run{{
+		ID: "r1", TaskID: "run-card", State: core.RunRunning,
+		Scope: []core.ScopePath{core.ScopeFile("active.go")},
+	}}
+	tasks := []core.Task{{
+		ID: "dependent", Status: core.TaskAvailable,
+		DependsOn: []core.TaskID{"__active__"},
+		Scope:     []core.ScopePath{core.ScopeFile("free.go")},
+	}}
+	chosen, skipped, err := NewPlanner(nil).Select(tasks, active, 1, false)
+	if err != nil {
+		t.Fatalf(`Select(tasks, active, 1, false): %v`, err)
+	}
+	if len(chosen) != 1 || len(skipped) != 0 {
+		t.Fatalf("chosen = %v, skipped = %+v", chosen, skipped)
 	}
 }
 

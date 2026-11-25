@@ -10,7 +10,13 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-type StatusService struct{ Store RunStore }
+// StatusStore is the run read side StatusService needs.
+type StatusStore interface {
+	ListActive(ctx context.Context) ([]*core.Run, error)
+	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
+}
+
+type StatusService struct{ Store StatusStore }
 
 // DefaultRecentLimit is the number of finished runs returned when no limit is set.
 const DefaultRecentLimit = 20
@@ -61,11 +67,16 @@ type ReconcileResult struct {
 	Error    string            `json:"error,omitempty"`
 }
 
+// ReconcileStore is the run lookup ReconcileService needs for the tick's state.
+type ReconcileStore interface {
+	FindByPR(ctx context.Context, pr int) (*core.Run, error)
+}
+
 // ReconcileService runs one reconciler tick on demand. It captures errors and
 // panics in the result so a forced tick can never stop the daemon loop.
 type ReconcileService struct {
 	Reconciler TickReconciler
-	Store      RunStore
+	Store      ReconcileStore
 }
 
 // Tick forces exactly one reconciler pass for pr and reports what happened. A
@@ -102,8 +113,13 @@ func (s *ReconcileService) Tick(ctx context.Context, pr int) (out ReconcileResul
 	return out
 }
 
+// WaitStore is the run lookup WaitService needs while it polls.
+type WaitStore interface {
+	Get(ctx context.Context, id core.RunID) (*core.Run, error)
+}
+
 type WaitService struct {
-	Store    RunStore
+	Store    WaitStore
 	Interval time.Duration
 }
 
@@ -593,6 +609,28 @@ func addCountMetrics(m *Metrics, counts []DecisionCount) {
 	}
 }
 
+// blockedReasonCategory reduces a free-form blocked reason to one of a small
+// fixed set of keys. Reasons carry SHAs, provider errors and command output, so
+// keying the metric by the raw text would grow the map without bound. Anything
+// outside the known categories lands in "other".
+func blockedReasonCategory(reason string) string {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case strings.HasPrefix(reason, "gate failed"):
+		return "gate failed"
+	case strings.HasPrefix(reason, "base_red"):
+		return "base red"
+	case strings.HasPrefix(reason, "rebase attempts"):
+		return "rebase attempts"
+	case strings.HasPrefix(reason, "fix attempts"):
+		return "fix attempts"
+	case strings.HasPrefix(reason, "idle"):
+		return "idle"
+	default:
+		return "other"
+	}
+}
+
 func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][]RunEvent, merged, blocked map[string]bool, now time.Time) {
 	for _, group := range [][]*core.Run{active, recent} {
 		for _, run := range group {
@@ -603,7 +641,7 @@ func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][
 			}
 			if run.State == core.RunBlocked && !blocked[id] {
 				blocked[id] = true
-				m.Blocked[run.Reason]++
+				m.Blocked[blockedReasonCategory(run.Reason)]++
 				m.BlockedCount++
 			}
 		}
@@ -635,7 +673,7 @@ func addDecisionMetrics(m *Metrics, histories map[string][]Decision, merged, blo
 			case "reconcile.decision":
 				if decision.Verdict == string(core.VerdictBlocked) && !blocked[decision.RunID] {
 					blocked[decision.RunID] = true
-					m.Blocked[decision.Reason]++
+					m.Blocked[blockedReasonCategory(decision.Reason)]++
 					m.BlockedCount++
 				}
 			}

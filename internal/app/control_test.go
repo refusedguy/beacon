@@ -55,13 +55,13 @@ func TestCancelRetriesTransientBusy(t *testing.T) {
 	ctx := context.Background()
 	store := newBusyStore()
 	if err := store.fakeStore.Save(ctx, core.NewRun("r-busy", "T-1", time.Now())); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.fakeStore.Save(ctx, core.NewRun("r-busy", "T-1", time.Now())): %v`, err)
 	}
 	store.failures["r-busy"] = 1
 
 	c := &Control{Store: store}
 	if err := c.Cancel(ctx, "r-busy"); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.Cancel(ctx, "r-busy"): %v`, err)
 	}
 	if got := store.runs["r-busy"]; got.State != core.RunClosed {
 		t.Fatalf("state = %s, want %s", got.State, core.RunClosed)
@@ -75,7 +75,7 @@ func TestCancelReturnsPersistentBusyAfterBoundedRetries(t *testing.T) {
 	ctx := context.Background()
 	store := newBusyStore()
 	if err := store.fakeStore.Save(ctx, core.NewRun("r-busy", "T-1", time.Now())); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.fakeStore.Save(ctx, core.NewRun("r-busy", "T-1", time.Now())): %v`, err)
 	}
 	store.failures["r-busy"] = 100
 
@@ -99,25 +99,30 @@ func TestParallelCancelsAllSucceed(t *testing.T) {
 	for i := 0; i < n; i++ {
 		id := core.RunID(fmt.Sprintf("r-%d", i))
 		if err := store.fakeStore.Save(ctx, core.NewRun(id, "T-1", time.Now())); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`store.fakeStore.Save(ctx, core.NewRun(id, "T-1", time.Now())): %v`, err)
 		}
 	}
 	c := &Control{Store: store}
 
-	errs := make(chan error, n)
+	type cancelResult struct {
+		id  core.RunID
+		err error
+	}
+	errs := make(chan cancelResult, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs <- c.Cancel(ctx, core.RunID(fmt.Sprintf("r-%d", i)))
+			id := core.RunID(fmt.Sprintf("r-%d", i))
+			errs <- cancelResult{id: id, err: c.Cancel(ctx, id)}
 		}(i)
 	}
 	wg.Wait()
 	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
+	for res := range errs {
+		if res.err != nil {
+			t.Fatalf("cancel %s: %v", res.id, res.err)
 		}
 	}
 	for i := 0; i < n; i++ {
@@ -137,13 +142,13 @@ func TestRetrySignalsReconciler(t *testing.T) {
 	run.RebaseAttempts = 2
 	run.FixAttempts = 2
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int
 	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
 	if err := c.Retry(ctx, "r1"); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.Retry(ctx, "r1"): %v`, err)
 	}
 
 	got := store.runs["r1"]
@@ -168,13 +173,13 @@ func TestRetryClosedRunWithPRReturnsToWaitingCI(t *testing.T) {
 	run.WorkspacePath = "/ws/T-1"
 	run.Reason = "worker session exited without PR"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int
 	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
 	if err := c.Retry(ctx, "r-closed-pr"); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.Retry(ctx, "r-closed-pr"): %v`, err)
 	}
 	got := store.runs["r-closed-pr"]
 	if got.State != core.RunWaitingCI || got.PRNumber != 42 {
@@ -196,13 +201,13 @@ func TestRetryClosedRunWithoutPRReturnsToPending(t *testing.T) {
 	run.SessionID = "sess-old"
 	run.WorkspacePath = "/ws/T-1"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int
 	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
 	if err := c.Retry(ctx, "r-closed-no-pr"); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.Retry(ctx, "r-closed-no-pr"): %v`, err)
 	}
 	got := store.runs["r-closed-no-pr"]
 	if got.State != core.RunPending || got.SessionID != "" || got.WorkspacePath != "" {
@@ -225,7 +230,7 @@ func TestRetryClosedRunRejectsActiveSibling(t *testing.T) {
 	active.State = core.RunRunning
 	for _, run := range []*core.Run{closed, active} {
 		if err := store.Save(ctx, run); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`store.Save(ctx, run): %v`, err)
 		}
 	}
 	c := &Control{Store: store}
@@ -249,12 +254,12 @@ func TestNudgeCallsWakeWithOperatorGuidance(t *testing.T) {
 	run.WorkspacePath = "/ws/T-1"
 	run.Branch = "beacon/T-1"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 	h := &fakeHarness{}
 	c := &Control{Store: store, Harness: h}
 	if err := c.Nudge(ctx, "r-nudge", "please rebase first"); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.Nudge(ctx, "r-nudge", "please rebase first"): %v`, err)
 	}
 	if len(h.wakes) != 1 {
 		t.Fatalf("wakes = %+v, want one", h.wakes)
@@ -277,7 +282,7 @@ func TestNudgeRejectsRunsWithoutLiveSession(t *testing.T) {
 	noSession.State = core.RunRunning
 	for _, run := range []*core.Run{terminal, noSession} {
 		if err := store.Save(ctx, run); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`store.Save(ctx, run): %v`, err)
 		}
 	}
 	h := &fakeHarness{}
@@ -299,13 +304,13 @@ func TestWatchPRBindsActiveRun(t *testing.T) {
 	run := core.NewRun("r-active", "T-1", time.Now().UTC())
 	run.State = core.RunRunning
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int
 	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
 	if err := c.WatchPR(ctx, "r-active", 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.WatchPR(ctx, "r-active", 42): %v`, err)
 	}
 	got := store.runs["r-active"]
 	if got.State != core.RunWaitingCI || got.PRNumber != 42 {
@@ -322,13 +327,13 @@ func TestWatchPRBindsPRToWaitingRun(t *testing.T) {
 	run := core.NewRun("r-waiting", "T-1", time.Now().UTC())
 	run.State = core.RunWaitingCI
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int
 	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
 	if err := c.WatchPR(ctx, "r-waiting", 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.WatchPR(ctx, "r-waiting", 42): %v`, err)
 	}
 	got := store.runs["r-waiting"]
 	if got.State != core.RunWaitingCI || got.PRNumber != 42 {
@@ -348,13 +353,13 @@ func TestWatchPRReopensRunClosedByWorkspaceCleanup(t *testing.T) {
 	run.SessionID = "sess-r-closed"
 	run.WorkspacePath = "/ws/T-1"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int
 	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
 	if err := c.WatchPR(ctx, "r-closed", 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.WatchPR(ctx, "r-closed", 42): %v`, err)
 	}
 	got := store.runs["r-closed"]
 	if got.State != core.RunWaitingCI || got.PRNumber != 42 {
@@ -374,7 +379,7 @@ func TestWatchPRReopensRunClosedByWorkspaceCleanup(t *testing.T) {
 		Workspace: &fakeWorkspace{}, Harness: &fakeHarness{},
 	}
 	if _, err := r.Reconcile(ctx, 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 	}
 	if merged := store.runs["r-closed"]; merged.State != core.RunMerged {
 		t.Fatalf("state = %s, want %s", merged.State, core.RunMerged)
@@ -394,7 +399,7 @@ func TestWatchPRRejectsRunClosedByOperator(t *testing.T) {
 	run.State = core.RunClosed
 	run.Reason = "cancelled by operator"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int
@@ -418,7 +423,7 @@ func TestRetryDoesNotSignalWhenRunIsNotBlocked(t *testing.T) {
 	run.State = core.RunWaitingCI
 	run.PRNumber = 42
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 
 	var signals []int

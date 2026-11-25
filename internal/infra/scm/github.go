@@ -1,3 +1,4 @@
+// Package scm adapts GitHub and GitLab to core.ScmGateway.
 package scm
 
 import (
@@ -11,10 +12,10 @@ import (
 	"github.com/google/go-github/v93/github"
 	"github.com/sony/gobreaker/v2"
 
-	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// GitHub implements core.ScmGateway against the GitHub REST API.
 type GitHub struct {
 	Client *github.Client
 	Owner  string
@@ -25,6 +26,7 @@ type GitHub struct {
 	etags  map[int]*etagEntry
 }
 
+// NewGitHub builds a GitHub gateway for owner and repo.
 func NewGitHub(client *github.Client, owner, repo, base string) *GitHub {
 	g := &GitHub{
 		Client: client,
@@ -103,6 +105,7 @@ func paginate[T any](br *gobreaker.CircuitBreaker[any], fetch func(*github.ListO
 	return all, nil
 }
 
+// Observe reads the current state of pull request pr.
 func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) {
 	p, err := g.getPR(ctx, pr)
 	if err != nil {
@@ -172,6 +175,7 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 	return o, nil
 }
 
+// checks returns the check runs for commit sha.
 func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, error) {
 	checkRuns, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.CheckRun, *github.Response, error) {
 		res, resp, err := g.Client.Checks.ListCheckRunsForRef(ctx, g.Owner, g.Repo, sha, &github.ListCheckRunsOptions{
@@ -198,6 +202,7 @@ func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, er
 	return out, nil
 }
 
+// checkState maps a GitHub check run to a core.CheckState.
 func checkState(c *github.CheckRun) core.CheckState {
 	if c.GetStatus() != "completed" {
 		return core.CheckPending
@@ -242,6 +247,7 @@ func ignoredPathsOnly(files []*github.CommitFile) bool {
 	return true
 }
 
+// approvals counts the latest approval review per user on pr.
 func (g *GitHub) approvals(ctx context.Context, pr int) (int, error) {
 	reviews, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.PullRequestReview, *github.Response, error) {
 		return g.Client.PullRequests.ListReviews(ctx, g.Owner, g.Repo, pr, opts)
@@ -271,6 +277,7 @@ func (g *GitHub) approvals(ctx context.Context, pr int) (int, error) {
 	return n, nil
 }
 
+// updateBranchResponse is the GraphQL response for a branch update.
 type updateBranchResponse struct {
 	Data struct {
 		UpdatePullRequestBranch struct {
@@ -284,6 +291,7 @@ type updateBranchResponse struct {
 	} `json:"errors"`
 }
 
+// updateBranchMutation asks GitHub to update a pull request branch.
 const updateBranchMutation = `mutation($id: ID!, $sha: GitObjectID!) {
   updatePullRequestBranch(input: {pullRequestId: $id, expectedHeadOid: $sha}) {
     pullRequest {
@@ -333,6 +341,7 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 	return sha, nil
 }
 
+// Merge squashes pr while its head is still expectedSHA.
 func (g *GitHub) Merge(ctx context.Context, pr int, expectedSHA, title string) error {
 	merged, err := guarded(g.br, func() (*github.PullRequestMergeResult, error) {
 		m, _, err := g.Client.PullRequests.Merge(ctx, g.Owner, g.Repo, pr, title, &github.PullRequestOptions{
@@ -350,4 +359,4 @@ func (g *GitHub) Merge(ctx context.Context, pr int, expectedSHA, title string) e
 	return nil
 }
 
-var _ app.ScmGateway = (*GitHub)(nil)
+var _ core.ScmGateway = (*GitHub)(nil)

@@ -1,3 +1,4 @@
+// Package notify sends operator notifications.
 package notify
 
 import (
@@ -9,23 +10,27 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/shared"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// Telegram sends notifications through the Telegram Bot API.
 type Telegram struct {
 	Token  string
 	ChatID string
 	HTTP   *http.Client
 }
 
+// NewTelegram builds a notifier for a bot token and chat.
 func NewTelegram(token, chatID string) *Telegram {
 	return &Telegram{Token: token, ChatID: chatID, HTTP: &http.Client{Timeout: 10 * time.Second}}
 }
 
+// Enabled reports whether a token and chat id are configured.
 func (t *Telegram) Enabled() bool { return t.Token != "" && t.ChatID != "" }
 
-func (t *Telegram) Notify(ctx context.Context, n app.Notification) error {
+// Notify sends n as a Telegram message.
+func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
 	if !t.Enabled() {
 		return nil
 	}

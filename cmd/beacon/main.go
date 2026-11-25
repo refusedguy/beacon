@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -64,6 +65,17 @@ type wiredInfra struct {
 	changes   chan int
 	decisions app.DecisionLogger
 }
+
+// The store adapter must satisfy each consumer-side port before any service is
+// built. A missing method fails the build at the composition root.
+var (
+	_ app.StatusStore     = (*sqlite.Store)(nil)
+	_ app.ReconcileStore  = (*sqlite.Store)(nil)
+	_ app.WaitStore       = (*sqlite.Store)(nil)
+	_ app.DispatchStore   = (*sqlite.Store)(nil)
+	_ app.ReconcilerStore = (*sqlite.Store)(nil)
+	_ core.RunStore       = (*sqlite.Store)(nil)
+)
 
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
 // started with a cwd, but a caller can pin the root without changing that cwd.
@@ -307,7 +319,9 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 		return core.ModelRef{}
 	}
 	endpoint := strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return core.ModelRef{}
 	}
@@ -316,7 +330,7 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 	} else {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return core.ModelRef{}
@@ -370,6 +384,10 @@ func main() {
 	root.AddCommand(newGCCommand(configPath))
 
 	if err := root.Execute(); err != nil {
+		var coder exitCoder
+		if errors.As(err, &coder) {
+			os.Exit(coder.ExitCode())
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

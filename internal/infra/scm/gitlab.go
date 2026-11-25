@@ -26,6 +26,7 @@ type GitLab struct {
 	br      *gobreaker.CircuitBreaker[any]
 }
 
+// NewGitLab builds a GitLab gateway for owner and repo.
 func NewGitLab(baseURL, token, owner, repo string) *GitLab {
 	return &GitLab{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -39,10 +40,12 @@ func NewGitLab(baseURL, token, owner, repo string) *GitLab {
 
 var _ core.ScmGateway = (*GitLab)(nil)
 
+// project returns the URL-escaped GitLab project path.
 func (g *GitLab) project() string {
 	return url.PathEscape(g.owner + "/" + g.repo)
 }
 
+// request sends an authenticated GitLab API request and returns its body.
 func (g *GitLab) request(ctx context.Context, method, path string, query url.Values, payload any) ([]byte, error) {
 	u := g.baseURL + path
 	if len(query) > 0 {
@@ -84,6 +87,7 @@ func (g *GitLab) request(ctx context.Context, method, path string, query url.Val
 	})
 }
 
+// getJSON decodes a GitLab GET response into out.
 func (g *GitLab) getJSON(ctx context.Context, path string, query url.Values, out any) error {
 	data, err := g.request(ctx, http.MethodGet, path, query, nil)
 	if err != nil {
@@ -95,6 +99,7 @@ func (g *GitLab) getJSON(ctx context.Context, path string, query url.Values, out
 	return json.Unmarshal(data, out)
 }
 
+// gitlabErrorCode maps an HTTP status to a core error code.
 func gitlabErrorCode(status int) core.ErrorCode {
 	switch status {
 	case http.StatusNotFound:
@@ -106,6 +111,7 @@ func gitlabErrorCode(status int) core.ErrorCode {
 	}
 }
 
+// mrPath returns the API path for merge request iid.
 func (g *GitLab) mrPath(iid int) string {
 	return fmt.Sprintf("/projects/%s/merge_requests/%d", g.project(), iid)
 }
