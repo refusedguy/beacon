@@ -42,10 +42,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer tracker.Close()
-			addr := os.Getenv("BEACON_API_ADDR")
-			if addr == "" {
-				addr = "127.0.0.1:7432"
-			}
+			addr := firstNonEmpty(os.Getenv("BEACON_API_ADDR"), "127.0.0.1:7432")
 			token, err := writeConnection(dir, "http://"+addr)
 			if err != nil {
 				return err
