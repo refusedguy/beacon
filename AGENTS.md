@@ -106,3 +106,9 @@ The OpenCode plugin rejects three commands at the tool boundary: `grep -r` over 
 ## Prose
 
 Write plain prose. Use active voice, short sentences and one idea per sentence. No em dashes, filler phrases or rule of three. Apply the same rules to docs, PR bodies and commit messages.
+
+## Conventions
+
+Use the standard library `testing` package for all tests. Do not add GoConvey or another third-party testing framework. Existing tests use `testing`, and the module declares no GoConvey dependency.
+
+Do not put copyright or license headers in Go files. The repository has no Genome Research Ltd header and no other copyright or SPDX header. Do not add one to new files.

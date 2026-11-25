@@ -305,7 +305,8 @@ func TestLoadAcceptsAbsentSCM(t *testing.T) {
 }
 
 func TestLoadRejectsBadInterval(t *testing.T) {
-	for _, value := range []string{"nope", "30", "5x"} {
+	// "30sec" is the typo the old silent fallback masked as 30 seconds.
+	for _, value := range []string{"nope", "30", "30sec", "5x"} {
 		t.Run(value, func(t *testing.T) {
 			path := writeConfig(t, "poll_interval: "+strconv.Quote(value)+"\n")
 			_, err := Load(path)
