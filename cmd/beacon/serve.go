@@ -86,7 +86,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 			case <-ctx.Done():
 				return nil
 			case err := <-errCh:
-				if err == http.ErrServerClosed || err == context.Canceled {
+				if err == nil || err == http.ErrServerClosed || err == context.Canceled {
 					return nil
 				}
 				writeDaemonError(dir, "serve", err)
@@ -111,7 +111,10 @@ func fanout[T any](ctx context.Context, src <-chan T, n int) []<-chan T {
 			select {
 			case <-ctx.Done():
 				return
-			case v := <-src:
+			case v, ok := <-src:
+				if !ok {
+					return
+				}
 				for _, out := range outs {
 					select {
 					case out <- v:
