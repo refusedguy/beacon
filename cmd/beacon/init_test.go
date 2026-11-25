@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,6 +52,33 @@ func TestRunInitUsesNewRebaseLimit(t *testing.T) {
 	}
 	if cfg.Merge.MaxAttempts != 12 {
 		t.Fatalf("generated merge.max_attempts = %d, want 12", cfg.Merge.MaxAttempts)
+	}
+}
+
+func TestRunInitDeclineFailsWithoutWritingConfig(t *testing.T) {
+	dir := initProject(t, "go.mod")
+	t.Chdir(dir)
+
+	var out bytes.Buffer
+	err := runInitWithInput(&initFlags{skipPlugin: true}, &out, strings.NewReader("n\n"), true)
+	if !errors.Is(err, errInitDeclined) {
+		t.Fatalf("runInitWithInput error = %v, want errInitDeclined", err)
+	}
+	if existsIn(dir, filepath.Join(".beacon", "config.yaml")) {
+		t.Error("declined init wrote a config")
+	}
+}
+
+func TestRunInitAcceptWritesConfig(t *testing.T) {
+	dir := initProject(t, "go.mod")
+	t.Chdir(dir)
+
+	var out bytes.Buffer
+	if err := runInitWithInput(&initFlags{skipPlugin: true}, &out, strings.NewReader("y\n"), true); err != nil {
+		t.Fatalf("runInitWithInput: %v", err)
+	}
+	if _, err := config.Load(filepath.Join(dir, ".beacon", "config.yaml")); err != nil {
+		t.Fatalf("accepted init did not write a config: %v", err)
 	}
 }
 

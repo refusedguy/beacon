@@ -29,16 +29,20 @@ func (c *Control) write(ctx context.Context, fn func() error) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	var err error
+	timer := time.NewTimer(controlRetryBase)
+	timer.Stop()
+	defer timer.Stop()
 	for attempt := 0; attempt < controlWriteAttempts; attempt++ {
 		err = fn()
 		if !isBusy(err) {
 			return err
 		}
 		if attempt+1 < controlWriteAttempts {
+			timer.Reset(controlRetryBase << attempt)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(controlRetryBase << attempt):
+			case <-timer.C:
 			}
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -405,6 +406,56 @@ func TestLaunchSourceCoversMCPCLIUIAndDaemon(t *testing.T) {
 	}
 	if run.ParentSessionID != "" {
 		t.Fatalf("parent session changed: %q", run.ParentSessionID)
+	}
+}
+
+func TestBlockedMetricMapStaysBoundedWithDistinctReasons(t *testing.T) {
+	now := time.Now().UTC()
+	reasons := []string{
+		"gate failed: provider error at sha 0123456789abcdef",
+		"gate failed: provider error at sha abcdef0123456789",
+		"gate failed: provider error at sha deadbeefdeadbeef",
+		"base_red on main at sha 1111111111111111",
+		"base_red on main at sha 2222222222222222",
+		"rebase attempts exhausted on 3333333333333333",
+		"fix attempts exhausted on 4444444444444444",
+		"idle without PR or changes 5555555555555555",
+	}
+	var active []*core.Run
+	histories := map[string][]Decision{}
+	for i, reason := range reasons {
+		run := core.NewRun(core.RunID(fmt.Sprintf("run-%d", i)), core.TaskID(fmt.Sprintf("T-%d", i)), now)
+		run.State = core.RunBlocked
+		run.Reason = reason
+		active = append(active, run)
+
+		id := fmt.Sprintf("decision-run-%d", i)
+		histories[id] = []Decision{{
+			Kind:    "reconcile.decision",
+			RunID:   id,
+			Verdict: string(core.VerdictBlocked),
+			Reason:  fmt.Sprintf("gate failed: provider error %d at sha %x", i, i),
+		}}
+	}
+
+	m := makeMetrics(active, nil, nil, histories, nil, now)
+	if len(m.Blocked) > 6 {
+		t.Fatalf("blocked keys = %d, want at most 6: %+v", len(m.Blocked), m.Blocked)
+	}
+	for key := range m.Blocked {
+		if strings.Contains(strings.ToLower(key), "sha") || len(key) > 20 {
+			t.Fatalf("blocked key %q carries reason detail", key)
+		}
+	}
+	if got := m.Blocked["gate failed"]; got != 11 {
+		t.Fatalf("gate failed count = %d, want 11: %+v", got, m.Blocked)
+	}
+	sum := 0
+	for _, n := range m.Blocked {
+		sum += n
+	}
+	if sum != m.BlockedCount || m.BlockedCount != len(reasons)*2 {
+		t.Fatalf("blocked sum = %d, count = %d, want %d", sum, m.BlockedCount, len(reasons)*2)
 	}
 }
 

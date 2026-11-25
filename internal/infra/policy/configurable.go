@@ -11,6 +11,7 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// Config holds the merge criteria that build a Policy.
 type Config struct {
 	RequiredChecks    []string
 	RequiredApprovals int
@@ -23,8 +24,10 @@ type Config struct {
 // mode means the LLM reviewer, matching the default on the task card.
 type ReviewRule struct{ Mode core.ReviewMode }
 
+// Name returns the review criterion name.
 func (r ReviewRule) Name() string { return "review" }
 
+// Evaluate reports whether o still needs review approval.
 func (r ReviewRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	if r.Mode == core.ReviewModeNone {
 		return core.VerdictNoop, ""
@@ -35,10 +38,12 @@ func (r ReviewRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	return core.VerdictWait, "epic review approval required"
 }
 
+// Policy evaluates an observation against a chain of criteria.
 type Policy struct {
 	criteria []core.Criterion
 }
 
+// New builds a Policy from the criteria enabled in cfg.
 func New(cfg Config) *Policy {
 	var rules []core.Criterion
 	if len(cfg.RequiredChecks) > 0 {
@@ -59,6 +64,7 @@ func New(cfg Config) *Policy {
 	return &Policy{criteria: rules}
 }
 
+// Evaluate decides whether the observation may merge.
 func (p *Policy) Evaluate(o core.Observation) core.MergeDecision {
 	return core.Decide(o, p.criteria)
 }
@@ -71,10 +77,13 @@ func (p *Policy) ReviewRequired(mode core.ReviewMode, o core.Observation) bool {
 	return verdict != core.VerdictNoop
 }
 
+// ChecksRule gates a merge on required checks passing.
 type ChecksRule struct{ Names []string }
 
+// Name returns the required checks criterion name.
 func (r ChecksRule) Name() string { return "required_checks" }
 
+// Evaluate reports which required checks have not passed.
 func (r ChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	if o.AllRequiredPass(r.Names) {
 		return core.VerdictNoop, ""
@@ -103,10 +112,13 @@ func (r ChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	return core.VerdictWait, "required checks not passed: " + strings.Join(notPassed, ", ")
 }
 
+// ApprovalsRule gates a merge on a minimum approval count.
 type ApprovalsRule struct{ Needed int }
 
+// Name returns the approvals criterion name.
 func (r ApprovalsRule) Name() string { return "approvals" }
 
+// Evaluate reports whether o has enough approvals.
 func (r ApprovalsRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	if o.Approvals >= r.Needed {
 		return core.VerdictNoop, ""
@@ -114,10 +126,13 @@ func (r ApprovalsRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	return core.VerdictWait, fmt.Sprintf("need %d approvals, have %d", r.Needed, o.Approvals)
 }
 
+// LabelRule gates a merge on required labels.
 type LabelRule struct{ Names []string }
 
+// Name returns the labels criterion name.
 func (r LabelRule) Name() string { return "labels" }
 
+// Evaluate reports which required labels are missing.
 func (r LabelRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	for _, want := range r.Names {
 		found := false
@@ -140,8 +155,10 @@ type CommandRule struct {
 	Timeout time.Duration
 }
 
+// Name returns the command gate criterion name.
 func (r CommandRule) Name() string { return "command_gate" }
 
+// Evaluate runs the gate command and blocks on a nonzero exit.
 func (r CommandRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	timeout := r.Timeout
 	if timeout <= 0 {

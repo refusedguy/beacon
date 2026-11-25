@@ -18,6 +18,7 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// GitWorktree creates and manages one git worktree per task.
 type GitWorktree struct {
 	Repo      string
 	Root      string
@@ -31,6 +32,7 @@ type GitWorktree struct {
 	commandHook func(dir string, args []string) error
 }
 
+// New builds a worktree manager for repo with worktrees under dir.
 func New(repo, base, dir string) (*GitWorktree, error) {
 	if !filepath.IsAbs(dir) {
 		abs, err := filepath.Abs(dir)
@@ -48,16 +50,20 @@ func New(repo, base, dir string) (*GitWorktree, error) {
 	return g, nil
 }
 
+// unsafeBranchChars matches characters that a branch name may not contain.
 var unsafeBranchChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
+// branchName maps a task id to its beacon branch name.
 func branchName(id core.TaskID) string {
 	return "beacon/" + unsafeBranchChars.ReplaceAllString(string(id), "-")
 }
 
+// run executes git in the repository with a bounded context.
 func (g *GitWorktree) run(ctx context.Context, args ...string) (string, error) {
 	return g.runInDir(ctx, g.Repo, args...)
 }
 
+// runInDir executes git in dir with a bounded context.
 func (g *GitWorktree) runInDir(ctx context.Context, dir string, args ...string) (string, error) {
 	if g.commandHook != nil {
 		if err := g.commandHook(dir, args); err != nil {
@@ -74,6 +80,7 @@ func (g *GitWorktree) runInDir(ctx context.Context, dir string, args ...string) 
 	return string(out), nil
 }
 
+// checkPath verifies that a workspace path exists.
 func checkPath(path string) error {
 	if path == "" {
 		return core.Errorf(core.CodeInvalidInput, "workspace path is empty")
@@ -84,6 +91,7 @@ func checkPath(path string) error {
 	return nil
 }
 
+// status reports whether the worktree at path is clean.
 func (g *GitWorktree) status(ctx context.Context, path string) (bool, error) {
 	out, err := g.runInDir(ctx, path, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
@@ -128,6 +136,7 @@ func (g *GitWorktree) cardOnlyDirt(ctx context.Context, path string) (dirty, onl
 	return true, all == inside, nil
 }
 
+// Create checks out a fresh worktree for task.
 func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspace, error) {
 	branch := branchName(task.ID)
 	path := filepath.Join(g.Dir, unsafeBranchChars.ReplaceAllString(string(task.ID), "-"))
@@ -225,6 +234,7 @@ func safeEpicBranch(branch string) string {
 	return "beacon/" + unsafeBranchChars.ReplaceAllString(strings.TrimPrefix(branch, "beacon/"), "-")
 }
 
+// Clean reports whether the workspace has no uncommitted changes.
 func (g *GitWorktree) Clean(ctx context.Context, ws core.Workspace) (bool, error) {
 	if err := checkPath(ws.Path); err != nil {
 		return false, err
@@ -334,6 +344,7 @@ func detachedPushContext(ctx context.Context, timeout time.Duration) (context.Co
 	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
+// HasChanges reports whether the workspace has uncommitted or unpushed work.
 func (g *GitWorktree) HasChanges(ctx context.Context, ws core.Workspace, base string) (bool, error) {
 	if err := checkPath(ws.Path); err != nil {
 		return false, err
@@ -356,6 +367,7 @@ func (g *GitWorktree) HasChanges(ctx context.Context, ws core.Workspace, base st
 	return n > 0, nil
 }
 
+// refresh updates worktree registration through the configured refresher.
 func (g *GitWorktree) refresh(ctx context.Context) {
 	if g.Refresher == nil {
 		return
@@ -365,6 +377,7 @@ func (g *GitWorktree) refresh(ctx context.Context) {
 	}
 }
 
+// Remove deletes a clean worktree and its local branch.
 func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	if ws.Path == "" {
 		return nil
@@ -398,6 +411,7 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	return nil
 }
 
+// ForceRemove deletes a worktree and its branch without a clean check.
 func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error {
 	defer g.refresh(ctx)
 	_, err := g.run(ctx, "worktree", "remove", "--force", ws.Path)

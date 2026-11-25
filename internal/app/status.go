@@ -609,6 +609,28 @@ func addCountMetrics(m *Metrics, counts []DecisionCount) {
 	}
 }
 
+// blockedReasonCategory reduces a free-form blocked reason to one of a small
+// fixed set of keys. Reasons carry SHAs, provider errors and command output, so
+// keying the metric by the raw text would grow the map without bound. Anything
+// outside the known categories lands in "other".
+func blockedReasonCategory(reason string) string {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case strings.HasPrefix(reason, "gate failed"):
+		return "gate failed"
+	case strings.HasPrefix(reason, "base_red"):
+		return "base red"
+	case strings.HasPrefix(reason, "rebase attempts"):
+		return "rebase attempts"
+	case strings.HasPrefix(reason, "fix attempts"):
+		return "fix attempts"
+	case strings.HasPrefix(reason, "idle"):
+		return "idle"
+	default:
+		return "other"
+	}
+}
+
 func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][]RunEvent, merged, blocked map[string]bool, now time.Time) {
 	for _, group := range [][]*core.Run{active, recent} {
 		for _, run := range group {
@@ -619,7 +641,7 @@ func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][
 			}
 			if run.State == core.RunBlocked && !blocked[id] {
 				blocked[id] = true
-				m.Blocked[run.Reason]++
+				m.Blocked[blockedReasonCategory(run.Reason)]++
 				m.BlockedCount++
 			}
 		}
@@ -651,7 +673,7 @@ func addDecisionMetrics(m *Metrics, histories map[string][]Decision, merged, blo
 			case "reconcile.decision":
 				if decision.Verdict == string(core.VerdictBlocked) && !blocked[decision.RunID] {
 					blocked[decision.RunID] = true
-					m.Blocked[decision.Reason]++
+					m.Blocked[blockedReasonCategory(decision.Reason)]++
 					m.BlockedCount++
 				}
 			}
