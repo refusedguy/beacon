@@ -1053,6 +1053,92 @@ func TestOpJournalRunIsIdempotent(t *testing.T) {
 	}
 }
 
+// extraResult is a result type that was not in the old withMeta switch. A new
+// mutation response only needs the shared metadata and a WithMeta method.
+type extraResult struct {
+	app.OperationMeta
+	Value string `json:"value"`
+}
+
+func (r extraResult) WithMeta(id, status string) any {
+	r.Status, r.OperationID = status, id
+	return r
+}
+
+func TestOpJournalRunAppliesMetaToUnknownResultType(t *testing.T) {
+	j := newOpJournal()
+	calls := 0
+	fn := func(context.Context) (any, error) {
+		calls++
+		return extraResult{Value: "kept"}, nil
+	}
+	first, err := j.run(context.Background(), "op-extra", fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := first.(extraResult)
+	if !ok || got.Value != "kept" || got.Status != "applied" || got.OperationID != "op-extra" {
+		t.Fatalf("first = %+v", first)
+	}
+
+	second, err := j.run(context.Background(), "op-extra", fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, ok := second.(extraResult)
+	if !ok || again.Value != "kept" || again.Status != "duplicate" || again.OperationID != "op-extra" {
+		t.Fatalf("second = %+v", second)
+	}
+	if calls != 1 {
+		t.Fatalf("mutation ran %d times, want 1", calls)
+	}
+
+	wire, err := json.Marshal(again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(wire, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["value"] != "kept" || fields["status"] != "duplicate" || fields["operation_id"] != "op-extra" {
+		t.Fatalf("wire shape = %s", wire)
+	}
+}
+
+func TestMutationResultsKeepFlatWireShape(t *testing.T) {
+	cases := []struct {
+		name   string
+		result app.OperationResult
+		fields []string
+	}{
+		{"created", app.CreatedTask{ID: "T-A"}, []string{"id", "status", "operation_id"}},
+		{"batch", app.CreateBatchResult{}, []string{"created", "status", "operation_id"}},
+		{"updated", app.UpdateResult{}, []string{"results", "status", "operation_id"}},
+		{"deleted", app.DeleteResult{}, []string{"results", "status", "operation_id"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wire, err := json.Marshal(tc.result.WithMeta("op-wire", "applied"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(wire, &fields); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range tc.fields {
+				if _, ok := fields[key]; !ok {
+					t.Fatalf("missing %q in %s", key, wire)
+				}
+			}
+			if fields["status"] != "applied" || fields["operation_id"] != "op-wire" {
+				t.Fatalf("metadata not at top level: %s", wire)
+			}
+		})
+	}
+}
+
 func TestOpJournalRunSerializesConcurrentCalls(t *testing.T) {
 	j := newOpJournal()
 	calls := 0
