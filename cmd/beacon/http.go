@@ -1,19 +1,74 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// subscriberBuffer is the number of PR changes queued for one monitor. A
+// monitor that falls further behind loses the extra changes and sees the run
+// state on a later refresh. The drop keeps one slow connection from blocking
+// the other monitors or the broadcaster.
+const subscriberBuffer = 16
+
+// changeSubscribers broadcasts PR change numbers to one channel per SSE
+// connection. Each connection owns its channel, so every monitor sees every
+// change.
+type changeSubscribers struct {
+	mu   sync.Mutex
+	subs map[chan int]struct{}
+}
+
+func newChangeSubscribers() *changeSubscribers {
+	return &changeSubscribers{subs: make(map[chan int]struct{})}
+}
+
+// subscribe adds a connection and returns its channel plus an unsubscribe
+// function. The caller must call unsubscribe when the connection closes.
+func (s *changeSubscribers) subscribe() (<-chan int, func()) {
+	ch := make(chan int, subscriberBuffer)
+	s.mu.Lock()
+	s.subs[ch] = struct{}{}
+	s.mu.Unlock()
+	return ch, func() {
+		s.mu.Lock()
+		delete(s.subs, ch)
+		s.mu.Unlock()
+	}
+}
+
+// run copies each PR change to every subscriber. A full subscriber channel is
+// skipped so a slow monitor cannot stall the broadcast.
+func (s *changeSubscribers) run(ctx context.Context, src <-chan int) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case pr := <-src:
+			s.mu.Lock()
+			for ch := range s.subs {
+				select {
+				case ch <- pr:
+				default:
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
 type apiServer struct {
 	wiring      *wiring
 	token       string
 	eventStream <-chan core.HarnessEvent
+	changes     *changeSubscribers
 }
 
 func (a *apiServer) handler() http.Handler {
@@ -101,8 +156,14 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	changes, unsubscribe := a.changes.subscribe()
+	defer unsubscribe()
 	rw.Header().Set("Content-Type", "text/event-stream")
 	rw.Header().Set("Cache-Control", "no-cache")
+	// Send the headers now so the monitor's request returns before the first
+	// event. Otherwise the connection appears to hang until the first ping.
+	rw.WriteHeader(http.StatusOK)
+	flusher.Flush()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	events := a.eventStream
@@ -113,7 +174,7 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		case ev := <-events:
 			writeSSE(rw, "harness", ev)
 			flusher.Flush()
-		case pr := <-a.wiring.changes:
+		case pr := <-changes:
 			writeSSE(rw, "pr_changed", map[string]int{"pr": pr})
 			flusher.Flush()
 		case <-ticker.C:
