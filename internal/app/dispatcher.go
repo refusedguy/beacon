@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -30,6 +31,11 @@ type Dispatcher struct {
 	WorkerInstructions string
 	ResolveModel       ModelResolver
 	Decisions          DecisionLogger
+
+	// slotsMu makes slot acquisition atomic across dispatch and promotion. A
+	// caller holds it from the Available check until every agent it starts is
+	// saved as active, so a concurrent path sees the updated store state.
+	slotsMu sync.Mutex
 }
 
 var _ core.AgentSlots = (*Dispatcher)(nil)
@@ -54,6 +60,9 @@ func newRunID() core.RunID {
 }
 
 func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error) {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+
 	var out DispatchResult
 	tasks, err := d.Source.ListAvailable(ctx)
 	if err != nil {
@@ -115,6 +124,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 			if err := d.startOne(ctx, run, task); err != nil {
 				out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
 				d.handleStartFailure(ctx, run, err)
+				// The failed run may still hold a slot when its worker survived.
+				// Re-read under slotsMu instead of spending the slot on the next
+				// task and exceeding the limit.
+				budget = d.Available(ctx)
 				continue
 			}
 			budget--
@@ -126,6 +139,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 
 // PromotePending starts queued runs when an agent slot becomes free.
 func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+
 	active, err := d.Store.ListActive(ctx)
 	if err != nil {
 		return nil, err
@@ -274,12 +290,13 @@ func (d *Dispatcher) inFlightLimit() int {
 
 // Available is the single agent-slot operation. It counts free slots against
 // MaxActiveAgents, falling back to the in-flight limit when no agent limit is
-// configured. A failed active-run listing fails open with one slot so a
-// transient store error never stalls dispatch, promotion or wake.
+// configured. A failed active-run listing fails closed with zero slots so a
+// transient store error cannot make dispatch, promotion or wake oversubscribe.
+// Callers that act on the result hold slotsMu from this check through the start.
 func (d *Dispatcher) Available(ctx context.Context) int {
 	active, err := d.Store.ListActive(ctx)
 	if err != nil {
-		return 1
+		return 0
 	}
 	limit := d.Concurrency.MaxActiveAgents
 	if limit <= 0 {
@@ -291,7 +308,11 @@ func (d *Dispatcher) Available(ctx context.Context) int {
 			used++
 		}
 	}
-	return limit - used
+	free := limit - used
+	if free < 0 {
+		return 0
+	}
+	return free
 }
 
 func firstNonEmptyLocal(values ...string) string {
