@@ -34,15 +34,19 @@ func (h *Harness) RunIdleWatch(ctx context.Context) {
 // watchLoop reconnects to the idle stream with exponential backoff.
 func (h *Harness) watchLoop(ctx context.Context) {
 	delay := h.ReconnectMin
+	timer := time.NewTimer(delay)
+	timer.Stop()
+	defer timer.Stop()
 	for ctx.Err() == nil {
 		_ = h.streamIdle(ctx)
 		if ctx.Err() != nil {
 			return
 		}
+		timer.Reset(delay)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-timer.C:
 		}
 		if delay < h.ReconnectMax {
 			delay *= 2
