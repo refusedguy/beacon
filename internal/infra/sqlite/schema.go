@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqliteDriver "modernc.org/sqlite"
 )
 
 const schema = `
@@ -118,10 +118,11 @@ func openDB(path string) (*sql.DB, error) {
 	// transaction. Deferred upgrades can fail with SQLITE_BUSY even after a
 	// busy timeout, which parallel control calls hit.
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_txlock=immediate"
-	db, err := sql.Open("sqlite", dsn)
+	connector, err := sqliteDriver.NewConnector(dsn)
 	if err != nil {
 		return nil, err
 	}
+	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(4)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()

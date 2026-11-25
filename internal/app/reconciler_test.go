@@ -1204,3 +1204,76 @@ func TestWakeSkippedWhenSlotStoreFails(t *testing.T) {
 		t.Fatalf("wakes = %d, want none when the slot store fails", len(h.wakes))
 	}
 }
+
+// observationSpyStore counts saves that change the recorded SHA pair.
+type observationSpyStore struct {
+	*fakeStore
+	last     map[core.RunID][2]string
+	recorded int
+}
+
+func newObservationSpyStore() *observationSpyStore {
+	return &observationSpyStore{fakeStore: newFakeStore(), last: map[core.RunID][2]string{}}
+}
+
+func (s *observationSpyStore) Save(ctx context.Context, run *core.Run) error {
+	pair := [2]string{run.ObservedSHA, run.ObservedBaseSHA}
+	if old, ok := s.last[run.ID]; ok && old != pair {
+		s.recorded++
+	}
+	s.last[run.ID] = pair
+	return s.fakeStore.Save(ctx, run)
+}
+
+func TestGreenBehindRecordsObservationOnce(t *testing.T) {
+	ctx := context.Background()
+	obs := core.Observation{
+		PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", Behind: true,
+		Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+	}
+	cases := []struct {
+		name      string
+		state     core.RunState
+		policy    core.MergePolicy
+		wantState core.RunState
+	}{
+		{"needs agent fix", core.RunNeedsAgentFix, behindAwarePolicy{}, core.RunWaitingCI},
+		{"needs rebase", core.RunNeedsRebase,
+			fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictNeedsRebase}}, core.RunWaitingCI},
+		{"merge", core.RunWaitingCI, behindAwarePolicy{}, core.RunMerged},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newObservationSpyStore()
+			run := makeRun("r-obs-once", 42, tc.state)
+			run.ObservedSHA = "sha1"
+			run.ObservedBaseSHA = "base-old"
+			run.UpdatedAt = time.Now().UTC().Add(-time.Hour)
+			oldUpdated := run.UpdatedAt
+			if err := store.Save(ctx, run); err != nil {
+				t.Fatal(err)
+			}
+			r := &Reconciler{
+				Store: store, SCM: &fakeSCM{obs: obs}, Policy: tc.policy,
+				Harness: &fakeHarness{}, Source: &fakeSource{},
+				Workspace: &fakeWorkspace{}, AutoRebase: true,
+			}
+			if _, err := r.Reconcile(ctx, 42); err != nil {
+				t.Fatal(err)
+			}
+			got := store.runs[run.ID]
+			if got.State != tc.wantState {
+				t.Fatalf("state = %s, want %s", got.State, tc.wantState)
+			}
+			if got.ObservedSHA != "sha2" || got.ObservedBaseSHA != "base-new" {
+				t.Fatalf("observed pair = %q/%q, want sha2/base-new", got.ObservedSHA, got.ObservedBaseSHA)
+			}
+			if !got.UpdatedAt.After(oldUpdated) {
+				t.Fatalf("UpdatedAt = %s, want fresh after %s", got.UpdatedAt, oldUpdated)
+			}
+			if store.recorded != 1 {
+				t.Fatalf("observation saves = %d, want 1", store.recorded)
+			}
+		})
+	}
+}
