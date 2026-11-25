@@ -783,8 +783,8 @@ func TestTaskCreateBatchOverInMemoryTransport(t *testing.T) {
 			t.Fatalf("created %d = %+v", i, got.Created[i])
 		}
 	}
-	if committer.calls != 2 {
-		t.Fatalf("commit calls = %d, want one per card", committer.calls)
+	if committer.calls != 1 {
+		t.Fatalf("commit calls = %d, want one for the whole batch", committer.calls)
 	}
 	second, err := os.ReadFile(filepath.Join(dir, "T-B2.md"))
 	if err != nil {
@@ -815,25 +815,34 @@ func TestTaskCreateBatchIsIdempotentOverInMemoryTransport(t *testing.T) {
 			t.Fatalf("card %d changed: %+v vs %+v", i, first.Created[i], second.Created[i])
 		}
 	}
-	if committer.calls != 2 {
-		t.Fatalf("repeated batch committed %d times, want 2", committer.calls)
+	if committer.calls != 1 {
+		t.Fatalf("repeated batch committed %d times, want 1", committer.calls)
 	}
 }
 
-// removingSource adds the Remove capability the batch rollback needs.
+// removingSource adds the Remove capability the batch rollback needs and can
+// fail one write to exercise it.
 type removingSource struct {
 	*tasksource.Markdown
 	removed []core.TaskID
+	failID  string
 }
 
-func (s *removingSource) Remove(_ context.Context, id core.TaskID) error {
+func (s *removingSource) Create(ctx context.Context, task core.Task) (core.Task, error) {
+	if string(task.ID) == s.failID {
+		return core.Task{}, errors.New("write failed")
+	}
+	return s.Markdown.Create(ctx, task)
+}
+
+func (s *removingSource) Remove(ctx context.Context, id core.TaskID) error {
 	s.removed = append(s.removed, id)
 	return os.Remove(filepath.Join(s.Dir, string(id)+".md"))
 }
 
 func TestTaskCreateBatchRollsBackOverInMemoryTransport(t *testing.T) {
 	dir := t.TempDir()
-	source := &removingSource{Markdown: tasksource.NewMarkdown(dir)}
+	source := &removingSource{Markdown: tasksource.NewMarkdown(dir), failID: "T-B2"}
 	committer := &stubCommitter{}
 	creator := &app.TaskCreator{
 		Source: source, Workspace: committer,
@@ -844,7 +853,8 @@ func TestTaskCreateBatchRollsBackOverInMemoryTransport(t *testing.T) {
 	_, res := callCreateBatch(t, cs, map[string]any{
 		"tasks": []any{
 			map[string]any{"id": "T-B1", "title": "First"},
-			map[string]any{"id": "T-B2", "title": "  "},
+			map[string]any{"id": "T-B2", "title": "Second"},
+			map[string]any{"id": "T-B3", "title": "Third"},
 		},
 	})
 	if !res.IsError {
@@ -853,13 +863,15 @@ func TestTaskCreateBatchRollsBackOverInMemoryTransport(t *testing.T) {
 	if len(source.removed) != 1 || source.removed[0] != "T-B1" {
 		t.Fatalf("removed = %v, want the card written before the failure", source.removed)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "T-B1.md")); !os.IsNotExist(err) {
-		t.Fatalf("failed batch left the first card on disk: %v", err)
+	for _, id := range []string{"T-B1", "T-B2", "T-B3"} {
+		if _, err := os.Stat(filepath.Join(dir, id+".md")); !os.IsNotExist(err) {
+			t.Fatalf("failed batch left card %s on disk: %v", id, err)
+		}
 	}
-	// The first card publishes before the later card fails; rollback removes
-	// its file but cannot undo that commit.
-	if committer.calls != 1 {
-		t.Fatalf("commit calls = %d, want the first card's publish only", committer.calls)
+	// Nothing publishes until all files are written, so a failed write leaves
+	// no card in the remote either.
+	if committer.calls != 0 {
+		t.Fatalf("commit calls = %d, want none after a failed write", committer.calls)
 	}
 }
 
