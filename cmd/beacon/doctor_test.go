@@ -379,11 +379,18 @@ func TestDoctorHTTPCheckAuth(t *testing.T) {
 }
 
 func TestDoctorSCMCheckToleratesSlowServer(t *testing.T) {
+	received := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(2500 * time.Millisecond)
+		close(received)
+		<-release
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
+	defer unblock()
 
 	cfg := config.Config{
 		BaseBranch: "main",
@@ -395,8 +402,17 @@ func TestDoctorSCMCheckToleratesSlowServer(t *testing.T) {
 			TokenEnv: "BEACON_DOCTOR_SLOW_TOKEN",
 		},
 	}
-	checks := doctorNetworkChecks(cfg, doctorHTTPClient())
+	done := make(chan []doctorCheck, 1)
+	go func() { done <- doctorNetworkChecks(cfg, doctorHTTPClient()) }()
 
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SCM check did not reach the server")
+	}
+	unblock()
+
+	checks := <-done
 	var scm doctorCheck
 	for _, c := range checks {
 		if c.name == "scm base branch" {
@@ -405,6 +421,52 @@ func TestDoctorSCMCheckToleratesSlowServer(t *testing.T) {
 	}
 	if scm.level != checkOK || scm.detail != "HTTP 200" {
 		t.Fatalf("scm base branch check = %v %q, want OK HTTP 200", scm.level, scm.detail)
+	}
+}
+
+func TestDoctorSCMCheckTimeout(t *testing.T) {
+	received := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(received)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	defer unblock()
+
+	cfg := config.Config{
+		BaseBranch: "main",
+		SCM: config.SCM{
+			Provider: "gitlab",
+			BaseURL:  srv.URL,
+			Owner:    "acme",
+			Repo:     "demo",
+			TokenEnv: "BEACON_DOCTOR_TIMEOUT_TOKEN",
+		},
+	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	done := make(chan []doctorCheck, 1)
+	go func() { done <- doctorNetworkChecks(cfg, client) }()
+
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SCM check did not reach the server")
+	}
+	checks := <-done
+
+	var scm doctorCheck
+	for _, c := range checks {
+		if c.name == "scm base branch" {
+			scm = c
+		}
+	}
+	if scm.level != checkWarn || scm.detail != "unreachable" {
+		t.Fatalf("scm base branch check = %v %q, want WARN unreachable", scm.level, scm.detail)
 	}
 }
 
