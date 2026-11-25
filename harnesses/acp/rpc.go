@@ -148,9 +148,11 @@ func (p *stdioProcess) call(
 	}
 }
 
-// answer replies to an agent request. Permission prompts are approved using
-// the first allow option. Other client methods are unsupported in this
-// minimal harness and get a method-not-found error instead of hanging.
+// answer replies to an agent request. Permission prompts are approved only
+// when the agent offers an explicit allow option. Without one the prompt is
+// cancelled so no request is auto-approved by fallback. Other client methods
+// are unsupported in this minimal harness and get a method-not-found error
+// instead of hanging.
 func (p *stdioProcess) answer(id *int64, method string, params json.RawMessage) {
 	resp := rpcResponse{JSONRPC: "2.0", ID: *id}
 	if method != "session/request_permission" {
@@ -163,6 +165,9 @@ func (p *stdioProcess) answer(id *int64, method string, params json.RawMessage) 
 	_ = p.enc.Encode(resp)
 }
 
+// firstAllowOption returns the ID of the first explicitly allowed option, or
+// an empty string when none is offered. An empty ID makes answer cancel the
+// permission request instead of selecting an arbitrary option.
 func firstAllowOption(params json.RawMessage) string {
 	var req struct {
 		Options []struct {
@@ -173,16 +178,12 @@ func firstAllowOption(params json.RawMessage) string {
 	if err := json.Unmarshal(params, &req); err != nil {
 		return ""
 	}
-	fallback := ""
 	for _, opt := range req.Options {
-		if fallback == "" {
-			fallback = opt.OptionID
-		}
 		if strings.HasPrefix(opt.Kind, "allow") {
 			return opt.OptionID
 		}
 	}
-	return fallback
+	return ""
 }
 
 func (p *stdioProcess) notify(ctx context.Context, method string, params any) error {
