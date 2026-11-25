@@ -30,13 +30,8 @@ type controlBatch struct {
 	Results []controlItem `json:"results"`
 }
 
-var controlTool = &msdk.Tool{
-	Name:        "beacon_control",
-	Description: "Control a run: approve, unblock, cancel, retry or watch.",
-}
-
 func registerControl(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, controlTool, func(ctx context.Context, _ *msdk.CallToolRequest, a ControlArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_control"), func(ctx context.Context, _ *msdk.CallToolRequest, a ControlArgs) (*msdk.CallToolResult, any, error) {
 		if a.RunIDs == nil {
 			if err := applyControl(ctx, sv, a.Action, a.RunID, a.PR, a.SHA); err != nil {
 				return nil, nil, err

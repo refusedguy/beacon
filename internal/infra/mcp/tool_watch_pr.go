@@ -15,13 +15,8 @@ type WatchPRArgs struct {
 	PR    int    `json:"pr"`
 }
 
-var watchPRTool = &msdk.Tool{
-	Name:        "beacon_watch_pr",
-	Description: "Bind a pull request to a running task.",
-}
-
 func registerWatchPR(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, watchPRTool, func(ctx context.Context, _ *msdk.CallToolRequest, a WatchPRArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_watch_pr"), func(ctx context.Context, _ *msdk.CallToolRequest, a WatchPRArgs) (*msdk.CallToolResult, any, error) {
 		if sv.Remote != nil {
 			if err := sv.Remote(ctx, "watch", a.RunID, a.PR, ""); err != nil {
 				return nil, nil, err
