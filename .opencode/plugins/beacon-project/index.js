@@ -1,12 +1,3 @@
-// OpenCode provides @opencode/plugin at runtime. Load it defensively so the
-// guard logic in this module stays importable in plain Node for tests.
-let Plugin
-try {
-  ;({ Plugin } = await import("@opencode/plugin"))
-} catch {
-  Plugin = { define: (definition) => definition }
-}
-
 import { projectRoot } from "./state/location.js"
 import { createMcpRegistrar, noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
 import { installProjectContext } from "./rules/context.js"
@@ -68,7 +59,7 @@ export async function resolveMcpRegistration(ctx, root, { agent, registrar, conf
   return registerBeaconMcp(ctx, root, options.mcpDeps ?? {})
 }
 
-export const beaconProject = Plugin.define({
+export const beaconProjectDefinition = {
   id: "beacon-project",
   async setup(ctx) {
     const root = projectRoot(ctx)
@@ -134,7 +125,17 @@ export const beaconProject = Plugin.define({
       await cleanup("status RPC", () => statusRpc?.dispose?.())
     }
   },
-})
+}
+
+// The caller supplies define so the plugin can be built with any double. The
+// entry module passes the OpenCode define with an identity fallback for plain
+// Node, without keeping the resolved Plugin module in a module-level value.
+export function defineBeaconProject(define) { return define(beaconProjectDefinition) }
+export const beaconProject = defineBeaconProject(
+  await import("@opencode/plugin")
+    .then(({ Plugin }) => Plugin.define)
+    .catch(() => (definition) => definition),
+)
 
 export { agentIdentity } from "./state/session_identity.js"
 export {

@@ -3,15 +3,18 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
 import {
   SHELL_GUARD_RULES,
   beaconProject,
+  beaconProjectDefinition,
   buildShellGuardRules,
   commandFromToolInput,
   commandSegments,
   commandSubstitutions,
   createRunChangeWatcher,
   currentSessionAgent,
+  defineBeaconProject,
   findShellGuardHit,
   guardedAgents,
   guardMode,
@@ -24,6 +27,7 @@ import {
   statusPanelEnabled,
   watcherEnabled,
 } from "./index.js"
+import { beaconStatusDefinition, defineBeaconStatus } from "./ui/ui.js"
 import { noopMcpRegistration, registeredBeaconConfig } from "./mcp/mcp.js"
 
 function fakeCtx() {
@@ -408,4 +412,34 @@ test("build setup keeps the status panel RPC for the operator TUI", async () => 
   const dispose = await beaconProject.setup(ctx)
   await dispose()
   assert.equal(panelRegistrations, 1)
+})
+
+test("both plugins can be defined with different doubles in one test", () => {
+  const projectCalls = []
+  const statusCalls = []
+  const project = defineBeaconProject((definition) => {
+    projectCalls.push(definition)
+    return { builtBy: "project", definition }
+  })
+  const status = defineBeaconStatus((definition) => {
+    statusCalls.push(definition)
+    return { builtBy: "status", definition }
+  })
+
+  assert.deepEqual(projectCalls, [beaconProjectDefinition])
+  assert.deepEqual(statusCalls, [beaconStatusDefinition])
+  assert.notEqual(project, status)
+  assert.equal(project.builtBy, "project")
+  assert.equal(status.builtBy, "status")
+  assert.equal(project.definition.id, "beacon-project")
+  assert.equal(status.definition.id, "beacon-project-status")
+  assert.equal(typeof project.definition.setup, "function")
+  assert.equal(typeof status.definition.setup, "function")
+})
+
+test("neither plugin module caches a resolved Plugin value at import", async () => {
+  for (const path of ["./index.js", "./ui/ui.js"]) {
+    const src = await readFile(new URL(path, import.meta.url), "utf8")
+    assert.equal(/\blet\s+Plugin\b/.test(src), false, `${path} has no module-level Plugin cache`)
+  }
 })
