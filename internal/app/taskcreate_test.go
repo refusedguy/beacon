@@ -1069,7 +1069,7 @@ func TestReviewModeMapsIdenticallyOnCreateUpdateAndRead(t *testing.T) {
 func TestEpicChildrenUseCoreExpansion(t *testing.T) {
 	epic := core.Task{ID: "T-CORE", Plan: epicPlan()}
 	got := epicChildren(epic.ID, epic.Plan)
-	want := core.ExpandChildren(epic, epicBranch(epic.ID))
+	want := core.SetParent(core.ExpandChildren(epic, epicBranch(epic.ID)), epic.ID)
 	if len(got) != len(want) {
 		t.Fatalf("children = %+v, want %+v", got, want)
 	}
