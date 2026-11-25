@@ -811,6 +811,39 @@ func TestListQueueTasksFiltersByStatusAndActiveRuns(t *testing.T) {
 	}
 }
 
+func TestEmptyRunListsEncodeAsArrays(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	lists := map[string]func() ([]*core.Run, error){
+		"active": func() ([]*core.Run, error) { return store.ListActive(ctx) },
+		"recent": func() ([]*core.Run, error) { return store.ListRecent(ctx, 0) },
+		"incident": func() ([]*core.Run, error) {
+			return store.ListByIncident(ctx, "no-such-incident")
+		},
+	}
+	for name, list := range lists {
+		runs, err := list()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if runs == nil {
+			t.Fatalf("%s list is nil, want empty slice", name)
+		}
+		b, err := json.Marshal(runs)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if string(b) != "[]" {
+			t.Fatalf("%s JSON = %s, want []", name, b)
+		}
+	}
+}
+
 func TestEmptySnapshotJSONHasStableKeysAndArrays(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"time"
 
@@ -108,18 +107,55 @@ func (c Config) Complete() bool {
 	if c.TaskSource.Provider == "" && c.TaskSource.Dir == "" {
 		return false
 	}
-	return c.SCM.Provider != "" || c.SCM.Owner != "" || c.SCM.Repo != ""
+	if c.SCM.Provider == "" || c.SCM.Owner == "" || c.SCM.Repo == "" {
+		return false
+	}
+	_, err := parseInterval(c.PollInterval)
+	return err == nil
 }
 
-func (c Config) Interval() time.Duration {
-	if c.PollInterval == "" {
-		return 30 * time.Second
+// parseInterval resolves the poll interval and returns the ParseDuration error
+// for a malformed value. Load rejects a bad value at the boundary so the
+// daemon never runs with a silently substituted interval.
+func parseInterval(value string) (time.Duration, error) {
+	if value == "" {
+		return 30 * time.Second, nil
 	}
-	d, err := time.ParseDuration(c.PollInterval)
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	return d, nil
+}
+
+// Interval returns the configured poll interval. Load validates PollInterval,
+// so the fallback only applies to configs built directly in code.
+func (c Config) Interval() time.Duration {
+	d, err := parseInterval(c.PollInterval)
 	if err != nil {
 		return 30 * time.Second
 	}
 	return d
+}
+
+// validate rejects a config that cannot drive the daemon. An absent SCM
+// section is left to Complete to reject on reload; a partial one fails here
+// with a clear message. A malformed poll interval surfaces the ParseDuration
+// error instead of silently falling back.
+func (c Config) validate() error {
+	set := 0
+	for _, field := range []string{c.SCM.Provider, c.SCM.Owner, c.SCM.Repo} {
+		if field != "" {
+			set++
+		}
+	}
+	if set > 0 && set < 3 {
+		return fmt.Errorf("scm requires provider, owner and repo together")
+	}
+	if _, err := parseInterval(c.PollInterval); err != nil {
+		return fmt.Errorf("invalid poll_interval %q: %w", c.PollInterval, err)
+	}
+	return nil
 }
 
 func Load(path string) (Config, error) {
@@ -144,6 +180,9 @@ func Load(path string) (Config, error) {
 	}
 	c.Notify.TelegramToken = literalOrEnv(c.Notify.TelegramToken, c.Notify.TelegramTokenEnv)
 	c.SCM.Token = literalOrEnv(c.SCM.Token, c.SCM.TokenEnv)
+	if err := c.validate(); err != nil {
+		return c, fmt.Errorf("config %s: %w", path, err)
+	}
 	if c.StateDB == "" {
 		c.StateDB = ".beacon/state.db"
 	}
@@ -196,43 +235,56 @@ func defaults() Config {
 	}
 }
 
-// expandNonSecrets expands ${VAR} only in fields that are not secret literals.
-func expandNonSecrets(v any) {
-	rv := reflect.ValueOf(v).Elem()
-	for i := 0; i < rv.NumField(); i++ {
-		f := rv.Field(i)
-		switch f.Kind() {
-		case reflect.String:
-			if !strings.Contains(f.String(), "${") {
-				continue
-			}
-			f.SetString(os.ExpandEnv(f.String()))
-		case reflect.Struct:
-			expandNonSecretsAddr(f.Addr().Interface())
-		}
+// expandNonSecrets resolves ${VAR} in ordinary settings. Secret values are
+// deliberately excluded: a token or secret is taken literally, or from the
+// environment variable named by its paired *_env field. A literal such as
+// "p${word}" stays verbatim so an unrelated env var cannot rewrite a secret.
+// Secret fields: SCM.Token, Harness.Token, Webhook.Secret,
+// Notify.TelegramToken.
+func expandNonSecrets(c *Config) {
+	c.StateDB = expandEnv(c.StateDB)
+	c.WorkspaceDir = expandEnv(c.WorkspaceDir)
+	c.BaseBranch = expandEnv(c.BaseBranch)
+	c.PollInterval = expandEnv(c.PollInterval)
+	c.TaskSource.Provider = expandEnv(c.TaskSource.Provider)
+	c.TaskSource.Dir = expandEnv(c.TaskSource.Dir)
+	c.TaskSource.Owner = expandEnv(c.TaskSource.Owner)
+	c.TaskSource.Repo = expandEnv(c.TaskSource.Repo)
+	c.TaskSource.TokenEnv = expandEnv(c.TaskSource.TokenEnv)
+	c.SCM.Provider = expandEnv(c.SCM.Provider)
+	c.SCM.Owner = expandEnv(c.SCM.Owner)
+	c.SCM.Repo = expandEnv(c.SCM.Repo)
+	c.SCM.TokenEnv = expandEnv(c.SCM.TokenEnv)
+	c.SCM.BaseURL = expandEnv(c.SCM.BaseURL)
+	c.Harness.Provider = expandEnv(c.Harness.Provider)
+	c.Harness.Endpoint = expandEnv(c.Harness.Endpoint)
+	c.Harness.Model = expandEnv(c.Harness.Model)
+	c.Harness.Command = expandEnv(c.Harness.Command)
+	c.Harness.PromptTemplate = expandEnv(c.Harness.PromptTemplate)
+	c.Harness.TokenEnv = expandEnv(c.Harness.TokenEnv)
+	c.Harness.ParentSessionID = expandEnv(c.Harness.ParentSessionID)
+	c.Harness.WorkerInstructions = expandEnv(c.Harness.WorkerInstructions)
+	for i := range c.Merge.RequiredChecks {
+		c.Merge.RequiredChecks[i] = expandEnv(c.Merge.RequiredChecks[i])
 	}
+	c.Merge.CommandGate = expandEnv(c.Merge.CommandGate)
+	for i := range c.Merge.Labels {
+		c.Merge.Labels[i] = expandEnv(c.Merge.Labels[i])
+	}
+	c.OnBaseRed.Mode = expandEnv(c.OnBaseRed.Mode)
+	c.Webhook.Addr = expandEnv(c.Webhook.Addr)
+	c.Webhook.SecretEnv = expandEnv(c.Webhook.SecretEnv)
+	c.Notify.TelegramTokenEnv = expandEnv(c.Notify.TelegramTokenEnv)
+	c.Notify.ChatID = expandEnv(c.Notify.ChatID)
 }
 
-func expandNonSecretsAddr(v any) {
-	rv := reflect.ValueOf(v).Elem()
-	for i := 0; i < rv.NumField(); i++ {
-		f := rv.Field(i)
-		switch f.Kind() {
-		case reflect.String:
-			if strings.Contains(f.String(), "${") {
-				f.SetString(os.ExpandEnv(f.String()))
-			}
-		case reflect.Struct:
-			expandNonSecretsAddr(f.Addr().Interface())
-		case reflect.Slice:
-			for j := 0; j < f.Len(); j++ {
-				e := f.Index(j)
-				if e.Kind() == reflect.String && strings.Contains(e.String(), "${") {
-					e.SetString(os.ExpandEnv(e.String()))
-				}
-			}
-		}
+// expandEnv keeps the original trigger: only ${VAR} references are expanded,
+// so a bare $ in a template or path stays literal.
+func expandEnv(s string) string {
+	if !strings.Contains(s, "${") {
+		return s
 	}
+	return os.ExpandEnv(s)
 }
 
 func WriteDefault(path string, c Config, force bool) error {

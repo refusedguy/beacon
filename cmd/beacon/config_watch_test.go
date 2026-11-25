@@ -52,7 +52,7 @@ func newTestWatcher(t *testing.T, path string) (*configWatcher, *reloadableHarne
 		t.Fatal(err)
 	}
 	_, _, token := loadTokens(cfg)
-	h, err := newHarness(cfg, token, "")
+	h, err := newHarness(cfg, token, "", root)
 	if err != nil {
 		t.Fatal(err)
 	}
