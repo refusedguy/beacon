@@ -243,12 +243,12 @@ func mergePolicy(cfg config.Config) core.MergePolicy {
 
 func newReconciler(
 	cfg config.Config,
-	store *sqlite.Store,
+	store core.RunStore,
 	scmGW core.ScmGateway,
 	h core.AgentHarness,
 	p core.MergePolicy,
 	source core.TaskSource,
-	wt *workspace.GitWorktree,
+	wt core.WorkspaceManager,
 	disp *app.Dispatcher,
 	changes chan int,
 	parentSession string,
