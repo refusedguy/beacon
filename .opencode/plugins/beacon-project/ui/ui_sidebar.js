@@ -6,7 +6,6 @@ import { REASON_WIDTH } from "./ui_model.js"
 import { truncate } from "./ui_alerts.js"
 import { truncateSidebarTitle } from "./ui_view.js"
 
-export const SIDEBAR_ACTIVE_LIMIT = 8
 export const SIDEBAR_LINES = 34
 
 // Presentation stays out of the renderer. Active titles keep the base tone and

@@ -353,7 +353,14 @@ async function setup(ctx, deps = {}) {
 }
 
 export const beaconStatusDefinition = { id: "beacon-project-status", setup }
-export function defineBeaconStatusPlugin(Plugin) { return Plugin.define(beaconStatusDefinition) }
-let Plugin
-try { ;({ Plugin } = await import("@opencode/plugin/tui")) } catch { Plugin = { define: (d) => d } }
-export default defineBeaconStatusPlugin(Plugin)
+
+// The caller supplies define so the plugin can be built with any double. The
+// entry module keeps the literal import for the OpenCode rewriter and falls
+// back to the identity define when plain Node cannot resolve the TUI package.
+export function defineBeaconStatus(define) { return define(beaconStatusDefinition) }
+export function defineBeaconStatusPlugin(Plugin) { return defineBeaconStatus(Plugin.define) }
+export default defineBeaconStatus(
+  await import("@opencode/plugin/tui")
+    .then(({ Plugin }) => Plugin.define)
+    .catch(() => (definition) => definition),
+)

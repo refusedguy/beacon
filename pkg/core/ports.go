@@ -2,6 +2,7 @@ package core
 
 import "context"
 
+// TaskSource is the port for reading and claiming task cards.
 type TaskSource interface {
 	ListAvailable(ctx context.Context) ([]Task, error)
 	Claim(ctx context.Context, id TaskID) error
@@ -17,12 +18,14 @@ type EpicParser interface {
 	Children(epic Task) []Task
 }
 
+// Workspace is a checked-out branch used by a run.
 type Workspace struct {
 	Path   string
 	Branch string
 	Base   string
 }
 
+// WorkspaceManager is the port for creating and cleaning run worktrees.
 type WorkspaceManager interface {
 	Create(ctx context.Context, task Task) (Workspace, error)
 	Clean(ctx context.Context, ws Workspace) (bool, error)
@@ -46,6 +49,7 @@ func (m ModelRef) IsZero() bool {
 	return m.ProviderID == "" && m.ID == "" && m.Variant == ""
 }
 
+// SpawnRequest is the input to an agent harness spawn.
 type SpawnRequest struct {
 	Task      Task
 	Workspace Workspace
@@ -59,11 +63,13 @@ type SpawnRequest struct {
 	IsFixer  bool
 }
 
+// Session is a harness session bound to a run.
 type Session struct {
 	ID string
 	PR int
 }
 
+// WakeContext supplies the context for waking an agent.
 type WakeContext struct {
 	RunID     RunID
 	PRNumber  int
@@ -76,6 +82,7 @@ type WakeContext struct {
 	FixTry    int
 }
 
+// HarnessEvent is an event emitted by an agent harness.
 type HarnessEvent struct {
 	RunID     RunID
 	SessionID string
@@ -83,6 +90,7 @@ type HarnessEvent struct {
 	Error     string
 }
 
+// AgentHarness is the port for starting and driving agent sessions.
 type AgentHarness interface {
 	Spawn(ctx context.Context, req SpawnRequest) (Session, error)
 	Wake(ctx context.Context, sessionID string, wake WakeContext) error
@@ -104,6 +112,7 @@ type IdleWatcher interface {
 	WatchIdle(ctx context.Context)
 }
 
+// ScmGateway is the port for source-control provider operations.
 type ScmGateway interface {
 	Observe(ctx context.Context, pr int) (Observation, error)
 	UpdateBranch(ctx context.Context, pr int, expectedSHA string) (string, error)
@@ -113,10 +122,12 @@ type ScmGateway interface {
 	OpenPR(ctx context.Context, head, base, title string) (int, error)
 }
 
+// MergePolicy evaluates an observation into a merge decision.
 type MergePolicy interface {
 	Evaluate(Observation) MergeDecision
 }
 
+// RunStore is the persistence port for runs, tasks and incidents.
 type RunStore interface {
 	Save(ctx context.Context, run *Run) error
 	Get(ctx context.Context, id RunID) (*Run, error)
@@ -139,16 +150,19 @@ type RunStore interface {
 	UpdateIncident(ctx context.Context, in *BaseIncident) error
 }
 
+// Notification is a message sent to a run's operator.
 type Notification struct {
 	RunID   RunID
 	Subject string
 	Body    string
 }
 
+// Notifier is the port for delivering notifications.
 type Notifier interface {
 	Notify(ctx context.Context, n Notification) error
 }
 
+// Concurrency bounds the number of in-flight runs and active agents.
 type Concurrency struct {
 	MaxInFlight     int
 	MaxActiveAgents int

@@ -5,8 +5,6 @@
 // канонический корень проекта, который переживает запуск из worktree.
 // Единственный источник корня проекта — canonical (решение 2 ADR 0069).
 
-import { resolve } from "node:path"
-
 export function locationInfo(ctx) {
   const location = ctx?.location
   if (!location || typeof location !== "object") return null
@@ -39,11 +37,4 @@ export function locationInfo(ctx) {
 
 export function projectRoot(ctx) {
   return locationInfo(ctx)?.root ?? null
-}
-
-// directory и canonical различаются при загрузке из worktree.
-export function isWorktree(ctx) {
-  const info = locationInfo(ctx)
-  if (!info?.canonical || !info.directory) return false
-  return resolve(info.directory) !== resolve(info.canonical)
 }
