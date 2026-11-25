@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app"
+	"github.com/refusedguy/beacon/internal/infra/shared"
 )
 
 type Telegram struct {
@@ -28,7 +29,7 @@ func (t *Telegram) Notify(ctx context.Context, n app.Notification) error {
 	if !t.Enabled() {
 		return nil
 	}
-	text := Redact(fmt.Sprintf("beacon [%s] %s: %s", n.RunID, n.Subject, n.Body))
+	text := shared.Redact(fmt.Sprintf("beacon [%s] %s: %s", n.RunID, n.Subject, n.Body))
 	payload, _ := json.Marshal(map[string]string{
 		"chat_id": t.ChatID,
 		"text":    text,
