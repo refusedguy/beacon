@@ -295,16 +295,15 @@ func (g *GitWorktree) CommitPath(ctx context.Context, ws core.Workspace, pathspe
 	return err
 }
 
-// detachedPushContext keeps a live caller context and replaces a cancelled one
-// with a bounded background context. A zero timeout falls back to one minute.
+// detachedPushContext returns a bounded context that keeps the caller's values
+// but cannot be cancelled with it. The commit is already durable when the push
+// starts, so an abort arriving mid-push must not leave it unpublished. A zero
+// timeout falls back to one minute.
 func detachedPushContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if ctx.Err() == nil {
-		return ctx, func() {}
-	}
 	if timeout <= 0 {
 		timeout = time.Minute
 	}
-	return context.WithTimeout(context.Background(), timeout)
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
 func (g *GitWorktree) HasChanges(ctx context.Context, ws core.Workspace, base string) (bool, error) {

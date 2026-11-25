@@ -636,14 +636,12 @@ func retryPublish(ctx context.Context, ws PathCommitter, root core.Workspace, pa
 	return ws.CommitPath(opCtx, root, pathspec, message)
 }
 
-// detachedContext returns the caller's context while it is live. Once it is
-// cancelled, a bounded background context takes over so work that cannot be
-// undone still finishes. The no-op cancel keeps callers uniform.
+// detachedContext returns a bounded context that keeps the caller's values but
+// cannot be cancelled with it. Callers use it only after a commit is durable.
+// Checking ctx.Err() once is not enough: a cancellation arriving mid-operation
+// would still abort a push or rollback that must finish.
 func detachedContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx.Err() != nil {
-		return context.WithTimeout(context.Background(), detachedPushTimeout)
-	}
-	return ctx, func() {}
+	return context.WithTimeout(context.WithoutCancel(ctx), detachedPushTimeout)
 }
 
 func rebaseBase(ctx context.Context, ws PathCommitter, root core.Workspace, base string) error {
