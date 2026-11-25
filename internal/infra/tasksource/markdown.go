@@ -1,4 +1,4 @@
-// Package tasksource adapts local markdown cards and GitHub issues to app.TaskSource.
+// Package tasksource adapts local markdown cards and GitHub issues to core.TaskSource.
 package tasksource
 
 import (
