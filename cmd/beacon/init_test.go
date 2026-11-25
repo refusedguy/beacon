@@ -27,7 +27,7 @@ func TestParseRemote(t *testing.T) {
 		t.Run(tc.raw, func(t *testing.T) {
 			r, err := parseRemote(tc.raw)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("parseRemote(tc.raw): %v", err)
 			}
 			if r.provider != tc.provider || r.owner != tc.owner || r.repo != tc.repo {
 				t.Fatalf("got %+v", r)
@@ -41,12 +41,12 @@ func TestRunInitUsesNewRebaseLimit(t *testing.T) {
 	t.Chdir(dir)
 
 	if err := runInit(&initFlags{nonInteractive: true, skipPlugin: true}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("runInit(&initFlags{nonInteractive: true, skipPlugin: true}): %v", err)
 	}
 
 	cfg, err := config.Load(".beacon/config.yaml")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("config.Load(\".beacon/config.yaml\"): %v", err)
 	}
 	if cfg.Merge.MaxAttempts != 12 {
 		t.Fatalf("generated merge.max_attempts = %d, want 12", cfg.Merge.MaxAttempts)
@@ -66,12 +66,12 @@ func TestRunInitNonInteractive(t *testing.T) {
 		weakPC:          true,
 	}
 	if err := runInit(f); err != nil {
-		t.Fatal(err)
+		t.Fatalf("runInit(f): %v", err)
 	}
 
 	cfg, err := config.Load(".beacon/config.yaml")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("config.Load(\".beacon/config.yaml\"): %v", err)
 	}
 	checks := []struct {
 		name string
@@ -102,7 +102,7 @@ func TestRunInitNonInteractive(t *testing.T) {
 	}
 	gitignore, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \".gitignore\")): %v", err)
 	}
 	for _, entry := range []string{".beacon/state.db*", ".beacon/worktrees/", ".beacon/connection.json", ".beacon/*.lock", ".beacon/daemon*", ".beacon/config.yaml"} {
 		if !strings.Contains(string(gitignore), entry) {
@@ -143,7 +143,7 @@ func TestBuildInitConfigStackInstructions(t *testing.T) {
 			dir := t.TempDir()
 			if tc.marker != "" {
 				if err := os.WriteFile(filepath.Join(dir, tc.marker), nil, 0o644); err != nil {
-					t.Fatal(err)
+					t.Fatalf("os.WriteFile(filepath.Join(dir, tc.marker), nil, 0o644): %v", err)
 				}
 			}
 			cfg := buildInitConfig(dir, initOptions{taskSource: "markdown", endpoint: "http://127.0.0.1:4096", weakPC: true, maxInFlight: 10, maxActiveAgents: 2}, remote, "main")
@@ -160,7 +160,7 @@ func TestBuildInitConfigStackInstructions(t *testing.T) {
 func TestBuildInitConfigFullVerificationWhenWeakPCDisabled(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), nil, 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(dir, \"go.mod\"), nil, 0o644): %v", err)
 	}
 	cfg := buildInitConfig(dir, initOptions{taskSource: "markdown", weakPC: false}, remote{provider: "github"}, "main")
 	if !strings.Contains(cfg.Harness.WorkerInstructions, "full test suite") {
@@ -181,10 +181,10 @@ func TestMergeOpenCodeConfigPreservesUserKeys(t *testing.T) {
 	dir := t.TempDir()
 	original := `{"theme":"dark","customRoot":42,"agents":{"worker":{"description":"Custom worker","mode":"primary","permissions":[{"action":"custom","effect":"allow","resource":"*"}]}},"mcp":{"beacon":{"command":["old"],"custom":true}}}`
 	if err := os.WriteFile(filepath.Join(dir, "opencode.json"), []byte(original), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(dir, \"opencode.json\"), []byte(original), 0o644): %v", err)
 	}
 	if err := mergeOpenCodeConfig(dir); err != nil {
-		t.Fatal(err)
+		t.Fatalf("mergeOpenCodeConfig(dir): %v", err)
 	}
 	doc := readOpenCode(t, dir)
 	if doc["theme"] != "dark" || doc["customRoot"] != float64(42) {
@@ -227,17 +227,17 @@ func TestMergeOpenCodeConfigPreservesUserKeys(t *testing.T) {
 func TestAppendGitignoreIsSafeAndIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".gitignore")
 	if err := os.WriteFile(path, []byte("node_modules/\ncustom.log\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(\"node_modules/\\ncustom.log\\n\"), 0o644): %v", err)
 	}
 	if err := appendGitignore(path); err != nil {
-		t.Fatal(err)
+		t.Fatalf("appendGitignore(path): %v", err)
 	}
 	if err := appendGitignore(path); err != nil {
-		t.Fatal(err)
+		t.Fatalf("appendGitignore(path): %v", err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(path): %v", err)
 	}
 	text := string(data)
 	for _, want := range []string{"node_modules/", "custom.log", ".beacon/state.db*", ".beacon/worktrees/", ".beacon/connection.json", ".beacon/*.lock", ".beacon/daemon*", ".beacon/config.yaml"} {
@@ -254,27 +254,27 @@ func TestDeployPluginCopiesSourceAndHonoursSkip(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "plugin")
 	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(filepath.Join(src, \"nested\"), 0o755): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(src, "index.js"), []byte("// plugin"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(src, \"index.js\"), []byte(\"// plugin\"), 0o644): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(src, "nested", "ui.js"), []byte("// ui"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(src, \"nested\", \"ui.js\"), []byte(\"// ui\"), 0o644): %v", err)
 	}
 	root := filepath.Join(dir, "target")
 	if err := deployPlugin(root, initOptions{pluginDir: src}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("deployPlugin(root, initOptions{pluginDir: src}): %v", err)
 	}
 	dst := filepath.Join(root, ".opencode", "plugins", "beacon-project")
 	for _, name := range []string{"index.js", filepath.Join("nested", "ui.js")} {
 		want, err := os.ReadFile(filepath.Join(src, name))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.ReadFile(filepath.Join(src, name)): %v", err)
 		}
 		got, err := os.ReadFile(filepath.Join(dst, name))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.ReadFile(filepath.Join(dst, name)): %v", err)
 		}
 		if string(got) != string(want) {
 			t.Errorf("plugin file %s changed", name)
@@ -282,7 +282,7 @@ func TestDeployPluginCopiesSourceAndHonoursSkip(t *testing.T) {
 	}
 	skipRoot := filepath.Join(dir, "skip")
 	if err := deployPlugin(skipRoot, initOptions{skipPlugin: true, pluginDir: src}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("deployPlugin(skipRoot, initOptions{skipPlugin: true, pluginDir: src}): %v", err)
 	}
 	if existsIn(skipRoot, filepath.Join(".opencode", "plugins", "beacon-project")) {
 		t.Error("--skip-plugin still deployed a plugin")
@@ -296,7 +296,7 @@ func initProject(t *testing.T, marker string) string {
 	runGit(t, dir, "remote", "add", "origin", "https://github.com/acme/demo.git")
 	if marker != "" {
 		if err := os.WriteFile(filepath.Join(dir, marker), nil, 0o644); err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.WriteFile(filepath.Join(dir, marker), nil, 0o644): %v", err)
 		}
 	}
 	return dir
@@ -306,11 +306,11 @@ func writeWorkflow(t *testing.T, dir string) {
 	t.Helper()
 	workflows := filepath.Join(dir, ".github", "workflows")
 	if err := os.MkdirAll(workflows, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(workflows, 0o755): %v", err)
 	}
 	content := "name: CI\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lint\n"
 	if err := os.WriteFile(filepath.Join(workflows, "ci.yml"), []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(workflows, \"ci.yml\"), []byte(content), 0o644): %v", err)
 	}
 }
 
@@ -318,11 +318,11 @@ func readOpenCode(t *testing.T, dir string) map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(dir, "opencode.json"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \"opencode.json\")): %v", err)
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(data, &doc); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal(data, &doc): %v", err)
 	}
 	return doc
 }

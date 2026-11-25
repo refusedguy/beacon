@@ -50,7 +50,7 @@ func TestMarkdownCreate(t *testing.T) {
 
 	created, err := s.Create(context.Background(), task)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Create(context.Background(), task): %v", err)
 	}
 	wantPath := filepath.Join(dir, string(task.ID)+".md")
 	if created.SourceRef != wantPath || created.Status != core.TaskAvailable {
@@ -58,7 +58,7 @@ func TestMarkdownCreate(t *testing.T) {
 	}
 	b, err := os.ReadFile(wantPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(wantPath): %v", err)
 	}
 	for _, want := range []string{"id: T-20261123-abcdef12", "status: available", "priority: 11", "E2E-03", "internal/app/a.go"} {
 		if !strings.Contains(string(b), want) {
@@ -70,7 +70,7 @@ func TestMarkdownCreate(t *testing.T) {
 	}
 	tasks, err := s.ListAvailable(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("tasks = %+v", tasks)
@@ -95,16 +95,16 @@ func TestMarkdownLegacyLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "archive")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(sub, 0o755): %v", err)
 	}
 	path := filepath.Join(sub, "legacy-card.md")
 	if err := os.WriteFile(path, []byte(legacyCard), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(legacyCard), 0o644): %v", err)
 	}
 	s := NewMarkdown(dir)
 	tasks, err := s.ListAvailable(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("want 1 task, got %d: %+v", len(tasks), tasks)
@@ -123,24 +123,24 @@ func TestMarkdownLegacyLifecycle(t *testing.T) {
 		t.Fatalf("SourceRef = %q, want %q", got.SourceRef, path)
 	}
 	if err := s.Claim(context.Background(), "T-1"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Claim(context.Background(), \"T-1\"): %v", err)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(path): %v", err)
 	}
 	if !strings.Contains(string(b), "Статус: in_progress") {
 		t.Fatalf("claim did not write in_progress: %s", b)
 	}
 	tasks, err = s.ListAvailable(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
 	}
 	if len(tasks) != 0 {
 		t.Fatalf("claimed task still available: %+v", tasks)
 	}
 	if err := s.Complete(context.Background(), "T-1"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Complete(context.Background(), \"T-1\"): %v", err)
 	}
 	b, _ = os.ReadFile(path)
 	if !strings.Contains(string(b), "Статус: done") {
@@ -151,16 +151,16 @@ func TestMarkdownLegacyLifecycle(t *testing.T) {
 func TestMarkdownFrontmatter(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "internal", "infra", "config"), 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(filepath.Join(dir, \"internal\", \"infra\", \"config\"), 0o755): %v", err)
 	}
 	path := filepath.Join(dir, "frontmatter.md")
 	if err := os.WriteFile(path, []byte(frontmatterCard), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(frontmatterCard), 0o644): %v", err)
 	}
 	s := NewMarkdown(dir)
 	tasks, err := s.ListAvailable(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("want 1 task, got %d: %+v", len(tasks), tasks)
@@ -188,7 +188,7 @@ func TestMarkdownFrontmatter(t *testing.T) {
 		t.Fatalf("SourceRef = %q, want %q", got.SourceRef, path)
 	}
 	if err := s.Claim(context.Background(), "T-2"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Claim(context.Background(), \"T-2\"): %v", err)
 	}
 	b, _ := os.ReadFile(path)
 	if !strings.Contains(string(b), "status: in_progress") {
@@ -204,12 +204,12 @@ func TestMarkdownMarkInWorkspace(t *testing.T) {
 	root := t.TempDir()
 	cardDir := filepath.Join(root, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	card := "---\nid: T-9\ntitle: Workspace card\nstatus: available\n---\n# T-9. Workspace card\n"
 	path := filepath.Join(cardDir, "T-9.md")
 	if err := os.WriteFile(path, []byte(card), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(card), 0o644): %v", err)
 	}
 	s := NewMarkdown(filepath.Join(root, "orchestrator-cards"))
 
@@ -218,7 +218,7 @@ func TestMarkdownMarkInWorkspace(t *testing.T) {
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(path): %v", err)
 	}
 	if !strings.Contains(string(b), "status: in_progress") {
 		t.Fatalf("card not marked in progress: %s", b)
@@ -239,28 +239,28 @@ func TestCardStorePatchStatus(t *testing.T) {
 	dir := t.TempDir()
 	legacy := filepath.Join(dir, "odd-name.md")
 	if err := os.WriteFile(legacy, []byte("# T-PATCH. Legacy\nBody line.\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(legacy, []byte(\"# T-PATCH. Legacy\\nBody line.\\n\"), 0o644): %v", err)
 	}
 	fm := filepath.Join(dir, "also-odd.md")
 	if err := os.WriteFile(fm, []byte("---\nid: T-FM\ntitle: Front\n---\n# T-FM. Wrong\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(fm, []byte(\"---\\nid: T-FM\\ntitle: Front\\n---\\n# T-FM. Wrong\\n\"), 0o644): %v", err)
 	}
 	store := CardStore{Dir: dir}
 
 	// Lookup follows the parsed ID, not the filename, and a missing status
 	// line is inserted in the card's own format.
 	if err := store.PatchStatus(context.Background(), "T-PATCH", "in_progress"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.PatchStatus(context.Background(), \"T-PATCH\", \"in_progress\"): %v", err)
 	}
 	b, err := os.ReadFile(legacy)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(legacy): %v", err)
 	}
 	if !strings.Contains(string(b), "Статус: in_progress") {
 		t.Fatalf("legacy status not written: %s", b)
 	}
 	if err := store.PatchStatus(context.Background(), "T-FM", "done"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.PatchStatus(context.Background(), \"T-FM\", \"done\"): %v", err)
 	}
 	b, _ = os.ReadFile(fm)
 	if !strings.Contains(string(b), "status: done") {
@@ -269,7 +269,7 @@ func TestCardStorePatchStatus(t *testing.T) {
 
 	// A second patch updates the existing line in place rather than adding one.
 	if err := store.PatchStatus(context.Background(), "T-FM", "in_progress"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.PatchStatus(context.Background(), \"T-FM\", \"in_progress\"): %v", err)
 	}
 	b, _ = os.ReadFile(fm)
 	if strings.Count(string(b), "status:") != 1 || !strings.Contains(string(b), "status: in_progress") {
@@ -336,13 +336,13 @@ func TestMarkdownFrontmatterEpic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "T-EPIC.md")
 	if err := os.WriteFile(path, []byte(epicCard), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(epicCard), 0o644): %v", err)
 	}
 	s := NewMarkdown(dir)
 
 	tasks, err := s.ListAvailable(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("tasks = %+v", tasks)
@@ -372,7 +372,7 @@ func TestMarkdownFrontmatterEpic(t *testing.T) {
 
 	children, err := s.Children(context.Background(), "T-EPIC")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Children(context.Background(), \"T-EPIC\"): %v", err)
 	}
 	if len(children) != 2 || children[0].ID != "T-EPIC-01" || children[1].ID != "T-EPIC-02" {
 		t.Fatalf("children = %+v", children)
@@ -406,7 +406,7 @@ func TestMarkdownCreateEpic(t *testing.T) {
 
 	created, err := s.Create(context.Background(), task)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Create(context.Background(), task): %v", err)
 	}
 	wantPath := filepath.Join(dir, "T-EPIC-2.md")
 	if created.SourceRef != wantPath {
@@ -414,7 +414,7 @@ func TestMarkdownCreateEpic(t *testing.T) {
 	}
 	b, err := os.ReadFile(wantPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(wantPath): %v", err)
 	}
 	for _, want := range []string{"kind: epic", "base_branch: main", "require_review: none", "title: Child one", "body: Handle the create path.", "priority: 6", "internal/app/create.go"} {
 		if !strings.Contains(string(b), want) {
@@ -424,7 +424,7 @@ func TestMarkdownCreateEpic(t *testing.T) {
 
 	tasks, err := s.ListAvailable(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("tasks = %+v", tasks)
@@ -443,7 +443,7 @@ func TestMarkdownCreateEpic(t *testing.T) {
 	}
 	children, err := s.Children(context.Background(), "T-EPIC-2")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Children(context.Background(), \"T-EPIC-2\"): %v", err)
 	}
 	if len(children) != 1 || children[0].ID != "T-EPIC-2-01" || children[0].Title != "Child one" {
 		t.Fatalf("children = %+v", children)
@@ -466,7 +466,7 @@ func TestMarkdownChildrenUsesInjectedParser(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "T-EPIC.md")
 	if err := os.WriteFile(path, []byte(epicCard), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(epicCard), 0o644): %v", err)
 	}
 	stub := &stubEpicParser{}
 	s := NewMarkdown(dir)
@@ -474,7 +474,7 @@ func TestMarkdownChildrenUsesInjectedParser(t *testing.T) {
 
 	children, err := s.Children(context.Background(), "T-EPIC")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("s.Children(context.Background(), \"T-EPIC\"): %v", err)
 	}
 	if stub.calls != 1 || len(children) != 1 || children[0].ID != "STUB-01" {
 		t.Fatalf("calls = %d, children = %+v", stub.calls, children)
@@ -486,11 +486,11 @@ func TestMarkdownChildrenOfTaskIsEmpty(t *testing.T) {
 	path := filepath.Join(dir, "T-PLAIN.md")
 	card := "---\nid: T-PLAIN\ntitle: Plain task\nstatus: available\n---\n"
 	if err := os.WriteFile(path, []byte(card), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(card), 0o644): %v", err)
 	}
 	children, err := NewMarkdown(dir).Children(context.Background(), "T-PLAIN")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewMarkdown(dir).Children(context.Background(), \"T-PLAIN\"): %v", err)
 	}
 	if len(children) != 0 {
 		t.Fatalf("children = %+v", children)
@@ -501,7 +501,7 @@ func TestMarkdownHonorsCancelledContext(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "T-CANCEL.md")
 	if err := os.WriteFile(path, []byte(frontmatterCard), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(frontmatterCard), 0o644): %v", err)
 	}
 	s := NewMarkdown(dir)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -537,7 +537,7 @@ func TestMarkdownMalformedFrontmatterReported(t *testing.T) {
 func TestScopeClassification(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "pkg"), 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(filepath.Join(dir, \"pkg\"), 0o755): %v", err)
 	}
 	card := "# T-3. Scope\nВладелец файлов: internal/**/*.go, pkg/, pkg/core/task.go\n"
 	got, ok := parseCard(card, filepath.Join(dir, "T-3.md"))
