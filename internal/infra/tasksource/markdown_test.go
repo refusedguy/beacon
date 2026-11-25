@@ -497,6 +497,43 @@ func TestMarkdownChildrenOfTaskIsEmpty(t *testing.T) {
 	}
 }
 
+func TestMarkdownHonorsCancelledContext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-CANCEL.md")
+	if err := os.WriteFile(path, []byte(frontmatterCard), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewMarkdown(dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := s.ListAvailable(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ListAvailable error = %v, want context.Canceled", err)
+	}
+	if _, err := s.Children(ctx, "T-2"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Children error = %v, want context.Canceled", err)
+	}
+	task := core.Task{ID: "T-NEW", Title: "New card"}
+	if _, err := s.Create(ctx, task); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "T-NEW.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Create wrote a card after cancellation: %v", err)
+	}
+}
+
+func TestMarkdownMalformedFrontmatterReported(t *testing.T) {
+	logs := captureTaskSourceLogs(t)
+	content := "---\nid: [unclosed\ntitle: Broken\n---\n# T-BROKEN. Broken\n"
+
+	if _, ok := parseCard(content, filepath.Join(t.TempDir(), "T-BROKEN.md")); ok {
+		t.Fatal("malformed frontmatter parsed as a card")
+	}
+	if !strings.Contains(logs.String(), "malformed card frontmatter") {
+		t.Fatalf("malformed frontmatter not reported: %s", logs.String())
+	}
+}
+
 func TestScopeClassification(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "pkg"), 0o755); err != nil {

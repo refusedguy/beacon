@@ -79,8 +79,16 @@ func (r *Reconciler) bindOpenPR(ctx context.Context, run *core.Run) (bool, error
 		return false, nil
 	}
 	pr, err := r.SCM.FindOpenPRByBranch(ctx, run.Branch)
-	if err != nil || pr <= 0 {
+	if err != nil {
+		// No open PR is the expected state for a run that has not pushed
+		// yet. Only a real lookup failure should surface as an error.
+		if core.CodeOf(err) == core.CodeNotFound {
+			return false, nil
+		}
 		return false, err
+	}
+	if pr <= 0 {
+		return false, nil
 	}
 	if err := run.Apply(core.Event{Kind: core.EvPRRegistered, PRNumber: pr}); err != nil {
 		return false, err
