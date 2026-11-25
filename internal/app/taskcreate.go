@@ -110,16 +110,20 @@ func (p pathCardPublisher) Publish(ctx context.Context, pathspec, message string
 }
 
 // IDFactory assigns IDs to new cards. Epic IDs stay stable for the same title
-// and plan, while batch IDs depend on the batch contents.
+// and plan, and batch IDs depend only on the batch contents. Neither derived
+// ID reads the clock, so the same content gets the same ID on any day. New
+// assigns an unconstrained random ID and is the only method that uses a date.
 type IDFactory interface {
 	New() (core.TaskID, error)
 	ForEpic(title string, plan []core.ChildSpec) core.TaskID
 	ForBatch(seed string, index int) core.TaskID
 }
 
-type defaultIDFactory struct{}
+// defaultIDFactory carries an optional explicit date for New. An empty Date
+// means today. Derived IDs ignore it.
+type defaultIDFactory struct{ Date string }
 
-func (defaultIDFactory) New() (core.TaskID, error) { return newTaskID() }
+func (f defaultIDFactory) New() (core.TaskID, error) { return newTaskID(f.Date) }
 
 func (defaultIDFactory) ForEpic(title string, plan []core.ChildSpec) core.TaskID {
 	return epicTaskID(title, plan)
@@ -240,6 +244,9 @@ type TaskCreator struct {
 	Workspace PathCommitter
 	Root      core.Workspace
 	Store     TaskGraphStore
+	// Date overrides the date used by generated random IDs. Derived epic and
+	// batch IDs ignore it, so setting it cannot change a content-derived ID.
+	Date string
 
 	Writer    CardWriter
 	Publisher CardPublisher
@@ -265,7 +272,7 @@ func (c *TaskCreator) ids() IDFactory {
 	if c.IDs != nil {
 		return c.IDs
 	}
-	return defaultIDFactory{}
+	return defaultIDFactory{Date: c.Date}
 }
 
 func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTask, error) {
@@ -287,7 +294,7 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		}
 	}
 	children := epicChildren(id, in.Plan)
-	key := idempotencyKey(id, children)
+	key := idempotencyKey(id, title, in.Plan)
 	writer := c.writer()
 	if epic {
 		if existing, ok := lookupCreated(ctx, writer, &c.Cache, key, id, children); ok {
@@ -342,10 +349,10 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 }
 
 // CreateBatch writes the given cards in order and returns one result per input.
-// IDs are derived from the batch contents, so repeating a call returns the
-// same cards instead of creating duplicates. A depends entry of the form @N
-// resolves to the ID of the Nth card in this batch (1-based) and must name an
-// earlier card.
+// IDs are derived from the batch contents alone, so repeating a call on any day
+// returns the same cards instead of creating duplicates. A depends entry of
+// the form @N resolves to the ID of the Nth card in this batch (1-based) and
+// must name an earlier card.
 //
 // The whole batch is one operation: every file is written first, then one
 // graph is synced and one commit is published. A failure at any stage removes
@@ -560,7 +567,7 @@ func rollbackBatch(ctx context.Context, writer CardWriter, store TaskGraphStore,
 
 // batchIDs assigns a stable ID to each input. An explicit ID wins. An epic
 // without one keeps the derivation Create uses, so an epic made alone or in a
-// batch gets the same ID.
+// batch gets the same ID. Derived IDs depend only on content, never on the day.
 func (c *TaskCreator) batchIDs(inputs []CreateTaskInput) []core.TaskID {
 	seed := batchSeed(inputs)
 	out := make([]core.TaskID, len(inputs))
@@ -613,9 +620,11 @@ func batchSeed(inputs []CreateTaskInput) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// batchTaskID derives the ID from the batch seed and position alone. No clock
+// is read, so the same batch on a later day keeps its IDs.
 func batchTaskID(seed string, index int) core.TaskID {
 	sum := sha256.Sum256([]byte(seed + "\x00" + strconv.Itoa(index)))
-	return core.TaskID("T-" + time.Now().UTC().Format("20060102") + "-" + hex.EncodeToString(sum[:4]))
+	return core.TaskID("T-" + hex.EncodeToString(sum[:4]))
 }
 
 var localRefPattern = regexp.MustCompile(`^@([1-9][0-9]*)$`)
@@ -778,13 +787,18 @@ func epicChildren(id core.TaskID, plan []core.ChildSpec) []core.Task {
 	return core.ExpandChildren(core.Task{ID: id, Plan: plan}, epicBranch(id))
 }
 
-func idempotencyKey(epicID core.TaskID, children []core.Task) string {
-	return string(epicID) + "|" + strings.Join(taskTitles(children), "\x00")
+// idempotencyKey keys the created cache by epic ID and content. The derived
+// ID is content-based, so the key is stable across days; an explicit ID still
+// distinguishes two epics that share a title and plan.
+func idempotencyKey(epicID core.TaskID, title string, plan []core.ChildSpec) string {
+	return string(epicID) + "|" + title + "|" + strings.Join(childTitles(plan), "\x00")
 }
 
+// epicTaskID derives the ID from the title and sorted child titles alone. No
+// clock is read, so creating the same epic on a later day keeps its ID.
 func epicTaskID(title string, plan []core.ChildSpec) core.TaskID {
 	sum := sha256.Sum256([]byte(title + "\x00" + strings.Join(childTitles(plan), "\x00")))
-	return core.TaskID("T-" + time.Now().UTC().Format("20060102") + "-" + hex.EncodeToString(sum[:4]))
+	return core.TaskID("T-" + hex.EncodeToString(sum[:4]))
 }
 
 func childTitles(specs []core.ChildSpec) []string {
@@ -834,10 +848,16 @@ func taskDependencies(values []string) []core.TaskID {
 	return out
 }
 
-func newTaskID() (core.TaskID, error) {
+// newTaskID assigns an unconstrained random ID. The date is explicit so a
+// caller can pin it; an empty date means today. This is the only ID generator
+// that reads the clock, and it never participates in content-derived IDs.
+func newTaskID(date string) (core.TaskID, error) {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", fmt.Errorf("generate task id: %w", err)
 	}
-	return core.TaskID("T-" + time.Now().UTC().Format("20060102") + "-" + hex.EncodeToString(b[:])), nil
+	if date == "" {
+		date = time.Now().UTC().Format("20060102")
+	}
+	return core.TaskID("T-" + date + "-" + hex.EncodeToString(b[:])), nil
 }

@@ -1,10 +1,22 @@
 package tasksource
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+func captureTaskSourceLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &buf
+}
 
 const epicIssueBody = `Epic issue body.
 
@@ -75,6 +87,19 @@ func TestParseTaskFieldsFlatEpicLines(t *testing.T) {
 	if got.ID != "T-FLAT" || got.Kind != core.TaskKindEpic ||
 		got.BaseBranch != "release/1" || got.RequireReview != core.ReviewModeNone {
 		t.Fatalf("flat fields = %+v", got)
+	}
+}
+
+func TestParseTaskFieldsMalformedYAMLReported(t *testing.T) {
+	logs := captureTaskSourceLogs(t)
+	body := "Issue body.\n\n" + "```yaml\n" + "id: [unclosed\npriority: 5\n" + "```\n"
+
+	got := ParseTaskFields(body, "", "")
+	if got.ID != "" {
+		t.Fatalf("ID = %q, want empty when YAML fails to parse", got.ID)
+	}
+	if !strings.Contains(logs.String(), "malformed YAML field block") {
+		t.Fatalf("malformed YAML not reported: %s", logs.String())
 	}
 }
 
