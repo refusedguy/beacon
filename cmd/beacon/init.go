@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -195,8 +196,21 @@ func confirmInit(out io.Writer, in io.Reader, r remote, base string) (bool, erro
 	return answer == "" || answer == "y" || answer == "yes", nil
 }
 
+// initDeclinedError reports that the operator rejected the detected config.
+type initDeclinedError struct{}
+
+func (initDeclinedError) Error() string { return "init declined" }
+
+var errInitDeclined = initDeclinedError{}
+
 // runInit detects the project, writes artifacts and prints the handoff.
 func runInit(f *initFlags) error {
+	return runInitWithInput(f, os.Stdout, os.Stdin, stdinIsTTY())
+}
+
+// runInitWithInput runs init against explicit streams. interactive reports
+// whether the operator can answer the confirmation prompt.
+func runInitWithInput(f *initFlags, out io.Writer, in io.Reader, interactive bool) error {
 	root, err := os.Getwd()
 	if err != nil {
 		return err
@@ -206,18 +220,21 @@ func runInit(f *initFlags) error {
 	if err != nil {
 		return err
 	}
-	if !opts.nonInteractive && stdinIsTTY() {
-		ok, err := confirmInit(os.Stdout, os.Stdin, r, base)
-		if err != nil || !ok {
+	if interactive && !opts.nonInteractive {
+		ok, err := confirmInit(out, in, r, base)
+		if err != nil {
 			return err
+		}
+		if !ok {
+			return errInitDeclined
 		}
 	}
 	cfg := buildInitConfig(root, opts, r, base)
-	fmt.Printf("Detected required checks: %v (review merge.required_checks)\n", cfg.Merge.RequiredChecks)
+	fmt.Fprintf(out, "Detected required checks: %v (review merge.required_checks)\n", cfg.Merge.RequiredChecks)
 	if err := writeInitArtifacts(root, cfg, opts); err != nil {
 		return err
 	}
-	printHandoff(os.Stdout, r)
+	printHandoff(out, r)
 	return nil
 }
 
@@ -401,7 +418,7 @@ func mergeOpenCodeConfig(root string) error {
 		data = []byte("{}")
 	}
 	var doc map[string]any
-	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if err := dec.Decode(&doc); err != nil {
 		return fmt.Errorf("opencode.json: %w", err)

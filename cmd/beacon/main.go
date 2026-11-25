@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -318,7 +319,9 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 		return core.ModelRef{}
 	}
 	endpoint := strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return core.ModelRef{}
 	}
@@ -327,7 +330,7 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 	} else {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return core.ModelRef{}
@@ -381,6 +384,10 @@ func main() {
 	root.AddCommand(newGCCommand(configPath))
 
 	if err := root.Execute(); err != nil {
+		var coder exitCoder
+		if errors.As(err, &coder) {
+			os.Exit(coder.ExitCode())
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
