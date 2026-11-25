@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS runs (
   observed_sha TEXT NOT NULL DEFAULT '',
   session_id TEXT NOT NULL DEFAULT '',
   parent_session_id TEXT NOT NULL DEFAULT '',
+  launch_source TEXT NOT NULL DEFAULT '',
+  agent_identity TEXT NOT NULL DEFAULT '',
   workspace_path TEXT NOT NULL DEFAULT '',
   branch TEXT NOT NULL DEFAULT '',
   scope_json TEXT NOT NULL DEFAULT '[]',
@@ -161,6 +163,8 @@ WHERE r.updated_at > r.created_at
 var runMigrationColumns = []struct{ name, ddl string }{
 	{"observed_base_sha", "observed_base_sha TEXT NOT NULL DEFAULT ''"},
 	{"checks_json", "checks_json TEXT NOT NULL DEFAULT '[]'"},
+	{"launch_source", "launch_source TEXT NOT NULL DEFAULT ''"},
+	{"agent_identity", "agent_identity TEXT NOT NULL DEFAULT ''"},
 }
 
 func ensureRunColumns(db *sql.DB) error {

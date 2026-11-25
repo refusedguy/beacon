@@ -84,7 +84,8 @@ func newDispatchCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer w.close()
-			res, err := w.dispatcher.Dispatch(cmd.Context(), n)
+			ctx := app.WithLaunch(cmd.Context(), core.LaunchCLI, "")
+			res, err := w.dispatcher.Dispatch(ctx, n)
 			if err != nil {
 				return err
 			}

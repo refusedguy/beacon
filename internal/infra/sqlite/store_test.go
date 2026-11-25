@@ -14,6 +14,28 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+func TestSavePersistsLaunchMetadata(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	run := core.NewRun("r1", "T-1", time.Now().UTC())
+	run.RecordLaunch(core.LaunchCLI, "operator")
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "r1")
+	if err != nil || got == nil {
+		t.Fatalf("get run = %+v err=%v", got, err)
+	}
+	if got.LaunchSource != core.LaunchCLI || got.AgentIdentity != "operator" {
+		t.Fatalf("launch = %q agent = %q, want cli/operator", got.LaunchSource, got.AgentIdentity)
+	}
+}
+
 func TestRecursiveReadyTasks(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

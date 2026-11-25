@@ -720,3 +720,19 @@ func TestConcurrentDispatchAndPromotionRespectMaxActiveAgents(t *testing.T) {
 		t.Fatalf("spawned agents = %d, want %d", len(h.sessions), maxAgents)
 	}
 }
+
+func TestDispatchResultJSONUsesLowercaseKeys(t *testing.T) {
+	b, err := json.Marshal(DispatchResult{
+		Runs:     []*core.Run{{ID: "r1"}},
+		Skipped:  []SkippedTask{{TaskID: "T-1"}},
+		Failures: []DispatchFailure{{TaskID: "T-2", Err: "boom"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"runs"`, `"skipped"`, `"failures"`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("dispatch JSON %s is missing %s", b, want)
+		}
+	}
+}

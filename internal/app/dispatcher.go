@@ -41,9 +41,9 @@ type Dispatcher struct {
 var _ core.AgentSlots = (*Dispatcher)(nil)
 
 type DispatchResult struct {
-	Runs     []*core.Run
-	Skipped  []SkippedTask
-	Failures []DispatchFailure
+	Runs     []*core.Run       `json:"runs"`
+	Skipped  []SkippedTask     `json:"skipped"`
+	Failures []DispatchFailure `json:"failures"`
 }
 
 type DispatchFailure struct {
@@ -115,6 +115,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 		if d.MaxAttempts > 0 {
 			run.MaxAttempts = d.MaxAttempts
 		}
+		run.RecordLaunch(launchFrom(ctx))
 		run.Scope = task.Scope
 		run.ParentSessionID = firstNonEmptyLocal(parentSession(ctx), d.ParentSessionID)
 		if err := d.Store.Save(ctx, run); err != nil {

@@ -307,4 +307,14 @@ func TestDispatchToolReportsStartedAndFailedRunsInSummary(t *testing.T) {
 	if byTask["T-OK"].id == byTask["T-BAD"].id || !strings.HasPrefix(byTask["T-BAD"].id, "run-") {
 		t.Fatalf("run ids = %q and %q", byTask["T-OK"].id, byTask["T-BAD"].id)
 	}
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].TaskID != "T-OK" {
+		t.Fatalf("active runs = %+v", active)
+	}
+	if active[0].LaunchSource != core.LaunchCLI || active[0].AgentIdentity != "operator" {
+		t.Fatalf("persisted launch = %q agent = %q, want cli/operator", active[0].LaunchSource, active[0].AgentIdentity)
+	}
 }

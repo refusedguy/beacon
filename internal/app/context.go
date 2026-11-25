@@ -1,6 +1,10 @@
 package app
 
-import "context"
+import (
+	"context"
+
+	"github.com/refusedguy/beacon/pkg/core"
+)
 
 type parentSessionKey struct{}
 
@@ -14,6 +18,26 @@ func parentSession(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+type launchKey struct{}
+
+type launchInfo struct {
+	source core.LaunchSource
+	agent  string
+}
+
+// WithLaunch carries the caller path and agent name from a command or tool to
+// the dispatcher, so the first Save persists them instead of a post-hoc update.
+func WithLaunch(ctx context.Context, source core.LaunchSource, agent string) context.Context {
+	return context.WithValue(ctx, launchKey{}, launchInfo{source: source, agent: agent})
+}
+
+func launchFrom(ctx context.Context) (core.LaunchSource, string) {
+	if v, ok := ctx.Value(launchKey{}).(launchInfo); ok {
+		return v.source, v.agent
+	}
+	return core.LaunchDaemon, ""
 }
 
 type cycleIDKey struct{}

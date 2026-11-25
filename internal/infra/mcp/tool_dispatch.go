@@ -41,16 +41,16 @@ func registerDispatch(s *msdk.Server, sv Services) {
 		if parent := parentSession(req); parent != "" {
 			ctx = app.WithParentSession(ctx, parent)
 		}
+		source, agent := dispatchCaller(req)
+		ctx = app.WithLaunch(ctx, source, agent)
 		res, err := sv.Dispatcher.Dispatch(ctx, a.N)
 		if err != nil {
 			return nil, nil, err
 		}
-		source, agent := dispatchCaller(req)
 		failed := failedRuns(ctx, sv.Dispatcher, res.Failures)
 		summary := make([]dispatchOutcome, 0, len(res.Runs)+len(failed)+len(res.Skipped))
 		runs := make([]*core.Run, 0, len(res.Runs)+len(failed))
 		for _, run := range res.Runs {
-			run.RecordLaunch(source, agent)
 			runs = append(runs, run)
 			summary = append(summary, outcomeForRun(run))
 		}
@@ -63,7 +63,6 @@ func registerDispatch(s *msdk.Server, sv Services) {
 				})
 				continue
 			}
-			run.RecordLaunch(source, agent)
 			runs = append(runs, run)
 			summary = append(summary, outcomeForRun(run))
 		}
