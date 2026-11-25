@@ -85,7 +85,9 @@ func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 	if err := run.Apply(core.Event{Kind: core.EvPRRegistered, PRNumber: pr}); err != nil {
 		switch {
 		case run.State == core.RunWaitingCI:
-			run.PRNumber = pr
+			if err := run.MarkExternal(pr); err != nil {
+				return err
+			}
 		case run.State == core.RunClosed && strings.HasPrefix(run.Reason, "workspace:"):
 			bound, err := c.Store.FindByPR(ctx, pr)
 			if err != nil {
@@ -94,10 +96,9 @@ func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 			if bound != nil && bound.ID != run.ID {
 				return core.Errorf(core.CodeConflict, "PR %d belongs to run %s", pr, bound.ID)
 			}
-			run.State = core.RunWaitingCI
-			run.Reason = ""
-			run.PRNumber = pr
-			run.UpdatedAt = time.Now().UTC()
+			if err := run.ReopenWithPR(pr); err != nil {
+				return err
+			}
 		default:
 			return err
 		}
@@ -187,9 +188,7 @@ func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 		}
 		switch run.State {
 		case core.RunBlocked:
-			run.RebaseAttempts = 0
-			run.FixAttempts = 0
-			if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "retried by operator"}); err != nil {
+			if err := run.RetryBlocked("retried by operator"); err != nil {
 				return err
 			}
 		case core.RunClosed:
