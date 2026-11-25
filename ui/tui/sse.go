@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+// Event is the monitor's copy of the daemon's loopback wire event. It is a
+// notification only; the client re-reads runs after receiving one.
 type Event struct {
 	ID    int64  `json:"id"`
 	Type  string `json:"type"`
