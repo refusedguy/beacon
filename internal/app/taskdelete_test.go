@@ -250,6 +250,29 @@ func TestTaskDeleterReportsRollbackFailureWithPaths(t *testing.T) {
 	}
 }
 
+func TestTaskDeleterRollbackFailureNamesAffectedCard(t *testing.T) {
+	dir := t.TempDir()
+	writeCards(t, dir, "T-CARD")
+	path := filepath.Join(dir, "docs", "tasks", "T-CARD.md")
+	ws := &rollbackFailWorkspace{
+		fakeWorkspace: &fakeWorkspace{log: &callLog{}},
+		paths:         []string{path},
+		err:           errors.New("push failed"),
+	}
+	deleter := newDeleter(dir, newFakeStore(), ws)
+
+	_, err := deleter.Delete(context.Background(), []string{"T-CARD"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "push failed") {
+		t.Fatalf("original error lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback card T-CARD") {
+		t.Fatalf("rollback error did not name the affected card: %v", err)
+	}
+}
+
 func TestTaskDeleterSyncsGraphOnceWithoutDeletedCards(t *testing.T) {
 	dir := t.TempDir()
 	writeCards(t, dir, "T-A", "T-B", "T-KEEP")

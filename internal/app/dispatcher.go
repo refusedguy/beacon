@@ -215,27 +215,39 @@ func (d *Dispatcher) handleStartFailure(ctx context.Context, run *core.Run, caus
 	slog.Error("dispatch task", "task", run.TaskID, "run", run.ID, "error", cause)
 	if d.workerAlive(ctx, run) {
 		if run.State == core.RunPending {
-			_ = run.Apply(core.Event{Kind: core.EvStart})
+			// The worker is alive and the cause is recorded on the run. A newer
+			// event may already have moved it out of pending, so this is best effort.
+			if err := run.Apply(core.Event{Kind: core.EvStart}); err != nil {
+				slog.Error("start live run", "task", run.TaskID, "run", run.ID, "error", err)
+			}
 		}
 		run.Reason = cause.Error()
 		run.UpdatedAt = time.Now().UTC()
 		if err := d.Store.Save(ctx, run); err != nil {
-			slog.Error("save live run", "run", run.ID, "error", err)
+			slog.Error("save live run", "task", run.TaskID, "run", run.ID, "error", err)
 		}
 		return
 	}
-	_ = run.Apply(core.Event{Kind: core.EvCancel, Reason: cause.Error()})
+	// A failed cancel transition means the run already reached a terminal state
+	// or moved on. The cause is logged above; the transition error is not silent.
+	if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: cause.Error()}); err != nil {
+		slog.Error("cancel failed start", "task", run.TaskID, "run", run.ID, "error", err)
+	}
 	if err := d.Store.Save(ctx, run); err != nil {
-		slog.Error("save cancelled run", "run", run.ID, "error", err)
+		slog.Error("save cancelled run", "task", run.TaskID, "run", run.ID, "error", err)
 	}
 	if run.SessionID != "" {
-		_ = d.Harness.Stop(ctx, run.SessionID)
+		if err := d.Harness.Stop(ctx, run.SessionID); err != nil {
+			slog.Error("stop failed worker", "task", run.TaskID, "run", run.ID, "error", err)
+		}
 	}
 	if run.WorkspacePath != "" {
 		// A failed spawn can leave the card rewritten to in_progress inside the
 		// worktree, making it dirty. A plain Remove would refuse it and leave a
 		// stale path that blocks the next dispatch, so force the removal.
-		_ = d.Workspace.ForceRemove(ctx, Workspace{Path: run.WorkspacePath, Branch: run.Branch})
+		if err := d.Workspace.ForceRemove(ctx, Workspace{Path: run.WorkspacePath, Branch: run.Branch}); err != nil {
+			slog.Error("force remove failed start worktree", "task", run.TaskID, "run", run.ID, "error", err)
+		}
 	}
 }
 

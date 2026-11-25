@@ -1132,3 +1132,106 @@ func TestOpJournalIsBounded(t *testing.T) {
 		t.Fatal("oldest entry was not evicted")
 	}
 }
+
+func TestOpJournalRunDuplicateReturnsContextError(t *testing.T) {
+	j := newOpJournal()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ownerDone := make(chan struct{})
+	go func() {
+		defer close(ownerDone)
+		_, _ = j.run(context.Background(), "op-cancel", func(context.Context) (any, error) {
+			close(started)
+			<-release
+			return app.DeleteResult{Pushed: true}, nil
+		})
+	}()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := j.run(ctx, "op-cancel", func(context.Context) (any, error) {
+			return nil, errors.New("duplicate must not run the mutation")
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled duplicate blocked on the in-flight operation")
+	}
+	close(release)
+	<-ownerDone
+}
+
+func TestOpJournalRunPanicDoesNotBlockLaterCalls(t *testing.T) {
+	j := newOpJournal()
+	_, err := j.run(context.Background(), "op-panic", func(context.Context) (any, error) {
+		panic("boom")
+	})
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("panic error = %v, want an error describing the panic", err)
+	}
+
+	done := make(chan app.DeleteResult, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := j.run(context.Background(), "op-panic", func(context.Context) (any, error) {
+			return app.DeleteResult{Pushed: true}, nil
+		})
+		if err != nil {
+			errs <- err
+			return
+		}
+		result, ok := got.(app.DeleteResult)
+		if !ok {
+			errs <- fmt.Errorf("unexpected result %T", got)
+			return
+		}
+		done <- result
+	}()
+
+	select {
+	case err := <-errs:
+		t.Fatalf("later call failed: %v", err)
+	case got := <-done:
+		if got.Status != "applied" || got.OperationID != "op-panic" {
+			t.Fatalf("later call = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("later call blocked after the operation panicked")
+	}
+}
+
+func TestMutationAndControlToolsRejectNilServices(t *testing.T) {
+	cs := deleteClient(t, Services{})
+	cases := []struct {
+		label string
+		name  string
+		args  map[string]any
+	}{
+		{"control", "beacon_control", map[string]any{"action": "approve", "run_id": "run-1"}},
+		{"controlMany", "beacon_control", map[string]any{"action": "approve", "run_ids": []any{"run-1"}}},
+		{"dispatch", "beacon_dispatch", map[string]any{"n": 1}},
+		{"watchPR", "beacon_watch_pr", map[string]any{"run_id": "run-1", "pr": 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+				Name: tc.name, Arguments: tc.args,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !res.IsError {
+				t.Fatalf("%s returned success with no service configured: %+v", tc.name, res)
+			}
+		})
+	}
+}

@@ -71,6 +71,38 @@ func (g *GitHub) guarded(fn func() (any, error)) (any, error) {
 	return guarded(g.br, fn)
 }
 
+// maxGitHubPages caps paginated calls so a bad Link header cannot keep the
+// daemon fetching pages forever. With PerPage=100 it covers 10,000 entries.
+const maxGitHubPages = 100
+
+// githubPage carries one page through the breaker, which stores any.
+type githubPage[T any] struct {
+	items []T
+	resp  *github.Response
+}
+
+// paginate follows NextPage until GitHub stops sending one or the cap is hit.
+// Every request goes through br, so pagination does not bypass the breaker.
+func paginate[T any](br *gobreaker.CircuitBreaker[any], fetch func(*github.ListOptions) ([]T, *github.Response, error)) ([]T, error) {
+	var all []T
+	opts := github.ListOptions{PerPage: 100}
+	for n := 0; n < maxGitHubPages; n++ {
+		page, err := guarded(br, func() (githubPage[T], error) {
+			items, resp, err := fetch(&opts)
+			return githubPage[T]{items: items, resp: resp}, err
+		})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.items...)
+		if page.resp == nil || page.resp.NextPage == 0 {
+			return all, nil
+		}
+		opts.Page = page.resp.NextPage
+	}
+	return all, nil
+}
+
 func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) {
 	p, err := g.getPR(ctx, pr)
 	if err != nil {
@@ -141,20 +173,20 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 }
 
 func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, error) {
-	res, err := guarded(g.br, func() (*github.ListCheckRunsResults, error) {
-		r, _, err := g.Client.Checks.ListCheckRunsForRef(ctx, g.Owner, g.Repo, sha, &github.ListCheckRunsOptions{
-			ListOptions: github.ListOptions{PerPage: 100},
+	checkRuns, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.CheckRun, *github.Response, error) {
+		res, resp, err := g.Client.Checks.ListCheckRunsForRef(ctx, g.Owner, g.Repo, sha, &github.ListCheckRunsOptions{
+			ListOptions: *opts,
 		})
-		return r, err
+		if res == nil {
+			return nil, resp, err
+		}
+		return res.CheckRuns, resp, err
 	})
 	if err != nil {
 		return nil, err
 	}
-	if res == nil {
-		return nil, nil
-	}
 	var out []core.CheckResult
-	for _, c := range res.CheckRuns {
+	for _, c := range checkRuns {
 		out = append(out, core.CheckResult{
 			Name:        c.GetName(),
 			State:       checkState(c),
@@ -183,28 +215,11 @@ func checkState(c *github.CheckRun) core.CheckState {
 	}
 }
 
-// changedFiles reads every changed file of a PR. GitHub paginates at 100.
+// changedFiles reads every changed file of a PR, one page at a time.
 func (g *GitHub) changedFiles(ctx context.Context, pr int) ([]*github.CommitFile, error) {
-	var all []*github.CommitFile
-	opts := &github.ListOptions{PerPage: 100}
-	for {
-		var (
-			page []*github.CommitFile
-			resp *github.Response
-		)
-		if _, err := guarded(g.br, func() (any, error) {
-			var err error
-			page, resp, err = g.Client.PullRequests.ListFiles(ctx, g.Owner, g.Repo, pr, opts)
-			return nil, err
-		}); err != nil {
-			return nil, err
-		}
-		all = append(all, page...)
-		if resp == nil || resp.NextPage == 0 {
-			return all, nil
-		}
-		opts.Page = resp.NextPage
-	}
+	return paginate(g.br, func(opts *github.ListOptions) ([]*github.CommitFile, *github.Response, error) {
+		return g.Client.PullRequests.ListFiles(ctx, g.Owner, g.Repo, pr, opts)
+	})
 }
 
 // ignoredPathsOnly reports whether every changed path is one the CI workflow
@@ -228,9 +243,8 @@ func ignoredPathsOnly(files []*github.CommitFile) bool {
 }
 
 func (g *GitHub) approvals(ctx context.Context, pr int) (int, error) {
-	reviews, err := guarded(g.br, func() ([]*github.PullRequestReview, error) {
-		r, _, err := g.Client.PullRequests.ListReviews(ctx, g.Owner, g.Repo, pr, &github.ListOptions{PerPage: 100})
-		return r, err
+	reviews, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.PullRequestReview, *github.Response, error) {
+		return g.Client.PullRequests.ListReviews(ctx, g.Owner, g.Repo, pr, opts)
 	})
 	if err != nil {
 		return 0, err
