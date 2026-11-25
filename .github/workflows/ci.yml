@@ -122,4 +122,4 @@ jobs:
         run: bash scripts/ci-advisory.sh
 
       - name: Plugin tests
-        run: node --test .opencode/plugins/beacon-project/*_test.js
+        run: node --test ".opencode/plugins/beacon-project/**/*_test.js"

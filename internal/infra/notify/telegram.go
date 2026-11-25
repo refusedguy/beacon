@@ -9,8 +9,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/shared"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 type Telegram struct {
@@ -25,7 +25,7 @@ func NewTelegram(token, chatID string) *Telegram {
 
 func (t *Telegram) Enabled() bool { return t.Token != "" && t.ChatID != "" }
 
-func (t *Telegram) Notify(ctx context.Context, n app.Notification) error {
+func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
 	if !t.Enabled() {
 		return nil
 	}

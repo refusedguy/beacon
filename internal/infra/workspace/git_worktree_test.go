@@ -97,17 +97,17 @@ func newTestGitWorktree(t *testing.T) (*GitWorktree, string) {
 	origin := filepath.Join(root, "origin.git")
 	repo := filepath.Join(root, "repo")
 	if err := os.MkdirAll(origin, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(origin, 0o755): %v", err)
 	}
 	if err := os.MkdirAll(repo, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(repo, 0o755): %v", err)
 	}
 	gitCmd(t, root, "init", "--bare", "--initial-branch=main", "origin.git")
 	gitCmd(t, repo, "init", "--initial-branch=main")
 	gitCmd(t, repo, "config", "user.name", "Test User")
 	gitCmd(t, repo, "config", "user.email", "test@example.com")
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(repo, \"README.md\"), []byte(\"base\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, repo, "add", "README.md")
 	gitCmd(t, repo, "commit", "-m", "initial")
@@ -115,7 +115,7 @@ func newTestGitWorktree(t *testing.T) (*GitWorktree, string) {
 	gitCmd(t, repo, "push", "-u", "origin", "main")
 	wt, err := New(repo, "main", filepath.Join(root, "worktrees"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("New(repo, \"main\", filepath.Join(root, \"worktrees\")): %v", err)
 	}
 	return wt, repo
 }
@@ -126,7 +126,7 @@ func TestGitWorktreeCreateUsesTaskBaseBranch(t *testing.T) {
 
 	gitCmd(t, repo, "checkout", "-b", "release/1")
 	if err := os.WriteFile(filepath.Join(repo, "base-only.txt"), []byte("release\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(repo, \"base-only.txt\"), []byte(\"release\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, repo, "add", "base-only.txt")
 	gitCmd(t, repo, "commit", "-m", "release base")
@@ -175,7 +175,7 @@ func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 	}
 
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("dirty main\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(repo, \"README.md\"), []byte(\"dirty main\\n\"), 0o644): %v", err)
 	}
 	if clean, err := wt.Clean(ctx, ws); err != nil || !clean {
 		t.Fatalf("Clean() with dirty main repo = %v, %v; want true, nil", clean, err)
@@ -183,7 +183,7 @@ func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 
 	dirty := filepath.Join(ws.Path, "agent.txt")
 	if err := os.WriteFile(dirty, []byte("agent work\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(dirty, []byte(\"agent work\\n\"), 0o644): %v", err)
 	}
 	if clean, err := wt.Clean(ctx, ws); err != nil || clean {
 		t.Fatalf("Clean() with dirty worktree = %v, %v; want false, nil", clean, err)
@@ -205,15 +205,15 @@ func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 
 	// A stale path holding only Beacon's card status marker is safe to replace.
 	if err := os.Remove(dirty); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.Remove(dirty): %v", err)
 	}
 	cardDir := filepath.Join(ws.Path, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	card := filepath.Join(cardDir, "T-CLEAN.md")
 	if err := os.WriteFile(card, []byte("status: in_progress\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(card, []byte(\"status: in_progress\\n\"), 0o644): %v", err)
 	}
 	recreated, err := wt.Create(ctx, core.Task{ID: "T-CLEAN"})
 	if err != nil {
@@ -254,18 +254,18 @@ func TestGitWorktreeRebaseBaseKeepsDirtyCard(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-REBASE-CARD"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-REBASE-CARD\"}): %v", err)
 	}
 	cardDir := filepath.Join(ws.Path, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	card := filepath.Join(cardDir, "T-NEW.md")
 	if err := os.WriteFile(card, []byte("status: available\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(card, []byte(\"status: available\\n\"), 0o644): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repo, "base2.txt"), []byte("advanced\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(repo, \"base2.txt\"), []byte(\"advanced\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, repo, "add", "base2.txt")
 	gitCmd(t, repo, "commit", "-m", "advance base")
@@ -323,13 +323,13 @@ func TestGitWorktreeCommitPathOnlyStagesPathspec(t *testing.T) {
 
 	cardDir := filepath.Join(ws.Path, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(cardDir, "T-COMMIT.md"), []byte("---\nid: T-COMMIT\nstatus: done\n---\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(cardDir, \"T-COMMIT.md\"), []byte(\"---\\nid: T-COMMIT\\nstatus: done\\n---\\n\"), 0o644): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(ws.Path, "agent.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(ws.Path, \"agent.go\"), []byte(\"package main\\n\"), 0o644): %v", err)
 	}
 	if err := wt.CommitPath(ctx, ws, "docs/tasks", "beacon: complete task T-COMMIT"); err != nil {
 		t.Fatalf("CommitPath() error = %v", err)
@@ -365,17 +365,17 @@ func TestGitWorktreeCommitPathRetryKeepsSingleCommit(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-RETRY"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-RETRY\"}): %v", err)
 	}
 	cardDir := filepath.Join(ws.Path, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(cardDir, "T-RETRY.md"), []byte("card\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(cardDir, \"T-RETRY.md\"), []byte(\"card\\n\"), 0o644): %v", err)
 	}
 	if err := wt.CommitPath(ctx, ws, "docs/tasks", "beacon: create task T-RETRY"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.CommitPath(ctx, ws, \"docs/tasks\", \"beacon: create task T-RETRY\"): %v", err)
 	}
 	head := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD"))
 
@@ -397,14 +397,14 @@ func TestGitWorktreeCommitPathPushSurvivesCancellationDuringPush(t *testing.T) {
 	defer cancel()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-PUSH-CANCEL"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-PUSH-CANCEL\"}): %v", err)
 	}
 	cardDir := filepath.Join(ws.Path, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(cardDir, "T-PUSH-CANCEL.md"), []byte("card\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(cardDir, \"T-PUSH-CANCEL.md\"), []byte(\"card\\n\"), 0o644): %v", err)
 	}
 
 	// The hook parks the push after the commit is durable so the caller can
@@ -416,10 +416,10 @@ func TestGitWorktreeCommitPathPushSurvivesCancellationDuringPush(t *testing.T) {
 	hook := fmt.Sprintf("#!/bin/sh\ntouch %q\ni=0\nwhile [ ! -f %q ]; do\n  sleep 0.02\n  i=$((i+1))\n  if [ $i -gt 500 ]; then exit 1; fi\ndone\n", started, release)
 	hooksDir := filepath.Join(repo, ".git", "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(hooksDir, 0o755): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(hooksDir, "pre-push"), []byte(hook), 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(hooksDir, \"pre-push\"), []byte(hook), 0o755): %v", err)
 	}
 
 	done := make(chan error, 1)
@@ -440,7 +440,7 @@ func TestGitWorktreeCommitPathPushSurvivesCancellationDuringPush(t *testing.T) {
 
 	cancel()
 	if err := os.WriteFile(release, nil, 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(release, nil, 0o644): %v", err)
 	}
 	select {
 	case err := <-done:
@@ -472,7 +472,7 @@ func TestGitWorktreeRebaseBaseMakesStaleBasePushable(t *testing.T) {
 	gitCmd(t, other, "config", "user.name", "Test User")
 	gitCmd(t, other, "config", "user.email", "test@example.com")
 	if err := os.WriteFile(filepath.Join(other, "remote.txt"), []byte("remote change\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(other, \"remote.txt\"), []byte(\"remote change\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, other, "add", "remote.txt")
 	gitCmd(t, other, "commit", "-m", "remote change")
@@ -482,10 +482,10 @@ func TestGitWorktreeRebaseBaseMakesStaleBasePushable(t *testing.T) {
 	// untracked card file since it does not overlap the rebased history.
 	cardDir := filepath.Join(repo, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(cardDir, "T-REBASE.md"), []byte("card\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(cardDir, \"T-REBASE.md\"), []byte(\"card\\n\"), 0o644): %v", err)
 	}
 
 	rootWS := core.Workspace{Path: repo, Branch: "main"}
@@ -512,7 +512,7 @@ func TestGitWorktreeCommitPathReportsNonFastForward(t *testing.T) {
 	origin := filepath.Join(root, "origin.git")
 	ws, err := wt.Create(ctx, core.Task{ID: "T-REJECT"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-REJECT\"}): %v", err)
 	}
 
 	// Create a divergent remote branch from a second checkout.
@@ -522,7 +522,7 @@ func TestGitWorktreeCommitPathReportsNonFastForward(t *testing.T) {
 	gitCmd(t, other, "config", "user.email", "test@example.com")
 	gitCmd(t, other, "checkout", "-b", ws.Branch, "origin/main")
 	if err := os.WriteFile(filepath.Join(other, "divergent.txt"), []byte("other\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(other, \"divergent.txt\"), []byte(\"other\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, other, "add", "divergent.txt")
 	gitCmd(t, other, "commit", "-m", "divergent change")
@@ -530,10 +530,10 @@ func TestGitWorktreeCommitPathReportsNonFastForward(t *testing.T) {
 
 	cardDir := filepath.Join(ws.Path, "docs", "tasks")
 	if err := os.MkdirAll(cardDir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cardDir, 0o755): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(cardDir, "T-REJECT.md"), []byte("card\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(cardDir, \"T-REJECT.md\"), []byte(\"card\\n\"), 0o644): %v", err)
 	}
 	err = wt.CommitPath(ctx, ws, "docs/tasks", "beacon: create task T-REJECT")
 	var nff *app.NonFastForwardError
@@ -558,20 +558,20 @@ func TestGitWorktreeHasChanges(t *testing.T) {
 
 	dirty := filepath.Join(ws.Path, "WIP.txt")
 	if err := os.WriteFile(dirty, []byte("uncommitted\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(dirty, []byte(\"uncommitted\\n\"), 0o644): %v", err)
 	}
 	if changed, err := wt.HasChanges(ctx, ws, "main"); err != nil || !changed {
 		t.Fatalf("HasChanges() with uncommitted file = %v, %v; want true, nil", changed, err)
 	}
 	if err := os.Remove(dirty); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.Remove(dirty): %v", err)
 	}
 	if changed, err := wt.HasChanges(ctx, ws, "main"); err != nil || changed {
 		t.Fatalf("HasChanges() after cleanup = %v, %v; want false, nil", changed, err)
 	}
 
 	if err := os.WriteFile(filepath.Join(ws.Path, "README.md"), []byte("agent commit\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(ws.Path, \"README.md\"), []byte(\"agent commit\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, ws.Path, "add", "README.md")
 	gitCmd(t, ws.Path, "commit", "-m", "agent commit")
@@ -588,7 +588,7 @@ func TestWorktreeRemoveRefreshesOpenCode(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-REFRESH"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-REFRESH\"}): %v", err)
 	}
 	if err := wt.Remove(ctx, ws); err != nil {
 		t.Fatalf("Remove() error = %v", err)
@@ -607,10 +607,10 @@ func TestWorktreeRemoveRefreshesAfterOutOfBandDelete(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-STALE"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-STALE\"}): %v", err)
 	}
 	if err := os.RemoveAll(ws.Path); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.RemoveAll(ws.Path): %v", err)
 	}
 	if err := wt.Remove(ctx, ws); err != nil {
 		t.Fatalf("Remove() after out-of-band delete = %v, want nil", err)
@@ -625,7 +625,7 @@ func TestWorktreeRemoveIgnoresRefreshFailure(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-REFRESH-FAIL"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-REFRESH-FAIL\"}): %v", err)
 	}
 	if err := wt.Remove(ctx, ws); err != nil {
 		t.Fatalf("Remove() with failing refresh = %v, want nil", err)
@@ -640,10 +640,10 @@ func TestForceRemoveRefreshesOpenCode(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-FORCE-REFRESH"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-FORCE-REFRESH\"}): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(ws.Path, "WIP.txt"), []byte("agent work\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(ws.Path, \"WIP.txt\"), []byte(\"agent work\\n\"), 0o644): %v", err)
 	}
 	if err := wt.ForceRemove(ctx, ws); err != nil {
 		t.Fatalf("ForceRemove() error = %v", err)
@@ -659,7 +659,7 @@ func breakGitAdmin(t *testing.T, wt *GitWorktree, ws core.Workspace) {
 	t.Helper()
 	admin := filepath.Join(wt.Root, ".git", "worktrees", filepath.Base(ws.Path))
 	if err := os.RemoveAll(admin); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.RemoveAll(admin): %v", err)
 	}
 }
 
@@ -668,7 +668,7 @@ func TestWorktreeRemoveRefreshesWhenGitCannotRemove(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-BROKEN-ADMIN"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-BROKEN-ADMIN\"}): %v", err)
 	}
 	breakGitAdmin(t, wt, ws)
 	if err := wt.Remove(ctx, ws); err == nil {
@@ -684,7 +684,7 @@ func TestForceRemoveRefreshesWhenGitCannotRemove(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-FORCE-BROKEN"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-FORCE-BROKEN\"}): %v", err)
 	}
 	breakGitAdmin(t, wt, ws)
 	if err := wt.ForceRemove(ctx, ws); err == nil {
@@ -700,7 +700,7 @@ func TestWorktreeCreateRefreshesAfterStaleCleanup(t *testing.T) {
 	ctx := context.Background()
 	task := core.Task{ID: "T-CREATE-STALE"}
 	if _, err := wt.Create(ctx, task); err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, task): %v", err)
 	}
 	// A retry finds the previous worktree still on disk. Create removes it as
 	// stale, so the editor's registration must be refreshed again.
@@ -720,10 +720,10 @@ func TestWorktreeRemovalReloadsLiveEditorLocations(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-RELOAD"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-RELOAD\"}): %v", err)
 	}
 	if err := wt.Remove(ctx, ws); err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Remove(ctx, ws): %v", err)
 	}
 	if got := len(rec.snapshot()); got != 1 {
 		t.Fatalf("worktree refresh calls = %d, want 1", got)
@@ -738,7 +738,7 @@ func TestWorktreeRefreshFailureSkipsLocationReload(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-NO-RELOAD"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-NO-RELOAD\"}): %v", err)
 	}
 	if err := wt.Remove(ctx, ws); err != nil {
 		t.Fatalf("Remove() with failing refresh = %v, want nil", err)
@@ -784,7 +784,7 @@ func TestGitWorktreeEnsureBranchRepeatsAreNoOps(t *testing.T) {
 	created := strings.TrimSpace(gitCmd(t, origin, "rev-parse", "refs/heads/beacon/T-EPIC"))
 
 	if err := os.WriteFile(filepath.Join(repo, "advance.txt"), []byte("new base\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(repo, \"advance.txt\"), []byte(\"new base\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, repo, "add", "advance.txt")
 	gitCmd(t, repo, "commit", "-m", "advance main")
@@ -858,7 +858,7 @@ func TestGitWorktreeRebaseBaseReportsCardDirtFailure(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-DIRT-ERR"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-DIRT-ERR\"}): %v", err)
 	}
 	statusErr := errors.New("injected status failure")
 	wt.commandHook = func(dir string, args []string) error {
@@ -879,18 +879,18 @@ func TestGitWorktreeRebaseBaseAbortFailureLeavesNoRebaseState(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-ABORT-FAIL"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-ABORT-FAIL\"}): %v", err)
 	}
 
 	// A worktree commit that conflicts with an advance on origin/main forces
 	// the rebase to stop with a real rebase state for the abort to clean up.
 	if err := os.WriteFile(filepath.Join(ws.Path, "README.md"), []byte("worktree change\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(ws.Path, \"README.md\"), []byte(\"worktree change\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, ws.Path, "add", "README.md")
 	gitCmd(t, ws.Path, "commit", "-m", "worktree change")
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("origin change\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(repo, \"README.md\"), []byte(\"origin change\\n\"), 0o644): %v", err)
 	}
 	gitCmd(t, repo, "add", "README.md")
 	gitCmd(t, repo, "commit", "-m", "origin change")
@@ -924,7 +924,7 @@ func TestGitWorktreeRemoveReportsBranchDeleteFailure(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-RM-BRANCH-ERR"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-RM-BRANCH-ERR\"}): %v", err)
 	}
 	branchErr := errors.New("injected branch delete failure")
 	wt.commandHook = func(dir string, args []string) error {
@@ -945,7 +945,7 @@ func TestGitWorktreeForceRemoveReportsBranchDeleteFailure(t *testing.T) {
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-FRM-BRANCH-ERR"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-FRM-BRANCH-ERR\"}): %v", err)
 	}
 	branchErr := errors.New("injected branch delete failure")
 	wt.commandHook = func(dir string, args []string) error {
