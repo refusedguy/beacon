@@ -79,7 +79,9 @@ async function setup(ctx, deps = {}) {
     load("@opentui/solid"), load("solid-js"),
   ])
   let BOLD = 0
-  try { ({ TextAttributes: { BOLD } } = await load("@opentui/core")) } catch {}
+  try { ({ TextAttributes: { BOLD } } = await load("@opentui/core")) } catch (error) {
+    console.debug(`beacon status panel: optional TUI core import failed: ${error?.message ?? error}`)
+  }
   const root = deps.root ?? projectRoot(ctx)
   const { sessionID, model } = await sessionIdentity(ctx)
   const source = createStatusSource(ctx, {
@@ -141,7 +143,7 @@ async function setup(ctx, deps = {}) {
     const flags = scope === "sidebar" ? sidebarOpen : detailSections
     const persist = scope === "sidebar" ? sidebarStore : detailStore
     flags[key] = !flags[key]
-    void persist[1]((draft) => { draft[key] = flags[key] }).catch(() => {})
+    void Promise.resolve(persist[1]((draft) => { draft[key] = flags[key] })).catch(() => {})
     applySlot(scope === "sidebar" ? "sidebar" : "detail")
   }
   function panelIsOpen() {
@@ -207,7 +209,7 @@ async function setup(ctx, deps = {}) {
     if (!id) return
     if (selectedID() === id && panelIsOpen()) { closePanel(); return }
     setSelectedID(id)
-    void store[1]((draft) => { draft.id = id }).catch(() => {})
+    void Promise.resolve(store[1]((draft) => { draft.id = id })).catch(() => {})
     openDetail()
   }
   const runAction = createActionRunner(ctx, source, { refresh: () => refresh() })
@@ -292,7 +294,9 @@ async function setup(ctx, deps = {}) {
     if (pending && !stopped) { pending = false; void refresh() }
   }
   let rpc = null
-  try { rpc = typeof ctx?.client?.rpc === "function" ? ctx.client.rpc(BeaconStatusRpc) : null } catch {}
+  try { rpc = typeof ctx?.client?.rpc === "function" ? ctx.client.rpc(BeaconStatusRpc) : null } catch (error) {
+    console.debug(`beacon status panel: RPC client unavailable: ${error?.message ?? error}`)
+  }
   const bridge = rpc?.events && watcherEnabled(options)
     ? createRunChangeBridge(rpc, tuiLocation(ctx), () => void refresh(), timers) : null
   void refresh()
@@ -334,12 +338,17 @@ async function setup(ctx, deps = {}) {
     } }),
     ctx.ui.slot({ append: "app", render: () => null }),
   ]
+  const cleanup = (label, dispose) => {
+    try { dispose?.() } catch (error) {
+      console.debug(`beacon status panel: ${label} cleanup failed: ${error?.message ?? error}`)
+    }
+  }
   return () => {
     stopped = true
-    timers.clearInterval(pollTimer)
-    bridge?.stop()
-    if (typeof removeKeymap === "function") removeKeymap()
-    disposers.forEach((d) => d?.())
+    cleanup("poll timer", () => timers.clearInterval(pollTimer))
+    cleanup("run watcher", () => bridge?.stop())
+    cleanup("keymap", removeKeymap)
+    disposers.forEach((dispose) => cleanup("slot", dispose))
   }
 }
 
