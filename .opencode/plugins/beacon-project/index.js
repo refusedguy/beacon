@@ -10,7 +10,7 @@ try {
 import { projectRoot } from "./state/location.js"
 import { noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
 import { installProjectContext } from "./rules/context.js"
-import { sessionIdentity } from "./state/session_identity.js"
+import { agentIdentity, sessionIdentity } from "./state/session_identity.js"
 import {
   pluginOptions, pollIntervalMs, snapshotLimits,
   statusPanelEnabled, watcherEnabled,
@@ -135,16 +135,8 @@ export function guardedAgents(config = {}) {
   return DEFAULT_GUARDED_AGENTS
 }
 
-export function eventAgent(event) {
-  const candidates = [event?.agent, event?.session?.agent, event?.agentName]
-  for (const value of candidates) {
-    if (typeof value === "string" && value) return value
-  }
-  return null
-}
-
 export function guardAppliesToAgent(event, config = {}) {
-  const agent = eventAgent(event)
+  const agent = agentIdentity(null, event)
   // When the event carries no agent, keep the guard as a safety net.
   if (!agent) return true
   return guardedAgents(config).includes(agent)
@@ -162,13 +154,12 @@ export function isWorkerAgent(agent) {
   return typeof agent === "string" && agent.trim().toLowerCase().includes("worker")
 }
 
-// OpenCode does not hand a session ID to plugin setup. Read the agent from a
-// context hint first, then from the newest session through the session domain.
-// This mirrors context.js's eventAgent/resolvedAgent lookup without a hook
-// event. An unknown agent falls back to registering, which is the safe path.
+// OpenCode does not hand a session ID to plugin setup. Read the agent from the
+// setup context through the shared adapter, then from the session domain. An
+// unknown agent falls back to registering, which is the safe path.
 export async function currentSessionAgent(ctx) {
   if (!ctx || typeof ctx !== "object") return null
-  const direct = eventAgent(ctx)
+  const direct = agentIdentity(ctx)
   if (direct) return direct
 
   const sessionID = ctx.sessionID ?? ctx.session?.id ?? ctx.session?.sessionID
@@ -176,7 +167,7 @@ export async function currentSessionAgent(ctx) {
     try {
       const info = await ctx.session.get({ sessionID })
       const data = info?.data ?? info
-      return eventAgent(data) ?? (typeof data?.agent === "string" ? data.agent : null)
+      return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
     } catch {}
   }
 
@@ -185,7 +176,7 @@ export async function currentSessionAgent(ctx) {
       const listed = await ctx.session.list({ order: "desc", limit: 1 })
       const sessions = Array.isArray(listed) ? listed : listed?.data ?? []
       const data = sessions[0]
-      if (data) return eventAgent(data) ?? (typeof data.agent === "string" ? data.agent : null)
+      if (data) return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
     } catch {}
   }
   return null
@@ -267,7 +258,7 @@ export const beaconProject = Plugin.define({
 
     // Config values may arrive under options or the full config object.
     const options = pluginOptions(ctx)
-    const agent = await currentSessionAgent(ctx)
+    const agent = agentIdentity(ctx) ?? (await currentSessionAgent(ctx))
     const isWorker = isWorkerAgent(agent)
 
     // Record the server config for the operator's manual attach. No daemon
@@ -321,5 +312,6 @@ export const beaconProject = Plugin.define({
   },
 })
 
+export { agentIdentity } from "./state/session_identity.js"
 export { pluginOptions, pollIntervalMs, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./state/options.js"
 export default beaconProject
