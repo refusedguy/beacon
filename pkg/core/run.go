@@ -6,23 +6,35 @@ import (
 	"time"
 )
 
+// RunID identifies a run.
 type RunID string
 
+// RunState is the lifecycle state of a run.
 type RunState string
 
 const (
-	RunPending       RunState = "pending"
-	RunRunning       RunState = "running"
-	RunWaitingCI     RunState = "waiting_ci"
-	RunNeedsRebase   RunState = "needs_rebase"
+	// RunPending means the run awaits a worker to start.
+	RunPending RunState = "pending"
+	// RunRunning means an agent is working on the run.
+	RunRunning RunState = "running"
+	// RunWaitingCI means the run waits for pull request checks.
+	RunWaitingCI RunState = "waiting_ci"
+	// RunNeedsRebase means the branch fell behind the base and needs a rebase.
+	RunNeedsRebase RunState = "needs_rebase"
+	// RunNeedsAgentFix means an agent fix is required before the run can proceed.
 	RunNeedsAgentFix RunState = "needs_agent_fix"
-	RunBlocked       RunState = "blocked"
-	RunMerged        RunState = "merged"
-	RunClosed        RunState = "closed"
+	// RunBlocked means an incident blocks the run.
+	RunBlocked RunState = "blocked"
+	// RunMerged means the run's pull request was merged.
+	RunMerged RunState = "merged"
+	// RunClosed means the run ended without a merge.
+	RunClosed RunState = "closed"
 )
 
+// Terminal reports whether the state is terminal.
 func (s RunState) Terminal() bool { return s == RunMerged || s == RunClosed }
 
+// ActiveAgent reports whether the state expects an active agent session.
 func (s RunState) ActiveAgent() bool { return s == RunRunning || s == RunNeedsAgentFix }
 
 // LaunchSource names the path that started a run. It describes the caller, not
@@ -30,9 +42,13 @@ func (s RunState) ActiveAgent() bool { return s == RunRunning || s == RunNeedsAg
 type LaunchSource string
 
 const (
-	LaunchMCP    LaunchSource = "mcp"
-	LaunchCLI    LaunchSource = "cli"
-	LaunchUI     LaunchSource = "ui"
+	// LaunchMCP means the run was started through an MCP tool.
+	LaunchMCP LaunchSource = "mcp"
+	// LaunchCLI means the run was started from the command line.
+	LaunchCLI LaunchSource = "cli"
+	// LaunchUI means the run was started from the monitor UI.
+	LaunchUI LaunchSource = "ui"
+	// LaunchDaemon means the run was started automatically by the daemon.
 	LaunchDaemon LaunchSource = "daemon"
 )
 
@@ -53,25 +69,41 @@ func ParseLaunchSource(raw string) LaunchSource {
 	}
 }
 
+// EventKind names a state transition event for a run.
 type EventKind string
 
 const (
-	EvStart         EventKind = "start"
-	EvPRRegistered  EventKind = "pr_registered"
+	// EvStart starts a pending run.
+	EvStart EventKind = "start"
+	// EvPRRegistered records the pull request bound to a run.
+	EvPRRegistered EventKind = "pr_registered"
+	// EvChecksPending records that checks are still running.
 	EvChecksPending EventKind = "checks_pending"
-	EvChecksPassed  EventKind = "checks_passed"
-	EvChecksFailed  EventKind = "checks_failed"
-	EvBehind        EventKind = "behind"
-	EvRebased       EventKind = "rebased"
-	EvRebaseFailed  EventKind = "rebase_failed"
-	EvAgentFixed    EventKind = "agent_fixed"
-	EvBlock         EventKind = "block"
-	EvUnblock       EventKind = "unblock"
-	EvCancel        EventKind = "cancel"
-	EvMerged        EventKind = "merged"
-	EvClosed        EventKind = "closed"
+	// EvChecksPassed records that checks passed.
+	EvChecksPassed EventKind = "checks_passed"
+	// EvChecksFailed records that checks failed.
+	EvChecksFailed EventKind = "checks_failed"
+	// EvBehind records that the branch fell behind the base.
+	EvBehind EventKind = "behind"
+	// EvRebased records a successful rebase.
+	EvRebased EventKind = "rebased"
+	// EvRebaseFailed records a failed rebase.
+	EvRebaseFailed EventKind = "rebase_failed"
+	// EvAgentFixed records that an agent fixed the run.
+	EvAgentFixed EventKind = "agent_fixed"
+	// EvBlock records that an incident blocked the run.
+	EvBlock EventKind = "block"
+	// EvUnblock records that the blocking incident cleared.
+	EvUnblock EventKind = "unblock"
+	// EvCancel records a cancellation.
+	EvCancel EventKind = "cancel"
+	// EvMerged records that the pull request was merged.
+	EvMerged EventKind = "merged"
+	// EvClosed records that the run was closed without a merge.
+	EvClosed EventKind = "closed"
 )
 
+// Event is a state transition request for a run.
 type Event struct {
 	Kind     EventKind
 	HeadSHA  string
@@ -88,6 +120,7 @@ var transitions = map[RunState]map[EventKind]RunState{
 	RunBlocked:       {EvUnblock: RunWaitingCI, EvCancel: RunClosed},
 }
 
+// Run is the full persisted state of one task execution.
 type Run struct {
 	ID                RunID
 	TaskID            TaskID
@@ -184,6 +217,7 @@ func NewWireControlResult(action ControlAction, id RunID) WireControlResult {
 	return WireControlResult{OK: true, Action: action.String(), RunID: string(id), Applied: true}
 }
 
+// NewRun creates a pending run with the default attempt budget.
 func NewRun(id RunID, task TaskID, now time.Time) *Run {
 	return &Run{ID: id, TaskID: task, State: RunPending, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
 }
@@ -196,8 +230,11 @@ func (r *Run) RecordLaunch(source LaunchSource, agent string) {
 	r.AgentIdentity = strings.TrimSpace(agent)
 }
 
+// CanRebase reports whether the run has a rebase attempt left.
 func (r *Run) CanRebase() bool { return r.RebaseAttempts < r.effectiveMax() }
-func (r *Run) CanWake() bool   { return r.FixAttempts < r.effectiveMax() }
+
+// CanWake reports whether the run has an agent fix attempt left.
+func (r *Run) CanWake() bool { return r.FixAttempts < r.effectiveMax() }
 
 // Retry re-arms a closed run. A run that already has a PR returns to
 // waiting_ci so the reconciler can finalize it. A run without a PR returns to
@@ -283,6 +320,7 @@ func (r *Run) effectiveMax() int {
 	return r.MaxAttempts
 }
 
+// Apply transitions the run using the given event.
 func (r *Run) Apply(e Event) error {
 	if r.State.Terminal() {
 		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("run %s is already %s", r.ID, r.State)}

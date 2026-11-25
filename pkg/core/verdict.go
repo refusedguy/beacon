@@ -5,12 +5,17 @@ import (
 	"time"
 )
 
+// CheckState is the conclusion of one CI check.
 type CheckState string
 
 const (
+	// CheckSuccess means the check passed.
 	CheckSuccess CheckState = "success"
+	// CheckFailure means the check failed.
 	CheckFailure CheckState = "failure"
+	// CheckPending means the check has not finished.
 	CheckPending CheckState = "pending"
+	// CheckSkipped means the check was skipped.
 	CheckSkipped CheckState = "skipped"
 )
 
@@ -55,6 +60,7 @@ func CIWallSeconds(checks []CheckResult) int64 {
 	return int64(end.Sub(start).Seconds())
 }
 
+// Observation is a provider snapshot of a pull request at one point in time.
 type Observation struct {
 	PRNumber          int
 	HeadSHA           string
@@ -80,6 +86,7 @@ type Observation struct {
 	IncompleteReason string
 }
 
+// Failure returns the first failed check.
 func (o Observation) Failure() (CheckResult, bool) {
 	for _, c := range o.Checks {
 		if c.State == CheckFailure {
@@ -89,6 +96,7 @@ func (o Observation) Failure() (CheckResult, bool) {
 	return CheckResult{}, false
 }
 
+// AllRequiredPass reports whether every named check passed or was skipped.
 func (o Observation) AllRequiredPass(names []string) bool {
 	if len(o.Checks) == 0 {
 		return false
@@ -119,15 +127,22 @@ func (o Observation) AllRequiredPass(names []string) bool {
 	return true
 }
 
+// Verdict is the reconciler's decision for one observation.
 type Verdict string
 
 const (
-	VerdictWait          Verdict = "wait"
-	VerdictMerge         Verdict = "merge"
-	VerdictNeedsRebase   Verdict = "needs_rebase"
+	// VerdictWait means the reconciler should observe again later.
+	VerdictWait Verdict = "wait"
+	// VerdictMerge means the pull request is ready to merge.
+	VerdictMerge Verdict = "merge"
+	// VerdictNeedsRebase means the branch must be rebased.
+	VerdictNeedsRebase Verdict = "needs_rebase"
+	// VerdictNeedsAgentFix means an agent must fix the pull request.
 	VerdictNeedsAgentFix Verdict = "needs_agent_fix"
-	VerdictBlocked       Verdict = "blocked"
-	VerdictNoop          Verdict = "noop"
+	// VerdictBlocked means an incident blocks the pull request.
+	VerdictBlocked Verdict = "blocked"
+	// VerdictNoop means no action is needed.
+	VerdictNoop Verdict = "noop"
 )
 
 // Criterion returns VerdictNoop when it passed. Any other verdict stops the chain.
@@ -136,6 +151,7 @@ type Criterion interface {
 	Evaluate(Observation) (Verdict, string)
 }
 
+// MergeDecision is the outcome of one policy evaluation.
 type MergeDecision struct {
 	Verdict   Verdict
 	Reason    string
@@ -189,6 +205,7 @@ func Decide(o Observation, criteria []Criterion) MergeDecision {
 	return MergeDecision{Verdict: VerdictMerge, Reason: "all criteria passed"}
 }
 
+// BaseStatus describes the CI status of a base branch.
 type BaseStatus struct {
 	BaseBranch     string
 	HeadSHA        string
@@ -196,6 +213,7 @@ type BaseStatus struct {
 	FailureExcerpt string
 }
 
+// Red reports whether a failed check is present.
 func (b BaseStatus) Red() bool {
 	for _, c := range b.FailedChecks {
 		if c.State == CheckFailure {
@@ -205,6 +223,7 @@ func (b BaseStatus) Red() bool {
 	return false
 }
 
+// BaseIncident records a red base branch and its fixer run.
 type BaseIncident struct {
 	ID               string
 	Repo             string
