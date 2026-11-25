@@ -227,6 +227,55 @@ func TestPlannerUsesSharedOverlapAuthority(t *testing.T) {
 	}
 }
 
+func TestActiveConflictDoesNotMatchCardNamedLikeSyntheticID(t *testing.T) {
+	active := []*core.Run{{
+		ID: "r1", TaskID: "run-card", State: core.RunRunning,
+		Scope: []core.ScopePath{core.ScopeFile("active.go")},
+	}}
+	tasks := []core.Task{
+		{ID: "__active__", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("free.go")}},
+		{ID: "clash", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("active.go")}},
+	}
+	// This checker matches by ID as well as by scope, so a synthetic card
+	// named __active__ would block the real card with that ID.
+	chosen, skipped, err := NewPlanner(core.Task.Overlaps).Select(tasks, active, 2, false)
+	if err != nil {
+		t.Fatalf(`Select(tasks, active, 2, false): %v`, err)
+	}
+	if ids := taskIDs(chosen); len(ids) != 1 || ids[0] != "__active__" {
+		t.Fatalf("chosen = %v, want [__active__]", ids)
+	}
+	byID := map[core.TaskID]SkippedTask{}
+	for _, s := range skipped {
+		byID[s.TaskID] = s
+	}
+	if len(byID) != 1 {
+		t.Fatalf("expected 1 skipped, got %+v", skipped)
+	}
+	if byID["clash"].Code != SkipActiveScopeOverlap {
+		t.Errorf("clash skip = %+v, want active scope overlap", byID["clash"])
+	}
+}
+
+func TestActiveConflictDoesNotMatchSyntheticIDAsDependency(t *testing.T) {
+	active := []*core.Run{{
+		ID: "r1", TaskID: "run-card", State: core.RunRunning,
+		Scope: []core.ScopePath{core.ScopeFile("active.go")},
+	}}
+	tasks := []core.Task{{
+		ID: "dependent", Status: core.TaskAvailable,
+		DependsOn: []core.TaskID{"__active__"},
+		Scope:     []core.ScopePath{core.ScopeFile("free.go")},
+	}}
+	chosen, skipped, err := NewPlanner(nil).Select(tasks, active, 1, false)
+	if err != nil {
+		t.Fatalf(`Select(tasks, active, 1, false): %v`, err)
+	}
+	if len(chosen) != 1 || len(skipped) != 0 {
+		t.Fatalf("chosen = %v, skipped = %+v", chosen, skipped)
+	}
+}
+
 func taskIDs(tasks []core.Task) []core.TaskID {
 	ids := make([]core.TaskID, 0, len(tasks))
 	for _, task := range tasks {
