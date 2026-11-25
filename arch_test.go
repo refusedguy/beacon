@@ -214,11 +214,10 @@ func TestSingleRedactHandler(t *testing.T) {
 	}
 }
 
-func TestSecretPatternsOnlyInShared(t *testing.T) {
+func TestSecretPatternsOnlyInRedact(t *testing.T) {
 	markers := []string{"gh[pousr]_", "github_pat_", "xox[baprs]", "AIza[A-Za-z0-9", "[0-9]+:[A-Za-z0-9_-]{35}"}
 	for _, path := range goFiles(t) {
-		if strings.HasSuffix(path, "_test.go") || path == "arch_test.go" ||
-			strings.HasPrefix(path, "harnesses/") || strings.HasPrefix(path, "ui/") {
+		if strings.HasSuffix(path, "_test.go") || path == "arch_test.go" {
 			continue
 		}
 		data, err := os.ReadFile(path)
@@ -226,8 +225,8 @@ func TestSecretPatternsOnlyInShared(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, marker := range markers {
-			if strings.Contains(string(data), marker) && path != "internal/infra/shared/redact.go" {
-				t.Errorf("secret pattern %q found outside shared in %s", marker, path)
+			if strings.Contains(string(data), marker) && path != "pkg/core/redact/redact.go" {
+				t.Errorf("secret pattern %q found outside redact in %s", marker, path)
 			}
 		}
 	}

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 const (
@@ -26,19 +27,7 @@ const (
 	modelLookupTimeout = 3 * time.Second
 )
 
-var (
-	prPattern      = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
-	secretPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-		regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
-		regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),
-		regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
-		regexp.MustCompile(`AIza[A-Za-z0-9_-]{30,}`),
-		regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)[^\s"']+`),
-		regexp.MustCompile(`(?i)((?:token|secret|password|api[_-]?key)\s*[:=]\s*)"[^"]+"`),
-		regexp.MustCompile(`(?i)((?:token|secret|password|api[_-]?key)\s*[:=]\s*)[^\s,;}]+`),
-	}
-)
+var prPattern = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
 
 type Harness struct {
 	Endpoint        string
@@ -119,18 +108,6 @@ func (h *Harness) init() {
 func (h *Harness) base() string {
 	h.init()
 	return h.Endpoint
-}
-
-func redact(s string) string {
-	for _, re := range secretPatterns {
-		s = re.ReplaceAllStringFunc(s, func(m string) string {
-			if i := strings.IndexAny(m, ":="); i >= 0 {
-				return m[:i+1] + " [REDACTED]"
-			}
-			return "[REDACTED]"
-		})
-	}
-	return s
 }
 
 func firstNonEmpty(a, b string) string {
@@ -286,7 +263,7 @@ func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte
 		return nil, resp.StatusCode, err
 	}
 	if resp.StatusCode >= 300 {
-		return data, resp.StatusCode, fmt.Errorf("opencode %s: status %d: %s", path, resp.StatusCode, redact(string(data)))
+		return data, resp.StatusCode, fmt.Errorf("opencode %s: status %d: %s", path, resp.StatusCode, redact.Redact(string(data)))
 	}
 	return data, resp.StatusCode, nil
 }
@@ -295,7 +272,7 @@ func (h *Harness) prompt(ctx context.Context, session, text, id string) error {
 	path := "/api/session/" + url.PathEscape(session) + "/prompt"
 	body := map[string]any{
 		"id":       id,
-		"text":     redact(text),
+		"text":     redact.Redact(text),
 		"delivery": "steer",
 		"resume":   true,
 	}
@@ -313,7 +290,7 @@ func (h *Harness) NotifyParent(ctx context.Context, sessionID, text string) erro
 	}
 	path := "/api/session/" + url.PathEscape(sessionID) + "/prompt"
 	body := map[string]any{
-		"id": messageID("notify"), "text": redact(text),
+		"id": messageID("notify"), "text": redact.Redact(text),
 		"delivery": "queue", "resume": false,
 	}
 	_, _, err := h.do(ctx, http.MethodPost, path, body)
@@ -362,7 +339,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	}
 	id := sessionIDFromJSON(data)
 	if id == "" {
-		return core.Session{}, fmt.Errorf("opencode: missing session id in %s", redact(string(data)))
+		return core.Session{}, fmt.Errorf("opencode: missing session id in %s", redact.Redact(string(data)))
 	}
 	h.bind(id, req.RunID)
 	if err := h.configureSession(ctx, id, req); err != nil {
