@@ -12,6 +12,76 @@ import (
 	"time"
 )
 
+// payloadAdapter extracts a PR or MR number from one provider's payload shape.
+type payloadAdapter func(body []byte) (int, error)
+
+var payloadAdapters = map[string]payloadAdapter{
+	"X-Hub-Signature-256": githubPayload,
+	"X-GitHub-Event":      githubPayload,
+	"X-Gitlab-Token":      gitlabPayload,
+	"X-Gitlab-Event":      gitlabPayload,
+}
+
+// providerHeaders are checked in order so selection never depends on map
+// iteration order. The first header present in the request wins.
+var providerHeaders = []string{
+	"X-Hub-Signature-256",
+	"X-GitHub-Event",
+	"X-Gitlab-Token",
+	"X-Gitlab-Event",
+}
+
+func githubPayload(body []byte) (int, error) {
+	var payload struct {
+		Number      int `json:"number"`
+		PullRequest struct {
+			Number int `json:"number"`
+		} `json:"pull_request"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, err
+	}
+	if payload.PullRequest.Number > 0 {
+		return payload.PullRequest.Number, nil
+	}
+	return payload.Number, nil
+}
+
+func gitlabPayload(body []byte) (int, error) {
+	var payload struct {
+		Number           int `json:"number"`
+		ObjectAttributes struct {
+			IID    int `json:"iid"`
+			Number int `json:"number"`
+		} `json:"object_attributes"`
+		MergeRequest struct {
+			IID int `json:"iid"`
+		} `json:"merge_request"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, err
+	}
+	if payload.ObjectAttributes.IID > 0 {
+		return payload.ObjectAttributes.IID, nil
+	}
+	if payload.MergeRequest.IID > 0 {
+		return payload.MergeRequest.IID, nil
+	}
+	if payload.ObjectAttributes.Number > 0 {
+		return payload.ObjectAttributes.Number, nil
+	}
+	return payload.Number, nil
+}
+
+func selectPayloadAdapter(h http.Header) payloadAdapter {
+	for _, header := range providerHeaders {
+		if h.Get(header) != "" {
+			return payloadAdapters[header]
+		}
+	}
+	return nil
+}
+
 // Webhook pushes PR numbers to a reconciler channel without polling.
 type Webhook struct {
 	Secret  string
@@ -33,35 +103,15 @@ func (w *Webhook) Handler() http.Handler {
 			http.Error(rw, "bad signature", http.StatusUnauthorized)
 			return
 		}
-		var payload struct {
-			Number      int `json:"number"`
-			PullRequest struct {
-				Number int `json:"number"`
-			} `json:"pull_request"`
-			ObjectAttributes struct {
-				IID    int `json:"iid"`
-				Number int `json:"number"`
-			} `json:"object_attributes"`
-			MergeRequest struct {
-				IID int `json:"iid"`
-			} `json:"merge_request"`
-		}
-		if err := json.Unmarshal(body, &payload); err != nil {
-			http.Error(rw, "bad json", http.StatusBadRequest)
+		adapter := selectPayloadAdapter(r.Header)
+		if adapter == nil {
+			http.Error(rw, "unknown provider", http.StatusBadRequest)
 			return
 		}
-		n := payload.PullRequest.Number
-		if n == 0 {
-			n = payload.ObjectAttributes.IID
-		}
-		if n == 0 {
-			n = payload.MergeRequest.IID
-		}
-		if n == 0 {
-			n = payload.ObjectAttributes.Number
-		}
-		if n == 0 {
-			n = payload.Number
+		n, err := adapter(body)
+		if err != nil {
+			http.Error(rw, "bad json", http.StatusBadRequest)
+			return
 		}
 		if n > 0 && w.Changes != nil {
 			select {

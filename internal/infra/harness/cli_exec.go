@@ -90,8 +90,12 @@ func (c *CLIExec) Wake(ctx context.Context, sessionID string, w core.WakeContext
 	return err
 }
 
-func (c *CLIExec) Stop(context.Context, string) error                 { return nil }
-func (c *CLIExec) IsAlive(context.Context, string) (bool, error)      { return false, nil }
+func (c *CLIExec) Stop(context.Context, string) error { return nil }
+
+// IsAlive reports true because a CLI command runs to completion and leaves no
+// session to inspect. Orphan cleanup closes a run only when its liveness check
+// returns false, so an unverifiable result must never kill a CLI worker.
+func (c *CLIExec) IsAlive(context.Context, string) (bool, error)      { return true, nil }
 func (c *CLIExec) NotifyParent(context.Context, string, string) error { return nil }
 func (c *CLIExec) Events() <-chan core.HarnessEvent                   { return c.events }
 
