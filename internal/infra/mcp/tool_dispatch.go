@@ -32,6 +32,9 @@ var dispatchTool = &msdk.Tool{
 
 func registerDispatch(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, dispatchTool, func(ctx context.Context, req *msdk.CallToolRequest, a DispatchArgs) (*msdk.CallToolResult, any, error) {
+		if sv.Dispatcher == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "dispatcher is not configured")
+		}
 		if a.N <= 0 {
 			a.N = 1
 		}
