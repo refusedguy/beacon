@@ -92,6 +92,14 @@ func splitFrontmatter(s string) (yamlText, body string, ok bool) {
 
 // parseCard parses one card's content and records its path.
 func parseCard(content, path string) (core.Task, bool) {
+	t, ok, _ := parseCardFields(content, path)
+	return t, ok
+}
+
+// parseCardFields parses one card and also reports whether it carried YAML
+// frontmatter. Callers that need the format reuse this result instead of
+// splitting the same text a second time.
+func parseCardFields(content, path string) (core.Task, bool, bool) {
 	dir := filepath.Dir(path)
 	fmText, body, hasFM := splitFrontmatter(content)
 	var t core.Task
@@ -99,7 +107,7 @@ func parseCard(content, path string) (core.Task, bool) {
 		var fm frontmatter
 		if err := yaml.Unmarshal([]byte(fmText), &fm); err != nil {
 			slog.Warn("tasksource: malformed card frontmatter", "path", path, "error", err)
-			return t, false
+			return t, false, hasFM
 		}
 		t.ID = core.TaskID(strings.TrimSpace(fm.ID))
 		t.Title = strings.TrimSpace(fm.Title)
@@ -133,7 +141,7 @@ func parseCard(content, path string) (core.Task, bool) {
 		t = parseLegacy(content, dir)
 	}
 	t.SourceRef = path
-	return t, t.ID != ""
+	return t, t.ID != "", hasFM
 }
 
 // headingID extracts an identifier and title from a card heading.

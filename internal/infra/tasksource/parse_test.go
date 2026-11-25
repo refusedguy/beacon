@@ -3,6 +3,7 @@ package tasksource
 import (
 	"bytes"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -100,6 +101,49 @@ func TestParseTaskFieldsParent(t *testing.T) {
 	yamlBody := "```yaml\nid: T-CHILD\nparent: T-EPIC\n```\n"
 	if other := ParseTaskFields(yamlBody, "", ""); other.ParentID() != "T-EPIC" {
 		t.Fatalf("yaml parent = %q", other.ParentID())
+	}
+}
+
+func TestParseTaskFieldsReusesIdenticalText(t *testing.T) {
+	body := "TaskID: T-CACHE\nScope: a.go\nDepends: 1\n"
+	first := ParseTaskFields(body, "docs/tasks", "GH")
+	second := ParseTaskFields(body, "docs/tasks", "GH")
+	fresh := parseTaskFields(body, "docs/tasks", "GH")
+
+	if !reflect.DeepEqual(first, fresh) || !reflect.DeepEqual(second, fresh) {
+		t.Fatalf("cached parse differs from fresh parse: first=%+v second=%+v fresh=%+v", first, second, fresh)
+	}
+
+	other := ParseTaskFields(body, "docs/tasks", "GL")
+	if len(other.Depends) != 1 || other.Depends[0] != "GL-1" {
+		t.Fatalf("dependency prefix from a different key = %v", other.Depends)
+	}
+}
+
+func TestParseTaskFieldsCacheReturnsIndependentSlices(t *testing.T) {
+	body := "TaskID: T-ISO\nScope: a.go\nDepends: 1\n"
+	first := ParseTaskFields(body, "", "")
+	first.Scope[0] = "changed.go"
+	first.Depends[0] = "changed"
+
+	second := ParseTaskFields(body, "", "")
+	if second.Scope[0] != "a.go" || second.Depends[0] != "1" {
+		t.Fatalf("cache leaked mutated fields: %+v", second)
+	}
+}
+
+func TestParseTaskFieldsCacheSeparatesBodies(t *testing.T) {
+	one := "TaskID: T-CACHE-ONE\nScope: a.go\n"
+	two := "TaskID: T-CACHE-TWO\nScope: b.go\n"
+	first := ParseTaskFields(one, "", "")
+	ParseTaskFields(two, "", "")
+	again := ParseTaskFields(one, "", "")
+
+	if first.ID != "T-CACHE-ONE" || again.ID != "T-CACHE-ONE" {
+		t.Fatalf("cache mixed two bodies: %q and %q", first.ID, again.ID)
+	}
+	if len(first.Scope) != 1 || first.Scope[0] != "a.go" {
+		t.Fatalf("scope = %v", first.Scope)
 	}
 }
 
