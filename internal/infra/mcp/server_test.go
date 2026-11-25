@@ -556,6 +556,30 @@ func TestTaskUpdateSingleOverInMemoryTransport(t *testing.T) {
 	}
 }
 
+func TestTaskUpdatePlanKeepsChildBodyOverInMemoryTransport(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpdateTestCard(t, dir, "T-A", "---\nid: T-A\nkind: epic\n---\nbody\n")
+	committer := &deleteCommitter{}
+	cs := deleteClient(t, updateService(dir, &deleteRunStore{}, committer))
+
+	got := callUpdate(t, cs, map[string]any{
+		"id": "T-A",
+		"plan": []any{
+			map[string]any{"title": "Child", "body": "Do the child work.", "scope": []any{"a.go"}},
+		},
+	})
+	if !got.Pushed || len(got.Results) != 1 || got.Results[0].Status != "updated" {
+		t.Fatalf("result = %+v", got)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "body: Do the child work.") {
+		t.Fatalf("child body was lost:\n%s", content)
+	}
+}
+
 func TestTaskUpdateBatchOverInMemoryTransport(t *testing.T) {
 	dir := t.TempDir()
 	a := writeUpdateTestCard(t, dir, "T-A", "---\nid: T-A\ntitle: Old A\n---\nbody\n")

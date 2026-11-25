@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -259,7 +260,12 @@ func (d *cardDoc) setCanonical(key string, lines []string) bool {
 func canonical(lines []string) string {
 	var b strings.Builder
 	for _, line := range lines {
-		b.WriteString(strings.Join(strings.Fields(line), ""))
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
@@ -276,11 +282,44 @@ func cleanList(values []string) []string {
 }
 
 func fieldValue(value string) string {
-	if value == "" || strings.Contains(value, ": ") || strings.Contains(value, " #") ||
-		strings.ContainsAny(value, "\n\r\"'") {
-		return strconv.Quote(value)
+	if isPlainYAML(value) {
+		return value
 	}
-	return value
+	return strconv.Quote(value)
+}
+
+// isPlainYAML reports whether value can be written after "key: " without
+// quoting. A title such as "[WIP] refactor" or "2026" is a valid YAML flow
+// sequence or number, so writing it raw corrupts the card frontmatter.
+func isPlainYAML(value string) bool {
+	if value == "" || strings.TrimSpace(value) != value {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "true", "false", "yes", "no", "on", "off", "null", "~":
+		return false
+	}
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		return false
+	}
+	for i, r := range value {
+		switch r {
+		case ':', '#', '"', '\'', '`', '[', ']', '{', '}', ',', '&', '*', '!', '|', '>', '%', '@', '?':
+			return false
+		}
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+		if i == 0 && (r == '-' || r == '.' || r == '~') {
+			return false
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.' ||
+			r == '/' || r == ' ' || r == '(' || r == ')' || r == '+' || r == '=' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func listLines(key string, values []string) []string {
@@ -353,6 +392,7 @@ func applyFrontmatter(doc *cardDoc, in UpdateInput) bool {
 
 type planSpecValue struct {
 	Title    string
+	Body     string
 	Scope    []string
 	Depends  []string
 	Priority int
@@ -375,6 +415,7 @@ func planSpecValues(specs []core.ChildSpec) []planSpecValue {
 	for _, spec := range specs {
 		out = append(out, planSpecValue{
 			Title:    strings.TrimSpace(spec.Title),
+			Body:     strings.TrimSpace(spec.Body),
 			Scope:    cleanList(plainValues(spec.Scope)),
 			Depends:  cleanList(plainValues(spec.Depends)),
 			Priority: spec.Priority,
@@ -400,6 +441,9 @@ func planLines(specs []planSpecValue) []string {
 	lines := []string{"plan:"}
 	for _, spec := range specs {
 		lines = append(lines, "  - title: "+fieldValue(spec.Title))
+		if spec.Body != "" {
+			lines = append(lines, "    body: "+fieldValue(spec.Body))
+		}
 		lines = append(lines, nested("scope", spec.Scope)...)
 		lines = append(lines, nested("depends", spec.Depends)...)
 		lines = append(lines, "    priority: "+strconv.Itoa(spec.Priority))

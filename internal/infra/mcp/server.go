@@ -336,7 +336,7 @@ func updateInput(a updateOneArgs) app.UpdateInput {
 		plan := make([]core.ChildSpec, 0, len(*a.Plan))
 		for _, spec := range *a.Plan {
 			plan = append(plan, core.ChildSpec{
-				Title: spec.Title, Scope: specScopes(spec.Scope),
+				Title: spec.Title, Body: spec.Body, Scope: specScopes(spec.Scope),
 				Depends: specDeps(spec.Depends), Priority: spec.Priority,
 			})
 		}

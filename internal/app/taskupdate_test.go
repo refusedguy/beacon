@@ -289,6 +289,7 @@ func TestTaskUpdaterUpdatesPlanAndBody(t *testing.T) {
 	body := "new body"
 	plan := []core.ChildSpec{{
 		Title:    "Child one",
+		Body:     "Do the child work.",
 		Scope:    []core.ScopePath{core.ScopeFile("a.go")},
 		Depends:  []core.TaskID{"EXT-1"},
 		Priority: 7,
@@ -304,12 +305,49 @@ func TestTaskUpdaterUpdatesPlanAndBody(t *testing.T) {
 		t.Fatalf("result = %+v", got)
 	}
 	updated := readUpdateCard(t, path)
-	for _, want := range []string{"plan:", "- title: Child one", "- a.go", "- EXT-1", "priority: 7", "new body"} {
+	for _, want := range []string{"plan:", "- title: Child one", "- a.go", "- EXT-1", "priority: 7", "body: Do the child work.", "new body"} {
 		if !strings.Contains(updated, want) {
 			t.Errorf("updated card lost %q:\n%s", want, updated)
 		}
 	}
 	if strings.Contains(updated, "old body") {
 		t.Errorf("old body still present:\n%s", updated)
+	}
+}
+
+func TestTaskUpdaterQuotesYAMLSpecialTitles(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpdateCard(t, dir, "T-A", "---\nid: T-A\ntitle: Old\n---\nbody\n")
+	updater := newUpdater(dir, newFakeStore(), &fakeWorkspace{log: &callLog{}})
+	title := "[WIP] refactor dispatcher"
+
+	got, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Pushed || got.Results[0].Status != "updated" {
+		t.Fatalf("result = %+v", got)
+	}
+	updated := readUpdateCard(t, path)
+	if !strings.Contains(updated, `title: "[WIP] refactor dispatcher"`) {
+		t.Fatalf("title was not quoted for YAML:\n%s", updated)
+	}
+}
+
+func TestTaskUpdaterTreatsInnerWhitespaceChangeAsUpdate(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpdateCard(t, dir, "T-A", "---\nid: T-A\ntitle: Old  title\n---\nbody\n")
+	updater := newUpdater(dir, newFakeStore(), &fakeWorkspace{log: &callLog{}})
+	title := "Old title"
+
+	got, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Results[0].Status != "updated" {
+		t.Fatalf("status = %q, want updated", got.Results[0].Status)
+	}
+	if updated := readUpdateCard(t, path); !strings.Contains(updated, "title: Old title") {
+		t.Fatalf("title change was dropped:\n%s", updated)
 	}
 }
