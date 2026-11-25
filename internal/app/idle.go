@@ -31,13 +31,14 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 	}
 	changed, err := r.Workspace.HasChanges(ctx, core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}, r.BaseBranch)
 	if err != nil {
-		slog.Error("idle change check", "run", run.ID, "error", err)
+		slog.Error("idle change check", "run", run.ID, "task", run.TaskID, "error", err)
 		return
 	}
 	if changed {
-		ok, err := r.Store.ClaimDelivery(ctx, "idle-nudge:"+string(run.ID))
+		key := "idle-nudge:" + string(run.ID)
+		ok, err := r.Store.ClaimDelivery(ctx, key)
 		if err != nil {
-			slog.Error("idle nudge key", "error", err)
+			slog.Error("idle nudge key", "run", run.ID, "task", run.TaskID, "error", err)
 			return
 		}
 		if ok {
@@ -46,20 +47,29 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 				Workspace: run.WorkspacePath,
 				Excerpt:   fmt.Sprintf("You finished a turn but no PR is open for branch %s. Push your changes, open the PR and call beacon_watch_pr.", run.Branch),
 			}
-			if err := r.Harness.Wake(ctx, run.SessionID, w); err != nil {
-				slog.Error("idle nudge", "run", run.ID, "error", err)
+			wakeErr := r.Harness.Wake(ctx, run.SessionID, w)
+			// The claim guards one idle event, not the run's lifetime. Release it
+			// so a later idle turn can nudge again instead of blocking the run.
+			if err := r.Store.ReleaseDelivery(ctx, key); err != nil {
+				slog.Error("release idle nudge key", "run", run.ID, "task", run.TaskID, "error", err)
+			}
+			if wakeErr != nil {
+				slog.Error("idle nudge", "run", run.ID, "task", run.TaskID, "error", wakeErr)
 			}
 			return
 		}
 	}
 	if err := run.Apply(core.Event{Kind: core.EvBlock, Reason: "idle without PR or changes"}); err != nil {
+		slog.Error("idle block transition", "run", run.ID, "task", run.TaskID, "error", err)
 		return
 	}
 	if err := r.Store.Save(ctx, run); err != nil {
-		slog.Error("idle block", "error", err)
+		slog.Error("idle block", "run", run.ID, "task", run.TaskID, "error", err)
 		return
 	}
-	_ = r.notify(run, "idle without PR", "agent finished without opening a PR")
+	if err := r.notify(run, "idle without PR", "agent finished without opening a PR"); err != nil {
+		slog.Error("idle block notify", "run", run.ID, "task", run.TaskID, "error", err)
+	}
 }
 
 // bindOpenPR records an open PR for a running run that has none. Agents can

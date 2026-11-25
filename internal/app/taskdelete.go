@@ -97,7 +97,7 @@ func (tx *cardTx) apply() error {
 }
 
 // rollback restores every applied change in reverse order. Each failure names
-// its path and all failures are joined so none is hidden.
+// the affected card and its path, and all failures are joined so none is hidden.
 func (tx *cardTx) rollback() error {
 	var errs []error
 	for i := tx.applied - 1; i >= 0; i-- {
@@ -112,10 +112,16 @@ func (tx *cardTx) rollback() error {
 			err = os.WriteFile(change.path, change.before, 0o644)
 		}
 		if err != nil {
-			errs = append(errs, fmt.Errorf("rollback %s: %w", change.path, err))
+			errs = append(errs, fmt.Errorf("rollback card %s (%s): %w", cardIDFromPath(change.path), change.path, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// cardIDFromPath returns the card id encoded in a docs/tasks/<id>.md path. It
+// is used only to make rollback errors name the affected card.
+func cardIDFromPath(path string) string {
+	return strings.TrimSuffix(filepath.Base(path), ".md")
 }
 
 // joinRollback keeps the original failure as the primary error and appends the
