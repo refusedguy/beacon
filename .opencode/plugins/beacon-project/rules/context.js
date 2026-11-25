@@ -1,5 +1,6 @@
 import { existsSync as fsExistsSync } from "node:fs"
 import { join } from "node:path"
+import { agentIdentity } from "../state/session_identity.js"
 
 export const SURVIVAL_KEY = "beacon/survival-rules"
 export const ORCHESTRATOR_KEY = "beacon/orchestrator-rules"
@@ -45,21 +46,10 @@ export function contextOptions(config = {}) {
 }
 
 // OpenCode puts the agent on the context event when it is available. Some
-// versions only expose a session ID, so fall back to ctx.session.get.
-export function eventAgent(event) {
-  const candidates = [
-    event?.agent, event?.agentName, event?.agentID,
-    event?.session?.agent, event?.session?.agentName, event?.session?.agentID,
-    event?.data?.agent,
-  ]
-  for (const value of candidates) {
-    if (typeof value === "string" && value) return value
-  }
-  return null
-}
-
+// versions only expose a session ID, so fall back to ctx.session.get. The key
+// lookup lives in the shared agentIdentity adapter.
 async function resolvedAgent(ctx, event) {
-  const direct = eventAgent(event)
+  const direct = agentIdentity(ctx, event)
   if (direct) return direct
   const sessionID = event?.sessionID ?? event?.session?.id
   if (typeof sessionID !== "string" || !sessionID) return null
@@ -67,7 +57,7 @@ async function resolvedAgent(ctx, event) {
   try {
     const info = await ctx.session.get({ sessionID })
     const data = info?.data ?? info
-    return eventAgent(data) ?? data?.agent?.id ?? data?.agentID ?? null
+    return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
   } catch {
     return null
   }

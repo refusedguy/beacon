@@ -8,9 +8,27 @@ export function cliEnv(root, { sessionID, model, env = process.env } = {}) {
   return out
 }
 
+// OpenCode exposes the session agent under different keys at setup, on hook
+// events and in session records. Read the union of those keys in one place so
+// the shell guard and MCP registration classify the same event identically.
+// The event wins over the setup context because it names the current session.
+export function agentIdentity(ctx, event) {
+  for (const source of [event, ctx]) {
+    const candidates = [
+      source?.agent, source?.agentName, source?.agentID,
+      source?.session?.agent, source?.session?.agentName, source?.session?.agentID,
+      source?.data?.agent,
+    ]
+    for (const value of candidates) {
+      if (typeof value === "string" && value) return value
+    }
+  }
+  return null
+}
+
 // Plugin setup does not always receive a session ID directly. Fall back to the
-// newest session, the same way currentSessionAgent resolves the agent. The
-// model is optional: never invent one when the session domain cannot provide it.
+// newest session, the same way the agent resolver does. The model is optional:
+// never invent one when the session domain cannot provide it.
 export async function sessionIdentity(ctx) {
   if (!ctx || typeof ctx !== "object") return {}
   let sessionID = ctx.sessionID ?? ctx.session?.id ?? ctx.session?.sessionID
@@ -24,6 +42,8 @@ export async function sessionIdentity(ctx) {
   }
   if (typeof sessionID !== "string" || !sessionID) return {}
   const identity = { sessionID }
+  const direct = agentIdentity(ctx)
+  if (direct) identity.agent = direct
   if (typeof ctx.session?.get !== "function") return identity
   try {
     const info = await ctx.session.get({ sessionID })
@@ -31,6 +51,10 @@ export async function sessionIdentity(ctx) {
     const ref = data?.model
     const model = ref?.id ?? ref?.modelID ?? ref?.modelId ?? data?.modelID ?? data?.modelId
     if (typeof model === "string" && model) identity.model = model
+    if (!identity.agent) {
+      const agent = agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
+      if (agent) identity.agent = agent
+    }
   } catch {}
   return identity
 }
