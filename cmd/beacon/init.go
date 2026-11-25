@@ -325,10 +325,13 @@ func detectRequiredChecks(root string) []string {
 	}
 	seen := make(map[string]bool)
 	for _, file := range files {
-		if data, err := os.ReadFile(file); err == nil {
-			for _, name := range parseJobNames(string(data)) {
-				seen[name] = true
-			}
+		data, err := os.ReadFile(file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping workflow %s: %v\n", file, err)
+			continue
+		}
+		for _, name := range parseJobNames(string(data)) {
+			seen[name] = true
 		}
 	}
 	out := make([]string, 0, len(seen))
