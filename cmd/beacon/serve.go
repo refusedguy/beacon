@@ -56,10 +56,18 @@ func newServeCommand(configPath *string) *cobra.Command {
 			events := fanout(ctx, w.harness.Events(), 2)
 			w.recon.Events = events[0]
 
-			errCh := make(chan error, 3)
-			go func() { errCh <- w.recon.Run(ctx, w.changes) }()
+			// The reconciler and the API previously read w.changes directly,
+			// so a single PR change went to whichever one was selected first.
+			// Give each its own view, then let the API fan changes out to every
+			// connected monitor.
+			changeViews := fanout(ctx, w.changes, 2)
+			subs := newChangeSubscribers()
+			go subs.run(ctx, changeViews[1])
 
-			api := &apiServer{wiring: w, token: token, eventStream: events[1]}
+			errCh := make(chan error, 3)
+			go func() { errCh <- w.recon.Run(ctx, changeViews[0]) }()
+
+			api := &apiServer{wiring: w, token: token, eventStream: events[1], changes: subs}
 			srv := &http.Server{Addr: addr, Handler: api.handler(), ReadHeaderTimeout: 5 * time.Second}
 			go func() {
 				<-ctx.Done()
@@ -94,11 +102,14 @@ func newServeCommand(configPath *string) *cobra.Command {
 	}
 }
 
-func fanout(ctx context.Context, src <-chan core.HarnessEvent, n int) []<-chan core.HarnessEvent {
-	outs := make([]chan core.HarnessEvent, n)
-	views := make([]<-chan core.HarnessEvent, n)
+// fanout copies every value from src into n buffered views. A slow view drops
+// the value instead of blocking the others. It works for harness events and
+// for PR change numbers alike.
+func fanout[T any](ctx context.Context, src <-chan T, n int) []<-chan T {
+	outs := make([]chan T, n)
+	views := make([]<-chan T, n)
 	for i := range outs {
-		outs[i] = make(chan core.HarnessEvent, 16)
+		outs[i] = make(chan T, 16)
 		views[i] = outs[i]
 	}
 	go func() {
@@ -106,10 +117,10 @@ func fanout(ctx context.Context, src <-chan core.HarnessEvent, n int) []<-chan c
 			select {
 			case <-ctx.Done():
 				return
-			case ev := <-src:
+			case v := <-src:
 				for _, out := range outs {
 					select {
-					case out <- ev:
+					case out <- v:
 					default:
 					}
 				}

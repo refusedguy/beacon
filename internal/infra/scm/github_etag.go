@@ -18,7 +18,7 @@ func (g *GitHub) getPR(ctx context.Context, number int) (*github.PullRequest, er
 	cached := g.etags[number]
 	g.etagMu.Unlock()
 
-	v, err := g.guarded(func() (any, error) {
+	pr, err := guarded(g.br, func() (*github.PullRequest, error) {
 		url := fmt.Sprintf("repos/%s/%s/pulls/%d", g.Owner, g.Repo, number)
 		req, err := g.Client.NewRequest(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -44,7 +44,7 @@ func (g *GitHub) getPR(ctx context.Context, number int) (*github.PullRequest, er
 	if err != nil {
 		return nil, err
 	}
-	return v.(*github.PullRequest), nil
+	return pr, nil
 }
 
 func initETagCache(g *GitHub) {

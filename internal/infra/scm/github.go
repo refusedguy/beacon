@@ -2,6 +2,7 @@ package scm
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,7 +19,7 @@ type GitHub struct {
 	Client *github.Client
 	Owner  string
 	Repo   string
-	Base   string
+	base   string
 	br     *gobreaker.CircuitBreaker[any]
 	etagMu sync.Mutex
 	etags  map[int]*etagEntry
@@ -29,20 +30,45 @@ func NewGitHub(client *github.Client, owner, repo, base string) *GitHub {
 		Client: client,
 		Owner:  owner,
 		Repo:   repo,
-		Base:   base,
-		br: gobreaker.NewCircuitBreaker[any](gobreaker.Settings{
-			Name:        "github",
-			Interval:    time.Minute,
-			Timeout:     15 * time.Second,
-			MaxRequests: 3,
-		}),
+		base:   base,
+		br:     newSCMBreaker("github"),
 	}
 	initETagCache(g)
 	return g
 }
 
+// newSCMBreaker builds a circuit breaker with the settings shared by both SCM
+// adapters.
+func newSCMBreaker(name string) *gobreaker.CircuitBreaker[any] {
+	return gobreaker.NewCircuitBreaker[any](gobreaker.Settings{
+		Name:        name,
+		Interval:    time.Minute,
+		Timeout:     15 * time.Second,
+		MaxRequests: 3,
+	})
+}
+
+// guarded runs fn through br and returns its typed result. The breaker stores
+// any, so the one checked conversion lives here instead of at every call site.
+func guarded[T any](br *gobreaker.CircuitBreaker[any], fn func() (T, error)) (T, error) {
+	var zero T
+	v, err := br.Execute(func() (any, error) { return fn() })
+	if err != nil {
+		return zero, err
+	}
+	if v == nil {
+		return zero, nil
+	}
+	out, ok := v.(T)
+	if !ok {
+		return zero, fmt.Errorf("scm breaker %s: unexpected result %T, want %T", br.Name(), v, zero)
+	}
+	return out, nil
+}
+
+// guarded keeps the any-shaped entry point used by OpenPR.
 func (g *GitHub) guarded(fn func() (any, error)) (any, error) {
-	return g.br.Execute(fn)
+	return guarded(g.br, fn)
 }
 
 func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) {
@@ -97,9 +123,12 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 
 	base := p.GetBase().GetRef()
 	if base == "" {
-		base = g.Base
+		base = g.base
 	}
-	cmp, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
+	cmp, err := guarded(g.br, func() (*github.CommitsComparison, error) {
+		c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
+		return c, err
+	})
 	if err != nil {
 		return o, err
 	}
@@ -109,7 +138,7 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 }
 
 func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, error) {
-	v, err := g.guarded(func() (any, error) {
+	res, err := guarded(g.br, func() (*github.ListCheckRunsResults, error) {
 		r, _, err := g.Client.Checks.ListCheckRunsForRef(ctx, g.Owner, g.Repo, sha, &github.ListCheckRunsOptions{
 			ListOptions: github.ListOptions{PerPage: 100},
 		})
@@ -118,7 +147,9 @@ func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, er
 	if err != nil {
 		return nil, err
 	}
-	res := v.(*github.ListCheckRunsResults)
+	if res == nil {
+		return nil, nil
+	}
 	var out []core.CheckResult
 	for _, c := range res.CheckRuns {
 		out = append(out, core.CheckResult{
@@ -158,7 +189,7 @@ func (g *GitHub) changedFiles(ctx context.Context, pr int) ([]*github.CommitFile
 			page []*github.CommitFile
 			resp *github.Response
 		)
-		if _, err := g.guarded(func() (any, error) {
+		if _, err := guarded(g.br, func() (any, error) {
 			var err error
 			page, resp, err = g.Client.PullRequests.ListFiles(ctx, g.Owner, g.Repo, pr, opts)
 			return nil, err
@@ -194,14 +225,13 @@ func ignoredPathsOnly(files []*github.CommitFile) bool {
 }
 
 func (g *GitHub) approvals(ctx context.Context, pr int) (int, error) {
-	v, err := g.guarded(func() (any, error) {
+	reviews, err := guarded(g.br, func() ([]*github.PullRequestReview, error) {
 		r, _, err := g.Client.PullRequests.ListReviews(ctx, g.Owner, g.Repo, pr, &github.ListOptions{PerPage: 100})
 		return r, err
 	})
 	if err != nil {
 		return 0, err
 	}
-	reviews := v.([]*github.PullRequestReview)
 	latest := make(map[string]string)
 	times := make(map[string]time.Time)
 	for _, r := range reviews {
@@ -250,7 +280,10 @@ const updateBranchMutation = `mutation($id: ID!, $sha: GitObjectID!) {
 // production while the httptest mocked success. The mutation returns the new
 // head SHA directly, so no polling is needed.
 func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (string, error) {
-	p, _, err := g.Client.PullRequests.Get(ctx, g.Owner, g.Repo, pr)
+	p, err := guarded(g.br, func() (*github.PullRequest, error) {
+		got, _, err := g.Client.PullRequests.Get(ctx, g.Owner, g.Repo, pr)
+		return got, err
+	})
 	if err != nil {
 		return "", err
 	}
@@ -268,7 +301,7 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 		return "", err
 	}
 	var result updateBranchResponse
-	if _, err := g.guarded(func() (any, error) {
+	if _, err := guarded(g.br, func() (*github.Response, error) {
 		return g.Client.Do(req, &result)
 	}); err != nil {
 		return "", err
@@ -284,9 +317,12 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 }
 
 func (g *GitHub) Merge(ctx context.Context, pr int, expectedSHA, title string) error {
-	merged, _, err := g.Client.PullRequests.Merge(ctx, g.Owner, g.Repo, pr, title, &github.PullRequestOptions{
-		MergeMethod: "squash",
-		SHA:         expectedSHA,
+	merged, err := guarded(g.br, func() (*github.PullRequestMergeResult, error) {
+		m, _, err := g.Client.PullRequests.Merge(ctx, g.Owner, g.Repo, pr, title, &github.PullRequestOptions{
+			MergeMethod: "squash",
+			SHA:         expectedSHA,
+		})
+		return m, err
 	})
 	if err != nil {
 		return err
