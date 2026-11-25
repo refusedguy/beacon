@@ -67,10 +67,27 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 	if in == nil {
 		return nil
 	}
+	if err := r.blockRunsOnRedBase(ctx, in, baseBranch, base.FailedChecks); err != nil {
+		return err
+	}
+	if strings.EqualFold(r.BaseRedMode, "notify_orchestrator") {
+		if err := r.notify(run, "base_red", "base branch is red: "+reason); err != nil {
+			return err
+		}
+		r.notifyParent(ctx, run, run.PRNumber, "base_red: "+reason)
+		return nil
+	}
+	return r.ensureFixer(ctx, in, base, run)
+}
+
+// blockRunsOnRedBase moves every run sharing a red base into blocked state.
+// Each failure is logged with the run and incident IDs so no block is silent.
+func (r *Reconciler) blockRunsOnRedBase(ctx context.Context, in *core.BaseIncident, baseBranch string, failed []core.CheckResult) error {
 	active, err := r.Store.ListActive(ctx)
 	if err != nil {
 		return err
 	}
+	baseFailed := failedNames(failed)
 	for _, other := range active {
 		if other.IsFixer || other.PRNumber == 0 {
 			continue
@@ -82,7 +99,7 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 			continue
 		}
 		otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
-		if err != nil || !intersects(failedNames(otherObs.Checks), failedNames(base.FailedChecks)) {
+		if err != nil || !intersects(failedNames(otherObs.Checks), baseFailed) {
 			continue
 		}
 		if err := other.Apply(core.Event{Kind: core.EvBlock, Reason: "base_red"}); err != nil {
@@ -94,14 +111,7 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 			slog.Error("block run on red base", "run", other.ID, "incident", in.ID, "error", err)
 		}
 	}
-	if strings.EqualFold(r.BaseRedMode, "notify_orchestrator") {
-		if err := r.notify(run, "base_red", "base branch is red: "+reason); err != nil {
-			return err
-		}
-		r.notifyParent(ctx, run, run.PRNumber, "base_red: "+reason)
-		return nil
-	}
-	return r.ensureFixer(ctx, in, base, run)
+	return nil
 }
 
 func sqliteChecks(names []string) string {
