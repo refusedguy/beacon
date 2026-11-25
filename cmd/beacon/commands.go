@@ -192,14 +192,6 @@ func newGCCommand(configPath *string) *cobra.Command {
 	}
 }
 
-const (
-	controlApprove = "approve"
-	controlUnblock = "unblock"
-	controlCancel  = "cancel"
-	controlRetry   = "retry"
-	controlNudge   = "nudge"
-)
-
 // controlResult is the stable JSON contract printed by beacon control on success.
 type controlResult struct {
 	OK     bool   `json:"ok"`
@@ -211,6 +203,7 @@ type controlRequest struct {
 	Action  string `json:"action"`
 	RunID   string `json:"run_id"`
 	SHA     string `json:"sha"`
+	PR      int    `json:"pr,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
@@ -228,61 +221,62 @@ func controlMessage(messages []string) string {
 func newControlCommand(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "control",
-		Short: "Approve, unblock, cancel, retry or nudge a run",
+		Short: "Control a run: " + strings.Join(core.ControlActionNames(), ", "),
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			action, _ := cmd.Flags().GetString("action")
 			runID, _ := cmd.Flags().GetString("run-id")
 			sha, _ := cmd.Flags().GetString("sha")
+			pr, _ := cmd.Flags().GetInt("pr")
 			message, _ := cmd.Flags().GetString("message")
 			if err := validateControl(action, runID, message); err != nil {
 				return err
 			}
-			if err := dispatchControl(cmd.Context(), *configPath, action, runID, sha, message); err != nil {
+			if err := dispatchControlWithPR(cmd.Context(), *configPath, action, runID, sha, pr, message); err != nil {
 				return err
 			}
 			return printJSON(controlResult{OK: true, Action: action, RunID: runID})
 		},
 	}
-	cmd.Flags().String("action", "", "approve, unblock, cancel, retry or nudge")
+	cmd.Flags().String("action", "", "one of "+strings.Join(core.ControlActionNames(), ", "))
 	cmd.Flags().String("run-id", "", "run ID to control")
 	cmd.Flags().String("sha", "", "observed SHA used by an approve action")
+	cmd.Flags().Int("pr", 0, "PR number bound by a watch action")
 	cmd.Flags().String("message", "", "guidance sent to the worker by a nudge action")
 	cmd.Flags().Bool("json", false, "print a machine readable result")
 	return cmd
 }
 
 func validateControl(action, runID string, message ...string) error {
-	switch action {
-	case controlApprove, controlUnblock, controlCancel, controlRetry, controlNudge:
-	default:
+	parsed := core.ParseControlAction(action)
+	if !parsed.Valid() {
 		return fmt.Errorf("unknown action %q", action)
 	}
 	if runID == "" {
 		return errors.New("run-id is required")
 	}
-	if action == controlNudge && controlMessage(message) == "" {
+	if parsed == core.ControlNudge && controlMessage(message) == "" {
 		return errors.New("message is required for nudge")
 	}
 	return nil
 }
 
-// dispatchControl forwards to the daemon when it owns the state database and
-// connection file. Without a live daemon it applies the control directly.
-func dispatchControl(ctx context.Context, configPath, action, runID, sha string, message ...string) error {
+// dispatchControlWithPR forwards to the daemon when it owns the state database
+// and connection file. Without a live daemon it applies the control directly.
+func dispatchControlWithPR(ctx context.Context, configPath, action, runID, sha string, pr int, message ...string) error {
 	cfg, _, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
 	if info, err := readConnection(filepath.Dir(cfg.StateDB)); err == nil && daemonAlive(cfg.StateDB) {
-		return postControl(ctx, info, action, runID, sha, message...)
+		return postControlWithPR(ctx, info, action, runID, sha, pr, message...)
 	}
 	w, err := wireCLI(configPath)
 	if err != nil {
 		return err
 	}
 	defer w.close()
-	return applyControl(ctx, w.control, action, runID, sha, message...)
+	return applyControlWithPR(ctx, w.control, action, runID, sha, pr, message...)
 }
 
 // controlPort is the slice of app.Control that the command drives.
@@ -294,27 +288,46 @@ type controlPort interface {
 	Nudge(ctx context.Context, id core.RunID, message string) error
 }
 
+// watchPort binds a PR locally when no daemon owns the state database.
+type watchPort interface {
+	WatchPR(ctx context.Context, id core.RunID, pr int) error
+}
+
 func applyControl(ctx context.Context, ctrl controlPort, action, runID, sha string, message ...string) error {
+	return applyControlWithPR(ctx, ctrl, action, runID, sha, 0, message...)
+}
+
+func applyControlWithPR(ctx context.Context, ctrl controlPort, action, runID, sha string, pr int, message ...string) error {
 	id := core.RunID(runID)
-	switch action {
-	case controlApprove:
+	switch core.ParseControlAction(action) {
+	case core.ControlApprove:
 		return ctrl.Approve(ctx, id, sha)
-	case controlUnblock:
+	case core.ControlUnblock:
 		return ctrl.Unblock(ctx, id)
-	case controlCancel:
+	case core.ControlCancel:
 		return ctrl.Cancel(ctx, id)
-	case controlRetry:
+	case core.ControlRetry:
 		return ctrl.Retry(ctx, id)
-	case controlNudge:
+	case core.ControlNudge:
 		return ctrl.Nudge(ctx, id, controlMessage(message))
+	case core.ControlWatch:
+		watcher, ok := ctrl.(watchPort)
+		if !ok {
+			return errors.New("watch requires the daemon API")
+		}
+		return watcher.WatchPR(ctx, id, pr)
 	default:
 		return fmt.Errorf("unknown action %q", action)
 	}
 }
 
 func postControl(ctx context.Context, info *connectionInfo, action, runID, sha string, message ...string) error {
+	return postControlWithPR(ctx, info, action, runID, sha, 0, message...)
+}
+
+func postControlWithPR(ctx context.Context, info *connectionInfo, action, runID, sha string, pr int, message ...string) error {
 	payload, err := json.Marshal(controlRequest{
-		Action: action, RunID: runID, SHA: sha, Message: controlMessage(message),
+		Action: action, RunID: runID, SHA: sha, PR: pr, Message: controlMessage(message),
 	})
 	if err != nil {
 		return err
