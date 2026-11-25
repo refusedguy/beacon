@@ -209,14 +209,28 @@ type CreateTaskInput struct {
 	Plan          []core.ChildSpec `json:"plan,omitempty"`
 }
 
+// OperationMeta is embedded in mutation result DTOs. It holds the operation id
+// and status that the MCP layer adds after a mutation completes. Embedding
+// promotes the fields to the top level of each result's JSON object, so the
+// wire shape stays the same.
+type OperationMeta struct {
+	Status      string `json:"status,omitempty"`
+	OperationID string `json:"operation_id,omitempty"`
+}
+
 type CreatedTask struct {
-	ID          string        `json:"id"`
-	Path        string        `json:"path"`
-	Pushed      bool          `json:"pushed"`
-	IDs         []string      `json:"ids,omitempty"`
-	Children    []CreatedTask `json:"children,omitempty"`
-	Status      string        `json:"status,omitempty"`
-	OperationID string        `json:"operation_id,omitempty"`
+	OperationMeta
+	ID       string        `json:"id"`
+	Path     string        `json:"path"`
+	Pushed   bool          `json:"pushed"`
+	IDs      []string      `json:"ids,omitempty"`
+	Children []CreatedTask `json:"children,omitempty"`
+}
+
+// WithMeta returns a copy of the result with its operation metadata set.
+func (r CreatedTask) WithMeta(id, status string) any {
+	r.Status, r.OperationID = status, id
+	return r
 }
 
 // CreatedCard is one entry in a batch create response.
@@ -227,10 +241,15 @@ type CreatedCard struct {
 
 // CreateBatchResult is the response for a batch task creation.
 type CreateBatchResult struct {
-	Created     []CreatedCard `json:"created"`
-	Pushed      bool          `json:"pushed"`
-	Status      string        `json:"status,omitempty"`
-	OperationID string        `json:"operation_id,omitempty"`
+	OperationMeta
+	Created []CreatedCard `json:"created"`
+	Pushed  bool          `json:"pushed"`
+}
+
+// WithMeta returns a copy of the result with its operation metadata set.
+func (r CreateBatchResult) WithMeta(id, status string) any {
+	r.Status, r.OperationID = status, id
+	return r
 }
 
 // detachedPushTimeout bounds a push that must finish after the caller's

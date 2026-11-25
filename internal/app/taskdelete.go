@@ -34,11 +34,16 @@ type DeletedTask struct {
 // have an active run; when it is non-empty no file was touched and nothing was
 // pushed.
 type DeleteResult struct {
-	Results     []DeletedTask `json:"results"`
-	Refused     []string      `json:"refused,omitempty"`
-	Pushed      bool          `json:"pushed"`
-	Status      string        `json:"status,omitempty"`
-	OperationID string        `json:"operation_id,omitempty"`
+	OperationMeta
+	Results []DeletedTask `json:"results"`
+	Refused []string      `json:"refused,omitempty"`
+	Pushed  bool          `json:"pushed"`
+}
+
+// WithMeta returns a copy of the result with its operation metadata set.
+func (r DeleteResult) WithMeta(id, status string) any {
+	r.Status, r.OperationID = status, id
+	return r
 }
 
 // TaskDeleter removes several task cards in one commit and push. Missing cards
