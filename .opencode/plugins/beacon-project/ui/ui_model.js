@@ -19,8 +19,6 @@ export const RESUBSCRIBE_MAX_MS = 30000
 export const REASON_WIDTH = 40
 export const RECENT_LIMIT = 5
 export const DECISION_LIMIT = 20
-export const SIDEBAR_SECTIONS = Object.freeze(["active", "queue", "recent"])
-export const DETAIL_SECTIONS = Object.freeze(["why", "checks", "timeline", "technical"])
 export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [], queue: [] })
 
 const bool = (v) => v === true || v === 1 || v === "true", raw = (v) => (v == null ? "" : v)
