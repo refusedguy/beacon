@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,6 +28,9 @@ func newServeCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer w.close()
+			if w.cfg.Webhook.Enabled && w.cfg.Webhook.Secret == "" {
+				return fmt.Errorf("webhook.enabled requires webhook.secret or webhook.secret_env")
+			}
 			dir := filepath.Dir(w.cfg.StateDB)
 			lock, err := acquireLock(dir)
 			if err != nil {
@@ -38,10 +42,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer tracker.Close()
-			addr := os.Getenv("BEACON_API_ADDR")
-			if addr == "" {
-				addr = "127.0.0.1:7432"
-			}
+			addr := firstNonEmpty(os.Getenv("BEACON_API_ADDR"), "127.0.0.1:7432")
 			token, err := writeConnection(dir, "http://"+addr)
 			if err != nil {
 				return err
