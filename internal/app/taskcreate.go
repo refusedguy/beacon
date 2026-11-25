@@ -705,7 +705,7 @@ func lookupCreated(ctx context.Context, writer CardWriter, cache *IdempotencyCac
 		}
 		out := make([]core.Task, 0, len(children)+1)
 		for _, child := range children {
-			out = append(out, core.Task{ID: child.ID, SourceRef: cardPath(child.ID)})
+			out = append(out, core.Task{ID: child.ID, Parent: id, SourceRef: cardPath(child.ID)})
 		}
 		return append(out, core.Task{ID: id, SourceRef: cardPath(id)}), true
 	}
@@ -809,7 +809,7 @@ func ensureBranch(ctx context.Context, ws any, branch, base string) error {
 // epicChildren gives an epic's plan the branch that its children branch from.
 // The expansion itself lives in core and is shared with the card parser.
 func epicChildren(id core.TaskID, plan []core.ChildSpec) []core.Task {
-	return core.ExpandChildren(core.Task{ID: id, Plan: plan}, epicBranch(id))
+	return core.SetParent(core.ExpandChildren(core.Task{ID: id, Plan: plan}, epicBranch(id)), id)
 }
 
 // idempotencyKey keys the created cache by epic ID and content. The derived

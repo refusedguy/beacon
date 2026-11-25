@@ -90,6 +90,19 @@ func TestParseTaskFieldsFlatEpicLines(t *testing.T) {
 	}
 }
 
+func TestParseTaskFieldsParent(t *testing.T) {
+	body := "TaskID: T-CHILD\nParent: T-EPIC\n"
+	got := ParseTaskFields(body, "", "")
+
+	if got.ParentID() != "T-EPIC" {
+		t.Fatalf("parent = %q, want T-EPIC", got.ParentID())
+	}
+	yamlBody := "```yaml\nid: T-CHILD\nparent: T-EPIC\n```\n"
+	if other := ParseTaskFields(yamlBody, "", ""); other.ParentID() != "T-EPIC" {
+		t.Fatalf("yaml parent = %q", other.ParentID())
+	}
+}
+
 func TestParseTaskFieldsMalformedYAMLReported(t *testing.T) {
 	logs := captureTaskSourceLogs(t)
 	body := "Issue body.\n\n" + "```yaml\n" + "id: [unclosed\npriority: 5\n" + "```\n"
@@ -125,7 +138,7 @@ func TestPlanParserChildren(t *testing.T) {
 	}
 	first := children[0]
 	if first.ID != "T-EPIC-01" || first.Title != "First child" || first.Priority != 9 ||
-		first.Kind != core.TaskKindTask || first.Status != core.TaskAvailable {
+		first.Kind != core.TaskKindTask || first.Status != core.TaskAvailable || first.Parent != "T-EPIC" {
 		t.Fatalf("first child = %+v", first)
 	}
 	if first.Body != "Implement the first child." {
