@@ -2,6 +2,7 @@ package scm
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -124,5 +125,26 @@ func TestGitHubObserveChecksEveryChangedFilePage(t *testing.T) {
 	}
 	if obs.WorkflowSkipped {
 		t.Fatal("WorkflowSkipped = true, want false for a code file on the second page")
+	}
+}
+
+func TestGuardedReturnsTypedResults(t *testing.T) {
+	br := newSCMBreaker("guarded-test")
+
+	value, err := guarded(br, func() (string, error) { return "ok", nil })
+	if err != nil || value != "ok" {
+		t.Fatalf("guarded() = %q, %v; want ok, nil", value, err)
+	}
+
+	var nilPR *github.PullRequest
+	pr, err := guarded(br, func() (*github.PullRequest, error) { return nilPR, nil })
+	if err != nil || pr != nilPR {
+		t.Fatalf("guarded() = %v, %v; want typed nil, nil", pr, err)
+	}
+
+	sentinel := errors.New("network down")
+	count, err := guarded(br, func() (int, error) { return 0, sentinel })
+	if count != 0 || !errors.Is(err, sentinel) {
+		t.Fatalf("guarded() = %d, %v; want 0, sentinel", count, err)
 	}
 }

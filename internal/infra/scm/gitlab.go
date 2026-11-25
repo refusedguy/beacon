@@ -11,36 +11,40 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sony/gobreaker/v2"
+
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
 // GitLab implements core.ScmGateway against the GitLab REST v4 API.
 type GitLab struct {
-	BaseURL string
-	Token   string
-	Owner   string
-	Repo    string
+	baseURL string
+	token   string
+	owner   string
+	repo    string
 	client  *http.Client
+	br      *gobreaker.CircuitBreaker[any]
 }
 
 func NewGitLab(baseURL, token, owner, repo string) *GitLab {
 	return &GitLab{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		Token:   token,
-		Owner:   owner,
-		Repo:    repo,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		token:   token,
+		owner:   owner,
+		repo:    repo,
 		client:  &http.Client{Timeout: 30 * time.Second},
+		br:      newSCMBreaker("gitlab"),
 	}
 }
 
 var _ core.ScmGateway = (*GitLab)(nil)
 
 func (g *GitLab) project() string {
-	return url.PathEscape(g.Owner + "/" + g.Repo)
+	return url.PathEscape(g.owner + "/" + g.repo)
 }
 
 func (g *GitLab) request(ctx context.Context, method, path string, query url.Values, payload any) ([]byte, error) {
-	u := g.BaseURL + path
+	u := g.baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
@@ -57,25 +61,27 @@ func (g *GitLab) request(ctx context.Context, method, path string, query url.Val
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-	if g.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+g.Token)
+	if g.token != "" {
+		req.Header.Set("Authorization", "Bearer "+g.token)
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, core.Errorf(gitlabErrorCode(resp.StatusCode), "gitlab %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
-	}
-	return data, nil
+	return guarded(g.br, func() ([]byte, error) {
+		resp, err := g.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, core.Errorf(gitlabErrorCode(resp.StatusCode), "gitlab %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
+		}
+		return data, nil
+	})
 }
 
 func (g *GitLab) getJSON(ctx context.Context, path string, query url.Values, out any) error {
