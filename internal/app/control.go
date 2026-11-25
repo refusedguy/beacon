@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -13,7 +14,18 @@ import (
 const (
 	controlWriteAttempts = 3
 	controlRetryBase     = 10 * time.Millisecond
+
+	// sqliteBusyCode is the SQLite SQLITE_BUSY result code. It belongs to the
+	// SQLite API, so a driver can reword its message without changing it.
+	sqliteBusyCode = 5
 )
+
+// sqliteCodedError is the shape of a driver error that carries a result code.
+// Declaring it here keeps the app layer independent of a concrete driver.
+type sqliteCodedError interface {
+	error
+	Code() int
+}
 
 // Control applies operator actions to runs and persists the resulting state.
 type Control struct {
@@ -50,13 +62,19 @@ func (c *Control) write(ctx context.Context, fn func() error) error {
 	return err
 }
 
-// isBusy recognises the write-lock conflicts reported by modernc.org/sqlite.
+// isBusy recognises SQLite write-lock conflicts. A typed driver error gives
+// the authoritative result code, so retries survive a driver message change.
+// The fallback covers errors that expose no code; it matches the canonical
+// marker exactly instead of lowercasing the whole message.
 func isBusy(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "database is locked")
+	var coded sqliteCodedError
+	if errors.As(err, &coded) {
+		return coded.Code() == sqliteBusyCode
+	}
+	return strings.Contains(err.Error(), "(SQLITE_BUSY)")
 }
 
 func (c *Control) get(ctx context.Context, id core.RunID) (*core.Run, error) {
