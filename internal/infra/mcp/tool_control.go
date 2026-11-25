@@ -32,7 +32,7 @@ type controlBatch struct {
 
 var controlTool = &msdk.Tool{
 	Name:        "beacon_control",
-	Description: "Control a run: approve, unblock, cancel, retry or bind a PR.",
+	Description: "Control a run: approve, unblock, cancel, retry or watch.",
 }
 
 func registerControl(s *msdk.Server, sv Services) {

@@ -245,6 +245,18 @@ func (h *Harness) runFor(session string) (core.RunID, bool) {
 	return run, ok
 }
 
+// unbind drops a session's run mapping so a long-lived daemon does not keep
+// every session it ever spawned.
+func (h *Harness) unbind(session string) {
+	if session == "" {
+		return
+	}
+	h.init()
+	h.mu.Lock()
+	delete(h.runs, session)
+	h.mu.Unlock()
+}
+
 func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
 	h.init()
 	parent := firstNonEmpty(req.ParentSessionID, h.ParentSessionID)
@@ -291,6 +303,7 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
+	h.unbind(sessionID)
 	_, status, err := h.do(ctx, http.MethodDelete, "/api/session/"+url.PathEscape(sessionID), nil)
 	if status == http.StatusNotFound {
 		return nil
@@ -304,6 +317,7 @@ func (h *Harness) IsAlive(ctx context.Context, sessionID string) (bool, error) {
 	}
 	_, status, err := h.do(ctx, http.MethodGet, "/api/session/"+url.PathEscape(sessionID), nil)
 	if status == http.StatusNotFound {
+		h.unbind(sessionID)
 		return false, nil
 	}
 	if err != nil {

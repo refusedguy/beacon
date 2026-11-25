@@ -231,20 +231,12 @@ func mutationTool(ctx context.Context, journal *opJournal, id string, fn func(co
 	return jsonResult(result), nil, nil
 }
 
+// withMeta sets idempotency metadata through the shared result contract. It
+// does not enumerate result types, so a new mutation response needs no change
+// here as long as it embeds app.OperationMeta and implements WithMeta.
 func withMeta(v any, id, status string) any {
-	switch r := v.(type) {
-	case app.CreatedTask:
-		r.Status, r.OperationID = status, id
-		return r
-	case app.CreateBatchResult:
-		r.Status, r.OperationID = status, id
-		return r
-	case app.UpdateResult:
-		r.Status, r.OperationID = status, id
-		return r
-	case app.DeleteResult:
-		r.Status, r.OperationID = status, id
-		return r
+	if result, ok := v.(app.OperationResult); ok {
+		return result.WithMeta(id, status)
 	}
 	return v
 }
