@@ -129,6 +129,81 @@ func TestExternalMergeRemovesCleanWorktree(t *testing.T) {
 	}
 }
 
+// ReviewRequired mirrors the policy review gate for the epic tests that drive
+// the reconciler through this fake.
+func (f fakePolicy) ReviewRequired(mode core.ReviewMode, obs core.Observation) bool {
+	if mode == core.ReviewModeNone {
+		return false
+	}
+	return obs.Approvals == 0
+}
+
+type recordingGatePolicy struct {
+	fakePolicy
+	required bool
+	calls    int
+	mode     core.ReviewMode
+	obs      core.Observation
+}
+
+func (g *recordingGatePolicy) ReviewRequired(mode core.ReviewMode, obs core.Observation) bool {
+	g.calls++
+	g.mode = mode
+	g.obs = obs
+	return g.required
+}
+
+func TestGuardEpicReviewUsesPolicyGate(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	epicRun(t, store, "epic-1", 55)
+	gate := &recordingGatePolicy{required: true}
+	r := &Reconciler{Store: store, Policy: gate, Source: epicSource(core.ReviewModeHuman)}
+	run := store.runs["epic-1"]
+	obs := core.Observation{PRNumber: 55, HeadSHA: "sha1", PRState: "open", Approvals: 1}
+
+	ok, err := r.guardEpicReview(ctx, run, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("policy required review but guard allowed the merge")
+	}
+	if gate.calls != 1 {
+		t.Fatalf("ReviewRequired calls = %d, want 1", gate.calls)
+	}
+	if gate.mode != core.ReviewModeHuman || gate.obs.HeadSHA != obs.HeadSHA {
+		t.Fatalf("gate got mode=%s obs=%+v, want human mode and observed SHA", gate.mode, gate.obs)
+	}
+
+	gate.required = false
+	ok, err = r.guardEpicReview(ctx, run, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("policy cleared review but guard still blocked the merge")
+	}
+	if gate.calls != 2 {
+		t.Fatalf("ReviewRequired calls = %d, want 2", gate.calls)
+	}
+}
+
+func TestGuardEpicReviewWithoutGateHoldsMerge(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	epicRun(t, store, "epic-1", 55)
+	r := &Reconciler{Store: store, Policy: behindAwarePolicy{}, Source: epicSource(core.ReviewModeNone)}
+
+	ok, err := r.guardEpicReview(ctx, store.runs["epic-1"], core.Observation{PRNumber: 55, HeadSHA: "sha1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("policy without a review gate must not clear the epic gate")
+	}
+}
+
 func TestCleanupKeepsActiveRunWorktree(t *testing.T) {
 	ws := &fakeWorkspace{dirty: true}
 	r := &Reconciler{Workspace: ws, Harness: &fakeHarness{}}
