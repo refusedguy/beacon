@@ -281,7 +281,11 @@ func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarnes
 		if strings.TrimSpace(cfg.Harness.Command) == "" {
 			return nil, fmt.Errorf("acp harness requires command")
 		}
-		return acp.New(cfg.Harness.Command, cfg.Harness.Model, parent), nil
+		return acp.NewFromConfig(acp.Config{
+			Command:         cfg.Harness.Command,
+			Model:           cfg.Harness.Model,
+			ParentSessionID: parent,
+		}), nil
 	default:
 		return harness.New(harness.Config{
 			Provider: cfg.Harness.Provider, Command: cfg.Harness.Command,
