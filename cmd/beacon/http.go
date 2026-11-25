@@ -93,6 +93,20 @@ type apiServer struct {
 	changes     *changeSubscribers
 }
 
+// startAPIServer serves the loopback API until ctx ends and reports its exit
+// on errCh. It owns the server lifecycle so the serve command stays short.
+func startAPIServer(ctx context.Context, services apiServices, token string, events <-chan core.HarnessEvent, changes *changeSubscribers, addr string, errCh chan<- error) {
+	api := &apiServer{services: services, token: token, eventStream: events, changes: changes}
+	srv := &http.Server{Addr: addr, Handler: api.handler(), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+	go func() { errCh <- srv.ListenAndServe() }()
+}
+
 func (a *apiServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
