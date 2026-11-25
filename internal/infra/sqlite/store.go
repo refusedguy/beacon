@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -146,7 +147,51 @@ func (s *Store) FindActiveByTask(ctx context.Context, task core.TaskID) (*core.R
 	return s.queryOne(ctx, `SELECT `+runColumns+` FROM runs WHERE task_id=? AND state NOT IN ('merged','closed','dropped') ORDER BY updated_at DESC LIMIT 1`, string(task))
 }
 
+// deliveryRetention bounds how long delivery keys and approvals stay in the
+// state database. Both are idempotency markers for a specific SHA, so a row
+// older than this window can never affect a new decision.
+const deliveryRetention = 30 * 24 * time.Hour
+
+// retentionBatchSize caps how many rows one prune pass removes from a table.
+// The reconcile tick stays short even after a long outage with accumulated
+// rows; a later tick removes the next batch.
+const retentionBatchSize = 1000
+
+// PruneStale deletes delivery and approval rows older than retention. It
+// returns the number of rows removed. A non-positive retention uses the
+// default 30-day window.
+func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64, error) {
+	if retention <= 0 {
+		retention = deliveryRetention
+	}
+	cutoff := nowUnix() - retention.Nanoseconds()
+	queries := []string{
+		`DELETE FROM deliveries WHERE key IN (SELECT key FROM deliveries WHERE created_at < ? LIMIT ?)`,
+		`DELETE FROM approvals WHERE rowid IN (SELECT rowid FROM approvals WHERE created_at < ? LIMIT ?)`,
+	}
+	var removed int64
+	for _, query := range queries {
+		res, err := s.db.ExecContext(ctx, query, cutoff, retentionBatchSize)
+		if err != nil {
+			return removed, err
+		}
+		n, err := res.RowsAffected()
+		removed += n
+		if err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
+}
+
 func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
+	// The reconciler calls ListActive on every tick. Reclaiming old rows here
+	// puts retention on that fixed schedule without a second goroutine or a
+	// second timer in the daemon. Cleanup is best effort: a failed prune must
+	// not stop the tick from reconciling active runs.
+	if _, err := s.PruneStale(ctx, deliveryRetention); err != nil {
+		slog.Warn("prune stale delivery rows", "error", err)
+	}
 	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN ('merged','closed') ORDER BY updated_at`)
 }
 

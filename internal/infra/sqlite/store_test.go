@@ -980,6 +980,107 @@ INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r-old', '
 	}
 }
 
+func countStoreRows(t *testing.T, store *Store, query string) int {
+	t.Helper()
+	var n int
+	if err := store.db.QueryRow(query).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func seedStaleDeliveryRows(t *testing.T, store *Store) {
+	t.Helper()
+	ctx := context.Background()
+	keys := []string{"merge:42:old", "merge:43:fresh"}
+	for _, key := range keys {
+		ok, err := store.ClaimDelivery(ctx, key)
+		if err != nil || !ok {
+			t.Fatalf("claim %s = %v, %v", key, ok, err)
+		}
+	}
+	for _, r := range []struct{ id, sha string }{{"r-old", "old-sha"}, {"r-fresh", "fresh-sha"}} {
+		if err := store.SetApproval(ctx, core.RunID(r.id), r.sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := nowUnix() - (31 * 24 * time.Hour).Nanoseconds()
+	if _, err := store.db.ExecContext(ctx, `UPDATE deliveries SET created_at=? WHERE key='merge:42:old'`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE approvals SET created_at=? WHERE run_id='r-old'`, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPruneStaleRemovesOldDeliveryAndApprovalRows(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	seedStaleDeliveryRows(t, store)
+	ctx := context.Background()
+
+	removed, err := store.PruneStale(ctx, 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2 (one delivery, one approval)", removed)
+	}
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM deliveries`); got != 1 {
+		t.Fatalf("deliveries = %d, want 1", got)
+	}
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM approvals`); got != 1 {
+		t.Fatalf("approvals = %d, want 1", got)
+	}
+
+	approved, err := store.Approved(ctx, "r-old", "old-sha")
+	if err != nil || approved {
+		t.Fatalf("old approval = %v, %v; want false", approved, err)
+	}
+	approved, err = store.Approved(ctx, "r-fresh", "fresh-sha")
+	if err != nil || !approved {
+		t.Fatalf("fresh approval = %v, %v; want true", approved, err)
+	}
+	ok, err := store.ClaimDelivery(ctx, "merge:42:old")
+	if err != nil || !ok {
+		t.Fatalf("reclaim old key = %v, %v; want true", ok, err)
+	}
+
+	// A second pass is harmless: there is nothing left inside the window.
+	removed, err = store.PruneStale(ctx, 30*24*time.Hour)
+	if err != nil || removed != 0 {
+		t.Fatalf("second prune = %d, %v; want 0, nil", removed, err)
+	}
+}
+
+func TestListActivePrunesStaleRowsOnReconcileTick(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	seedStaleDeliveryRows(t, store)
+
+	// The reconcile ticker calls ListActive on every pass, so this is the
+	// fixed schedule that keeps the idempotency tables bounded.
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active = %+v, want none", active)
+	}
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM deliveries`); got != 1 {
+		t.Fatalf("deliveries after tick = %d, want 1", got)
+	}
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM approvals`); got != 1 {
+		t.Fatalf("approvals after tick = %d, want 1", got)
+	}
+}
+
 func TestConcurrentSavesDoNotReturnBusy(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

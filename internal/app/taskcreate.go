@@ -209,14 +209,34 @@ type CreateTaskInput struct {
 	Plan          []core.ChildSpec `json:"plan,omitempty"`
 }
 
+// OperationMeta is the idempotency metadata shared by every mutation response.
+// Embedding it keeps the status and operation_id JSON fields in one place, so
+// callers can set them without knowing the concrete result type.
+type OperationMeta struct {
+	Status      string `json:"status,omitempty"`
+	OperationID string `json:"operation_id,omitempty"`
+}
+
+// OperationResult is any mutation response that carries shared operation
+// metadata. A new result type joins by embedding OperationMeta and adding a
+// WithMeta method; no caller that handles OperationResult needs to change.
+type OperationResult interface {
+	WithMeta(id, status string) any
+}
+
 type CreatedTask struct {
-	ID          string        `json:"id"`
-	Path        string        `json:"path"`
-	Pushed      bool          `json:"pushed"`
-	IDs         []string      `json:"ids,omitempty"`
-	Children    []CreatedTask `json:"children,omitempty"`
-	Status      string        `json:"status,omitempty"`
-	OperationID string        `json:"operation_id,omitempty"`
+	ID       string        `json:"id"`
+	Path     string        `json:"path"`
+	Pushed   bool          `json:"pushed"`
+	IDs      []string      `json:"ids,omitempty"`
+	Children []CreatedTask `json:"children,omitempty"`
+	OperationMeta
+}
+
+// WithMeta returns a copy of r carrying the operation id and status.
+func (r CreatedTask) WithMeta(id, status string) any {
+	r.Status, r.OperationID = status, id
+	return r
 }
 
 // CreatedCard is one entry in a batch create response.
@@ -227,10 +247,15 @@ type CreatedCard struct {
 
 // CreateBatchResult is the response for a batch task creation.
 type CreateBatchResult struct {
-	Created     []CreatedCard `json:"created"`
-	Pushed      bool          `json:"pushed"`
-	Status      string        `json:"status,omitempty"`
-	OperationID string        `json:"operation_id,omitempty"`
+	Created []CreatedCard `json:"created"`
+	Pushed  bool          `json:"pushed"`
+	OperationMeta
+}
+
+// WithMeta returns a copy of r carrying the operation id and status.
+func (r CreateBatchResult) WithMeta(id, status string) any {
+	r.Status, r.OperationID = status, id
+	return r
 }
 
 // detachedPushTimeout bounds a push that must finish after the caller's
