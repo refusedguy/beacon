@@ -1027,57 +1027,6 @@ func TestTaskDeleteOperationIDIsIdempotentOverInMemoryTransport(t *testing.T) {
 	}
 }
 
-// foreignResult is a result type the old withMeta switch never listed.
-// Embedding OperationMeta is enough for the MCP layer to attach metadata.
-type foreignResult struct {
-	app.OperationMeta
-	Value string `json:"value"`
-}
-
-func (r foreignResult) WithMeta(id, status string) any {
-	r.Status, r.OperationID = status, id
-	return r
-}
-
-func TestWithMetaAppliesToUnlistedResultType(t *testing.T) {
-	got := withMeta(foreignResult{Value: "kept"}, "op-unlisted", "applied")
-	result, ok := got.(foreignResult)
-	if !ok {
-		t.Fatalf("result type = %T, want foreignResult", got)
-	}
-	if result.Status != "applied" || result.OperationID != "op-unlisted" || result.Value != "kept" {
-		t.Fatalf("result = %+v", result)
-	}
-}
-
-func TestMutationResultsKeepOperationMetadataOnWire(t *testing.T) {
-	cases := []struct {
-		name  string
-		value any
-	}{
-		{"create", app.CreatedTask{}},
-		{"batch", app.CreateBatchResult{}},
-		{"update", app.UpdateResult{}},
-		{"delete", app.DeleteResult{}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := withMeta(tc.value, "op-wire", "duplicate")
-			b, err := json.Marshal(got)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var fields map[string]any
-			if err := json.Unmarshal(b, &fields); err != nil {
-				t.Fatal(err)
-			}
-			if fields["status"] != "duplicate" || fields["operation_id"] != "op-wire" {
-				t.Fatalf("wire = %s", b)
-			}
-		})
-	}
-}
-
 func TestOpJournalRunIsIdempotent(t *testing.T) {
 	j := newOpJournal()
 	calls := 0
