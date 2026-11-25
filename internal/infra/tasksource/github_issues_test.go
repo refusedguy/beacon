@@ -47,3 +47,50 @@ func TestGitHubIssuesParsesYAMLAndScopes(t *testing.T) {
 		t.Fatalf("depends = %v", task.DependsOn)
 	}
 }
+
+func TestGitHubIssuesFindsReadyTaskOnSecondPage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("page") == "" {
+			w.Header().Set("Link", `</repos/o/r/issues?page=2>; rel="next"`)
+			_, _ = w.Write([]byte(`[{"number":10,"title":"claimed","body":"","labels":[{"name":"beacon/claimed"}]}]`))
+			return
+		}
+		_, _ = fmt.Fprint(w, `[{"number":12,"title":"ready","html_url":"https://github.com/o/r/issues/12","body":""}]`)
+	}))
+	defer srv.Close()
+	client, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithEnterpriseURLs(srv.URL+"/", srv.URL+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewGitHubIssues(client, "o", "r")
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "GH-12" {
+		t.Fatalf("tasks = %+v, want GH-12 from page two", tasks)
+	}
+}
+
+func TestGitHubIssuesStopsAtPageCap(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Link", `</repos/o/r/issues?page=2>; rel="next"`)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	client, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithEnterpriseURLs(srv.URL+"/", srv.URL+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewGitHubIssues(client, "o", "r")
+	if _, err := s.ListAvailable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != maxIssuePages {
+		t.Fatalf("issues calls = %d, want %d", calls, maxIssuePages)
+	}
+}

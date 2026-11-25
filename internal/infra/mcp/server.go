@@ -180,8 +180,9 @@ func (j *opJournal) cached(id string) (any, bool) {
 // run applies fn once per operation id. Repeats and concurrent callers reuse
 // the stored result with a duplicate status. A caller cancelled after its
 // commit records a recovered status, since the push finished in a detached
-// context.
-func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context) (any, error)) (any, error) {
+// context. A cancelled waiter returns ctx.Err. A panic in fn is recovered into
+// an error and still releases every waiter, so a later call can retry.
+func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context) (any, error)) (out any, err error) {
 	if id == "" {
 		return fn(ctx)
 	}
@@ -191,21 +192,33 @@ func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context)
 	wait, owner := j.claim(id)
 	if !owner {
 		if wait != nil {
-			<-wait
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		if result, ok := j.cached(id); ok {
 			return withMeta(result, id, "duplicate"), nil
 		}
 		return nil, core.Errorf(core.CodeUnavailable, "operation %q did not complete", id)
 	}
-	result, err := fn(ctx)
-	status := "applied"
-	if err == nil && ctx.Err() != nil {
-		status = "recovered"
-	}
-	j.finish(id, result, err)
+	var result any
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = core.Errorf(core.CodeUnavailable, "operation %q panicked: %v", id, rec)
+			j.finish(id, nil, err)
+			return
+		}
+		j.finish(id, result, err)
+	}()
+	result, err = fn(ctx)
 	if err != nil {
 		return nil, err
+	}
+	status := "applied"
+	if ctx.Err() != nil {
+		status = "recovered"
 	}
 	return withMeta(result, id, status), nil
 }
