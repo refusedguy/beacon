@@ -84,6 +84,7 @@ func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Eve
 }
 
 func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
+	recordObservation(run, obs.HeadSHA, obs.BaseSHA)
 	_, isEpic := r.epicTask(ctx, run.TaskID)
 	if !run.IsFixer && !isEpic && run.WorkspacePath != "" {
 		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {
@@ -93,7 +94,6 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 		message := "beacon: complete task " + string(run.TaskID)
 		if err := r.commitCard(ctx, ws, cardsPath, message); err != nil {
 			slog.Warn("card publish failed before merge", "run", run.ID, "pr", obs.PRNumber, "error", err)
-			recordObservation(run, obs.HeadSHA, obs.BaseSHA)
 			if saveErr := r.Store.Save(ctx, run); saveErr != nil {
 				slog.Error("save observation after card publish failure", "run", run.ID, "error", saveErr)
 			}

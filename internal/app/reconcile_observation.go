@@ -86,17 +86,14 @@ func (r *Reconciler) greenButBehind(
 	decision core.MergeDecision,
 ) (core.MergeDecision, error) {
 	if run.State == core.RunNeedsAgentFix {
-		run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
 		return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksPassed, HeadSHA: obs.HeadSHA}, obs)
 	}
 	mergeable := obs
 	mergeable.Behind = false
 	if merged := r.Policy.Evaluate(mergeable); merged.Verdict == core.VerdictMerge {
-		run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
 		return r.mergeIfReviewed(ctx, run, obs, merged)
 	}
 	if run.State == core.RunNeedsRebase || run.State == core.RunRunning {
-		run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
 		if run.State == core.RunNeedsRebase && !run.CanRebase() {
 			return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase attempts exhausted"}, obs)
 		}
