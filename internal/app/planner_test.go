@@ -189,3 +189,48 @@ func TestPlannerSerializesTasksWithoutScope(t *testing.T) {
 		t.Fatalf("strict mode should skip unscoped tasks: %+v %v", skipped, err)
 	}
 }
+
+func TestPlannerUsesSharedOverlapAuthority(t *testing.T) {
+	tasks := []core.Task{
+		{ID: "dir", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeDir("src")}},
+		{ID: "glob", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopePattern("src/**/*.go")}},
+		{ID: "nested", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopePattern("src/lib/*.go")}},
+		{ID: "docs", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("docs/readme.md")}},
+	}
+	for name, p := range map[string]ConflictPlanner{
+		"default checker":     NewPlanner(nil),
+		"shared core checker": NewPlanner(core.PathsAndDependencies),
+	} {
+		t.Run(name, func(t *testing.T) {
+			chosen, skipped, err := p.Select(tasks, nil, 4, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids := taskIDs(chosen)
+			if len(ids) != 2 || ids[0] != "dir" || ids[1] != "docs" {
+				t.Fatalf("chosen = %v, want [dir docs]", ids)
+			}
+			byID := map[core.TaskID]SkippedTask{}
+			for _, s := range skipped {
+				byID[s.TaskID] = s
+			}
+			if len(byID) != 2 {
+				t.Fatalf("expected 2 skipped, got %+v", skipped)
+			}
+			if byID["glob"].Code != SkipSelectedScopeOverlap {
+				t.Errorf("glob skip = %+v, want selected scope overlap", byID["glob"])
+			}
+			if byID["nested"].Code != SkipSelectedScopeOverlap {
+				t.Errorf("nested skip = %+v, want selected scope overlap", byID["nested"])
+			}
+		})
+	}
+}
+
+func taskIDs(tasks []core.Task) []core.TaskID {
+	ids := make([]core.TaskID, 0, len(tasks))
+	for _, task := range tasks {
+		ids = append(ids, task.ID)
+	}
+	return ids
+}

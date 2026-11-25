@@ -46,3 +46,55 @@ func TestOverlap(t *testing.T) {
 		})
 	}
 }
+
+func TestScopeKindAndValue(t *testing.T) {
+	cases := []struct {
+		scope ScopePath
+		kind  byte
+		value string
+	}{
+		{ScopeFile("src/a.go"), 'f', "src/a.go"},
+		{ScopeDir("src"), 'd', "src"},
+		{ScopePattern("src/**/*.go"), 'g', "src/**/*.go"},
+		{ScopeAll(), 'a', "*"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.scope), func(t *testing.T) {
+			if got := tc.scope.Kind(); got != tc.kind {
+				t.Errorf("Kind = %q, want %q", got, tc.kind)
+			}
+			if got := Kind(tc.scope); got != tc.kind {
+				t.Errorf("Kind(scope) = %q, want %q", got, tc.kind)
+			}
+			if got := tc.scope.Value(); got != tc.value {
+				t.Errorf("Value = %q, want %q", got, tc.value)
+			}
+			if got := Value(tc.scope); got != tc.value {
+				t.Errorf("Value(scope) = %q, want %q", got, tc.value)
+			}
+		})
+	}
+}
+
+func TestScopeOverlapAuthority(t *testing.T) {
+	dir := ScopeDir("src")
+	glob := ScopePattern("src/**/*.go")
+	if !dir.Covers(glob) {
+		t.Fatal("scope src must cover src/**/*.go")
+	}
+	a := Task{ID: "A", Scope: []ScopePath{dir}}
+	b := Task{ID: "B", Scope: []ScopePath{glob}}
+	if !OverlapByPaths(a, b) {
+		t.Fatal("scope src must overlap src/**/*.go")
+	}
+
+	other := ScopePattern("src/lib/*.go")
+	if !OverlapByPaths(Task{ID: "C", Scope: []ScopePath{glob}}, Task{ID: "D", Scope: []ScopePath{other}}) {
+		t.Fatal("glob patterns with a common prefix must overlap")
+	}
+
+	unrelated := ScopeFile("docs/readme.md")
+	if OverlapByPaths(a, Task{ID: "E", Scope: []ScopePath{unrelated}}) {
+		t.Fatal("scope src must not overlap docs/readme.md")
+	}
+}
