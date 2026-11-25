@@ -15,7 +15,7 @@ func externalReconciler(t *testing.T, state string, fixer bool) (*Reconciler, *f
 	run := makeRun("r1", 42, core.RunWaitingCI)
 	run.IsFixer = fixer
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	src := &fakeSource{}
 	if fixer {
@@ -33,7 +33,7 @@ func externalReconciler(t *testing.T, state string, fixer bool) (*Reconciler, *f
 func TestManualMergeClosesRun(t *testing.T) {
 	r, store, src, h := externalReconciler(t, "merged", false)
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunMerged || got.HeadSHA != "sha9" {
@@ -50,7 +50,7 @@ func TestManualMergeClosesRun(t *testing.T) {
 func TestManualCloseClosesRun(t *testing.T) {
 	r, store, src, h := externalReconciler(t, "closed", false)
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunClosed {
@@ -71,10 +71,10 @@ func TestExternalMergeOrCloseNotifiesParentWithState(t *testing.T) {
 			run := store.runs["r1"]
 			run.ParentSessionID = "ses_parent"
 			if err := store.Save(context.Background(), run); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 			}
 			if _, err := r.Reconcile(context.Background(), 42); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 			}
 			if len(h.notifications) != 1 {
 				t.Fatalf("notifications = %d, want 1", len(h.notifications))
@@ -95,7 +95,7 @@ func TestExternalMergeOrCloseNotifiesParentWithState(t *testing.T) {
 func TestFixerMergeSkipsTaskSourceComplete(t *testing.T) {
 	r, store, src, h := externalReconciler(t, "merged", true)
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if store.runs["r1"].State != core.RunMerged {
 		t.Fatalf("run = %+v", store.runs["r1"])
@@ -110,7 +110,7 @@ func TestExternalMergeForceRemovesDirtyWorktree(t *testing.T) {
 	ws := &fakeWorkspace{dirty: true}
 	r.Workspace = ws
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if ws.forcedRemoves != 1 || ws.removed != 0 {
 		t.Fatalf("forcedRemoves = %d, removed = %d; want 1 and 0", ws.forcedRemoves, ws.removed)
@@ -122,7 +122,7 @@ func TestExternalMergeRemovesCleanWorktree(t *testing.T) {
 	ws := &fakeWorkspace{}
 	r.Workspace = ws
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if ws.removed != 1 || ws.forcedRemoves != 0 {
 		t.Fatalf("removed = %d, forcedRemoves = %d; want 1 and 0", ws.removed, ws.forcedRemoves)
@@ -164,7 +164,7 @@ func TestGuardEpicReviewUsesPolicyGate(t *testing.T) {
 
 	ok, err := r.guardEpicReview(ctx, run, obs)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.guardEpicReview(ctx, run, obs): %v`, err)
 	}
 	if ok {
 		t.Fatal("policy required review but guard allowed the merge")
@@ -179,7 +179,7 @@ func TestGuardEpicReviewUsesPolicyGate(t *testing.T) {
 	gate.required = false
 	ok, err = r.guardEpicReview(ctx, run, obs)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.guardEpicReview(ctx, run, obs): %v`, err)
 	}
 	if !ok {
 		t.Fatal("policy cleared review but guard still blocked the merge")
@@ -197,7 +197,7 @@ func TestGuardEpicReviewWithoutGateHoldsMerge(t *testing.T) {
 
 	ok, err := r.guardEpicReview(ctx, store.runs["epic-1"], core.Observation{PRNumber: 55, HeadSHA: "sha1"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.guardEpicReview(ctx, store.runs["epic-1"], core.Observation{PRNumber: 55, HeadSHA: "sha1"}): %v`, err)
 	}
 	if ok {
 		t.Fatal("policy without a review gate must not clear the epic gate")
@@ -209,7 +209,7 @@ func TestCleanupKeepsActiveRunWorktree(t *testing.T) {
 	r := &Reconciler{Workspace: ws, Harness: &fakeHarness{}}
 	run := makeRun("r1", 42, core.RunRunning)
 	if err := r.cleanupRun(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.cleanupRun(context.Background(), run): %v`, err)
 	}
 	if ws.forcedRemoves != 0 || ws.removed != 0 {
 		t.Fatalf("forcedRemoves = %d, removed = %d; want 0 and 0", ws.forcedRemoves, ws.removed)

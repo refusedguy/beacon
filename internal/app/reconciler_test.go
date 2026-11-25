@@ -55,7 +55,7 @@ func TestOrphanWatchdogLeavesLiveRunWithoutPRAlone(t *testing.T) {
 	run := makeRun("r-live", 0, core.RunRunning)
 	run.UpdatedAt = time.Now().UTC().Add(-10 * time.Minute)
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 	h := &orphanHarness{fakeHarness: &fakeHarness{}, alive: true}
 	ws := &fakeWorkspace{}
@@ -77,7 +77,7 @@ func TestOrphanWatchdogBindsPRByBranch(t *testing.T) {
 	run := makeRun("r-bind", 0, core.RunRunning)
 	run.Branch = "beacon/T-1"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 	h := &orphanHarness{fakeHarness: &fakeHarness{}, alive: true}
 	r, changes := orphanReconciler(store, &fakeSCM{foundPR: 77}, h, &fakeWorkspace{})
@@ -109,7 +109,7 @@ func TestOrphanWatchdogClosesDeadSessionAndFreesSlot(t *testing.T) {
 	run.UpdatedAt = time.Now().UTC().Add(-10 * time.Minute)
 	run.ParentSessionID = "parent-session"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
 	}
 	h := &orphanHarness{fakeHarness: &fakeHarness{}, alive: false}
 	ws := &fakeWorkspace{dirty: true}
@@ -142,7 +142,7 @@ func TestOrphanWatchdogSkipsRecentAndFailedLivenessChecks(t *testing.T) {
 	old.UpdatedAt = time.Now().UTC().Add(-10 * time.Minute)
 	for _, run := range []*core.Run{recent, old} {
 		if err := store.Save(ctx, run); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`store.Save(ctx, run): %v`, err)
 		}
 	}
 	h := &orphanHarness{fakeHarness: &fakeHarness{}, err: errors.New("liveness unavailable")}
@@ -194,7 +194,7 @@ func newReconciler(t *testing.T, decision core.Verdict, obs core.Observation) (*
 	store := newFakeStore()
 	run := makeRun("r1", 42, core.RunWaitingCI)
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	scm := &fakeSCM{obs: obs}
 	h := &fakeHarness{}
@@ -218,7 +218,7 @@ func TestReconcileWaitingCIToAutoRebase(t *testing.T) {
 	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Behind: true})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunWaitingCI || got.RebaseAttempts != 1 || scm.rebases != 1 {
@@ -237,12 +237,12 @@ func TestIndependentBaseChangeDoesNotConsumeRebaseAttempt(t *testing.T) {
 	run.ObservedSHA = "sha1"
 	run.ObservedBaseSHA = "base-old"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 
 	for i := 0; i < 4; i++ {
 		if _, err := r.Reconcile(context.Background(), 42); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 		}
 	}
 	if scm.rebases != 0 {
@@ -264,7 +264,7 @@ func TestRedPRWithNewBaseStillRebases(t *testing.T) {
 			Checks: []core.CheckResult{{Name: "ci", State: core.CheckFailure}},
 		})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if scm.rebases != 1 {
 		t.Fatalf("branch updates = %d, want 1", scm.rebases)
@@ -278,7 +278,7 @@ func TestConflictWithNeedsRebaseStillRebases(t *testing.T) {
 			Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
 		})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if scm.rebases != 1 {
 		t.Fatalf("branch updates = %d, want 1", scm.rebases)
@@ -289,7 +289,7 @@ func TestReconcileWaitingCIToWakeAgent(t *testing.T) {
 	r, store, _, h, _ := newReconciler(t, core.VerdictNeedsAgentFix,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", FailureExcerpt: "panic: boom"})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunWaitingCI || got.FixAttempts != 1 || len(h.wakes) != 1 {
@@ -299,7 +299,7 @@ func TestReconcileWaitingCIToWakeAgent(t *testing.T) {
 		t.Fatalf("bad wake context: %+v", h.wakes[0])
 	}
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if len(h.wakes) != 1 {
 		t.Fatalf("duplicate wake for same SHA: %d", len(h.wakes))
@@ -320,7 +320,7 @@ func TestReconcileMergeMarksAndCommitsCardBeforeMerge(t *testing.T) {
 	r.Workspace = ws
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	mergedAt := -1
 	for i, entry := range log.items {
@@ -355,7 +355,7 @@ func TestReconcileMergeSkipsCardForFixer(t *testing.T) {
 	run := store.runs["r1"]
 	run.IsFixer = true
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	log := &callLog{}
 	scm.log = log
@@ -364,7 +364,7 @@ func TestReconcileMergeSkipsCardForFixer(t *testing.T) {
 	r.Workspace = ws
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if len(src.marked) != 0 || len(ws.commits) != 0 {
 		t.Fatalf("fixer marked or committed card: marked=%+v commits=%+v", src.marked, ws.commits)
@@ -386,14 +386,14 @@ func TestReconcileMergeNotifiesParentAfterMerge(t *testing.T) {
 	run := store.runs["r1"]
 	run.ParentSessionID = "ses_parent"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	log := &callLog{}
 	scm.log = log
 	h.log = log
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	mergeAt, notifyAt := -1, -1
 	for i, entry := range log.items {
@@ -429,7 +429,7 @@ func TestReconcileMergeWithoutParentSkipsNotification(t *testing.T) {
 	r, _, _, h, _ := newReconciler(t, core.VerdictMerge,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if len(h.notifications) != 0 {
 		t.Fatalf("notifications = %d, want 0", len(h.notifications))
@@ -440,14 +440,14 @@ func TestReconcileWaitingCIToMerge(t *testing.T) {
 	r, store, scm, h, src := newReconciler(t, core.VerdictMerge,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunMerged || scm.merges != 1 || len(src.complete) != 1 || h.stops != 1 {
 		t.Fatalf("state=%s merges=%d complete=%v stops=%d", got.State, scm.merges, src.complete, h.stops)
 	}
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if scm.merges != 1 {
 		t.Fatal("merge was not idempotent")
@@ -490,7 +490,7 @@ func TestRebaseOneHeadAdvanceCausesOneRebase(t *testing.T) {
 
 	for i := 0; i < 4; i++ {
 		if _, err := r.Reconcile(context.Background(), 42); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 		}
 	}
 	if scm.updates != 1 {
@@ -505,7 +505,7 @@ func TestRebaseSuccessMarksNewHead(t *testing.T) {
 	r.SCM = scm
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.HeadSHA != "new-sha2" {
@@ -525,7 +525,7 @@ func TestRebaseFailureDoesNotRetrySameSHA(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		if _, err := r.Reconcile(context.Background(), 42); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 		}
 	}
 	if scm.updates != 1 {
@@ -546,7 +546,7 @@ func TestWaitingRunAdvancesObservedSHA(t *testing.T) {
 	r.SCM = scm
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunWaitingCI {
@@ -563,14 +563,14 @@ func TestRebaseNewBaseSHAWithFixedHeadRebasesOnce(t *testing.T) {
 	run.ObservedSHA = "sha1"
 	run.ObservedBaseSHA = "base-old"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	scm := newBaseMovingSCM("sha1", "base-new")
 	r.SCM = scm
 
 	for i := 0; i < 4; i++ {
 		if _, err := r.Reconcile(context.Background(), 42); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 		}
 	}
 	if scm.updates != 1 {
@@ -592,12 +592,12 @@ func TestWakeNewBaseSHAWithFixedHeadWakesOnce(t *testing.T) {
 	run.ObservedSHA = "sha1"
 	run.ObservedBaseSHA = "base-old"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 
 	for i := 0; i < 4; i++ {
 		if _, err := r.Reconcile(context.Background(), 42); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 		}
 	}
 	if len(h.wakes) != 1 {
@@ -620,12 +620,12 @@ func TestBehindGreenPRMergesWhenMergeable(t *testing.T) {
 	run.ObservedSHA = "sha1"
 	run.ObservedBaseSHA = "base-old"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 
 	decision, err := r.Reconcile(context.Background(), 42)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if decision.Verdict != core.VerdictMerge {
 		t.Fatalf("verdict = %s, want merge", decision.Verdict)
@@ -651,10 +651,10 @@ func TestGreenBehindNeedsRebaseLeavesStuckState(t *testing.T) {
 	run := store.runs["r1"]
 	run.State = core.RunNeedsRebase
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunWaitingCI {
@@ -674,7 +674,7 @@ func TestBehindGreenPRWithConflictDoesNotMerge(t *testing.T) {
 	r.Policy = behindAwarePolicy{}
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if scm.merges != 0 {
 		t.Fatalf("merges = %d, want 0 for a conflicting PR", scm.merges)
@@ -702,7 +702,7 @@ func epicRun(t *testing.T, store *fakeStore, id core.RunID, pr int) {
 	run.TaskID = "T-EPIC"
 	run.Branch = "beacon/T-EPIC"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 }
 
@@ -713,7 +713,7 @@ func TestChildPRMergesIntoEpicBranchAndOpensEpicPR(t *testing.T) {
 	child.TaskID = "T-EPIC-01"
 	child.Branch = "beacon/T-EPIC-01"
 	if err := store.Save(ctx, child); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(ctx, child): %v`, err)
 	}
 	store.ready = []core.Task{{ID: "T-EPIC", Title: "Big epic", Kind: core.TaskKindEpic}}
 	scm := &fakeSCM{
@@ -728,7 +728,7 @@ func TestChildPRMergesIntoEpicBranchAndOpensEpicPR(t *testing.T) {
 	}
 
 	if _, err := r.Reconcile(ctx, 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 	}
 	if got := store.runs["child-1"]; got.State != core.RunMerged {
 		t.Fatalf("child state = %s, want merged", got.State)
@@ -760,10 +760,10 @@ func TestEpicPROpensOnceWhenChildrenDone(t *testing.T) {
 	}
 
 	if err := r.reconcileEpics(ctx); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.reconcileEpics(ctx): %v`, err)
 	}
 	if err := r.reconcileEpics(ctx); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.reconcileEpics(ctx): %v`, err)
 	}
 	if len(scm.openedPRs) != 1 {
 		t.Fatalf("epic PRs opened = %d, want 1", len(scm.openedPRs))
@@ -785,7 +785,7 @@ func TestEpicLLMReviewIsDefaultAndAutoMergesOnApproval(t *testing.T) {
 
 	decision, err := r.Reconcile(ctx, 55)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 55): %v`, err)
 	}
 	if decision.Verdict != core.VerdictWait || scm.merges != 0 {
 		t.Fatalf("decision=%+v merges=%d, want wait with no merge", decision, scm.merges)
@@ -798,11 +798,11 @@ func TestEpicLLMReviewIsDefaultAndAutoMergesOnApproval(t *testing.T) {
 	}
 
 	if err := store.SetApproval(ctx, "epic-1", "sha1"); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.SetApproval(ctx, "epic-1", "sha1"): %v`, err)
 	}
 	decision, err = r.Reconcile(ctx, 55)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 55): %v`, err)
 	}
 	if decision.Verdict != core.VerdictMerge || scm.merges != 1 {
 		t.Fatalf("decision=%+v merges=%d, want merge", decision, scm.merges)
@@ -827,7 +827,7 @@ func TestEpicHumanReviewWaitsForManualApproval(t *testing.T) {
 
 	decision, err := r.Reconcile(ctx, 55)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 55): %v`, err)
 	}
 	if decision.Verdict != core.VerdictWait || scm.merges != 0 {
 		t.Fatalf("decision=%+v merges=%d, human gate did not hold", decision, scm.merges)
@@ -836,11 +836,11 @@ func TestEpicHumanReviewWaitsForManualApproval(t *testing.T) {
 		t.Fatalf("human gate spawned %d reviewers", len(h.sessions))
 	}
 	if err := store.SetApproval(ctx, "epic-1", "sha1"); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.SetApproval(ctx, "epic-1", "sha1"): %v`, err)
 	}
 	decision, err = r.Reconcile(ctx, 55)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 55): %v`, err)
 	}
 	if decision.Verdict != core.VerdictMerge || scm.merges != 1 {
 		t.Fatalf("decision=%+v merges=%d, want merge after approval", decision, scm.merges)
@@ -862,7 +862,7 @@ func TestEpicReviewNoneSkipsGate(t *testing.T) {
 
 	decision, err := r.Reconcile(ctx, 55)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(ctx, 55): %v`, err)
 	}
 	if decision.Verdict != core.VerdictMerge || scm.merges != 1 {
 		t.Fatalf("decision=%+v merges=%d, want immediate merge", decision, scm.merges)
@@ -884,11 +884,11 @@ func TestNeedsAgentFixWithGreenChecksAdvancesToMerged(t *testing.T) {
 	run.ObservedSHA = "sha1"
 	run.ObservedBaseSHA = "base-old"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunWaitingCI {
@@ -903,7 +903,7 @@ func TestNeedsAgentFixWithGreenChecksAdvancesToMerged(t *testing.T) {
 
 	r.Policy = fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge, Reason: "all criteria passed"}}
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if got = store.runs["r1"]; got.State != core.RunMerged {
 		t.Fatalf("state = %s, want merged", got.State)
@@ -916,7 +916,7 @@ func TestMergeWithEmptyWorkspacePathStillMerges(t *testing.T) {
 	run := store.runs["r1"]
 	run.WorkspacePath = ""
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	log := &callLog{}
 	scm.log = log
@@ -925,7 +925,7 @@ func TestMergeWithEmptyWorkspacePathStillMerges(t *testing.T) {
 	r.Workspace = ws
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunMerged || scm.merges != 1 {
@@ -945,7 +945,7 @@ func TestMergeRetriesNonFastForwardPushFromRemoteBranch(t *testing.T) {
 	run := store.runs["r1"]
 	run.Branch = "beacon/T-1"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	scm.observeSeq = []core.Observation{
 		{PRNumber: 42, HeadSHA: "sha2", PRState: "open"},
@@ -957,7 +957,7 @@ func TestMergeRetriesNonFastForwardPushFromRemoteBranch(t *testing.T) {
 	r.Workspace = ws
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunMerged || scm.merges != 1 {
@@ -980,7 +980,7 @@ func TestMergeWithFailedRefreshWarnsAndStillMerges(t *testing.T) {
 	run := store.runs["r1"]
 	run.Branch = "beacon/T-1"
 	if err := store.Save(context.Background(), run); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 	}
 	log := &callLog{}
 	scm.log = log
@@ -989,7 +989,7 @@ func TestMergeWithFailedRefreshWarnsAndStillMerges(t *testing.T) {
 	logs := captureDecisions(t)
 
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunMerged || scm.merges != 1 {
@@ -1008,7 +1008,7 @@ func TestMergeSetsHumanReason(t *testing.T) {
 	r, store, _, _, _ := newReconciler(t, core.VerdictMerge,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunMerged {
@@ -1022,7 +1022,7 @@ func TestMergeSetsHumanReason(t *testing.T) {
 func TestExternalMergeSetsHumanReason(t *testing.T) {
 	store := newFakeStore()
 	if err := store.Save(context.Background(), makeRun("r1", 42, core.RunWaitingCI)); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), makeRun("r1", 42, core.RunWaitingCI)): %v`, err)
 	}
 	r := &Reconciler{
 		Store: store,
@@ -1032,7 +1032,7 @@ func TestExternalMergeSetsHumanReason(t *testing.T) {
 		Harness: &fakeHarness{}, Source: &fakeSource{}, Workspace: &fakeWorkspace{},
 	}
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if got.State != core.RunMerged {
@@ -1052,7 +1052,7 @@ func TestReconcilePersistsObservedChecks(t *testing.T) {
 	r, store, _, _, _ := newReconciler(t, core.VerdictWait,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Checks: checks})
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	got := store.runs["r1"]
 	if len(got.Checks) != 1 || got.Checks[0].Name != "ci" {
@@ -1094,12 +1094,12 @@ func TestApplyAndSaveRecordsBothSHAsFromExplicitObservation(t *testing.T) {
 			run.ObservedSHA = "old-head"
 			run.ObservedBaseSHA = "old-base"
 			if err := store.Save(ctx, run); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`store.Save(ctx, run): %v`, err)
 			}
 			r := &Reconciler{Store: store}
 			e := core.Event{Kind: core.EvChecksPending, HeadSHA: tc.obs.HeadSHA}
 			if err := r.applyAndSave(ctx, run, e, tc.obs); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`r.applyAndSave(ctx, run, e, tc.obs): %v`, err)
 			}
 			got := store.runs[run.ID]
 			if got.ObservedSHA != tc.wantHead || got.ObservedBaseSHA != tc.wantBase {
@@ -1147,7 +1147,7 @@ func TestObservationCallSitesPreserveBothSHAs(t *testing.T) {
 				scm.updateErr = errors.New("rebase conflict")
 			}
 			if _, err := r.Reconcile(ctx, 42); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 			}
 			got := store.runs["r1"]
 			if got.ObservedSHA != tc.wantHead || got.ObservedBaseSHA != baseSHA {
@@ -1183,7 +1183,7 @@ func TestWakeSkippedWhenAgentSlotsExhausted(t *testing.T) {
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", FailureExcerpt: "panic: boom"})
 	r.AgentSlots = fakeAgentSlots(0)
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if len(h.wakes) != 0 {
 		t.Fatalf("wakes = %d, want none when no agent slot is free", len(h.wakes))
@@ -1198,7 +1198,7 @@ func TestWakeSkippedWhenSlotStoreFails(t *testing.T) {
 		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
 	}
 	if _, err := r.Reconcile(context.Background(), 42); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
 	}
 	if len(h.wakes) != 0 {
 		t.Fatalf("wakes = %d, want none when the slot store fails", len(h.wakes))
@@ -1251,7 +1251,7 @@ func TestGreenBehindRecordsObservationOnce(t *testing.T) {
 			run.UpdatedAt = time.Now().UTC().Add(-time.Hour)
 			oldUpdated := run.UpdatedAt
 			if err := store.Save(ctx, run); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`store.Save(ctx, run): %v`, err)
 			}
 			r := &Reconciler{
 				Store: store, SCM: &fakeSCM{obs: obs}, Policy: tc.policy,
@@ -1259,7 +1259,7 @@ func TestGreenBehindRecordsObservationOnce(t *testing.T) {
 				Workspace: &fakeWorkspace{}, AutoRebase: true,
 			}
 			if _, err := r.Reconcile(ctx, 42); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
 			}
 			got := store.runs[run.ID]
 			if got.State != tc.wantState {

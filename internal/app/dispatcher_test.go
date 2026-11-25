@@ -37,7 +37,7 @@ func TestTwoPoolConcurrency(t *testing.T) {
 	}
 	res, err := d.Dispatch(context.Background(), 20)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 20): %v`, err)
 	}
 	if len(res.Runs) != 20 {
 		t.Fatalf(" dispatched %d runs", len(res.Runs))
@@ -61,10 +61,10 @@ func TestTwoPoolConcurrency(t *testing.T) {
 	for _, r := range res.Runs {
 		if r.State == core.RunRunning {
 			if err := r.Apply(core.Event{Kind: core.EvPRRegistered, PRNumber: 42}); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`r.Apply(core.Event{Kind: core.EvPRRegistered, PRNumber: 42}): %v`, err)
 			}
 			if err := store.Save(context.Background(), r); err != nil {
-				t.Fatal(err)
+				t.Fatalf(`store.Save(context.Background(), r): %v`, err)
 			}
 			break
 		}
@@ -87,7 +87,7 @@ func TestDispatchMarksCardInWorkspace(t *testing.T) {
 		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
 	}
 	if _, err := d.Dispatch(context.Background(), 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	if len(src.marked) != 1 || src.marked[0].id != "T-MARK" ||
 		src.marked[0].path != "/ws/T-MARK" || src.marked[0].status != "in_progress" {
@@ -108,7 +108,7 @@ func TestDispatchTellsChildAgentTheBaseBranch(t *testing.T) {
 		Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
 	}
 	if _, err := d.Dispatch(context.Background(), 2); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 2): %v`, err)
 	}
 	if len(h.prompts) != 2 {
 		t.Fatalf("prompts = %d, want 2", len(h.prompts))
@@ -139,7 +139,7 @@ func TestDispatchDoesNotRetryActiveTask(t *testing.T) {
 	active := core.NewRun("r-existing", tasks[0].ID, time.Now().UTC())
 	active.State = core.RunRunning
 	if err := store.Save(context.Background(), active); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), active): %v`, err)
 	}
 	d := &Dispatcher{
 		Source: src, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
@@ -148,7 +148,7 @@ func TestDispatchDoesNotRetryActiveTask(t *testing.T) {
 	}
 	res, err := d.Dispatch(context.Background(), 20)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 20): %v`, err)
 	}
 	for _, s := range res.Skipped {
 		if s.TaskID == tasks[0].ID {
@@ -178,7 +178,7 @@ func TestDispatchReportsStructuredConflicts(t *testing.T) {
 	active.State = core.RunRunning
 	active.Scope = []core.ScopePath{core.ScopeFile("docs/tasks/c.md")}
 	if err := store.Save(context.Background(), active); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), active): %v`, err)
 	}
 	d := &Dispatcher{
 		Source: &fakeSource{tasks: tasks}, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
@@ -187,7 +187,7 @@ func TestDispatchReportsStructuredConflicts(t *testing.T) {
 	}
 	res, err := d.Dispatch(context.Background(), 20)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 20): %v`, err)
 	}
 	if len(res.Runs) != 1 || res.Runs[0].TaskID != "A" {
 		t.Fatalf("unexpected runs: %+v", res.Runs)
@@ -255,11 +255,11 @@ func assertFailureJSON(t *testing.T, failures []DispatchFailure, want string) {
 	t.Helper()
 	b, err := json.Marshal(failures)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Marshal(failures): %v`, err)
 	}
 	var got []map[string]any
 	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`json.Unmarshal(b, &got): %v`, err)
 	}
 	if len(got) != 1 || got[0]["Err"] != want {
 		t.Fatalf("failure JSON = %s, want Err %q", b, want)
@@ -282,7 +282,7 @@ func TestDispatchFailureJSONIncludesWorkspaceConflict(t *testing.T) {
 	}
 	res, err := d.Dispatch(context.Background(), 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	assertFailureJSON(t, res.Failures, want)
 }
@@ -300,7 +300,7 @@ func TestDispatchKeepsRunWithLiveWorkerAfterStatusFailure(t *testing.T) {
 	}
 	res, err := d.Dispatch(ctx, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(ctx, 1): %v`, err)
 	}
 	if len(res.Failures) != 1 {
 		t.Fatalf("failures = %d, want 1", len(res.Failures))
@@ -320,7 +320,7 @@ func TestDispatchKeepsRunWithLiveWorkerAfterStatusFailure(t *testing.T) {
 
 	c := &Control{Store: store, Harness: h, Workspace: ws}
 	if err := c.WatchPR(ctx, run.ID, 43); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`c.WatchPR(ctx, run.ID, 43): %v`, err)
 	}
 	if bound := store.runs[run.ID]; bound.State != core.RunWaitingCI || bound.PRNumber != 43 {
 		t.Fatalf("state=%s pr=%d, want %s/43", bound.State, bound.PRNumber, core.RunWaitingCI)
@@ -339,7 +339,7 @@ func TestDispatchClosesRunWhenWorkerIsGone(t *testing.T) {
 		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
 	}
 	if _, err := d.Dispatch(ctx, 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(ctx, 1): %v`, err)
 	}
 	recent, err := store.ListRecent(ctx, 10)
 	if err != nil || len(recent) != 1 {
@@ -371,7 +371,7 @@ func TestDispatchSpawnFailureForceRemovesDirtyWorktree(t *testing.T) {
 	}
 	res, err := d.Dispatch(ctx, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(ctx, 1): %v`, err)
 	}
 	if len(res.Failures) != 1 {
 		t.Fatalf("failures = %d, want 1", len(res.Failures))
@@ -402,7 +402,7 @@ func TestDispatchRetriesTaskAfterSpawnFailureForceRemoval(t *testing.T) {
 	d.Harness = &fakeHarness{}
 	second, err := d.Dispatch(ctx, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(ctx, 1): %v`, err)
 	}
 	if len(second.Failures) != 0 || len(second.Runs) != 1 {
 		t.Fatalf("second dispatch: %+v, want one started run", second)
@@ -435,7 +435,7 @@ func TestDispatchFailureJSONIncludesSpawnTimeout(t *testing.T) {
 	}
 	res, err := d.Dispatch(context.Background(), 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	assertFailureJSON(t, res.Failures, want)
 }
@@ -459,7 +459,7 @@ func TestDispatchPrependsWorkerInstructions(t *testing.T) {
 	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
 	d := newInstructionDispatcher(h, custom)
 	if _, err := d.Dispatch(context.Background(), 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	if len(h.requests) != 1 {
 		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
@@ -477,7 +477,7 @@ func TestDispatchWithoutWorkerInstructionsKeepsStockPrompt(t *testing.T) {
 	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
 	d := newInstructionDispatcher(h, "")
 	if _, err := d.Dispatch(context.Background(), 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	if len(h.requests) != 1 {
 		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
@@ -503,7 +503,7 @@ func TestDispatchResolvesModelFromParentSession(t *testing.T) {
 	}
 	ctx := WithParentSession(context.Background(), "ses_parent")
 	if _, err := d.Dispatch(ctx, 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(ctx, 1): %v`, err)
 	}
 	if len(parents) != 1 || parents[0] != "ses_parent" {
 		t.Fatalf("resolved parents = %v, want [ses_parent]", parents)
@@ -524,7 +524,7 @@ func TestDispatchWithoutResolverLeavesHarnessDefault(t *testing.T) {
 	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
 	d := newInstructionDispatcher(h, "")
 	if _, err := d.Dispatch(context.Background(), 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	if len(h.requests) != 1 {
 		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
@@ -558,7 +558,7 @@ func TestDispatchEnsuresMissingEpicBranchBeforeWorkspace(t *testing.T) {
 	}
 	res, err := d.Dispatch(context.Background(), 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	if len(res.Failures) != 0 {
 		t.Fatalf("failures = %+v", res.Failures)
@@ -588,7 +588,7 @@ func TestDispatchReportsBranchCreationFailure(t *testing.T) {
 	}
 	res, err := d.Dispatch(context.Background(), 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	if len(res.Failures) != 1 || !strings.Contains(res.Failures[0].Err, "base branch: push failed") {
 		t.Fatalf("failures = %+v, want the branch error", res.Failures)
@@ -606,7 +606,7 @@ func TestDispatchLeavesMainTasksWithoutBranchWork(t *testing.T) {
 		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
 	}
 	if _, err := d.Dispatch(context.Background(), 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
 	}
 	if len(ws.branches) != 0 || ws.creates != 1 {
 		t.Fatalf("branches = %v, creates = %d, want no branch work", ws.branches, ws.creates)
@@ -629,7 +629,7 @@ func TestAgentSlotsAvailableCountsActiveAgents(t *testing.T) {
 	pending.State = core.RunPending
 	for _, run := range []*core.Run{running, pending} {
 		if err := store.Save(context.Background(), run); err != nil {
-			t.Fatal(err)
+			t.Fatalf(`store.Save(context.Background(), run): %v`, err)
 		}
 	}
 	d := &Dispatcher{Store: store, Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 2}}
@@ -639,7 +639,7 @@ func TestAgentSlotsAvailableCountsActiveAgents(t *testing.T) {
 	second := core.NewRun("r-run-2", "T-3", time.Now().UTC())
 	second.State = core.RunNeedsAgentFix
 	if err := store.Save(context.Background(), second); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), second): %v`, err)
 	}
 	if got := d.Available(context.Background()); got != 0 {
 		t.Fatalf("Available = %d, want 0 after two active agents", got)
@@ -705,7 +705,7 @@ func TestConcurrentDispatchAndPromotionRespectMaxActiveAgents(t *testing.T) {
 
 	active, err := store.ListActive(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.ListActive(context.Background()): %v`, err)
 	}
 	agents := 0
 	for _, r := range active {
