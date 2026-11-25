@@ -1,3 +1,4 @@
+// Package opencode implements the AgentHarness adapter for the OpenCode HTTP API.
 package opencode
 
 import (
@@ -20,8 +21,10 @@ import (
 	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
+// requestTimeout bounds each OpenCode HTTP request.
 const requestTimeout = 30 * time.Second
 
+// Harness is an AgentHarness that talks to a running OpenCode server.
 type Harness struct {
 	Endpoint        string
 	Repo            string
@@ -42,8 +45,10 @@ type Harness struct {
 	runs      map[string]core.RunID
 }
 
+// OpenCode is an alias kept for callers that use the older name.
 type OpenCode = Harness
 
+// Config holds the settings used to build a Harness.
 type Config struct {
 	Endpoint        string
 	Repo            string
@@ -72,6 +77,7 @@ func New(cfg Config) *Harness {
 	return h
 }
 
+// init lazily fills in defaults and allocates the harness channels and maps.
 func (h *Harness) init() {
 	h.initOnce.Do(func() {
 		if h.Endpoint == "" {
@@ -100,11 +106,13 @@ func (h *Harness) init() {
 	})
 }
 
+// base returns the configured OpenCode endpoint after initialization.
 func (h *Harness) base() string {
 	h.init()
 	return h.Endpoint
 }
 
+// firstNonEmpty returns the first non-empty string among a and b.
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
@@ -129,12 +137,14 @@ func (h *Harness) modelRef(req core.SpawnRequest) core.ModelRef {
 	return core.ModelRef{}
 }
 
+// messageID builds a unique prompt id with a prefix and random suffix.
 func messageID(prefix string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	return fmt.Sprintf("msg_%s_%s_%d", prefix, hex.EncodeToString(b[:]), time.Now().UnixNano())
 }
 
+// sessionIDFromJSON extracts a session id from an OpenCode response body.
 func sessionIDFromJSON(data []byte) string {
 	var envelope struct {
 		ID   string `json:"id"`
@@ -163,6 +173,7 @@ func ApplyAuth(req *http.Request, token string) {
 	}
 }
 
+// do sends an HTTP request to OpenCode and returns the body and status.
 func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
 	h.init()
 	var reader io.Reader
@@ -198,6 +209,7 @@ func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte
 	return data, resp.StatusCode, nil
 }
 
+// prompt posts a steering prompt to an OpenCode session.
 func (h *Harness) prompt(ctx context.Context, session, text, id string) error {
 	path := "/api/session/" + url.PathEscape(session) + "/prompt"
 	body := map[string]any{
@@ -227,6 +239,7 @@ func (h *Harness) NotifyParent(ctx context.Context, sessionID, text string) erro
 	return err
 }
 
+// bind records the run that owns a session.
 func (h *Harness) bind(session string, run core.RunID) {
 	if session == "" || run == "" {
 		return
@@ -237,6 +250,7 @@ func (h *Harness) bind(session string, run core.RunID) {
 	h.mu.Unlock()
 }
 
+// runFor returns the run bound to a session.
 func (h *Harness) runFor(session string) (core.RunID, bool) {
 	h.init()
 	h.mu.RLock()
@@ -257,6 +271,7 @@ func (h *Harness) unbind(session string) {
 	h.mu.Unlock()
 }
 
+// Spawn creates and configures an OpenCode session, then sends the initial prompt.
 func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
 	h.init()
 	parent := firstNonEmpty(req.ParentSessionID, h.ParentSessionID)
@@ -293,12 +308,14 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	return core.Session{ID: id, PR: core.PRFromText(string(data))}, nil
 }
 
+// Wake binds a wake context to a session and sends a limited wake prompt.
 func (h *Harness) Wake(ctx context.Context, sessionID string, w core.WakeContext) error {
 	h.init()
 	h.bind(sessionID, w.RunID)
 	return h.prompt(ctx, sessionID, core.WakeTextLimited(w, h.ExcerptLimit), messageID("wake"))
 }
 
+// Stop deletes an OpenCode session.
 func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
@@ -311,6 +328,7 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	return err
 }
 
+// IsAlive reports whether an OpenCode session still exists.
 func (h *Harness) IsAlive(ctx context.Context, sessionID string) (bool, error) {
 	if sessionID == "" {
 		return false, nil
@@ -326,6 +344,7 @@ func (h *Harness) IsAlive(ctx context.Context, sessionID string) (bool, error) {
 	return true, nil
 }
 
+// canonicalPath resolves symlinks in path, falling back to a clean path.
 func canonicalPath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return resolved
@@ -373,11 +392,13 @@ func (h *Harness) RefreshWorktrees(ctx context.Context) error {
 	return nil
 }
 
+// Events returns the channel that carries session idle events.
 func (h *Harness) Events() <-chan core.HarnessEvent {
 	h.init()
 	return h.events
 }
 
+// Harness and OpenCode satisfy the core harness, worktree and idle ports.
 var (
 	_ core.AgentHarness      = (*Harness)(nil)
 	_ core.AgentHarness      = (*OpenCode)(nil)
