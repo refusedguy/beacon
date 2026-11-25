@@ -3,6 +3,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,6 +25,10 @@ type GitWorktree struct {
 	Dir       string
 	Timeout   time.Duration
 	Refresher core.WorktreeRefresher
+
+	// commandHook is a test seam. Production leaves it nil. A non-nil hook
+	// fails a chosen git subcommand by returning an error before it runs.
+	commandHook func(dir string, args []string) error
 }
 
 func New(repo, base, dir string) (*GitWorktree, error) {
@@ -54,6 +59,11 @@ func (g *GitWorktree) run(ctx context.Context, args ...string) (string, error) {
 }
 
 func (g *GitWorktree) runInDir(ctx context.Context, dir string, args ...string) (string, error) {
+	if g.commandHook != nil {
+		if err := g.commandHook(dir, args); err != nil {
+			return "", fmt.Errorf("git -C %s %s (injected): %w", dir, strings.Join(args, " "), err)
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, g.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "git", append([]string{"-C", dir}, args...)...)
@@ -166,9 +176,9 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	}
 	mergeBase, err := g.run(ctx, "merge-base", "origin/"+base, branch)
 	if err != nil {
-		_, _ = g.run(ctx, "worktree", "remove", path)
+		_, cleanupErr := g.run(ctx, "worktree", "remove", path)
 		g.refresh(ctx)
-		return core.Workspace{}, err
+		return core.Workspace{}, joinCleanup(err, "remove worktree after failed merge-base", cleanupErr)
 	}
 	return core.Workspace{Path: path, Branch: branch, Base: strings.TrimSpace(mergeBase)}, nil
 }
@@ -242,15 +252,33 @@ func (g *GitWorktree) RebaseBase(ctx context.Context, ws core.Workspace, base st
 	args := []string{"rebase"}
 	// A card write that lost a race with a merge must not stop a rebase. The
 	// stash is restored afterwards, so an uncommitted new card stays untouched.
-	if dirty, onlyCards, err := g.cardOnlyDirt(ctx, ws.Path); err == nil && dirty && onlyCards {
+	dirty, onlyCards, err := g.cardOnlyDirt(ctx, ws.Path)
+	if err != nil {
+		return err
+	}
+	if dirty && onlyCards {
 		args = append(args, "--autostash")
 	}
 	args = append(args, "origin/"+base)
 	if _, err := g.runInDir(ctx, ws.Path, args...); err != nil {
-		_, _ = g.runInDir(ctx, ws.Path, "rebase", "--abort")
-		return err
+		return joinCleanup(err, "abort rebase", g.abortRebase(ctx, ws.Path))
 	}
 	return nil
+}
+
+// abortRebase returns the worktree to a non-rebase state. A failed abort can
+// leave git's rebase state behind and block the next rebase, so a quit follows
+// as a fallback. Every failure is reported, none is dropped.
+func (g *GitWorktree) abortRebase(ctx context.Context, path string) error {
+	_, abortErr := g.runInDir(ctx, path, "rebase", "--abort")
+	if abortErr == nil {
+		return nil
+	}
+	errs := []error{fmt.Errorf("rebase --abort: %w", abortErr)}
+	if _, err := g.runInDir(ctx, path, "rebase", "--quit"); err != nil {
+		errs = append(errs, fmt.Errorf("rebase --quit: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 // isNonFastForward recognizes git's stable markers for a push rejected because
@@ -363,7 +391,9 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 		return err
 	}
 	if ws.Branch != "" {
-		_, _ = g.run(ctx, "branch", "-d", ws.Branch)
+		if _, err := g.run(ctx, "branch", "-d", ws.Branch); err != nil {
+			return fmt.Errorf("delete branch %s: %w", ws.Branch, err)
+		}
 	}
 	return nil
 }
@@ -372,7 +402,18 @@ func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error 
 	defer g.refresh(ctx)
 	_, err := g.run(ctx, "worktree", "remove", "--force", ws.Path)
 	if err == nil && ws.Branch != "" {
-		_, _ = g.run(ctx, "branch", "-D", ws.Branch)
+		if _, err := g.run(ctx, "branch", "-D", ws.Branch); err != nil {
+			return fmt.Errorf("delete branch %s: %w", ws.Branch, err)
+		}
 	}
 	return err
+}
+
+// joinCleanup keeps the primary failure and appends a cleanup failure so a
+// caller sees both. A nil cleanup leaves the primary error unchanged.
+func joinCleanup(primary error, what string, cleanup error) error {
+	if cleanup == nil {
+		return primary
+	}
+	return fmt.Errorf("%w; %s: %w", primary, what, cleanup)
 }
