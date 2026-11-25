@@ -32,6 +32,8 @@ type Run struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+// Action is a control verb sent to the loopback API. The TUI is a separate
+// module and cannot import pkg/core, so this list mirrors core.ControlActions.
 type Action string
 
 const (
@@ -39,7 +41,35 @@ const (
 	ActionUnblock Action = "unblock"
 	ActionCancel  Action = "cancel"
 	ActionRetry   Action = "retry"
+	ActionNudge   Action = "nudge"
+	ActionWatch   Action = "watch"
 )
+
+// actions is the single vocabulary used by both the parser and the validator.
+var actions = [...]Action{
+	ActionApprove,
+	ActionUnblock,
+	ActionCancel,
+	ActionRetry,
+	ActionNudge,
+	ActionWatch,
+}
+
+// ParseAction converts a wire verb into its typed form. Unknown verbs keep
+// their text so the caller can report what it received.
+func ParseAction(raw string) Action {
+	return Action(raw)
+}
+
+// Valid reports whether a belongs to the control vocabulary.
+func (a Action) Valid() bool {
+	for _, known := range actions {
+		if a == known {
+			return true
+		}
+	}
+	return false
+}
 
 type ControlRequest struct {
 	Action Action `json:"action"`
@@ -144,6 +174,9 @@ func (c *Client) Runs(ctx context.Context) ([]Run, error) {
 }
 
 func (c *Client) Control(ctx context.Context, req ControlRequest) (ControlResult, error) {
+	if !req.Action.Valid() {
+		return ControlResult{}, fmt.Errorf("tui: unknown action %q", req.Action)
+	}
 	if req.RunID == "" {
 		return ControlResult{}, fmt.Errorf("tui: control needs a run id")
 	}
