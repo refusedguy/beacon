@@ -14,12 +14,14 @@ import (
 	"time"
 )
 
+// connectionInfo is the daemon's loopback address, auth token and process id.
 type connectionInfo struct {
 	Addr  string `json:"addr"`
 	Token string `json:"token"`
 	PID   int    `json:"pid"`
 }
 
+// acquireLock takes an exclusive file lock in dir, failing when another daemon holds it.
 func acquireLock(dir string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -35,6 +37,7 @@ func acquireLock(dir string) (*os.File, error) {
 	return f, nil
 }
 
+// writeConnection records the loopback address and a fresh token, returning the token.
 func writeConnection(dir, addr string) (string, error) {
 	var b [24]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -53,6 +56,7 @@ func writeConnection(dir, addr string) (string, error) {
 	return token, nil
 }
 
+// readConnection loads the daemon's loopback connection record from dir.
 func readConnection(dir string) (*connectionInfo, error) {
 	b, err := os.ReadFile(filepath.Join(dir, "connection.json"))
 	if err != nil {
@@ -65,6 +69,7 @@ func readConnection(dir string) (*connectionInfo, error) {
 	return &info, nil
 }
 
+// removeConnection deletes the connection record on shutdown.
 func removeConnection(dir string) {
 	path := filepath.Join(dir, "connection.json")
 	// Shutdown cleanup is best effort: the lock is already released and the
@@ -74,6 +79,7 @@ func removeConnection(dir string) {
 	}
 }
 
+// daemonStateFile and daemonErrorFile name the daemon status records; heartbeatEvery and staleAfter set heartbeat cadence and freshness.
 const (
 	daemonStateFile = "daemon.json"
 	daemonErrorFile = "daemon-error.json"
@@ -81,6 +87,7 @@ const (
 	staleAfter      = 30 * time.Second
 )
 
+// daemonState is the on-disk heartbeat record written by a running daemon.
 type daemonState struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started_at"`
@@ -88,12 +95,14 @@ type daemonState struct {
 	Heartbeat time.Time `json:"heartbeat"`
 }
 
+// daemonError is the on-disk record of the daemon's most recent fatal error.
 type daemonError struct {
 	At      time.Time `json:"at"`
 	Kind    string    `json:"kind"`
 	Message string    `json:"message"`
 }
 
+// daemonStatus is the liveness report built from the state and error records.
 type daemonStatus struct {
 	State              string       `json:"state"`
 	PID                int          `json:"pid,omitempty"`
@@ -104,6 +113,7 @@ type daemonStatus struct {
 	Error              *daemonError `json:"error,omitempty"`
 }
 
+// daemonTracker writes heartbeats until closed and owns the state file lifecycle.
 type daemonTracker struct {
 	mu    sync.Mutex
 	dir   string
@@ -112,6 +122,7 @@ type daemonTracker struct {
 	done  chan struct{}
 }
 
+// startDaemonState writes the initial state and starts the heartbeat loop.
 func startDaemonState(dir string) (*daemonTracker, error) {
 	root, err := filepath.Abs(filepath.Dir(dir))
 	if err != nil {
@@ -135,6 +146,7 @@ func startDaemonState(dir string) (*daemonTracker, error) {
 	return t, nil
 }
 
+// loop refreshes the heartbeat on a ticker until Close stops it.
 func (t *daemonTracker) loop() {
 	defer close(t.done)
 	tick := time.NewTicker(heartbeatEvery)
@@ -151,6 +163,7 @@ func (t *daemonTracker) loop() {
 	}
 }
 
+// refresh updates the heartbeat timestamp and writes the state atomically.
 func (t *daemonTracker) refresh() error {
 	t.mu.Lock()
 	t.state.Heartbeat = time.Now().UTC()
@@ -159,6 +172,7 @@ func (t *daemonTracker) refresh() error {
 	return writeJSONAtomic(filepath.Join(t.dir, daemonStateFile), state)
 }
 
+// write persists the current daemon state atomically.
 func (t *daemonTracker) write() error {
 	t.mu.Lock()
 	state := t.state
@@ -166,6 +180,7 @@ func (t *daemonTracker) write() error {
 	return writeJSONAtomic(filepath.Join(t.dir, daemonStateFile), state)
 }
 
+// Close stops the heartbeat loop and removes the state file.
 func (t *daemonTracker) Close() {
 	close(t.stop)
 	<-t.done
@@ -177,6 +192,7 @@ func (t *daemonTracker) Close() {
 	}
 }
 
+// writeDaemonError persists a fatal error record for the doctor command to read.
 func writeDaemonError(dir, kind string, err error) {
 	record := daemonError{At: time.Now().UTC(), Kind: kind, Message: err.Error()}
 	if writeErr := writeJSONAtomic(filepath.Join(dir, daemonErrorFile), record); writeErr != nil {
@@ -184,6 +200,7 @@ func writeDaemonError(dir, kind string, err error) {
 	}
 }
 
+// readDaemonStatus reconstructs daemon liveness from the state and error files.
 func readDaemonStatus(dir string) daemonStatus {
 	status := daemonStatus{State: "absent"}
 	data, err := os.ReadFile(filepath.Join(dir, daemonStateFile))
@@ -222,6 +239,7 @@ func readDaemonStatus(dir string) daemonStatus {
 	return status
 }
 
+// pidAlive reports whether a process with pid exists or can be signaled.
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -230,6 +248,7 @@ func pidAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// writeJSONAtomic encodes v to a temp file and renames it into place.
 func writeJSONAtomic(path string, v any) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".beacon-state-*")
 	if err != nil {

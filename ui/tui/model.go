@@ -10,17 +10,20 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// loadTimeout bounds API calls; visibleRows caps the number of displayed runs.
 const (
 	loadTimeout = 5 * time.Second
 	visibleRows = 20
 )
 
+// cursorStyle, headerStyle and errorStyle color the run list and status line.
 var (
 	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	headerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("204"))
 )
 
+// model is the Bubble Tea state for the run monitor.
 type model struct {
 	client *Client
 	runs   []Run
@@ -30,11 +33,13 @@ type model struct {
 	width  int
 }
 
+// runsMsg carries a fetched run snapshot or its error.
 type runsMsg struct {
 	runs []Run
 	err  error
 }
 
+// actionMsg carries the result of a control action.
 type actionMsg struct {
 	action Action
 	runID  string
@@ -42,16 +47,20 @@ type actionMsg struct {
 	err    error
 }
 
+// refreshMsg requests a re-read of runs after an event.
 type refreshMsg struct{}
 
+// newModel builds the initial monitor model for c.
 func newModel(c *Client) model {
 	return model{client: c, status: "loading runs from " + c.Endpoint}
 }
 
+// Init starts the first run fetch.
 func (m model) Init() tea.Cmd {
 	return m.reload()
 }
 
+// reload returns a command that fetches the current run snapshot.
 func (m model) reload() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
@@ -61,6 +70,7 @@ func (m model) reload() tea.Cmd {
 	}
 }
 
+// selected returns the run under the cursor.
 func (m model) selected() (Run, bool) {
 	if m.cursor < 0 || m.cursor >= len(m.runs) {
 		return Run{}, false
@@ -68,6 +78,7 @@ func (m model) selected() (Run, bool) {
 	return m.runs[m.cursor], true
 }
 
+// apply returns a command that sends action for the selected run.
 func (m model) apply(action Action) tea.Cmd {
 	run, ok := m.selected()
 	if !ok {
@@ -87,6 +98,7 @@ func (m model) apply(action Action) tea.Cmd {
 	}
 }
 
+// Update applies a Bubble Tea message to the model.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -129,6 +141,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// onKey handles a key press and returns the updated model.
 func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c", "esc":
@@ -153,6 +166,7 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// View renders the run list and status line.
 func (m model) View() string {
 	var b strings.Builder
 	title := "Beacon runs"
@@ -197,6 +211,7 @@ func (m model) View() string {
 	return b.String()
 }
 
+// truncate shortens s to limit runes with an ellipsis.
 func truncate(s string, limit int) string {
 	if limit <= 0 {
 		return ""
@@ -208,6 +223,7 @@ func truncate(s string, limit int) string {
 	return string(runes[:limit-1]) + "…"
 }
 
+// maxInt returns the larger of a and b.
 func maxInt(a, b int) int {
 	if a > b {
 		return a
