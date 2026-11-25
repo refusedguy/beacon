@@ -260,8 +260,11 @@ export const nextStepLine = (run) => run ? (NEXT_STEPS[str(run.state).toLowerCas
 // The host truncates from the middle, so clipped text is cut here from the end.
 // No ellipsis ever appears in the middle of a rendered string.
 export function truncate(value, width) {
-  const text = str(value)
-  return text.length <= width ? text : width <= 1 ? text.slice(0, width) : `${text.slice(0, width - 1)}…`
+  const chars = Array.from(str(value))
+  if (chars.length <= width) return chars.join("")
+  if (width <= 0) return ""
+  if (width === 1) return "…"
+  return `${chars.slice(0, width - 1).join("")}…`
 }
 
 const REASON_RULES = [
