@@ -64,8 +64,30 @@ func (s *changeSubscribers) run(ctx context.Context, src <-chan int) {
 	}
 }
 
+// apiStatus and apiControl are the whole service surface the loopback API
+// needs. Keeping them as interfaces prevents handlers from reaching the
+// dispatcher, SCM, harness or task services behind the wiring root.
+type apiStatus interface {
+	Active(ctx context.Context) ([]*core.Run, error)
+}
+
+type apiControl interface {
+	WatchPR(ctx context.Context, id core.RunID, pr int) error
+	Approve(ctx context.Context, id core.RunID, sha string) error
+	Unblock(ctx context.Context, id core.RunID) error
+	Cancel(ctx context.Context, id core.RunID) error
+	Retry(ctx context.Context, id core.RunID) error
+	Nudge(ctx context.Context, id core.RunID, message string) error
+}
+
+// apiServices is the slice of the wiring root exposed to the API server.
+type apiServices struct {
+	status  apiStatus
+	control apiControl
+}
+
 type apiServer struct {
-	wiring      *wiring
+	services    apiServices
 	token       string
 	eventStream <-chan core.HarnessEvent
 	changes     *changeSubscribers
@@ -100,7 +122,7 @@ func (a *apiServer) runs(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	runs, err := a.wiring.status.Active(r.Context())
+	runs, err := a.services.status.Active(r.Context())
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
@@ -133,17 +155,17 @@ func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
 	var err error
 	switch action {
 	case core.ControlWatch:
-		err = a.wiring.control.WatchPR(r.Context(), id, in.PR)
+		err = a.services.control.WatchPR(r.Context(), id, in.PR)
 	case core.ControlApprove:
-		err = a.wiring.control.Approve(r.Context(), id, in.SHA)
+		err = a.services.control.Approve(r.Context(), id, in.SHA)
 	case core.ControlUnblock:
-		err = a.wiring.control.Unblock(r.Context(), id)
+		err = a.services.control.Unblock(r.Context(), id)
 	case core.ControlCancel:
-		err = a.wiring.control.Cancel(r.Context(), id)
+		err = a.services.control.Cancel(r.Context(), id)
 	case core.ControlRetry:
-		err = a.wiring.control.Retry(r.Context(), id)
+		err = a.services.control.Retry(r.Context(), id)
 	case core.ControlNudge:
-		err = a.wiring.control.Nudge(r.Context(), id, in.Message)
+		err = a.services.control.Nudge(r.Context(), id, in.Message)
 	default:
 		http.Error(rw, "unknown action", http.StatusBadRequest)
 		return

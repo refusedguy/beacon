@@ -69,7 +69,12 @@ func newServeCommand(configPath *string) *cobra.Command {
 			errCh := make(chan error, 3)
 			go func() { errCh <- w.recon.Run(ctx, changeViews[0]) }()
 
-			api := &apiServer{wiring: w, token: token, eventStream: events[1], changes: subs}
+			api := &apiServer{
+				services:    apiServices{status: w.status, control: w.control},
+				token:       token,
+				eventStream: events[1],
+				changes:     subs,
+			}
 			srv := &http.Server{Addr: addr, Handler: api.handler(), ReadHeaderTimeout: 5 * time.Second}
 			go func() {
 				<-ctx.Done()
