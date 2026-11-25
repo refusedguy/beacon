@@ -52,6 +52,133 @@ type TaskBatchCreator interface {
 	CreateMany(ctx context.Context, tasks []core.Task) ([]core.Task, error)
 }
 
+// CardWriter is the source role TaskCreator uses for cards. It writes a whole
+// graph in one call and lists what the source already knows.
+type CardWriter interface {
+	Available(ctx context.Context) ([]core.Task, error)
+	Write(ctx context.Context, tasks []core.Task) ([]core.Task, error)
+	Remove(ctx context.Context, ids ...core.TaskID)
+}
+
+// sourceCardWriter adapts TaskSource and its optional batch and remove
+// capabilities to CardWriter. Removal is best effort: a failed rollback must
+// not hide the original create error.
+type sourceCardWriter struct{ Source TaskSource }
+
+func (w sourceCardWriter) Available(ctx context.Context) ([]core.Task, error) {
+	return w.Source.ListAvailable(ctx)
+}
+
+func (w sourceCardWriter) Write(ctx context.Context, tasks []core.Task) ([]core.Task, error) {
+	if batch, ok := w.Source.(TaskBatchCreator); ok {
+		return batch.CreateMany(ctx, tasks)
+	}
+	out := make([]core.Task, 0, len(tasks))
+	for _, task := range tasks {
+		created, err := w.Source.Create(ctx, task)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, created)
+	}
+	return out, nil
+}
+
+func (w sourceCardWriter) Remove(ctx context.Context, ids ...core.TaskID) {
+	remover, ok := w.Source.(TaskRemover)
+	if !ok {
+		return
+	}
+	for _, id := range ids {
+		_ = remover.Remove(ctx, id)
+	}
+}
+
+// CardPublisher commits one pathspec. The workspace and root are bound at
+// construction, so a caller names only what changed and why.
+type CardPublisher interface {
+	Publish(ctx context.Context, pathspec, message string) error
+}
+
+type pathCardPublisher struct {
+	ws   PathCommitter
+	root core.Workspace
+}
+
+func (p pathCardPublisher) Publish(ctx context.Context, pathspec, message string) error {
+	return publishPath(ctx, p.ws, p.root, pathspec, message)
+}
+
+// IDFactory assigns IDs to new cards. Epic IDs stay stable for the same title
+// and plan, while batch IDs depend on the batch contents.
+type IDFactory interface {
+	New() (core.TaskID, error)
+	ForEpic(title string, plan []core.ChildSpec) core.TaskID
+	ForBatch(seed string, index int) core.TaskID
+}
+
+type defaultIDFactory struct{}
+
+func (defaultIDFactory) New() (core.TaskID, error) { return newTaskID() }
+
+func (defaultIDFactory) ForEpic(title string, plan []core.ChildSpec) core.TaskID {
+	return epicTaskID(title, plan)
+}
+
+func (defaultIDFactory) ForBatch(seed string, index int) core.TaskID {
+	return batchTaskID(seed, index)
+}
+
+// IdempotencyCache remembers completed create operations so a repeated call
+// returns the same cards without writing them again.
+type IdempotencyCache struct {
+	mu      sync.Mutex
+	created map[string][]core.Task
+	batch   map[core.TaskID]CreatedTask
+}
+
+func (c *IdempotencyCache) Created(key string) ([]core.Task, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tasks, ok := c.created[key]
+	return tasks, ok
+}
+
+func (c *IdempotencyCache) RememberCreated(key string, tasks []core.Task) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.created == nil {
+		c.created = make(map[string][]core.Task)
+	}
+	c.created[key] = tasks
+}
+
+func (c *IdempotencyCache) Batch(ids []core.TaskID) map[core.TaskID]CreatedTask {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[core.TaskID]CreatedTask, len(ids))
+	for _, id := range ids {
+		if task, ok := c.batch[id]; ok {
+			out[id] = task
+		}
+	}
+	return out
+}
+
+func (c *IdempotencyCache) RememberBatch(ids []core.TaskID, results []CreatedTask) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.batch == nil {
+		c.batch = make(map[core.TaskID]CreatedTask)
+	}
+	for i, out := range results {
+		if i >= len(ids) {
+			break
+		}
+		c.batch[ids[i]] = out
+	}
+}
+
 // NonFastForwardError marks a push rejected because the remote ref advanced.
 // A caller retries the publish once after rebasing on the latest origin base.
 type NonFastForwardError struct{ Err error }
@@ -114,9 +241,31 @@ type TaskCreator struct {
 	Root      core.Workspace
 	Store     TaskGraphStore
 
-	mu      sync.Mutex
-	created map[string][]core.Task
-	batch   map[core.TaskID]CreatedTask
+	Writer    CardWriter
+	Publisher CardPublisher
+	IDs       IDFactory
+	Cache     IdempotencyCache
+}
+
+func (c *TaskCreator) writer() CardWriter {
+	if c.Writer != nil {
+		return c.Writer
+	}
+	return sourceCardWriter{Source: c.Source}
+}
+
+func (c *TaskCreator) publisher() CardPublisher {
+	if c.Publisher != nil {
+		return c.Publisher
+	}
+	return pathCardPublisher{ws: c.Workspace, root: c.Root}
+}
+
+func (c *TaskCreator) ids() IDFactory {
+	if c.IDs != nil {
+		return c.IDs
+	}
+	return defaultIDFactory{}
 }
 
 func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTask, error) {
@@ -125,22 +274,23 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	if title == "" {
 		return out, core.Errorf(core.CodeInvalidInput, "task title is required")
 	}
-	kind := normalizeKind(in.Kind)
+	kind := core.NormalizeTaskKind(in.Kind)
 	epic := kind == core.TaskKindEpic
 	id := core.TaskID(strings.TrimSpace(in.ID))
 	if id == "" && epic {
-		id = epicTaskID(title, in.Plan)
+		id = c.ids().ForEpic(title, in.Plan)
 	}
 	if id == "" {
 		var err error
-		if id, err = newTaskID(); err != nil {
+		if id, err = c.ids().New(); err != nil {
 			return out, err
 		}
 	}
-	children := childTasks(id, in.Plan)
+	children := epicChildren(id, in.Plan)
 	key := idempotencyKey(id, children)
+	writer := c.writer()
 	if epic {
-		if existing, ok := c.lookup(ctx, key, id, children); ok {
+		if existing, ok := lookupCreated(ctx, writer, &c.Cache, key, id, children); ok {
 			return c.result(existing), nil
 		}
 		// Children fetch this branch before the epic opens a PR, so publish it
@@ -155,7 +305,7 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		Scope: taskScopes(in.Scope), DependsOn: taskDependencies(in.Depends),
 		Priority: in.Priority, Status: core.TaskAvailable,
 		Kind: kind, BaseBranch: strings.TrimSpace(in.BaseBranch),
-		RequireReview: normalizeReview(in.RequireReview), Plan: in.Plan,
+		RequireReview: core.NormalizeReviewMode(in.RequireReview), Plan: in.Plan,
 		SourceRef: cardPath(id),
 	}
 	if epic {
@@ -165,33 +315,28 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	}
 	graph := append(append([]core.Task{}, children...), task)
 
-	created, err := c.writeTasks(ctx, graph)
+	created, err := writer.Write(ctx, graph)
 	if err != nil {
-		c.rollback(ctx, created)
+		rollbackCards(ctx, writer, created)
 		return out, err
 	}
 	if c.Store != nil {
-		available, err := c.Source.ListAvailable(ctx)
+		available, err := writer.Available(ctx)
 		if err != nil {
-			c.rollback(ctx, created)
+			rollbackCards(ctx, writer, created)
 			return out, err
 		}
 		if err := c.Store.SyncTasks(ctx, withCreated(available, created)); err != nil {
-			c.rollback(ctx, created)
+			rollbackCards(ctx, writer, created)
 			return out, err
 		}
 	}
-	if err := c.publish(ctx, id); err != nil {
-		c.rollback(ctx, created)
+	if err := c.publisher().Publish(ctx, cardsPath, "beacon: create task "+string(id)); err != nil {
+		rollbackCards(ctx, writer, created)
 		return out, err
 	}
 	if epic {
-		c.mu.Lock()
-		if c.created == nil {
-			c.created = make(map[string][]core.Task)
-		}
-		c.created[key] = created
-		c.mu.Unlock()
+		c.Cache.RememberCreated(key, created)
 	}
 	return c.result(created), nil
 }
@@ -219,7 +364,8 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 		return nil, err
 	}
 
-	available, existing, results := c.existingBatchCards(ctx, ids)
+	writer := c.writer()
+	available, existing, results := c.existingBatchCards(ctx, writer, ids)
 	graph := make([]core.Task, 0, len(inputs))
 	groups := make([]batchGroup, len(inputs))
 	for i, in := range resolved {
@@ -231,31 +377,31 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 		graph = append(graph, group...)
 	}
 	if len(graph) == 0 {
-		c.rememberBatch(ids, results)
+		c.Cache.RememberBatch(ids, results)
 		return results, nil
 	}
 	if err := c.ensureBatchBranches(ctx, resolved, ids, existing); err != nil {
 		return nil, err
 	}
 
-	written, err := c.writeTasks(ctx, graph)
+	written, err := writer.Write(ctx, graph)
 	if err != nil {
-		c.rollbackBatch(ctx, written, available, false)
+		rollbackBatch(ctx, writer, c.Store, written, available, false)
 		return nil, err
 	}
 	if len(written) != len(graph) {
-		c.rollbackBatch(ctx, written, available, false)
+		rollbackBatch(ctx, writer, c.Store, written, available, false)
 		return nil, fmt.Errorf("created %d of %d cards", len(written), len(graph))
 	}
 
 	if c.Store != nil {
 		if err := c.Store.SyncTasks(ctx, withCreated(available, written)); err != nil {
-			c.rollbackBatch(ctx, written, available, true)
+			rollbackBatch(ctx, writer, c.Store, written, available, true)
 			return nil, err
 		}
 	}
-	if err := c.publish(ctx, ids[0]); err != nil {
-		c.rollbackBatch(ctx, written, available, c.Store != nil)
+	if err := c.publisher().Publish(ctx, cardsPath, "beacon: create task "+string(ids[0])); err != nil {
+		rollbackBatch(ctx, writer, c.Store, written, available, c.Store != nil)
 		return nil, err
 	}
 
@@ -265,7 +411,7 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 		}
 		results[i] = c.result(written[group.start:group.end])
 	}
-	c.rememberBatch(ids, results)
+	c.Cache.RememberBatch(ids, results)
 	return results, nil
 }
 
@@ -309,19 +455,19 @@ func resolveBatchInputs(inputs []CreateTaskInput, ids []core.TaskID) ([]CreateTa
 // batchGroupTasks builds the cards for one input. An epic contributes its
 // children followed by the epic, matching the single-card Create flow.
 func batchGroupTasks(in CreateTaskInput, id core.TaskID) []core.Task {
-	kind := normalizeKind(in.Kind)
+	kind := core.NormalizeTaskKind(in.Kind)
 	task := core.Task{
 		ID: id, Title: strings.TrimSpace(in.Title), Body: strings.TrimSpace(in.Body),
 		Scope: taskScopes(in.Scope), DependsOn: taskDependencies(in.Depends),
 		Priority: in.Priority, Status: core.TaskAvailable,
 		Kind: kind, BaseBranch: strings.TrimSpace(in.BaseBranch),
-		RequireReview: normalizeReview(in.RequireReview), Plan: in.Plan,
+		RequireReview: core.NormalizeReviewMode(in.RequireReview), Plan: in.Plan,
 		SourceRef: cardPath(id),
 	}
 	if kind != core.TaskKindEpic {
 		return []core.Task{task}
 	}
-	children := childTasks(id, in.Plan)
+	children := epicChildren(id, in.Plan)
 	for _, child := range children {
 		task.DependsOn = append(task.DependsOn, child.ID)
 	}
@@ -329,17 +475,10 @@ func batchGroupTasks(in CreateTaskInput, id core.TaskID) []core.Task {
 }
 
 // existingBatchCards resolves all already known cards in one source read.
-func (c *TaskCreator) existingBatchCards(ctx context.Context, ids []core.TaskID) ([]core.Task, []bool, []CreatedTask) {
-	c.mu.Lock()
-	batch := make(map[core.TaskID]CreatedTask, len(ids))
-	for _, id := range ids {
-		if out, ok := c.batch[id]; ok {
-			batch[id] = out
-		}
-	}
-	c.mu.Unlock()
+func (c *TaskCreator) existingBatchCards(ctx context.Context, writer CardWriter, ids []core.TaskID) ([]core.Task, []bool, []CreatedTask) {
+	batch := c.Cache.Batch(ids)
 
-	available, err := c.Source.ListAvailable(ctx)
+	available, err := writer.Available(ctx)
 	if err != nil {
 		available = nil
 	}
@@ -370,7 +509,7 @@ func (c *TaskCreator) ensureBatchBranches(ctx context.Context, resolved []Create
 	base := publishBase(c.Root)
 	seen := make(map[string]bool)
 	for i, in := range resolved {
-		if existing[i] || normalizeKind(in.Kind) != core.TaskKindEpic {
+		if existing[i] || core.NormalizeTaskKind(in.Kind) != core.TaskKindEpic {
 			continue
 		}
 		branch := epicBranch(ids[i])
@@ -385,23 +524,37 @@ func (c *TaskCreator) ensureBatchBranches(ctx context.Context, resolved []Create
 	return nil
 }
 
+// rollbackCards removes the cards written before a single create failed.
+func rollbackCards(ctx context.Context, writer CardWriter, tasks []core.Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	opCtx, cancel := detachedContext(ctx)
+	defer cancel()
+	ids := make([]core.TaskID, 0, len(tasks))
+	for i := len(tasks) - 1; i >= 0; i-- {
+		ids = append(ids, tasks[i].ID)
+	}
+	writer.Remove(opCtx, ids...)
+}
+
 // rollbackBatch removes every card written by a failed batch in one pass and
 // unpublishes them from the task graph. There is no commit to undo when the
 // failure happened before publish; restoring the earlier graph keeps the
 // dispatcher from seeing cards whose files are gone.
-func (c *TaskCreator) rollbackBatch(ctx context.Context, written, available []core.Task, synced bool) {
+func rollbackBatch(ctx context.Context, writer CardWriter, store TaskGraphStore, written, available []core.Task, synced bool) {
 	if len(written) == 0 {
 		return
 	}
 	opCtx, cancel := detachedContext(ctx)
 	defer cancel()
-	if remover, ok := c.Source.(TaskRemover); ok {
-		for i := len(written) - 1; i >= 0; i-- {
-			_ = remover.Remove(opCtx, written[i].ID)
-		}
+	ids := make([]core.TaskID, 0, len(written))
+	for i := len(written) - 1; i >= 0; i-- {
+		ids = append(ids, written[i].ID)
 	}
-	if synced && c.Store != nil {
-		_ = c.Store.SyncTasks(opCtx, available)
+	writer.Remove(opCtx, ids...)
+	if synced && store != nil {
+		_ = store.SyncTasks(opCtx, available)
 	}
 }
 
@@ -416,11 +569,11 @@ func (c *TaskCreator) batchIDs(inputs []CreateTaskInput) []core.TaskID {
 			out[i] = core.TaskID(id)
 			continue
 		}
-		if normalizeKind(in.Kind) == core.TaskKindEpic {
-			out[i] = epicTaskID(in.Title, in.Plan)
+		if core.NormalizeTaskKind(in.Kind) == core.TaskKindEpic {
+			out[i] = c.ids().ForEpic(in.Title, in.Plan)
 			continue
 		}
-		out[i] = batchTaskID(seed, i)
+		out[i] = c.ids().ForBatch(seed, i)
 	}
 	return out
 }
@@ -479,51 +632,6 @@ func localRefIndex(value string) (int, bool) {
 	return n, true
 }
 
-func (c *TaskCreator) rememberBatch(ids []core.TaskID, created []CreatedTask) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.batch == nil {
-		c.batch = make(map[core.TaskID]CreatedTask)
-	}
-	for i, out := range created {
-		if i >= len(ids) {
-			break
-		}
-		c.batch[ids[i]] = out
-	}
-}
-
-func (c *TaskCreator) publish(ctx context.Context, id core.TaskID) error {
-	return publishPath(ctx, c.Workspace, c.Root, cardsPath, "beacon: create task "+string(id))
-}
-
-func (c *TaskCreator) writeTasks(ctx context.Context, tasks []core.Task) ([]core.Task, error) {
-	if batch, ok := c.Source.(TaskBatchCreator); ok {
-		return batch.CreateMany(ctx, tasks)
-	}
-	out := make([]core.Task, 0, len(tasks))
-	for _, task := range tasks {
-		created, err := c.Source.Create(ctx, task)
-		if err != nil {
-			return out, err
-		}
-		out = append(out, created)
-	}
-	return out, nil
-}
-
-func (c *TaskCreator) rollback(ctx context.Context, tasks []core.Task) {
-	remover, ok := c.Source.(TaskRemover)
-	if !ok {
-		return
-	}
-	opCtx, cancel := detachedContext(ctx)
-	defer cancel()
-	for i := len(tasks) - 1; i >= 0; i-- {
-		_ = remover.Remove(opCtx, tasks[i].ID)
-	}
-}
-
 // withCreated adds cards that the source has not listed yet to the full
 // available set. SyncTasks replaces the whole graph, so dropping either side
 // would hide cards from dispatch.
@@ -547,14 +655,12 @@ func withCreated(available, created []core.Task) []core.Task {
 	return out
 }
 
-func (c *TaskCreator) lookup(ctx context.Context, key string, id core.TaskID, children []core.Task) ([]core.Task, bool) {
-	c.mu.Lock()
-	tasks, ok := c.created[key]
-	c.mu.Unlock()
+func lookupCreated(ctx context.Context, writer CardWriter, cache *IdempotencyCache, key string, id core.TaskID, children []core.Task) ([]core.Task, bool) {
+	tasks, ok := cache.Created(key)
 	if ok {
 		return tasks, true
 	}
-	available, err := c.Source.ListAvailable(ctx)
+	available, err := writer.Available(ctx)
 	if err != nil {
 		return nil, false
 	}
@@ -666,19 +772,10 @@ func ensureBranch(ctx context.Context, ws any, branch, base string) error {
 	return ensurer.EnsureBranch(ctx, branch, base)
 }
 
-func childTasks(epicID core.TaskID, plan []core.ChildSpec) []core.Task {
-	branch := epicBranch(epicID)
-	out := make([]core.Task, 0, len(plan))
-	for i, spec := range plan {
-		out = append(out, core.Task{
-			ID: core.ChildTaskID(epicID, i+1), Title: strings.TrimSpace(spec.Title),
-			Body:  strings.TrimSpace(spec.Body),
-			Scope: spec.Scope, DependsOn: append([]core.TaskID(nil), spec.Depends...),
-			Priority: spec.Priority, Status: core.TaskAvailable,
-			Kind: core.TaskKindTask, BaseBranch: branch,
-		})
-	}
-	return out
+// epicChildren gives an epic's plan the branch that its children branch from.
+// The expansion itself lives in core and is shared with the card parser.
+func epicChildren(id core.TaskID, plan []core.ChildSpec) []core.Task {
+	return core.ExpandChildren(core.Task{ID: id, Plan: plan}, epicBranch(id))
 }
 
 func idempotencyKey(epicID core.TaskID, children []core.Task) string {
@@ -706,24 +803,6 @@ func taskTitles(tasks []core.Task) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func normalizeKind(kind core.TaskKind) core.TaskKind {
-	if strings.EqualFold(strings.TrimSpace(string(kind)), string(core.TaskKindEpic)) {
-		return core.TaskKindEpic
-	}
-	return core.TaskKindTask
-}
-
-func normalizeReview(mode core.ReviewMode) core.ReviewMode {
-	switch strings.ToLower(strings.TrimSpace(string(mode))) {
-	case string(core.ReviewModeHuman):
-		return core.ReviewModeHuman
-	case string(core.ReviewModeNone):
-		return core.ReviewModeNone
-	default:
-		return core.ReviewModeLLM
-	}
 }
 
 func taskScopes(values []string) []core.ScopePath {

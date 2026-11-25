@@ -188,21 +188,11 @@ func planSpecs(specs []core.ChildSpec) []planSpec {
 }
 
 func normalizeKind(s string) core.TaskKind {
-	if strings.EqualFold(strings.TrimSpace(s), "epic") {
-		return core.TaskKindEpic
-	}
-	return core.TaskKindTask
+	return core.NormalizeTaskKind(core.TaskKind(s))
 }
 
 func normalizeReview(s string) core.ReviewMode {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "human", "manual":
-		return core.ReviewModeHuman
-	case "none", "off", "skip":
-		return core.ReviewModeNone
-	default:
-		return core.ReviewModeLLM
-	}
+	return core.NormalizeReviewMode(core.ReviewMode(s))
 }
 
 // PlanParser is the default core.EpicParser. It numbers children in plan order.
@@ -211,20 +201,7 @@ type PlanParser struct{}
 var _ core.EpicParser = PlanParser{}
 
 func (PlanParser) Children(epic core.Task) []core.Task {
-	out := make([]core.Task, 0, len(epic.Plan))
-	for i, spec := range epic.Plan {
-		out = append(out, core.Task{
-			ID:        core.ChildTaskID(epic.ID, i+1),
-			Title:     strings.TrimSpace(spec.Title),
-			Body:      strings.TrimSpace(spec.Body),
-			Scope:     spec.Scope,
-			DependsOn: spec.Depends,
-			Priority:  spec.Priority,
-			Status:    core.TaskAvailable,
-			Kind:      core.TaskKindTask,
-		})
-	}
-	return out
+	return core.ExpandChildren(epic, "")
 }
 
 // ParseTaskFields reads a fenced YAML block and flat Scope/Depends/Priority lines.
