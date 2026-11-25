@@ -316,6 +316,29 @@ func TestWatchPRBindsActiveRun(t *testing.T) {
 	}
 }
 
+func TestWatchPRBindsPRToWaitingRun(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := core.NewRun("r-waiting", "T-1", time.Now().UTC())
+	run.State = core.RunWaitingCI
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	var signals []int
+	c := &Control{Store: store, OnChange: func(pr int) { signals = append(signals, pr) }}
+	if err := c.WatchPR(ctx, "r-waiting", 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r-waiting"]
+	if got.State != core.RunWaitingCI || got.PRNumber != 42 {
+		t.Fatalf("state=%s pr=%d, want %s/42", got.State, got.PRNumber, core.RunWaitingCI)
+	}
+	if len(signals) != 1 || signals[0] != 42 {
+		t.Fatalf("signals = %v, want [42]", signals)
+	}
+}
+
 func TestWatchPRReopensRunClosedByWorkspaceCleanup(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()
