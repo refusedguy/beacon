@@ -4,13 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Hash the real build inputs: Go sources under cmd, internal and pkg, plus the
-# module files. HEAD is deliberately excluded so a commit that touches none of
-# these cannot make the binary look stale.
+# Hash the real build inputs: Go sources under cmd, internal, pkg, harnesses and
+# ui/tui, plus the module files. HEAD is deliberately excluded so a commit that
+# touches none of these cannot make the binary look stale.
 compute_build_hash() {
   {
     local dirs=()
-    for dir in cmd internal pkg; do
+    for dir in cmd internal pkg harnesses ui/tui; do
       if [ -d "$dir" ]; then dirs+=("$dir"); fi
     done
     if [ ${#dirs[@]} -gt 0 ]; then
