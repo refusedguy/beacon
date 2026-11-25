@@ -349,3 +349,18 @@ test("task tree reads the parent field before the generated ID shape", () => {
   assert.deepEqual(tree.children.get("T-OTHER"), ["T-EPIC-01"])
   assert.deepEqual(tree.children.get("T-EPIC"), ["T-EPIC-02"])
 })
+
+test("task tree takes the longest existing prefix and indexes every epic once", () => {
+  const tree = taskTree([
+    { id: "T-A" },
+    { id: "T-A-B" },
+    { id: "T-A-B-C" },
+    { id: "T-LONELY", kind: "epic" },
+  ])
+  assert.equal(tree.parent.get("T-A-B"), "T-A")
+  assert.equal(tree.parent.get("T-A-B-C"), "T-A-B", "the deepest known prefix wins")
+  assert.deepEqual(tree.children.get("T-A-B"), ["T-A-B-C"])
+  assert.equal(tree.epic.has("T-A-B"), true, "a parent counts as an epic without the kind field")
+  assert.equal(tree.epic.has("T-LONELY"), true, "an explicit epic stays one with no children")
+  assert.equal(tree.epic.has("T-A-B-C"), false, "a leaf is not an epic")
+})
