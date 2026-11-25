@@ -265,11 +265,17 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case pr := <-changes:
+		case pr, ok := <-changes:
+			if !ok {
+				return nil
+			}
 			if pr > 0 {
 				r.safeReconcile(ctx, pr)
 			}
-		case event := <-r.harnessEvents():
+		case event, ok := <-r.harnessEvents():
+			if !ok {
+				return nil
+			}
 			r.HandleHarnessEvent(ctx, event)
 		case <-ticker.C:
 			if err := r.checkBaseRecovery(ctx); err != nil {
