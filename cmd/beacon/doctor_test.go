@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -37,6 +39,68 @@ func TestDoctorExitCode(t *testing.T) {
 	}
 }
 
+func TestDoctorCommandReturnsExitError(t *testing.T) {
+	dir := initProject(t, "go.mod")
+	t.Setenv("BEACON_PROJECT_ROOT", dir)
+	t.Chdir(dir)
+
+	cmd := newDoctorCommand(new(string))
+	cmd.SetOut(io.Discard)
+	err := cmd.RunE(cmd, nil)
+	var coder exitCoder
+	if !errors.As(err, &coder) {
+		t.Fatalf("RunE error = %v, want an error with an exit code", err)
+	}
+	if coder.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1", coder.ExitCode())
+	}
+}
+
+func TestDoctorCommandSucceedsWithoutExitError(t *testing.T) {
+	dir := initProject(t, "go.mod")
+	writeDoctorProject(t, dir, config.Harness{Provider: "opencode", Endpoint: "http://127.0.0.1:9999", Command: "worker"})
+	t.Setenv("BEACON_PROJECT_ROOT", dir)
+	t.Chdir(dir)
+	if err := mergeOpenCodeConfig(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := newDoctorCommand(new(string))
+	cmd.SetOut(io.Discard)
+	// RunE builds its own HTTP client; the probes only warn when unreachable.
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("RunE error = %v, want nil", err)
+	}
+}
+
+func TestDoctorHTTPCheckUsesCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reached := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(reached)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	defer cancel()
+
+	done := make(chan doctorCheck, 1)
+	go func() {
+		done <- doctorHTTPCheck(ctx, "endpoint", srv.URL, "", bearerAuth, &http.Client{})
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe did not reach the server")
+	}
+	cancel()
+
+	got := <-done
+	if got.level != checkWarn || got.detail != "unreachable" {
+		t.Fatalf("check = %v %q, want WARN unreachable", got.level, got.detail)
+	}
+}
+
 func TestDoctorCheckLabels(t *testing.T) {
 	if checkOK.label() != "[OK]" || checkWarn.label() != "[WARN]" || checkFail.label() != "[FAIL]" {
 		t.Fatal("check labels do not match the doctor contract")
@@ -61,7 +125,7 @@ func TestDoctorMissingConfigFails(t *testing.T) {
 	t.Chdir(dir)
 
 	var out bytes.Buffer
-	code := runDoctor(&out, "", &http.Client{})
+	code := runDoctor(context.Background(), &out, "", &http.Client{})
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
@@ -80,7 +144,7 @@ func TestDoctorFailsOnNonWorkerHarnessCommand(t *testing.T) {
 	t.Chdir(dir)
 
 	var out bytes.Buffer
-	code := runDoctor(&out, "", okClient())
+	code := runDoctor(context.Background(), &out, "", okClient())
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
@@ -104,7 +168,7 @@ func TestDoctorReportsHealthyProjectWithoutLeakingToken(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	code := runDoctor(&out, "", okClient())
+	code := runDoctor(context.Background(), &out, "", okClient())
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0\n%s", code, out.String())
 	}
@@ -128,7 +192,7 @@ func TestDoctorRejectsEnabledWebhookWithoutSecret(t *testing.T) {
 	t.Chdir(dir)
 
 	var out bytes.Buffer
-	code := runDoctor(&out, "", okClient())
+	code := runDoctor(context.Background(), &out, "", okClient())
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1\n%s", code, out.String())
 	}
@@ -154,7 +218,7 @@ func TestDoctorAcceptsEnabledWebhookWithSecret(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	code := runDoctor(&out, "", okClient())
+	code := runDoctor(context.Background(), &out, "", okClient())
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0\n%s", code, out.String())
 	}
@@ -360,7 +424,7 @@ func TestDoctorHTTPCheckAuth(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			got := doctorHTTPCheck("endpoint", srv.URL, tc.token, tc.auth, &http.Client{})
+			got := doctorHTTPCheck(context.Background(), "endpoint", srv.URL, tc.token, tc.auth, &http.Client{})
 			if got.level != checkOK {
 				t.Fatalf("level = %v, detail = %q; want OK", got.level, got.detail)
 			}
@@ -403,7 +467,7 @@ func TestDoctorSCMCheckToleratesSlowServer(t *testing.T) {
 		},
 	}
 	done := make(chan []doctorCheck, 1)
-	go func() { done <- doctorNetworkChecks(cfg, doctorHTTPClient()) }()
+	go func() { done <- doctorNetworkChecks(context.Background(), cfg, doctorHTTPClient()) }()
 
 	select {
 	case <-received:
@@ -450,7 +514,7 @@ func TestDoctorSCMCheckTimeout(t *testing.T) {
 	}
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	done := make(chan []doctorCheck, 1)
-	go func() { done <- doctorNetworkChecks(cfg, client) }()
+	go func() { done <- doctorNetworkChecks(context.Background(), cfg, client) }()
 
 	select {
 	case <-received:
@@ -485,7 +549,7 @@ func TestDoctorSCMCheckUnreachable(t *testing.T) {
 			TokenEnv: "BEACON_DOCTOR_UNREACHABLE_TOKEN",
 		},
 	}
-	checks := doctorNetworkChecks(cfg, doctorHTTPClient())
+	checks := doctorNetworkChecks(context.Background(), cfg, doctorHTTPClient())
 
 	var scm doctorCheck
 	for _, c := range checks {
@@ -514,7 +578,7 @@ func TestDoctorSCMCheckHTTPError(t *testing.T) {
 			TokenEnv: "BEACON_DOCTOR_HTTP_ERROR_TOKEN",
 		},
 	}
-	checks := doctorNetworkChecks(cfg, doctorHTTPClient())
+	checks := doctorNetworkChecks(context.Background(), cfg, doctorHTTPClient())
 
 	var scm doctorCheck
 	for _, c := range checks {
