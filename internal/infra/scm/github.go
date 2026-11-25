@@ -11,7 +11,6 @@ import (
 	"github.com/google/go-github/v93/github"
 	"github.com/sony/gobreaker/v2"
 
-	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -350,4 +349,4 @@ func (g *GitHub) Merge(ctx context.Context, pr int, expectedSHA, title string) e
 	return nil
 }
 
-var _ app.ScmGateway = (*GitHub)(nil)
+var _ core.ScmGateway = (*GitHub)(nil)
