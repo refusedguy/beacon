@@ -46,7 +46,7 @@ func goFiles(t *testing.T) []string {
 			return nil
 		})
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("filepath.Walk(root, func(path string, info os.FileInfo, err error) error: %v", err)
 		}
 	}
 	return files
@@ -62,7 +62,7 @@ func importsOf(t *testing.T, path string) []string {
 	for _, spec := range f.Imports {
 		v, err := strconv.Unquote(spec.Path.Value)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("strconv.Unquote(spec.Path.Value): %v", err)
 		}
 		out = append(out, v)
 	}
@@ -80,7 +80,7 @@ func TestProductionFileSize(t *testing.T) {
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.ReadFile(path): %v", err)
 		}
 		lines := strings.Count(string(data), "\n") + 1
 		if lines > maxProductionLines {
@@ -199,7 +199,7 @@ func TestSingleRedactHandler(t *testing.T) {
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.ReadFile(path): %v", err)
 		}
 		if !strings.Contains(string(data), "type redactHandler") {
 			continue
@@ -222,7 +222,7 @@ func TestSecretPatternsOnlyInRedact(t *testing.T) {
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.ReadFile(path): %v", err)
 		}
 		for _, marker := range markers {
 			if strings.Contains(string(data), marker) && path != "pkg/core/redact/redact.go" {

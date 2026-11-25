@@ -37,6 +37,7 @@ type eventRelay struct {
 	changed chan struct{}
 }
 
+// newEventRelay creates a relay with a fresh event channel and reload signal.
 func newEventRelay() *eventRelay {
 	return &eventRelay{
 		out:     make(chan core.HarnessEvent, 64),
@@ -44,12 +45,14 @@ func newEventRelay() *eventRelay {
 	}
 }
 
+// reloadSignal returns the channel that fires on the next config reload.
 func (r *eventRelay) reloadSignal() <-chan struct{} {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.changed
 }
 
+// signalReload wakes listeners and installs a fresh channel for the next reload.
 func (r *eventRelay) signalReload() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -57,6 +60,7 @@ func (r *eventRelay) signalReload() {
 	r.changed = make(chan struct{})
 }
 
+// configWatcher polls the config file and swaps live state when a valid change lands.
 type configWatcher struct {
 	path     string
 	root     string
@@ -70,6 +74,7 @@ type configWatcher struct {
 	live atomic.Pointer[liveState]
 }
 
+// newConfigWatcher builds a watcher seeded with the initial state and current file hash.
 func newConfigWatcher(path, root, parent string, initial *liveState, interval time.Duration) *configWatcher {
 	cw := &configWatcher{path: path, root: root, parent: parent, interval: interval}
 	if cw.interval <= 0 {
@@ -82,6 +87,7 @@ func newConfigWatcher(path, root, parent string, initial *liveState, interval ti
 	return cw
 }
 
+// newLiveState builds a config snapshot with its harness, policy and event relay.
 func newLiveState(cfg config.Config, h core.AgentHarness) *liveState {
 	return &liveState{cfg: cfg, harness: h, policy: mergePolicy(cfg), relay: newEventRelay()}
 }
@@ -143,6 +149,7 @@ func (cw *configWatcher) reload() bool {
 	return true
 }
 
+// build constructs a new live state for cfg, or nil when the harness needs a restart.
 func (cw *configWatcher) build(cfg config.Config, root string) *liveState {
 	_, _, token := loadTokens(cfg)
 	h, err := newHarness(cfg, token, cw.parent, root)
@@ -212,6 +219,7 @@ type reloadableHarness struct {
 	relay *eventRelay
 }
 
+// init starts the event pump once, seeding the relay from the current harness.
 func (h *reloadableHarness) init() {
 	h.once.Do(func() {
 		h.relay = (*h.live).Load().relay
@@ -219,6 +227,7 @@ func (h *reloadableHarness) init() {
 	})
 }
 
+// current returns the harness held by the latest live snapshot.
 func (h *reloadableHarness) current() core.AgentHarness {
 	return (*h.live).Load().harness
 }
@@ -254,31 +263,38 @@ func (h *reloadableHarness) pump() {
 	}
 }
 
+// Spawn delegates to the current harness.
 func (h *reloadableHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
 	return h.current().Spawn(ctx, req)
 }
 
+// Wake delegates to the current harness.
 func (h *reloadableHarness) Wake(ctx context.Context, session string, wake core.WakeContext) error {
 	return h.current().Wake(ctx, session, wake)
 }
 
+// Stop delegates to the current harness.
 func (h *reloadableHarness) Stop(ctx context.Context, session string) error {
 	return h.current().Stop(ctx, session)
 }
 
+// IsAlive delegates to the current harness.
 func (h *reloadableHarness) IsAlive(ctx context.Context, session string) (bool, error) {
 	return h.current().IsAlive(ctx, session)
 }
 
+// NotifyParent delegates to the current harness.
 func (h *reloadableHarness) NotifyParent(ctx context.Context, session, text string) error {
 	return h.current().NotifyParent(ctx, session, text)
 }
 
+// Events returns the stable relay channel that collects events across reloads.
 func (h *reloadableHarness) Events() <-chan core.HarnessEvent {
 	h.init()
 	return h.relay.out
 }
 
+// RefreshWorktrees delegates to the current harness when it supports worktree refresh.
 func (h *reloadableHarness) RefreshWorktrees(ctx context.Context) error {
 	refresher, ok := h.current().(core.WorktreeRefresher)
 	if !ok {
@@ -287,6 +303,7 @@ func (h *reloadableHarness) RefreshWorktrees(ctx context.Context) error {
 	return refresher.RefreshWorktrees(ctx)
 }
 
+// WatchIdle forwards idle watching to the current harness and retargets on reload.
 func (h *reloadableHarness) WatchIdle(ctx context.Context) {
 	h.init()
 	for {
@@ -323,6 +340,7 @@ type reloadablePolicy struct {
 	live *atomic.Pointer[liveState]
 }
 
+// Evaluate delegates to the merge policy in the current snapshot.
 func (p *reloadablePolicy) Evaluate(obs core.Observation) core.MergeDecision {
 	return (*p.live).Load().policy.Evaluate(obs)
 }
