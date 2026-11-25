@@ -16,6 +16,7 @@ import (
 // verification off the operator's machine.
 const DefaultWorkerInstructions = "Worker environment: weak PC. Run targeted tests only for the files or packages you changed; leave full test suites, full builds and full repo linters to CI. Use the beacon_* MCP tools only. Never locate, build or execute the beacon binary or cmd/beacon source from a shell."
 
+// Config holds every setting loaded from .beacon/config.yaml.
 type Config struct {
 	StateDB      string      `yaml:"state_db"`
 	WorkspaceDir string      `yaml:"workspace_dir"`
@@ -32,11 +33,13 @@ type Config struct {
 	Notify       Notify      `yaml:"notify"`
 }
 
+// Concurrency bounds the daemon's concurrent work.
 type Concurrency struct {
 	MaxInFlight     int `yaml:"max_in_flight"`
 	MaxActiveAgents int `yaml:"max_active_agents"`
 }
 
+// TaskSource selects where the daemon reads task cards.
 type TaskSource struct {
 	Provider string `yaml:"provider"`
 	Dir      string `yaml:"dir"`
@@ -45,6 +48,7 @@ type TaskSource struct {
 	TokenEnv string `yaml:"token_env"`
 }
 
+// SCM holds the source control provider settings.
 type SCM struct {
 	Provider string `yaml:"provider"`
 	Owner    string `yaml:"owner"`
@@ -70,6 +74,7 @@ type Harness struct {
 	WorkerInstructions string `yaml:"worker_instructions"`
 }
 
+// Merge holds the automerge settings.
 type Merge struct {
 	RequiredChecks    []string `yaml:"required_checks"`
 	RequiredApprovals int      `yaml:"required_approvals"`
@@ -79,11 +84,13 @@ type Merge struct {
 	MaxAttempts       int      `yaml:"max_attempts"`
 }
 
+// OnBaseRed configures the response to a failing base branch.
 type OnBaseRed struct {
 	Mode           string `yaml:"mode"`
 	MaxFixAttempts int    `yaml:"max_fix_attempts"`
 }
 
+// Webhook holds the webhook server settings.
 type Webhook struct {
 	Enabled   bool   `yaml:"enabled"`
 	Addr      string `yaml:"addr"`
@@ -91,6 +98,7 @@ type Webhook struct {
 	SecretEnv string `yaml:"secret_env"`
 }
 
+// Notify holds the Telegram notification settings.
 type Notify struct {
 	TelegramToken    string `yaml:"telegram_token"`
 	TelegramTokenEnv string `yaml:"telegram_token_env"`
@@ -158,6 +166,7 @@ func (c Config) validate() error {
 	return nil
 }
 
+// Load reads the config at path and fills in defaults.
 func Load(path string) (Config, error) {
 	var c Config
 	if path == "" {
@@ -213,6 +222,7 @@ func Load(path string) (Config, error) {
 	return c, nil
 }
 
+// literalOrEnv returns the environment value when set, else literal.
 func literalOrEnv(literal, envName string) string {
 	if v := os.Getenv(envName); v != "" {
 		return v
@@ -220,6 +230,7 @@ func literalOrEnv(literal, envName string) string {
 	return literal
 }
 
+// defaults returns the config used when no config file exists.
 func defaults() Config {
 	return Config{
 		StateDB:      ".beacon/state.db",
@@ -287,6 +298,7 @@ func expandEnv(s string) string {
 	return os.ExpandEnv(s)
 }
 
+// WriteDefault writes c to path, refusing to overwrite unless force is set.
 func WriteDefault(path string, c Config, force bool) error {
 	if !force {
 		if _, err := os.Stat(path); err == nil {
