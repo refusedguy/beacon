@@ -19,14 +19,17 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/shared"
 )
 
+// checkLevel ranks a doctor check as OK, warning or failure.
 type checkLevel int
 
+// checkOK, checkWarn and checkFail order doctor results by severity.
 const (
 	checkOK checkLevel = iota
 	checkWarn
 	checkFail
 )
 
+// label renders the check level as a bracketed marker.
 func (l checkLevel) label() string {
 	switch l {
 	case checkOK:
@@ -38,12 +41,14 @@ func (l checkLevel) label() string {
 	}
 }
 
+// doctorCheck is one named result line printed by the doctor command.
 type doctorCheck struct {
 	name   string
 	level  checkLevel
 	detail string
 }
 
+// doctorExitCode returns a nonzero exit code when any check failed.
 func doctorExitCode(checks []doctorCheck) int {
 	for _, c := range checks {
 		if c.level == checkFail {
@@ -53,18 +58,22 @@ func doctorExitCode(checks []doctorCheck) int {
 	return 0
 }
 
+// printDoctorChecks writes each check's level, name and detail to out.
 func printDoctorChecks(out io.Writer, checks []doctorCheck) {
 	for _, c := range checks {
 		_, _ = fmt.Fprintf(out, "%s %s: %s\n", c.level.label(), c.name, c.detail)
 	}
 }
 
+// doctorHTTPTimeout bounds each doctor network probe.
 const doctorHTTPTimeout = 5 * time.Second
 
+// doctorHTTPClient builds an HTTP client with the doctor timeout.
 func doctorHTTPClient() *http.Client {
 	return &http.Client{Timeout: doctorHTTPTimeout}
 }
 
+// newDoctorCommand builds the doctor Cobra command.
 func newDoctorCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
@@ -80,6 +89,7 @@ func newDoctorCommand(configPath *string) *cobra.Command {
 	}
 }
 
+// runDoctor runs all checks and returns the process exit code.
 func runDoctor(out io.Writer, configPath string, client *http.Client) int {
 	root, err := projectRoot()
 	if err != nil {
@@ -95,6 +105,7 @@ func runDoctor(out io.Writer, configPath string, client *http.Client) int {
 	return doctorExitCode(checks)
 }
 
+// doctorConfigPath resolves the config path from a flag or the project root.
 func doctorConfigPath(root, flag string) string {
 	if flag != "" {
 		return flag
@@ -102,6 +113,7 @@ func doctorConfigPath(root, flag string) string {
 	return filepath.Join(root, ".beacon", "config.yaml")
 }
 
+// gitOutputAt runs a git command in root and returns trimmed output, or an empty string.
 func gitOutputAt(root string, args ...string) string {
 	out, err := exec.Command("git", append([]string{"-C", root}, args...)...).Output()
 	if err != nil {
@@ -110,6 +122,7 @@ func gitOutputAt(root string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// doctorGitChecks verifies the work tree and the origin remote.
 func doctorGitChecks(root string) []doctorCheck {
 	inside, err := exec.Command("git", "-C", root, "rev-parse", "--is-inside-work-tree").Output()
 	if err != nil || strings.TrimSpace(string(inside)) != "true" {
@@ -124,6 +137,7 @@ func doctorGitChecks(root string) []doctorCheck {
 	return checks
 }
 
+// doctorConfigChecks validates the config and returns the parsed config.
 func doctorConfigChecks(root, path string) ([]doctorCheck, config.Config) {
 	var checks []doctorCheck
 	if _, err := os.Stat(path); err != nil {
@@ -149,6 +163,7 @@ func doctorConfigChecks(root, path string) ([]doctorCheck, config.Config) {
 	return append(checks, doctorTasksCheck(root)), cfg
 }
 
+// doctorBaseBranch verifies that the configured base branch exists.
 func doctorBaseBranch(root string, cfg config.Config) doctorCheck {
 	if cfg.BaseBranch == "" {
 		return doctorCheck{"base branch", checkFail, "base_branch is empty"}
@@ -161,6 +176,7 @@ func doctorBaseBranch(root string, cfg config.Config) doctorCheck {
 	return doctorCheck{"base branch", checkWarn, cfg.BaseBranch + " not found locally or on origin"}
 }
 
+// doctorTokenCheck reports whether the SCM token is available.
 func doctorTokenCheck(cfg config.Config) doctorCheck {
 	if cfg.SCM.Token != "" || os.Getenv(cfg.SCM.TokenEnv) != "" {
 		return doctorCheck{"scm token", checkOK, "present via env or config"}
@@ -168,6 +184,7 @@ func doctorTokenCheck(cfg config.Config) doctorCheck {
 	return doctorCheck{"scm token", checkWarn, "not set; export " + cfg.SCM.TokenEnv}
 }
 
+// doctorWebhookCheck verifies the webhook configuration.
 func doctorWebhookCheck(cfg config.Config) doctorCheck {
 	if !cfg.Webhook.Enabled {
 		return doctorCheck{"webhook", checkOK, "disabled"}
@@ -178,6 +195,7 @@ func doctorWebhookCheck(cfg config.Config) doctorCheck {
 	return doctorCheck{"webhook", checkOK, "enabled with a secret"}
 }
 
+// doctorTasksCheck verifies that the markdown task directory exists.
 func doctorTasksCheck(root string) doctorCheck {
 	info, err := os.Stat(filepath.Join(root, "docs", "tasks"))
 	if err == nil && info.IsDir() {
@@ -186,6 +204,7 @@ func doctorTasksCheck(root string) doctorCheck {
 	return doctorCheck{"docs/tasks", checkWarn, "missing; markdown task source needs it"}
 }
 
+// doctorToolChecks validates opencode.json, permissions, the binary and the daemon.
 func doctorToolChecks(root string, cfg config.Config) []doctorCheck {
 	var checks []doctorCheck
 	path := filepath.Join(root, "opencode.json")
@@ -203,6 +222,7 @@ func doctorToolChecks(root string, cfg config.Config) []doctorCheck {
 	return checks
 }
 
+// doctorFileShapeCheck verifies that the agents and the beacon MCP server are configured.
 func doctorFileShapeCheck(doc map[string]any, root string) doctorCheck {
 	agents, _ := doc["agents"].(map[string]any)
 	var missing []string
@@ -244,6 +264,7 @@ func beaconMCPSource(doc map[string]any) string {
 	return ""
 }
 
+// readParentOpenCode loads the parent workspace opencode.json, or nil.
 func readParentOpenCode(root string) map[string]any {
 	path := filepath.Join(filepath.Dir(root), "opencode.json")
 	data, err := os.ReadFile(path)
@@ -257,6 +278,7 @@ func readParentOpenCode(root string) map[string]any {
 	return doc
 }
 
+// doctorPermissionCheck compares configured permissions with the generated set.
 func doctorPermissionCheck(doc map[string]any) doctorCheck {
 	gen := beaconmcp.GeneratedPermissions(beaconmcp.ToolCatalog())
 	if !beaconmcp.PermissionsInSync(doc["permissions"], gen.Global) {
@@ -278,6 +300,7 @@ func doctorPermissionCheck(doc map[string]any) doctorCheck {
 	return doctorCheck{"permissions", checkOK, "in sync with ToolCatalog"}
 }
 
+// doctorBinaryCheck locates the beacon binary on PATH or in the project.
 func doctorBinaryCheck(root string) doctorCheck {
 	if path, err := exec.LookPath("beacon"); err == nil {
 		return doctorCheck{"beacon binary", checkOK, path}
@@ -288,6 +311,7 @@ func doctorBinaryCheck(root string) doctorCheck {
 	return doctorCheck{"beacon binary", checkWarn, "not in PATH or .opencode/bin"}
 }
 
+// doctorDaemonCheck reports daemon liveness from its status record.
 func doctorDaemonCheck(cfg config.Config) doctorCheck {
 	status := readDaemonStatus(filepath.Dir(cfg.StateDB))
 	switch status.State {
@@ -301,6 +325,7 @@ func doctorDaemonCheck(cfg config.Config) doctorCheck {
 	}
 }
 
+// doctorNetworkChecks probes the OpenCode endpoint and the SCM base branch.
 func doctorNetworkChecks(cfg config.Config, client *http.Client) []doctorCheck {
 	return []doctorCheck{
 		doctorHTTPCheck("opencode endpoint", strings.TrimRight(cfg.Harness.Endpoint, "/")+"/api/project",
@@ -310,10 +335,12 @@ func doctorNetworkChecks(cfg config.Config, client *http.Client) []doctorCheck {
 	}
 }
 
+// bearerAuth sets a Bearer Authorization header on req.
 func bearerAuth(req *http.Request, token string) {
 	req.Header.Set("Authorization", "Bearer "+token)
 }
 
+// scmBranchURL builds the branch API URL for the configured SCM provider.
 func scmBranchURL(cfg config.Config) string {
 	if cfg.BaseBranch == "" {
 		return ""
@@ -331,6 +358,7 @@ func scmBranchURL(cfg config.Config) string {
 		url.PathEscape(cfg.SCM.Repo) + "/branches/" + base
 }
 
+// doctorHTTPCheck performs one network probe and formats its result.
 func doctorHTTPCheck(name, endpoint, token string, auth func(*http.Request, string), client *http.Client) doctorCheck {
 	if endpoint == "" || endpoint == "/api/project" {
 		return doctorCheck{name, checkWarn, "not configured"}
