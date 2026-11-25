@@ -105,7 +105,7 @@ func (a *apiServer) runs(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(rw, runs)
+	writeJSON(rw, core.NewWireRuns(runs))
 }
 
 func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
@@ -152,7 +152,7 @@ func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusConflict)
 		return
 	}
-	writeJSON(rw, map[string]string{"status": "ok"})
+	writeJSON(rw, core.NewWireControlResult(action, id))
 }
 
 func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
@@ -177,7 +177,7 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case ev := <-events:
-			writeSSE(rw, "harness", ev)
+			writeSSE(rw, "harness", core.NewWireEvent(ev))
 			flusher.Flush()
 		case pr := <-changes:
 			writeSSE(rw, "pr_changed", map[string]int{"pr": pr})
