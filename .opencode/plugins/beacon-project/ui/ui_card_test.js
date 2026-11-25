@@ -6,7 +6,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   CARD_PANEL_NAME, PANEL_NAME, baseIncidentItem, beaconStatusDefinition,
-  createStatusSource, fixPrompt, readCard, sidebarModel,
+  cardFamily, createStatusSource, fixPrompt, readCard, sidebarModel,
 } from "./ui.js"
 import { NOW, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -330,4 +330,17 @@ test("an empty depends list adds no link and back with no history closes the pan
   layer.commands.find((command) => command.id === "beacon.card.back").run()
   assert.equal(h.closed.length, 1, "back with no history closes the panel")
   h.dispose()
+})
+
+test("card family uses the parent field instead of an ID prefix", () => {
+  const queue = [
+    { id: "T-EPIC", kind: "epic" },
+    { id: "T-OTHER", kind: "epic" },
+    { id: "T-EPIC-01", parent: "T-OTHER" },
+  ]
+  const family = cardFamily({ id: "T-EPIC-01", parent: "T-OTHER" }, queue)
+  assert.equal(family.parent, "T-OTHER")
+  assert.deepEqual(family.children, [])
+  const epic = cardFamily({ id: "T-OTHER", depends: "T-EPIC-01" }, queue)
+  assert.deepEqual(epic.children, ["T-EPIC-01"])
 })

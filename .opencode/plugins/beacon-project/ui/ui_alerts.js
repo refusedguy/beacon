@@ -66,12 +66,33 @@ export function shortTaskID(value) {
   return id ? id.replace(/^T-\d{8}-/, "") : "-"
 }
 
-// A generated child carries its parent's ID as a prefix. Longest match wins
-// when a nested ID happens to contain a shorter epic ID.
-const queueParent = (list, id) => list
-  .map((item) => str(item?.id))
-  .filter((parent) => parent && parent !== id && id.startsWith(`${parent}-`))
-  .sort((a, b) => b.length - a.length)[0] || ""
+// TaskTree is the single index of parent-child relations for the queue and
+// card panels. An explicit parent field is authoritative. Snapshots that still
+// carry only generated IDs fall back to the longest ID prefix, so older
+// daemons keep their layout until they publish the parent field.
+export function taskTree(items = []) {
+  const list = Array.isArray(items) ? items : []
+  const byID = new Map(list.map((item) => [str(item?.id), item]))
+  const parent = new Map()
+  const ids = [...byID.keys()]
+  for (const id of ids) {
+    const value = str(byID.get(id)?.parent)
+    if (value && value !== id && byID.has(value)) parent.set(id, value)
+  }
+  for (const id of ids) {
+    if (parent.has(id)) continue
+    parent.set(id, ids
+      .filter((value) => value && value !== id && id.startsWith(`${value}-`))
+      .sort((a, b) => b.length - a.length)[0] || "")
+  }
+  const children = new Map()
+  for (const [child, value] of parent) {
+    if (!value) continue
+    if (!children.has(value)) children.set(value, [])
+    children.get(value).push(child)
+  }
+  return { list, byID, parent, children }
+}
 
 export const spacerItem = () => ({
   marker: "", name: "", status: "", color: "muted", kind: "spacer",
@@ -113,16 +134,15 @@ function taskRows(item, { epic, parent, blockers, children }) {
 export function queueGroups(queue = [], hidden = null) {
   const list = Array.isArray(queue) ? queue : []
   const shown = hidden ? list.filter((item) => !hidden.has(str(item?.id))) : list
-  const parents = new Map(list.map((item) => [str(item?.id), queueParent(list, str(item?.id))]))
-  const parentsWithChildren = new Set(parents.values())
-  const childIDs = new Set([...parents].filter(([, parent]) => parent).map(([id]) => id))
-  const childCount = new Map()
-  for (const parent of parents.values()) childCount.set(parent, (childCount.get(parent) ?? 0) + 1)
+  const { parent, children } = taskTree(list)
+  const parentsWithChildren = new Set(children.keys())
+  const childIDs = new Set([...parent].filter(([, value]) => value).map(([id]) => id))
+  const childCount = new Map([...children].map(([id, members]) => [id, members.length]))
   const blockers = new Map(list.map((item) => [str(item?.id), queueBlockers(item, childIDs)]))
   const groupOf = (item) => {
     const id = str(item?.id)
     const own = blockers.get(id) ?? []
-    return own[0] || (blockers.get(parents.get(id) || "") ?? [])[0] || ""
+    return own[0] || (blockers.get(parent.get(id) || "") ?? [])[0] || ""
   }
   const groups = new Map()
   const order = []
@@ -131,7 +151,7 @@ export function queueGroups(queue = [], hidden = null) {
     if (!groups.has(key)) { groups.set(key, []); order.push(key) }
     groups.get(key).push(item)
   }
-  return { groups, order, parents, parentsWithChildren, childCount, blockers }
+  return { groups, order, parents: parent, parentsWithChildren, childCount, blockers }
 }
 
 export const blockedGroupKeys = (queue = []) => queueGroups(queue).order.filter(Boolean)
@@ -179,15 +199,10 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null) {
   const list = Array.isArray(queue) ? queue : []
   if (!epicOpen) return queueLineItems(list, null, blockedOpen)
   const ids = list.map((item) => str(item?.id))
-  const parentOf = (id) => ids.filter((p) => p && p !== id && id.startsWith(`${p}-`))
-    .sort((a, b) => b.length - a.length)[0] || ""
-  const childrenOf = (id) => ids.filter((child) => parentOf(child) === id)
-  const counts = new Map()
-  for (const id of ids) {
-    const parent = parentOf(id)
-    if (parent) counts.set(parent, (counts.get(parent) ?? 0) + 1)
-  }
-  const isEpic = (id) => counts.has(id)
+  const { parent, children } = taskTree(list)
+  const parentOf = (id) => parent.get(id) || ""
+  const childrenOf = (id) => children.get(id) ?? []
+  const isEpic = (id) => children.has(id)
     || list.some((i) => str(i?.id) === id && str(i?.kind).toLowerCase() === "epic")
   // Walk up to the direct child under each ancestor epic. This hides the whole
   // subtree of a collapsed epic and of a child beyond the cap.
