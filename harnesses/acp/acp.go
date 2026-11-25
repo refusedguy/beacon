@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -82,10 +83,37 @@ func (h *Harness) init() {
 		h.sessions = make(map[string]*acpSession)
 	}
 	if h.newProcess == nil {
-		h.newProcess = func(command, cwd string) (process, error) {
-			return startProcess(command, cwd)
-		}
+		h.newProcess = startManagedProcess
 	}
+}
+
+// managedProcess watches an agent subprocess and records when it exits. The
+// waiter reaps the child, so signal 0 or ProcessState alone cannot be used to
+// tell a dead agent from one that has not been waited on yet.
+type managedProcess struct {
+	process
+	exited atomic.Bool
+}
+
+func startManagedProcess(command, cwd string) (process, error) {
+	p, err := startProcess(command, cwd)
+	if err != nil {
+		return nil, err
+	}
+	m := &managedProcess{process: p}
+	go func() {
+		_ = p.cmd.Wait()
+		m.exited.Store(true)
+	}()
+	return m, nil
+}
+
+func (m *managedProcess) alive() bool { return !m.exited.Load() }
+
+func (m *managedProcess) close() error {
+	err := m.process.close()
+	m.exited.Store(true)
+	return err
 }
 
 func (h *Harness) open(ctx context.Context, cwd string) (process, error) {
@@ -248,9 +276,23 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	return s.proc.close()
 }
 
+// IsAlive reports whether the agent behind a session is still running. A
+// session whose process has exited is dropped so orphan reconciliation can
+// redispatch the task to a fresh worker.
 func (h *Harness) IsAlive(_ context.Context, sessionID string) (bool, error) {
-	s, _ := h.session(sessionID)
-	return s != nil, nil
+	s, ok := h.session(sessionID)
+	if !ok || s == nil || s.proc == nil {
+		return false, nil
+	}
+	if p, ok := s.proc.(interface{ alive() bool }); ok && !p.alive() {
+		h.mu.Lock()
+		if h.sessions[sessionID] == s {
+			delete(h.sessions, sessionID)
+		}
+		h.mu.Unlock()
+		return false, nil
+	}
+	return true, nil
 }
 
 // NotifyParent is a no-op. ACP workers are independent sessions with no
