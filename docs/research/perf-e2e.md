@@ -255,6 +255,6 @@ This is a controller benchmark on a weak shared machine. It does not call
 GitHub, start a real agent, render the monitor or touch a worktree. The SCM and
 harness are fakes; the SQLite store is real. Dispatch is timed at
 `Dispatcher.Dispatch`, one call below the MCP wrapper, because the wrapper only
-extracts metadata and builds the result JSON. The number to take from this
-dossier is the split between the two paths and the write-bound limiter, not an
-absolute latency for a production daemon.
+extracts metadata and builds the result JSON. Use the path split and the
+write-bound limiter from this dossier. Do not read the absolute latency as a
+production-daemon number.
