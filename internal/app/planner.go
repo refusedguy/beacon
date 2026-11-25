@@ -135,13 +135,18 @@ func (p GreedyPlanner) activeConflict(t core.Task, active []*core.Run) (*core.Ru
 		if r == nil || r.State.Terminal() {
 			continue
 		}
-		for _, s := range r.Scope {
-			if p.Overlap(t, core.Task{ID: "__active__", Scope: []core.ScopePath{s}}) {
-				return r, intersectScopes(t.Scope, r.Scope)
-			}
+		if p.overlapsScope(t, r.Scope) {
+			return r, intersectScopes(t.Scope, r.Scope)
 		}
 	}
 	return nil, nil
+}
+
+// overlapsScope checks path overlap only. An active run carries scope but no
+// card identity, so passing a synthetic card to the injected checker would let
+// a real card with that ID match by identity instead of by scope.
+func (GreedyPlanner) overlapsScope(t core.Task, runScope []core.ScopePath) bool {
+	return core.OverlapByPaths(t, core.Task{Scope: runScope})
 }
 
 // intersectScopes returns the entries of a that cover or are covered by an
