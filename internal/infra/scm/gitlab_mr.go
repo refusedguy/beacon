@@ -183,11 +183,15 @@ func (g *GitLab) UpdateBranch(ctx context.Context, mrIID int, expectedSHA string
 	if rebased.SHA != "" && rebased.SHA != expectedSHA {
 		return rebased.SHA, nil
 	}
+	timer := time.NewTimer(time.Second)
+	timer.Stop()
+	defer timer.Stop()
 	for i := 0; i < 12; i++ {
+		timer.Reset(time.Second)
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(time.Second):
+		case <-timer.C:
 		}
 		var current glMR
 		if err := g.getJSON(ctx, g.mrPath(mrIID), nil, &current); err != nil {
