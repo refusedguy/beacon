@@ -81,17 +81,28 @@ export function taskTree(items = []) {
   }
   for (const id of ids) {
     if (parent.has(id)) continue
-    parent.set(id, ids
-      .filter((value) => value && value !== id && id.startsWith(`${value}-`))
-      .sort((a, b) => b.length - a.length)[0] || "")
+    // Walk this ID's own hyphen boundaries instead of scanning every other ID.
+    // The first boundary that names a known card is the longest prefix, which is
+    // what the old filter and sort selected.
+    let found = ""
+    for (let at = id.lastIndexOf("-"); at > 0; at = id.lastIndexOf("-", at - 1)) {
+      const candidate = id.slice(0, at)
+      if (byID.has(candidate)) { found = candidate; break }
+    }
+    parent.set(id, found)
   }
   const children = new Map()
+  const epic = new Set()
+  for (const item of list) {
+    if (str(item?.kind).toLowerCase() === "epic") epic.add(str(item?.id))
+  }
   for (const [child, value] of parent) {
     if (!value) continue
     if (!children.has(value)) children.set(value, [])
     children.get(value).push(child)
+    epic.add(value)
   }
-  return { list, byID, parent, children }
+  return { list, byID, parent, children, epic }
 }
 
 export const spacerItem = () => ({
@@ -101,9 +112,9 @@ const countLabel = (n, one, many) => `${n} ${n === 1 ? one : many}`
 
 // The snapshot carries only unresolved deps. Children of an epic already have
 // their own rows, so they never become blocker headers.
-const queueBlockers = (item, childIDs) => (Array.isArray(item?.dependsOn) ? item.dependsOn
+const queueBlockers = (item, parent) => (Array.isArray(item?.dependsOn) ? item.dependsOn
   : Array.isArray(item?.depends_on) ? item.depends_on : [])
-  .map(str).filter((dep) => dep && !childIDs.has(dep))
+  .map(str).filter((dep) => dep && !parent.get(dep))
 
 function taskRows(item, { epic, parent, blockers, children }) {
   const id = str(item?.id)
@@ -131,14 +142,14 @@ function taskRows(item, { epic, parent, blockers, children }) {
 // One group per unresolved blocker. A child with no dep of its own follows its
 // epic's blocker, so an expanded epic keeps a single header. The rendered
 // headers and the global Queue toggle share this grouping.
-export function queueGroups(queue = [], hidden = null) {
+export function queueGroups(queue = [], hidden = null, tree = null) {
   const list = Array.isArray(queue) ? queue : []
+  const index = tree ?? taskTree(list)
   const shown = hidden ? list.filter((item) => !hidden.has(str(item?.id))) : list
-  const { parent, children } = taskTree(list)
-  const parentsWithChildren = new Set(children.keys())
-  const childIDs = new Set([...parent].filter(([, value]) => value).map(([id]) => id))
-  const childCount = new Map([...children].map(([id, members]) => [id, members.length]))
-  const blockers = new Map(list.map((item) => [str(item?.id), queueBlockers(item, childIDs)]))
+  const { parent } = index
+  // A dep that names a child card is an internal edge, not a blocker header.
+  // The parent map already holds that answer, so no extra Set is needed.
+  const blockers = new Map(list.map((item) => [str(item?.id), queueBlockers(item, parent)]))
   const groupOf = (item) => {
     const id = str(item?.id)
     const own = blockers.get(id) ?? []
@@ -151,7 +162,7 @@ export function queueGroups(queue = [], hidden = null) {
     if (!groups.has(key)) { groups.set(key, []); order.push(key) }
     groups.get(key).push(item)
   }
-  return { groups, order, parents: parent, parentsWithChildren, childCount, blockers }
+  return { groups, order, parents: parent, blockers, tree: index }
 }
 
 export const blockedGroupKeys = (queue = []) => queueGroups(queue).order.filter(Boolean)
@@ -162,8 +173,8 @@ export const QUEUE_CHILD_LIMIT = 3
 
 // A null blockedOpen keeps the flat legacy rows for pure callers that never
 // drive the toggle. With a map, only groups marked true expand.
-export function queueLineItems(queue = [], hidden = null, blockedOpen = null) {
-  const { groups, order, parents, parentsWithChildren, childCount, blockers } = queueGroups(queue, hidden)
+export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tree = null) {
+  const { groups, order, tree: index, blockers } = queueGroups(queue, hidden, tree)
   const rows = []
   for (const key of order) {
     if (rows.length) rows.push(spacerItem())
@@ -182,9 +193,9 @@ export function queueLineItems(queue = [], hidden = null, blockedOpen = null) {
     for (const item of capped ? members.slice(0, QUEUE_CHILD_LIMIT) : members) {
       const id = str(item?.id)
       rows.push(...taskRows(item, {
-        epic: str(item?.kind).toLowerCase() === "epic" || parentsWithChildren.has(id),
-        parent: parents.get(id) || "", blockers: blockers.get(id) ?? [],
-        children: childCount.get(id) ?? 0,
+        epic: index.epic.has(id),
+        parent: index.parent.get(id) || "", blockers: blockers.get(id) ?? [],
+        children: index.children.get(id)?.length ?? 0,
       }))
     }
     if (capped) rows.push({
@@ -197,13 +208,15 @@ export function queueLineItems(queue = [], hidden = null, blockedOpen = null) {
 
 export function queueRows(queue = [], epicOpen = null, blockedOpen = null) {
   const list = Array.isArray(queue) ? queue : []
-  if (!epicOpen) return queueLineItems(list, null, blockedOpen)
+  // One index for this render. queueLineItems used to rebuild it, and isEpic
+  // used to rescan the whole queue for every row.
+  const tree = taskTree(list)
+  if (!epicOpen) return queueLineItems(list, null, blockedOpen, tree)
+  const { parent, children, epic } = tree
   const ids = list.map((item) => str(item?.id))
-  const { parent, children } = taskTree(list)
   const parentOf = (id) => parent.get(id) || ""
   const childrenOf = (id) => children.get(id) ?? []
-  const isEpic = (id) => children.has(id)
-    || list.some((i) => str(i?.id) === id && str(i?.kind).toLowerCase() === "epic")
+  const isEpic = (id) => epic.has(id)
   // Walk up to the direct child under each ancestor epic. This hides the whole
   // subtree of a collapsed epic and of a child beyond the cap.
   const childUnder = (id, ancestor) => {
@@ -226,7 +239,7 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null) {
       parent = parentOf(parent)
     }
   }
-  const rows = queueLineItems(list, hidden, blockedOpen)
+  const rows = queueLineItems(list, hidden, blockedOpen, tree)
   const summaries = []
   for (const id of ids) {
     if (!isEpic(id) || epicOpen[id] !== true) continue
