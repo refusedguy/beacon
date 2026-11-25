@@ -164,7 +164,7 @@ func (s *Store) queryAll(ctx context.Context, query string, args ...any) ([]*cor
 		return nil, err
 	}
 	defer rows.Close()
-	var out []*core.Run
+	out := make([]*core.Run, 0)
 	for rows.Next() {
 		r, err := scanRun(rows)
 		if err != nil {
