@@ -808,3 +808,155 @@ func TestGitWorktreeEnsureBranchFailureLeavesNoRemoteBranch(t *testing.T) {
 		t.Fatalf("failed EnsureBranch still published a branch: %s", out)
 	}
 }
+
+// rebaseInProgress reports whether git still holds rebase state for the path.
+func rebaseInProgress(t *testing.T, path string) bool {
+	t.Helper()
+	for _, name := range []string{"rebase-merge", "rebase-apply"} {
+		out := strings.TrimSpace(gitCmd(t, path, "rev-parse", "--git-path", name))
+		if !filepath.IsAbs(out) {
+			out = filepath.Join(path, out)
+		}
+		if _, err := os.Stat(out); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func TestGitWorktreeCreateReportsMergeBaseCleanupFailure(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	mergeErr := errors.New("injected merge-base failure")
+	cleanupErr := errors.New("injected worktree remove failure")
+	wt.commandHook = func(dir string, args []string) error {
+		if len(args) == 0 {
+			return nil
+		}
+		switch args[0] {
+		case "merge-base":
+			return mergeErr
+		case "worktree":
+			if len(args) > 1 && args[1] == "remove" {
+				return cleanupErr
+			}
+		}
+		return nil
+	}
+
+	_, err := wt.Create(ctx, core.Task{ID: "T-MB-CLEANUP"})
+	if !errors.Is(err, mergeErr) {
+		t.Fatalf("Create() error = %v, want the merge-base failure", err)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("Create() error = %v, want the worktree cleanup failure", err)
+	}
+}
+
+func TestGitWorktreeRebaseBaseReportsCardDirtFailure(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-DIRT-ERR"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusErr := errors.New("injected status failure")
+	wt.commandHook = func(dir string, args []string) error {
+		if len(args) > 0 && args[0] == "status" {
+			return statusErr
+		}
+		return nil
+	}
+
+	err = wt.RebaseBase(ctx, ws, "main")
+	if !errors.Is(err, statusErr) {
+		t.Fatalf("RebaseBase() error = %v, want the card dirt status failure", err)
+	}
+}
+
+func TestGitWorktreeRebaseBaseAbortFailureLeavesNoRebaseState(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-ABORT-FAIL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A worktree commit that conflicts with an advance on origin/main forces
+	// the rebase to stop with a real rebase state for the abort to clean up.
+	if err := os.WriteFile(filepath.Join(ws.Path, "README.md"), []byte("worktree change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, ws.Path, "add", "README.md")
+	gitCmd(t, ws.Path, "commit", "-m", "worktree change")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("origin change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo, "add", "README.md")
+	gitCmd(t, repo, "commit", "-m", "origin change")
+	gitCmd(t, repo, "push", "origin", "main")
+
+	abortErr := errors.New("injected abort failure")
+	wt.commandHook = func(dir string, args []string) error {
+		if len(args) > 1 && args[0] == "rebase" && args[1] == "--abort" {
+			return abortErr
+		}
+		return nil
+	}
+
+	err = wt.RebaseBase(ctx, ws, "main")
+	if err == nil {
+		t.Fatal("RebaseBase() error = nil, want the rebase conflict and abort failure")
+	}
+	if !errors.Is(err, abortErr) {
+		t.Fatalf("RebaseBase() error = %v, want the abort failure", err)
+	}
+	if !strings.Contains(err.Error(), "rebase origin/main") {
+		t.Fatalf("RebaseBase() error = %v, want the original rebase failure", err)
+	}
+	if rebaseInProgress(t, ws.Path) {
+		t.Fatal("worktree left mid-rebase after a failed abort")
+	}
+}
+
+func TestGitWorktreeRemoveReportsBranchDeleteFailure(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-RM-BRANCH-ERR"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branchErr := errors.New("injected branch delete failure")
+	wt.commandHook = func(dir string, args []string) error {
+		if len(args) > 1 && args[0] == "branch" {
+			return branchErr
+		}
+		return nil
+	}
+
+	err = wt.Remove(ctx, ws)
+	if !errors.Is(err, branchErr) {
+		t.Fatalf("Remove() error = %v, want the branch delete failure", err)
+	}
+}
+
+func TestGitWorktreeForceRemoveReportsBranchDeleteFailure(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-FRM-BRANCH-ERR"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branchErr := errors.New("injected branch delete failure")
+	wt.commandHook = func(dir string, args []string) error {
+		if len(args) > 1 && args[0] == "branch" {
+			return branchErr
+		}
+		return nil
+	}
+
+	err = wt.ForceRemove(ctx, ws)
+	if !errors.Is(err, branchErr) {
+		t.Fatalf("ForceRemove() error = %v, want the branch delete failure", err)
+	}
+}

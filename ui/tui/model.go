@@ -198,10 +198,14 @@ func (m model) View() string {
 }
 
 func truncate(s string, limit int) string {
-	if len(s) <= limit {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
 		return s
 	}
-	return s[:limit-1] + "…"
+	return string(runes[:limit-1]) + "…"
 }
 
 func maxInt(a, b int) int {
