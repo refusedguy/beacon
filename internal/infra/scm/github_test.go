@@ -156,6 +156,77 @@ func TestGitHubObserveChecksEveryChangedFilePage(t *testing.T) {
 	}
 }
 
+func TestGitHubObserveChecksEveryCheckRunPage(t *testing.T) {
+	base := ghObserveHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("changed files fetched even though checks were returned")
+	})
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/check-runs") {
+			if r.URL.Query().Get("page") == "" {
+				w.Header().Set("Link", `</repos/o/r/commits/abc/check-runs?page=2>; rel="next"`)
+				_, _ = w.Write([]byte(`{"total_count":1,"check_runs":[{"name":"first","status":"completed","conclusion":"success"}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"total_count":1,"check_runs":[{"name":"second","status":"completed","conclusion":"failure","output":{"title":"failed on page two","text":""}}]}`))
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+	obs, err := g.Observe(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Checks) != 2 {
+		t.Fatalf("checks = %+v, want two entries", obs.Checks)
+	}
+	if obs.FailureExcerpt != "failed on page two" {
+		t.Fatalf("FailureExcerpt = %q, want the failure from page two", obs.FailureExcerpt)
+	}
+}
+
+func TestGitHubObserveCountsApprovalsOnEveryReviewsPage(t *testing.T) {
+	base := ghObserveHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	})
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/reviews") {
+			if r.URL.Query().Get("page") == "" {
+				w.Header().Set("Link", `</repos/o/r/pulls/42/reviews?page=2>; rel="next"`)
+				_, _ = w.Write([]byte(`[{"user":{"login":"alice"},"state":"CHANGES_REQUESTED","submitted_at":"2024-01-01T00:00:00Z"}]`))
+				return
+			}
+			_, _ = w.Write([]byte(`[{"user":{"login":"bob"},"state":"APPROVED","submitted_at":"2024-01-02T00:00:00Z"}]`))
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+	obs, err := g.Observe(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Approvals != 1 {
+		t.Fatalf("Approvals = %d, want 1 from page two", obs.Approvals)
+	}
+}
+
+func TestChecksStopsAtPageCap(t *testing.T) {
+	calls := 0
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Link", `</repos/o/r/commits/abc/check-runs?page=2>; rel="next"`)
+		_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+	}))
+	if _, err := g.checks(context.Background(), "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != maxGitHubPages {
+		t.Fatalf("check-runs calls = %d, want %d", calls, maxGitHubPages)
+	}
+}
+
 func TestGuardedReturnsTypedResults(t *testing.T) {
 	br := newSCMBreaker("guarded-test")
 
