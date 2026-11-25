@@ -60,10 +60,10 @@ type CardWriter interface {
 	Remove(ctx context.Context, ids ...core.TaskID)
 }
 
-// sourceCardWriter adapts TaskSource and its optional batch and remove
+// sourceCardWriter adapts core.TaskSource and its optional batch and remove
 // capabilities to CardWriter. Removal is best effort: a failed rollback must
 // not hide the original create error.
-type sourceCardWriter struct{ Source TaskSource }
+type sourceCardWriter struct{ Source core.TaskSource }
 
 func (w sourceCardWriter) Available(ctx context.Context) ([]core.Task, error) {
 	return w.Source.ListAvailable(ctx)
@@ -265,7 +265,7 @@ const detachedPushTimeout = 30 * time.Second
 // TaskCreator writes cards through the source, then commits and pushes them.
 // An epic with a plan expands into deterministic child cards before the epic.
 type TaskCreator struct {
-	Source    TaskSource
+	Source    core.TaskSource
 	Workspace PathCommitter
 	Root      core.Workspace
 	Store     TaskGraphStore

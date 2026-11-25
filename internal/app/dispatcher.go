@@ -18,12 +18,24 @@ import (
 // the harness default.
 type ModelResolver func(parentSession string) core.ModelRef
 
+// DispatchStore is the store surface Dispatcher uses while it selects and
+// starts tasks.
+type DispatchStore interface {
+	SyncTasks(ctx context.Context, tasks []core.Task) error
+	ListReadyTasks(ctx context.Context) ([]core.Task, error)
+	ListActive(ctx context.Context) ([]*core.Run, error)
+	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
+	FindActiveByTask(ctx context.Context, task core.TaskID) (*core.Run, error)
+	Save(ctx context.Context, run *core.Run) error
+	SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error
+}
+
 type Dispatcher struct {
 	Source             core.TaskSource
 	Planner            ConflictPlanner
 	Workspace          core.WorkspaceManager
 	Harness            core.AgentHarness
-	Store              core.RunStore
+	Store              DispatchStore
 	Concurrency        core.Concurrency
 	StrictScope        bool
 	MaxAttempts        int
@@ -261,7 +273,7 @@ func (d *Dispatcher) handleStartFailure(ctx context.Context, run *core.Run, caus
 		// A failed spawn can leave the card rewritten to in_progress inside the
 		// worktree, making it dirty. A plain Remove would refuse it and leave a
 		// stale path that blocks the next dispatch, so force the removal.
-		if err := d.Workspace.ForceRemove(ctx, Workspace{Path: run.WorkspacePath, Branch: run.Branch}); err != nil {
+		if err := d.Workspace.ForceRemove(ctx, core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}); err != nil {
 			slog.Error("force remove failed start worktree", "task", run.TaskID, "run", run.ID, "error", err)
 		}
 	}

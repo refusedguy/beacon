@@ -65,6 +65,17 @@ type wiredInfra struct {
 	decisions app.DecisionLogger
 }
 
+// The store adapter must satisfy each consumer-side port before any service is
+// built. A missing method fails the build at the composition root.
+var (
+	_ app.StatusStore     = (*sqlite.Store)(nil)
+	_ app.ReconcileStore  = (*sqlite.Store)(nil)
+	_ app.WaitStore       = (*sqlite.Store)(nil)
+	_ app.DispatchStore   = (*sqlite.Store)(nil)
+	_ app.ReconcilerStore = (*sqlite.Store)(nil)
+	_ core.RunStore       = (*sqlite.Store)(nil)
+)
+
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
 // started with a cwd, but a caller can pin the root without changing that cwd.
 func projectRoot() (string, error) {

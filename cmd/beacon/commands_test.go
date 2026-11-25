@@ -75,7 +75,7 @@ func TestApplyControlRoutesEveryAction(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			ctrl := &fakeControl{}
 			if err := applyControl(context.Background(), ctrl, action, "r1", "abc"); err != nil {
-				t.Fatal(err)
+				t.Fatalf("applyControl(context.Background(), ctrl, action, \"r1\", \"abc\"): %v", err)
 			}
 			if len(ctrl.actions) != 1 || ctrl.actions[0] != action {
 				t.Fatalf("actions = %v", ctrl.actions)
@@ -92,7 +92,7 @@ func TestApplyControlRoutesEveryAction(t *testing.T) {
 
 func TestValidateControlRequiresNudgeMessage(t *testing.T) {
 	if err := validateControl("nudge", "r1", "follow the checklist"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("validateControl(\"nudge\", \"r1\", \"follow the checklist\"): %v", err)
 	}
 	if err := validateControl("nudge", "r1"); err == nil {
 		t.Fatal("nudge without a message was accepted")
@@ -102,7 +102,7 @@ func TestValidateControlRequiresNudgeMessage(t *testing.T) {
 func TestApplyControlForwardsNudgeMessage(t *testing.T) {
 	ctrl := &fakeControl{}
 	if err := applyControl(context.Background(), ctrl, "nudge", "r1", "", "please rebase first"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("applyControl(context.Background(), ctrl, \"nudge\", \"r1\", \"\", \"please rebase first\"): %v", err)
 	}
 	if len(ctrl.actions) != 1 || ctrl.actions[0] != "nudge" {
 		t.Fatalf("actions = %v", ctrl.actions)
@@ -125,15 +125,15 @@ func TestControlCommandForwardsNudgeMessageToDaemon(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, ".beacon")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(dir, 0o755): %v", err)
 	}
 	info := connectionInfo{Addr: srv.URL, Token: "tok", PID: os.Getpid()}
 	data, err := json.Marshal(info)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Marshal(info): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "connection.json"), data, 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(dir, \"connection.json\"), data, 0o600): %v", err)
 	}
 	t.Setenv("BEACON_PROJECT_ROOT", root)
 
@@ -141,7 +141,7 @@ func TestControlCommandForwardsNudgeMessageToDaemon(t *testing.T) {
 	cmd := newControlCommand(&configPath)
 	cmd.SetArgs([]string{"--action", "nudge", "--run-id", "r1", "--message", "check the tests"})
 	if err := cmd.Execute(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("cmd.Execute(): %v", err)
 	}
 	if got.Action != "nudge" || got.RunID != "r1" || got.Message != "check the tests" {
 		t.Fatalf("forwarded = %+v", got)
@@ -180,15 +180,15 @@ func TestControlCommandForwardsToDaemonAndPrintsJSON(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, ".beacon")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(dir, 0o755): %v", err)
 	}
 	info := connectionInfo{Addr: srv.URL, Token: "tok", PID: os.Getpid()}
 	data, err := json.Marshal(info)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Marshal(info): %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "connection.json"), data, 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(filepath.Join(dir, \"connection.json\"), data, 0o600): %v", err)
 	}
 	t.Setenv("BEACON_PROJECT_ROOT", root)
 
@@ -198,7 +198,7 @@ func TestControlCommandForwardsToDaemonAndPrintsJSON(t *testing.T) {
 	var execErr error
 	out := captureStdout(t, func() { execErr = cmd.Execute() })
 	if execErr != nil {
-		t.Fatal(execErr)
+		t.Fatalf("cmd.Execute(): %v", execErr)
 	}
 	if got.Action != "approve" || got.RunID != "r1" || got.SHA != "abc" {
 		t.Fatalf("forwarded = %+v", got)
@@ -240,7 +240,7 @@ func captureStdout(t *testing.T, fn func()) string {
 	old := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.Pipe(): %v", err)
 	}
 	os.Stdout = w
 	defer func() { os.Stdout = old }()
@@ -248,7 +248,7 @@ func captureStdout(t *testing.T, fn func()) string {
 	_ = w.Close()
 	data, err := io.ReadAll(r)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("io.ReadAll(r): %v", err)
 	}
 	return string(data)
 }
@@ -283,7 +283,7 @@ func TestWireCLIPassesEnvironmentParent(t *testing.T) {
 	t.Setenv("BEACON_PARENT_SESSION", "ses_cli_parent")
 	got := captureCLIWire(t, nil)
 	if _, err := wireCLI("cfg.yaml"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("wireCLI(\"cfg.yaml\"): %v", err)
 	}
 	if *got != "ses_cli_parent" {
 		t.Fatalf("wire parent = %q, want ses_cli_parent", *got)
@@ -294,7 +294,7 @@ func TestWireCLIAcceptsEmptyEnvironment(t *testing.T) {
 	t.Setenv("BEACON_PARENT_SESSION", "")
 	got := captureCLIWire(t, nil)
 	if _, err := wireCLI("cfg.yaml"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("wireCLI(\"cfg.yaml\"): %v", err)
 	}
 	if *got != "" {
 		t.Fatalf("wire parent = %q, want empty", *got)

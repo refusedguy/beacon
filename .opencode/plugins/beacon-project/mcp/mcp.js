@@ -7,7 +7,7 @@ export const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 export const BEACON_BUILD_SCRIPT = "scripts/build-beacon.sh"
 export const BUILD_HASH_FLAG = "--hash"
 
-const SOURCE_DIRS = ["cmd", "internal", "pkg"]
+const SOURCE_DIRS = ["cmd", "internal", "pkg", "harnesses", "ui/tui"]
 const MODULE_FILES = ["go.mod", "go.sum", "go.work"]
 
 const defaultDeps = {

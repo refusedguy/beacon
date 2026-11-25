@@ -16,6 +16,7 @@ import (
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
+// initFlags holds the values parsed from the init command flags.
 type initFlags struct {
 	maxInFlight     int
 	maxActiveAgents int
@@ -32,6 +33,7 @@ type initFlags struct {
 	skipPlugin      bool
 }
 
+// initOptions is the resolved configuration used by the init flow.
 type initOptions struct {
 	taskSource      string
 	scm             string
@@ -46,6 +48,7 @@ type initOptions struct {
 	force           bool
 }
 
+// newInitCommand builds the init Cobra command and registers its flags.
 func newInitCommand() *cobra.Command {
 	f := &initFlags{}
 	cmd := &cobra.Command{
@@ -71,6 +74,7 @@ func newInitCommand() *cobra.Command {
 	return cmd
 }
 
+// resolveInitOptions turns parsed flags into init options with defaults.
 func resolveInitOptions(f *initFlags) initOptions {
 	o := initOptions{
 		taskSource:      firstNonEmpty(f.taskSource, "markdown"),
@@ -97,6 +101,7 @@ func resolveInitOptions(f *initFlags) initOptions {
 	return o
 }
 
+// remote identifies the project's SCM host, owner and repository.
 type remote struct {
 	provider string
 	owner    string
@@ -104,6 +109,7 @@ type remote struct {
 	host     string
 }
 
+// parseRemote extracts provider, owner and repo from a git remote URL.
 func parseRemote(raw string) (remote, error) {
 	s := strings.TrimSpace(raw)
 	s = strings.TrimSuffix(s, ".git")
@@ -134,6 +140,7 @@ func parseRemote(raw string) (remote, error) {
 	return remote{provider: provider, owner: owner, repo: repo, host: host}, nil
 }
 
+// allDigits reports whether s is a non-empty string of decimal digits.
 func allDigits(s string) bool {
 	if s == "" {
 		return false
@@ -146,6 +153,7 @@ func allDigits(s string) bool {
 	return true
 }
 
+// gitOutput runs a git command and returns trimmed output, or an empty string.
 func gitOutput(args ...string) string {
 	out, err := exec.Command("git", args...).Output()
 	if err != nil {
@@ -154,6 +162,7 @@ func gitOutput(args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// detectRemoteAndBase reads the origin URL and the default base branch.
 func detectRemoteAndBase() (remote, string, error) {
 	r, err := parseRemote(gitOutput("remote", "get-url", "origin"))
 	if err != nil {
@@ -166,11 +175,13 @@ func detectRemoteAndBase() (remote, string, error) {
 	return r, base, nil
 }
 
+// stdinIsTTY reports whether stdin is a terminal.
 func stdinIsTTY() bool {
 	info, err := os.Stdin.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
+// confirmInit asks the operator to accept the detected configuration.
 func confirmInit(out io.Writer, in io.Reader, r remote, base string) (bool, error) {
 	_, _ = fmt.Fprintf(out, "Configure Beacon for %s/%s (base %s)? [Y/n] ", r.owner, r.repo, base)
 	var answer string
@@ -184,6 +195,7 @@ func confirmInit(out io.Writer, in io.Reader, r remote, base string) (bool, erro
 	return answer == "" || answer == "y" || answer == "yes", nil
 }
 
+// runInit detects the project, writes artifacts and prints the handoff.
 func runInit(f *initFlags) error {
 	root, err := os.Getwd()
 	if err != nil {
@@ -209,6 +221,7 @@ func runInit(f *initFlags) error {
 	return nil
 }
 
+// buildInitConfig constructs the Beacon config from resolved options and the remote.
 func buildInitConfig(root string, o initOptions, r remote, base string) config.Config {
 	provider := firstNonEmpty(o.scm, r.provider)
 	tokenEnv := "GITHUB_TOKEN"
@@ -241,6 +254,7 @@ func buildInitConfig(root string, o initOptions, r remote, base string) config.C
 	}
 }
 
+// gitlabAPI returns the GitLab API base URL for host.
 func gitlabAPI(host string) string {
 	if host == "" || host == "gitlab.com" {
 		return "https://gitlab.com/api/v4"
@@ -248,6 +262,7 @@ func gitlabAPI(host string) string {
 	return "https://" + host + "/api/v4"
 }
 
+// writeInitArtifacts writes the config, tasks directory, gitignore, opencode config and plugin.
 func writeInitArtifacts(root string, cfg config.Config, o initOptions) error {
 	path := filepath.Join(root, ".beacon", "config.yaml")
 	if err := config.WriteDefault(path, cfg, o.force); err != nil {
@@ -265,6 +280,7 @@ func writeInitArtifacts(root string, cfg config.Config, o initOptions) error {
 	return deployPlugin(root, o)
 }
 
+// ensureTasksDir creates docs/tasks and its .gitkeep marker.
 func ensureTasksDir(root string) error {
 	dir := filepath.Join(root, "docs", "tasks")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -277,11 +293,13 @@ func ensureTasksDir(root string) error {
 	return os.WriteFile(path, nil, 0o644)
 }
 
+// stackInfo identifies the project stack and its targeted test instruction.
 type stackInfo struct {
 	kind     string
 	targeted string
 }
 
+// workerInstructions returns the test instruction for the given weak-PC setting.
 func (s stackInfo) workerInstructions(weakPC bool) string {
 	if !weakPC {
 		return "Run the full test suite, the full build and the repository linters before reporting done."
@@ -289,6 +307,7 @@ func (s stackInfo) workerInstructions(weakPC bool) string {
 	return s.targeted
 }
 
+// detectStack identifies the project stack from marker files.
 func detectStack(root string) stackInfo {
 	if existsIn(root, "go.mod") {
 		return stackInfo{"go", "Worker environment: weak PC. Run targeted tests only for the packages you changed (for example, go test ./internal/app). Leave full go test ./..., go build ./... and repo linters to CI."}
@@ -308,16 +327,19 @@ func detectStack(root string) stackInfo {
 	return stackInfo{"generic", config.DefaultWorkerInstructions}
 }
 
+// existsIn reports whether name exists under root.
 func existsIn(root, name string) bool {
 	_, err := os.Stat(filepath.Join(root, name))
 	return err == nil
 }
 
+// hasMarker reports whether any file under root matches pattern.
 func hasMarker(root, pattern string) bool {
 	matches, err := filepath.Glob(filepath.Join(root, pattern))
 	return err == nil && len(matches) > 0
 }
 
+// detectRequiredChecks collects job names from CI workflow files.
 func detectRequiredChecks(root string) []string {
 	files, err := filepath.Glob(filepath.Join(root, ".github", "workflows", "*.y*ml"))
 	if err != nil {
@@ -342,6 +364,7 @@ func detectRequiredChecks(root string) []string {
 	return out
 }
 
+// parseJobNames extracts job names from a workflow document.
 func parseJobNames(content string) []string {
 	var names []string
 	inJobs := false
@@ -367,6 +390,7 @@ func parseJobNames(content string) []string {
 	return names
 }
 
+// mergeOpenCodeConfig adds agents, permissions and the beacon MCP server to opencode.json.
 func mergeOpenCodeConfig(root string) error {
 	path := filepath.Join(root, "opencode.json")
 	data, err := os.ReadFile(path)
@@ -411,12 +435,14 @@ func mergeOpenCodeConfig(root string) error {
 	return os.WriteFile(path, append(out, '\n'), 0o644)
 }
 
+// roleDefinition describes one generated operator role.
 type roleDefinition struct {
 	description string
 	mode        string
 	perms       []beaconmcp.Permission
 }
 
+// roleDefinitions maps role names to their description, mode and permissions.
 func roleDefinitions(gen beaconmcp.PermissionSet) map[string]roleDefinition {
 	return map[string]roleDefinition{
 		"orchestrator": {"Creates and dispatches Beacon tasks.", "all", gen.Allow},
@@ -425,6 +451,7 @@ func roleDefinitions(gen beaconmcp.PermissionSet) map[string]roleDefinition {
 	}
 }
 
+// mergeMCPServer installs the pooled beacon MCP server entry in doc.
 func mergeMCPServer(doc map[string]any, root string) {
 	mcpMap, _ := doc["mcp"].(map[string]any)
 	if mcpMap == nil {
@@ -442,6 +469,7 @@ func mergeMCPServer(doc map[string]any, root string) {
 	mcpMap["beacon"] = server
 }
 
+// pluginSource resolves the project plugin source directory.
 func pluginSource(explicit string) string {
 	if explicit != "" {
 		return explicit
@@ -460,6 +488,7 @@ func pluginSource(explicit string) string {
 	return ""
 }
 
+// deployPlugin copies the project plugin into the repository.
 func deployPlugin(root string, o initOptions) error {
 	if o.skipPlugin {
 		return nil
@@ -482,6 +511,7 @@ func deployPlugin(root string, o initOptions) error {
 	return nil
 }
 
+// copyTree recursively copies src into dst.
 func copyTree(src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -503,6 +533,7 @@ func copyTree(src, dst string) error {
 	})
 }
 
+// appendGitignore adds Beacon artifacts to the gitignore file.
 func appendGitignore(path string) error {
 	entries := []string{
 		".beacon/state.db*",
@@ -540,6 +571,7 @@ func appendGitignore(path string) error {
 	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }
 
+// printHandoff writes the next steps for the operator.
 func printHandoff(out io.Writer, r remote) {
 	_, _ = fmt.Fprintln(out, "\nBeacon setup complete. Next steps:")
 	_, _ = fmt.Fprintln(out, "  1. Export GITHUB_TOKEN (or GITLAB_TOKEN) and BEACON_OPENCODE_TOKEN if needed.")

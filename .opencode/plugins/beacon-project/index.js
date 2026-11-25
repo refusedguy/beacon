@@ -36,7 +36,9 @@ export async function currentSessionAgent(ctx) {
       const info = await ctx.session.get({ sessionID })
       const data = info?.data ?? info
       return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
-    } catch {}
+    } catch (error) {
+      console.debug(`beacon plugin: session lookup failed: ${error?.message ?? error}`)
+    }
   }
 
   if (typeof ctx.session?.list === "function") {
@@ -45,7 +47,9 @@ export async function currentSessionAgent(ctx) {
       const sessions = Array.isArray(listed) ? listed : listed?.data ?? []
       const data = sessions[0]
       if (data) return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
-    } catch {}
+    } catch (error) {
+      console.debug(`beacon plugin: session list failed: ${error?.message ?? error}`)
+    }
   }
   return null
 }
@@ -118,11 +122,16 @@ export const beaconProject = Plugin.define({
     }
 
     return async () => {
-      watcher?.stop()
-      await guard?.dispose?.()
-      await context?.()
-      await mcp?.dispose?.()
-      await statusRpc?.dispose?.()
+      const cleanup = async (label, dispose) => {
+        try { await dispose?.() } catch (error) {
+          console.debug(`beacon plugin: ${label} cleanup failed: ${error?.message ?? error}`)
+        }
+      }
+      await cleanup("run watcher", () => watcher?.stop())
+      await cleanup("shell guard", () => guard?.dispose?.())
+      await cleanup("project context", context)
+      await cleanup("MCP registration", () => mcp?.dispose?.())
+      await cleanup("status RPC", () => statusRpc?.dispose?.())
     }
   },
 })

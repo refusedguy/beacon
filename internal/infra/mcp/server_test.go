@@ -24,20 +24,20 @@ func TestToolCatalogMatchesRegisteredTools(t *testing.T) {
 	clientTransport, serverTransport := msdk.NewInMemoryTransports()
 	ss, err := server.Connect(context.Background(), serverTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("server.Connect(context.Background(), serverTransport, nil): %v", err)
 	}
 	defer ss.Close()
 
 	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
 	cs, err := client.Connect(context.Background(), clientTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("client.Connect(context.Background(), clientTransport, nil): %v", err)
 	}
 	defer cs.Close()
 
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.ListTools(context.Background(), nil): %v", err)
 	}
 
 	catalog := ToolCatalog()
@@ -106,13 +106,13 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 	clientTransport, serverTransport := msdk.NewInMemoryTransports()
 	ss, err := server.Connect(context.Background(), serverTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("server.Connect(context.Background(), serverTransport, nil): %v", err)
 	}
 	defer ss.Close()
 	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
 	cs, err := client.Connect(context.Background(), clientTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("client.Connect(context.Background(), clientTransport, nil): %v", err)
 	}
 	defer cs.Close()
 
@@ -129,7 +129,7 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_create\"): %v", err)
 	}
 	if len(res.Content) == 0 {
 		t.Fatal("empty tool result")
@@ -140,7 +140,7 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 	}
 	var created app.CreatedTask
 	if err := json.Unmarshal([]byte(text.Text), &created); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal([]byte(text.Text), &created): %v", err)
 	}
 	if created.ID != "T-EPIC" || len(created.Children) != 2 || len(created.IDs) != 3 {
 		t.Fatalf("created = %+v", created)
@@ -151,7 +151,7 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 
 	child, err := os.ReadFile(filepath.Join(dir, "T-EPIC-01.md"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \"T-EPIC-01.md\")): %v", err)
 	}
 	if !strings.Contains(string(child), "base_branch: beacon/T-EPIC") ||
 		!strings.Contains(string(child), "- EXT-1") {
@@ -159,7 +159,7 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 	}
 	epic, err := os.ReadFile(filepath.Join(dir, "T-EPIC.md"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \"T-EPIC.md\")): %v", err)
 	}
 	for _, id := range []string{"T-EPIC-01", "T-EPIC-02"} {
 		if !strings.Contains(string(epic), "- "+id) {
@@ -178,12 +178,12 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_create\"): %v", err)
 	}
 	text = res.Content[0].(*msdk.TextContent)
 	var again app.CreatedTask
 	if err := json.Unmarshal([]byte(text.Text), &again); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal([]byte(text.Text), &again): %v", err)
 	}
 	if again.ID != created.ID || len(again.IDs) != len(created.IDs) {
 		t.Fatalf("repeated create = %+v", again)
@@ -205,13 +205,13 @@ func TestTaskCreateChildBodiesOverInMemoryTransport(t *testing.T) {
 	clientTransport, serverTransport := msdk.NewInMemoryTransports()
 	ss, err := server.Connect(context.Background(), serverTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("server.Connect(context.Background(), serverTransport, nil): %v", err)
 	}
 	defer ss.Close()
 	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
 	cs, err := client.Connect(context.Background(), clientTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("client.Connect(context.Background(), clientTransport, nil): %v", err)
 	}
 	defer cs.Close()
 
@@ -226,7 +226,7 @@ func TestTaskCreateChildBodiesOverInMemoryTransport(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_create\"): %v", err)
 	}
 	if len(res.Content) == 0 {
 		t.Fatal("empty tool result")
@@ -237,7 +237,7 @@ func TestTaskCreateChildBodiesOverInMemoryTransport(t *testing.T) {
 	}
 	var created app.CreatedTask
 	if err := json.Unmarshal([]byte(text.Text), &created); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal([]byte(text.Text), &created): %v", err)
 	}
 	if created.ID != "T-EPIC" || len(created.Children) != 2 {
 		t.Fatalf("created = %+v", created)
@@ -245,14 +245,14 @@ func TestTaskCreateChildBodiesOverInMemoryTransport(t *testing.T) {
 
 	first, err := os.ReadFile(filepath.Join(dir, "T-EPIC-01.md"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \"T-EPIC-01.md\")): %v", err)
 	}
 	if !strings.Contains(string(first), "Write the first module.") {
 		t.Fatalf("first child card missing body:\n%s", first)
 	}
 	second, err := os.ReadFile(filepath.Join(dir, "T-EPIC-02.md"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \"T-EPIC-02.md\")): %v", err)
 	}
 	if strings.Contains(string(second), "Write the first module.") {
 		t.Fatalf("second child carried the first body:\n%s", second)
@@ -260,7 +260,7 @@ func TestTaskCreateChildBodiesOverInMemoryTransport(t *testing.T) {
 
 	epic, err := os.ReadFile(filepath.Join(dir, "T-EPIC.md"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \"T-EPIC.md\")): %v", err)
 	}
 	if !strings.Contains(string(epic), "body: Write the first module.") {
 		t.Fatalf("epic card plan missing child body:\n%s", epic)
@@ -301,13 +301,13 @@ func deleteClient(t *testing.T, sv Services) *msdk.ClientSession {
 	clientTransport, serverTransport := msdk.NewInMemoryTransports()
 	ss, err := server.Connect(context.Background(), serverTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("server.Connect(context.Background(), serverTransport, nil): %v", err)
 	}
 	t.Cleanup(func() { _ = ss.Close() })
 	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
 	cs, err := client.Connect(context.Background(), clientTransport, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("client.Connect(context.Background(), clientTransport, nil): %v", err)
 	}
 	t.Cleanup(func() { _ = cs.Close() })
 	return cs
@@ -317,12 +317,12 @@ func writeDeleteCards(t *testing.T, dir string, ids ...string) {
 	t.Helper()
 	cards := filepath.Join(dir, "docs", "tasks")
 	if err := os.MkdirAll(cards, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cards, 0o755): %v", err)
 	}
 	for _, id := range ids {
 		body := "---\nid: " + id + "\n---\n# " + id + ". Card\n"
 		if err := os.WriteFile(filepath.Join(cards, id+".md"), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.WriteFile(filepath.Join(cards, id+\".md\"), []byte(body), 0o644): %v", err)
 		}
 	}
 }
@@ -336,7 +336,7 @@ func cardExistsAt(t *testing.T, dir, id string) bool {
 	if errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	t.Fatal(err)
+	t.Fatalf("os.Stat(filepath.Join(dir, \"docs\", \"tasks\", id+\".md\")): %v", err)
 	return false
 }
 
@@ -351,7 +351,7 @@ func callDelete(t *testing.T, cs *msdk.ClientSession, ids ...string) app.DeleteR
 		Arguments: map[string]any{"ids": args},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_delete\"): %v", err)
 	}
 	if len(res.Content) == 0 {
 		t.Fatal("empty tool result")
@@ -362,7 +362,7 @@ func callDelete(t *testing.T, cs *msdk.ClientSession, ids ...string) app.DeleteR
 	}
 	var deleted app.DeleteResult
 	if err := json.Unmarshal([]byte(text.Text), &deleted); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal([]byte(text.Text), &deleted): %v", err)
 	}
 	return deleted
 }
@@ -472,7 +472,7 @@ func TestTaskDeleteRollsBackWhenCommitFails(t *testing.T) {
 		Arguments: map[string]any{"ids": []any{"T-A", "T-B"}},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_delete\"): %v", err)
 	}
 	if !res.IsError {
 		t.Fatal("expected a tool error when the commit fails")
@@ -486,11 +486,11 @@ func writeUpdateTestCard(t *testing.T, dir, id, content string) string {
 	t.Helper()
 	cards := filepath.Join(dir, "docs", "tasks")
 	if err := os.MkdirAll(cards, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.MkdirAll(cards, 0o755): %v", err)
 	}
 	path := filepath.Join(cards, id+".md")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.WriteFile(path, []byte(content), 0o644): %v", err)
 	}
 	return path
 }
@@ -513,7 +513,7 @@ func callUpdate(t *testing.T, cs *msdk.ClientSession, updates ...map[string]any)
 		Arguments: map[string]any{"updates": args},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_update\"): %v", err)
 	}
 	if len(res.Content) == 0 {
 		t.Fatal("empty tool result")
@@ -524,7 +524,7 @@ func callUpdate(t *testing.T, cs *msdk.ClientSession, updates ...map[string]any)
 	}
 	var updated app.UpdateResult
 	if err := json.Unmarshal([]byte(text.Text), &updated); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal([]byte(text.Text), &updated): %v", err)
 	}
 	return updated
 }
@@ -544,7 +544,7 @@ func TestTaskUpdateSingleOverInMemoryTransport(t *testing.T) {
 	}
 	content, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(path): %v", err)
 	}
 	if !strings.Contains(string(content), "title: New title") ||
 		!strings.Contains(string(content), "status: available") ||
@@ -573,11 +573,11 @@ func TestTaskUpdateBatchOverInMemoryTransport(t *testing.T) {
 	}
 	contentA, err := os.ReadFile(a)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(a): %v", err)
 	}
 	contentB, err := os.ReadFile(b)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(b): %v", err)
 	}
 	if !strings.Contains(string(contentA), "title: New A") || !strings.Contains(string(contentB), "title: New B") {
 		t.Fatal("batch did not update both cards")
@@ -634,7 +634,7 @@ func TestTaskUpdateRefusesActiveRunOverInMemoryTransport(t *testing.T) {
 	for path, want := range map[string]string{a: "Old A", b: "Old B"} {
 		content, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("os.ReadFile(path): %v", err)
 		}
 		if !strings.Contains(string(content), want) {
 			t.Fatalf("refusal touched %s: %s", path, content)
@@ -658,14 +658,14 @@ func TestTaskUpdateRollsBackWhenCommitFails(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_update\"): %v", err)
 	}
 	if !res.IsError {
 		t.Fatal("expected a tool error when the commit fails")
 	}
 	content, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(path): %v", err)
 	}
 	if string(content) != "---\nid: T-A\ntitle: Old\n---\nbody\n" {
 		t.Fatalf("failed commit did not restore card: %s", content)
@@ -692,7 +692,7 @@ func callReconcile(t *testing.T, cs *msdk.ClientSession, pr int) app.ReconcileRe
 		Arguments: map[string]any{"pr": pr},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_reconcile\"): %v", err)
 	}
 	if res.IsError || len(res.Content) == 0 {
 		t.Fatalf("unexpected reconcile result: %+v", res)
@@ -703,7 +703,7 @@ func callReconcile(t *testing.T, cs *msdk.ClientSession, pr int) app.ReconcileRe
 	}
 	var out app.ReconcileResult
 	if err := json.Unmarshal([]byte(text.Text), &out); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal([]byte(text.Text), &out): %v", err)
 	}
 	return out
 }
@@ -755,7 +755,7 @@ func callCreateBatch(t *testing.T, cs *msdk.ClientSession, args map[string]any) 
 		Name: "beacon_task_create", Arguments: args,
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_create\"): %v", err)
 	}
 	if len(res.Content) == 0 {
 		t.Fatalf("empty tool result: %+v", res)
@@ -801,7 +801,7 @@ func TestTaskCreateBatchOverInMemoryTransport(t *testing.T) {
 	}
 	second, err := os.ReadFile(filepath.Join(dir, "T-B2.md"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(filepath.Join(dir, \"T-B2.md\")): %v", err)
 	}
 	if !strings.Contains(string(second), "- T-B1") {
 		t.Fatalf("second card does not depend on the first:\n%s", second)
@@ -910,7 +910,7 @@ func callUpdateArgs(t *testing.T, cs *msdk.ClientSession, args map[string]any) a
 		Name: "beacon_task_update", Arguments: args,
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_update\"): %v", err)
 	}
 	return decodeToolResult[app.UpdateResult](t, res)
 }
@@ -921,7 +921,7 @@ func callDeleteArgs(t *testing.T, cs *msdk.ClientSession, args map[string]any) a
 		Name: "beacon_task_delete", Arguments: args,
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cs.CallTool(Name: \"beacon_task_delete\"): %v", err)
 	}
 	return decodeToolResult[app.DeleteResult](t, res)
 }
@@ -982,7 +982,7 @@ func TestTaskUpdateOperationIDIsIdempotentOverInMemoryTransport(t *testing.T) {
 	}
 	content, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.ReadFile(path): %v", err)
 	}
 	if !strings.Contains(string(content), "title: New") {
 		t.Fatalf("card not updated: %s", content)
@@ -1036,14 +1036,14 @@ func TestOpJournalRunIsIdempotent(t *testing.T) {
 	}
 	first, err := j.run(context.Background(), "op-1", fn)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("j.run(context.Background(), \"op-1\", fn): %v", err)
 	}
 	if got, ok := first.(app.DeleteResult); !ok || got.Status != "applied" {
 		t.Fatalf("first = %+v", first)
 	}
 	second, err := j.run(context.Background(), "op-1", fn)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("j.run(context.Background(), \"op-1\", fn): %v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("mutation ran %d times, want 1", calls)
@@ -1074,7 +1074,7 @@ func TestOpJournalRunAppliesMetaToUnknownResultType(t *testing.T) {
 	}
 	first, err := j.run(context.Background(), "op-extra", fn)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("j.run(context.Background(), \"op-extra\", fn): %v", err)
 	}
 	got, ok := first.(extraResult)
 	if !ok || got.Value != "kept" || got.Status != "applied" || got.OperationID != "op-extra" {
@@ -1083,7 +1083,7 @@ func TestOpJournalRunAppliesMetaToUnknownResultType(t *testing.T) {
 
 	second, err := j.run(context.Background(), "op-extra", fn)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("j.run(context.Background(), \"op-extra\", fn): %v", err)
 	}
 	again, ok := second.(extraResult)
 	if !ok || again.Value != "kept" || again.Status != "duplicate" || again.OperationID != "op-extra" {
@@ -1095,11 +1095,11 @@ func TestOpJournalRunAppliesMetaToUnknownResultType(t *testing.T) {
 
 	wire, err := json.Marshal(again)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Marshal(again): %v", err)
 	}
 	var fields map[string]any
 	if err := json.Unmarshal(wire, &fields); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal(wire, &fields): %v", err)
 	}
 	if fields["value"] != "kept" || fields["status"] != "duplicate" || fields["operation_id"] != "op-extra" {
 		t.Fatalf("wire shape = %s", wire)
@@ -1121,11 +1121,11 @@ func TestMutationResultsKeepFlatWireShape(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			wire, err := json.Marshal(tc.result.WithMeta("op-wire", "applied"))
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("json.Marshal(tc.result.WithMeta(\"op-wire\", \"applied\")): %v", err)
 			}
 			var fields map[string]any
 			if err := json.Unmarshal(wire, &fields); err != nil {
-				t.Fatal(err)
+				t.Fatalf("json.Unmarshal(wire, &fields): %v", err)
 			}
 			for _, key := range tc.fields {
 				if _, ok := fields[key]; !ok {
@@ -1181,7 +1181,7 @@ func TestOpJournalRunMarksRecoveredCaller(t *testing.T) {
 		return app.DeleteResult{Pushed: true, Results: []app.DeletedTask{{ID: "T-A", Status: "deleted"}}}, nil
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("j.run(ctx, \"op-recovered\", func(context.Context) (any, error): %v", err)
 	}
 	got, ok := result.(app.DeleteResult)
 	if !ok || got.Status != "recovered" || got.OperationID != "op-recovered" || !got.Pushed {
@@ -1192,7 +1192,7 @@ func TestOpJournalRunMarksRecoveredCaller(t *testing.T) {
 		return nil, nil
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("j.run(context.Background(), \"op-recovered\", func(context.Context) (any, error): %v", err)
 	}
 	if again, ok := repeat.(app.DeleteResult); !ok || again.Status != "duplicate" {
 		t.Fatalf("repeat = %+v", repeat)
@@ -1205,7 +1205,7 @@ func TestOpJournalIsBounded(t *testing.T) {
 		if _, err := j.run(context.Background(), fmt.Sprintf("op-%d", i), func(context.Context) (any, error) {
 			return app.DeleteResult{}, nil
 		}); err != nil {
-			t.Fatal(err)
+			t.Fatalf("j.run(op-i): %v", err)
 		}
 	}
 	j.mu.Lock()
@@ -1313,7 +1313,7 @@ func TestMutationAndControlToolsRejectNilServices(t *testing.T) {
 				Name: tc.name, Arguments: tc.args,
 			})
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("cs.CallTool(Name: tc.name): %v", err)
 			}
 			if !res.IsError {
 				t.Fatalf("%s returned success with no service configured: %+v", tc.name, res)
