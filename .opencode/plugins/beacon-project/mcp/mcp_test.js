@@ -14,7 +14,6 @@ import {
   BEACON_SERVER,
   BEACON_PROJECT_ROOT_ENV,
   BEACON_BUILD_SCRIPT,
-  BUILD_HASH_FLAG,
 } from "./mcp.js"
 
 const ROOT = "/project"
@@ -22,7 +21,7 @@ const BINARY_MTIME = 1000
 
 function localPaths(root = ROOT) {
   const local = join(root, ".opencode", "bin", "beacon")
-  return { local, sha: `${local}.build-sha` }
+  return { local }
 }
 
 function fakeDeps({ files = {}, env = {}, mtimes = {}, dirs = {}, statErrors = [] } = {}) {
@@ -71,13 +70,12 @@ function localBinaryDeps(overrides = {}) {
 }
 
 // Build a tree with a .go source under cmd/beacon at a controlled mtime.
-function sourceTreeDeps(sourceMtime = 500, { withBuildRecord = true } = {}) {
-  const { local, sha } = localPaths()
+function sourceTreeDeps(sourceMtime = 500) {
+  const { local } = localPaths()
   const cmd = join(ROOT, "cmd")
   const cmdBeacon = join(cmd, "beacon")
   const mainGo = join(cmdBeacon, "main.go")
   const files = { [local]: "binary", [mainGo]: "package main" }
-  if (withBuildRecord) files[sha] = "h0\n"
   return {
     mainGo,
     deps: fakeDeps({
@@ -111,17 +109,12 @@ function buildCalls(deps) {
   return deps.execCalls.filter((call) => call.cmd === "bash")
 }
 
-function hashCalls(deps) {
-  return deps.execCalls.filter((call) => call.args.includes(BUILD_HASH_FLAG))
-}
-
-test("a fresh binary is used without a rebuild and without a hash subprocess", () => {
+test("a fresh binary is used without a rebuild", () => {
   const { local } = localPaths()
   const deps = localBinaryDeps()
 
   assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
   assert.equal(buildCalls(deps).length, 0)
-  assert.equal(hashCalls(deps).length, 0)
 })
 
 test("one resolution does not spawn bash more than once", () => {
@@ -133,7 +126,6 @@ test("one resolution does not spawn bash more than once", () => {
   }
 
   assert.equal(buildCalls(deps).length, 0)
-  assert.equal(hashCalls(deps).length, 0)
 })
 
 test("a newer .go source triggers one rebuild with the build script", () => {
@@ -146,7 +138,6 @@ test("a newer .go source triggers one rebuild with the build script", () => {
   assert.equal(builds.length, 1)
   assert.deepEqual(builds[0].args, [join(ROOT, ...BEACON_BUILD_SCRIPT.split("/"))])
   assert.equal(builds[0].opts.cwd, ROOT)
-  assert.equal(hashCalls(deps).length, 0)
 })
 
 test("a newer source under pkg triggers a rebuild", () => {
@@ -176,9 +167,9 @@ test("a newer module file triggers a rebuild", () => {
   assert.equal(buildCalls(deps).length, 1)
 })
 
-test("a missing build record does not rebuild when sources are older", () => {
+test("sources older than the binary do not trigger a rebuild", () => {
   const { local } = localPaths()
-  const deps = sourceTreeDeps(500, { withBuildRecord: false }).deps
+  const deps = sourceTreeDeps(500).deps
 
   assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
   assert.equal(buildCalls(deps).length, 0)
@@ -276,7 +267,7 @@ test("registrations are keyed by project root", async (t) => {
   assert.equal(registeredBeaconConfig(other), second.config)
 })
 
-test("four location resolutions spawn no build or hash subprocess", async (t) => {
+test("four location resolutions spawn no build subprocess", async (t) => {
   const registrations = []
   const allDeps = []
   for (let i = 0; i < 4; i += 1) {
@@ -292,7 +283,6 @@ test("four location resolutions spawn no build or hash subprocess", async (t) =>
 
   for (const deps of allDeps) {
     assert.equal(deps.execCalls.length, 0)
-    assert.equal(hashCalls(deps).length, 0)
   }
 })
 

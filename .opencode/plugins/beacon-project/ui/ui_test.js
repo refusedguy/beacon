@@ -4,7 +4,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   ACTION_NAMES, DECISION_LIMIT, PANEL_NAME, beaconStatusDefinition,
-  createDetailMount, createRowMount, detailLines, normalizeRun, snapshotLineItems,
+  createDetailMount, createRowMount, defineBeaconStatus, detailLines, normalizeRun, snapshotLineItems,
 } from "./ui.js"
 import { NOW, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -169,4 +169,11 @@ test("rendered detail caps decisions at 20 with an earlier marker", () => {
   const names = rows.map((i) => i.name ?? i.text)
   assert.equal(names.filter((n) => n.includes("reconcile.decision")).length, DECISION_LIMIT)
   assert.ok(names.includes("... 5 earlier decisions"))
+})
+
+test("the status plugin is defined with the caller's define function", () => {
+  let received = null
+  const built = defineBeaconStatus((definition) => { received = definition; return { built: true } })
+  assert.equal(received, beaconStatusDefinition)
+  assert.deepEqual(built, { built: true })
 })

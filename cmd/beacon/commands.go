@@ -28,13 +28,14 @@ func parentSessionFromEnv() string {
 	return os.Getenv("BEACON_PARENT_SESSION")
 }
 
-// cliWire is the wiring entry point shared by the CLI commands. Tests replace
-// it to observe the parent session handed to the wiring layer.
-var cliWire = wire
+// wireFn builds the wiring for a config path and a parent session. Commands
+// receive one explicitly so tests can supply their own without mutating a
+// package-level variable.
+type wireFn func(path, parentSession string) (*wiring, error)
 
 // wireCLI wires a CLI command with the parent session from the environment.
-func wireCLI(path string) (*wiring, error) {
-	return cliWire(path, parentSessionFromEnv())
+func wireCLI(fn wireFn, path string) (*wiring, error) {
+	return fn(path, parentSessionFromEnv())
 }
 
 func wireReadOnly(path string) (config.Config, *sqlite.Store, *workspace.GitWorktree, error) {
@@ -67,7 +68,7 @@ func daemonSnapshot(status daemonStatus) *app.DaemonSnapshot {
 	return out
 }
 
-func newDispatchCommand(configPath *string) *cobra.Command {
+func newDispatchCommand(configPath *string, fn wireFn) *cobra.Command {
 	return &cobra.Command{
 		Use:   "dispatch [n]",
 		Short: "Start up to n non-overlapping tasks",
@@ -79,7 +80,7 @@ func newDispatchCommand(configPath *string) *cobra.Command {
 					return err
 				}
 			}
-			w, err := wireCLI(*configPath)
+			w, err := wireCLI(fn, *configPath)
 			if err != nil {
 				return err
 			}
@@ -233,7 +234,7 @@ func controlMessage(messages []string) string {
 
 // newControlCommand freezes the CLI contract. The json flag is accepted for
 // scripting compatibility; a successful control action always prints JSON.
-func newControlCommand(configPath *string) *cobra.Command {
+func newControlCommand(configPath *string, fn wireFn) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "control",
 		Short: "Control a run: " + strings.Join(core.ControlActionNames(), ", "),
@@ -262,7 +263,7 @@ func newControlCommand(configPath *string) *cobra.Command {
 			if err := validateControl(action, runID, message); err != nil {
 				return err
 			}
-			if err := dispatchControlWithPR(cmd.Context(), *configPath, action, runID, sha, pr, message); err != nil {
+			if err := dispatchControlWithPR(cmd.Context(), fn, *configPath, action, runID, sha, pr, message); err != nil {
 				return err
 			}
 			return printJSON(controlResult{OK: true, Action: action, RunID: runID})
@@ -293,7 +294,7 @@ func validateControl(action, runID string, message ...string) error {
 
 // dispatchControlWithPR forwards to the daemon when it owns the state database
 // and connection file. Without a live daemon it applies the control directly.
-func dispatchControlWithPR(ctx context.Context, configPath, action, runID, sha string, pr int, message ...string) error {
+func dispatchControlWithPR(ctx context.Context, fn wireFn, configPath, action, runID, sha string, pr int, message ...string) error {
 	cfg, _, err := loadConfig(configPath)
 	if err != nil {
 		return err
@@ -301,7 +302,7 @@ func dispatchControlWithPR(ctx context.Context, configPath, action, runID, sha s
 	if info, err := readConnection(filepath.Dir(cfg.StateDB)); err == nil && daemonAlive(cfg.StateDB) {
 		return postControlWithPR(ctx, info, action, runID, sha, pr, message...)
 	}
-	w, err := wireCLI(configPath)
+	w, err := wireCLI(fn, configPath)
 	if err != nil {
 		return err
 	}

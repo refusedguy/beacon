@@ -69,15 +69,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 			errCh := make(chan error, 3)
 			go func() { errCh <- w.recon.Run(ctx, changeViews[0]) }()
 
-			api := &apiServer{wiring: w, token: token, eventStream: events[1], changes: subs}
-			srv := &http.Server{Addr: addr, Handler: api.handler(), ReadHeaderTimeout: 5 * time.Second}
-			go func() {
-				<-ctx.Done()
-				shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = srv.Shutdown(shutdown)
-			}()
-			go func() { errCh <- srv.ListenAndServe() }()
+			startAPIServer(ctx, apiServices{status: w.status, control: w.control}, token, events[1], subs, addr, errCh)
 
 			if w.cfg.Webhook.Enabled {
 				hookAddr := w.cfg.Webhook.Addr
