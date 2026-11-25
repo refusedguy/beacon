@@ -321,6 +321,43 @@ func TestNotifyParentUsesQueueDeliveryWithoutResume(t *testing.T) {
 	}
 }
 
+func TestSpawnThenStopEmptiesRunMap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			_, _ = io.WriteString(w, `{"id":"ses_stop"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/session/ses_stop":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(Config{Endpoint: srv.URL})
+	sess, err := h.Spawn(context.Background(), testSpawnRequest())
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if _, ok := h.runFor(sess.ID); !ok {
+		t.Fatalf("Spawn did not bind session %q", sess.ID)
+	}
+	if err := h.Stop(context.Background(), sess.ID); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if _, ok := h.runFor(sess.ID); ok {
+		t.Error("session still bound after Stop")
+	}
+	h.mu.RLock()
+	n := len(h.runs)
+	h.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("run map has %d entries after Stop, want 0", n)
+	}
+}
+
 func TestStopAndIsAlive(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/session/ses_42" {

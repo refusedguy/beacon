@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -240,7 +241,7 @@ func TestWireServicesInjectsDecisionSink(t *testing.T) {
 		store: store, changes: make(chan int, 1),
 		decisions: app.DecisionLogger{Sink: store},
 	}
-	w := wireServices(cfg, t.TempDir(), "", infra)
+	w := wireServices(cfg, t.TempDir(), "", infra, bareHarness{}, mergePolicy(cfg), nil)
 	if w.dispatcher.Decisions.Sink != store {
 		t.Error("dispatcher is missing the decision sink")
 	}
@@ -252,7 +253,7 @@ func TestWireServicesInjectsDecisionSink(t *testing.T) {
 func TestWireServicesConfiguresTaskWriters(t *testing.T) {
 	cfg := config.Config{BaseBranch: "main"}
 	infra := &wiredInfra{changes: make(chan int, 1)}
-	w := wireServices(cfg, t.TempDir(), "", infra)
+	w := wireServices(cfg, t.TempDir(), "", infra, bareHarness{}, mergePolicy(cfg), nil)
 	if w.taskCreator == nil || w.taskDeleter == nil || w.taskUpdater == nil {
 		t.Fatalf("task writers: creator=%v deleter=%v updater=%v",
 			w.taskCreator, w.taskDeleter, w.taskUpdater)
@@ -271,7 +272,7 @@ func TestWireServicesReconcilerUsesConfigParentWhenEnvironmentEmpty(t *testing.T
 		Harness:    config.Harness{ParentSessionID: "ses_from_config"},
 	}
 	infra := &wiredInfra{changes: make(chan int, 1)}
-	w := wireServices(cfg, t.TempDir(), "", infra)
+	w := wireServices(cfg, t.TempDir(), "", infra, bareHarness{}, mergePolicy(cfg), nil)
 	if w.recon.ParentSessionID != "ses_from_config" {
 		t.Fatalf("reconciler parent = %q, want ses_from_config", w.recon.ParentSessionID)
 	}
@@ -286,8 +287,57 @@ func TestWireServicesReconcilerPrefersEnvironmentParent(t *testing.T) {
 		Harness:    config.Harness{ParentSessionID: "ses_from_config"},
 	}
 	infra := &wiredInfra{changes: make(chan int, 1)}
-	w := wireServices(cfg, t.TempDir(), "ses_from_env", infra)
+	w := wireServices(cfg, t.TempDir(), "ses_from_env", infra, bareHarness{}, mergePolicy(cfg), nil)
 	if w.recon.ParentSessionID != "ses_from_env" {
 		t.Fatalf("reconciler parent = %q, want ses_from_env", w.recon.ParentSessionID)
+	}
+}
+
+func TestWireInjectsReloadableWrappersAtConstruction(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
+	w, err := wire(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+
+	h, ok := w.harness.(*reloadableHarness)
+	if !ok {
+		t.Fatalf("w.harness = %T, want *reloadableHarness", w.harness)
+	}
+	if w.dispatcher.Harness != h {
+		t.Error("dispatcher did not get the reloadable harness")
+	}
+	if w.control.Harness != h {
+		t.Error("control did not get the reloadable harness")
+	}
+	if w.recon.Harness != h {
+		t.Error("reconciler did not get the reloadable harness")
+	}
+	if w.workspace.Refresher != h {
+		t.Error("workspace did not get the reloadable refresher")
+	}
+	p, ok := w.recon.Policy.(*reloadablePolicy)
+	if !ok {
+		t.Fatalf("reconciler policy = %T, want *reloadablePolicy", w.recon.Policy)
+	}
+	if h.live != &w.watcher.live || p.live != &w.watcher.live {
+		t.Error("wrappers do not follow the config watcher")
+	}
+	if got := w.dispatcher.ResolveModel(""); got.ID != "model-a" {
+		t.Fatalf("initial model = %q, want model-a", got.ID)
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWatchFile(t, path, strings.Replace(string(body), "model: model-a", "model: model-b", 1))
+	if !w.watcher.reload() {
+		t.Fatal("reload did not apply the changed config")
+	}
+	if got := w.dispatcher.ResolveModel(""); got.ID != "model-b" {
+		t.Fatalf("model after reload = %q, want model-b", got.ID)
 	}
 }

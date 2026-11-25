@@ -223,6 +223,9 @@ func (r *Reconciler) agentSlots() core.AgentSlots {
 	return nil
 }
 
+// hasAgentSlot delegates the wake decision to the same AgentSlots policy used
+// by dispatch and promotion. A store error makes Available return zero, so a
+// wake is skipped rather than started on an unreadable budget.
 func (r *Reconciler) hasAgentSlot(ctx context.Context) bool {
 	slots := r.agentSlots()
 	if slots == nil {
