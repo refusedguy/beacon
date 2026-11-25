@@ -156,8 +156,11 @@ type Concurrency struct {
 
 // AgentSlots owns the agent-slot budget policy. Available returns the number
 // of free slots; a positive count permits another worker to start. The
-// implementation owns the default limit and fails open when active runs cannot
-// be listed, so dispatch, promotion and wake checks share one policy.
+// implementation owns the default limit and fails closed when active runs
+// cannot be listed, so dispatch, promotion and wake checks share one policy.
+// Callers that start an agent hold the implementation's acquisition lock from
+// the Available call through the start, so concurrent paths cannot spend the
+// same slot twice.
 type AgentSlots interface {
 	Available(ctx context.Context) int
 }

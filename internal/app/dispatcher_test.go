@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -664,12 +665,58 @@ func TestAgentSlotsAvailableDefaultsToInFlightLimit(t *testing.T) {
 	}
 }
 
-func TestAgentSlotsAvailableFailsOpen(t *testing.T) {
+func TestAgentSlotsAvailableFailsClosed(t *testing.T) {
 	d := &Dispatcher{
 		Store:       &listActiveErrorStore{fakeStore: newFakeStore()},
 		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
 	}
-	if got := d.Available(context.Background()); got <= 0 {
-		t.Fatalf("Available = %d, want a positive count on a store error", got)
+	if got := d.Available(context.Background()); got != 0 {
+		t.Fatalf("Available = %d, want 0 on a store error", got)
+	}
+}
+
+func TestConcurrentDispatchAndPromotionRespectMaxActiveAgents(t *testing.T) {
+	const maxAgents = 3
+	store := newFakeStore()
+	h := &fakeHarness{}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: twentyTasks()}, Planner: NewPlanner(nil),
+		Workspace: &fakeWorkspace{}, Harness: h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: maxAgents},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx := context.Background()
+			if i%2 == 0 {
+				if _, err := d.Dispatch(ctx, 20); err != nil {
+					t.Errorf("dispatch: %v", err)
+				}
+				return
+			}
+			if _, err := d.PromotePending(ctx); err != nil {
+				t.Errorf("promote: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	agents := 0
+	for _, r := range active {
+		if r.State.ActiveAgent() {
+			agents++
+		}
+	}
+	if agents != maxAgents {
+		t.Fatalf("active agents = %d, want %d", agents, maxAgents)
+	}
+	if len(h.sessions) != maxAgents {
+		t.Fatalf("spawned agents = %d, want %d", len(h.sessions), maxAgents)
 	}
 }
