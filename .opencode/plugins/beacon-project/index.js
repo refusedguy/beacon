@@ -8,7 +8,7 @@ try {
 }
 
 import { projectRoot } from "./state/location.js"
-import { noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
+import { createMcpRegistrar, noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
 import { installProjectContext } from "./rules/context.js"
 import { agentIdentity, sessionIdentity } from "./state/session_identity.js"
 import {
@@ -184,7 +184,7 @@ export async function currentSessionAgent(ctx) {
 
 // Resolve once. Workers get a no-op so no command resolution runs and no config
 // is registered. Every other agent keeps the registration behavior as it was.
-export async function resolveMcpRegistration(ctx, root, { agent } = {}) {
+export async function resolveMcpRegistration(ctx, root, { agent, registrar } = {}) {
   const resolved = agent ?? (await currentSessionAgent(ctx))
   const options = ctx?.options && typeof ctx.options === "object" ? ctx.options : {}
   if (isWorkerAgent(resolved)) {
@@ -192,6 +192,7 @@ export async function resolveMcpRegistration(ctx, root, { agent } = {}) {
       ? options.noopMcpRegistration()
       : noopMcpRegistration()
   }
+  if (registrar) return registrar.registerBeaconMcp(ctx, root)
   return registerBeaconMcp(ctx, root, options.mcpDeps ?? {})
 }
 
@@ -265,7 +266,8 @@ export const beaconProject = Plugin.define({
     // starts per session. A worker skips this because it already inherits the
     // parent's pooled connection and re-registering reconnects the operator's
     // TUI. The no-op keeps the cleanup path identical.
-    const mcp = await resolveMcpRegistration(ctx, root, { agent })
+    const registrar = createMcpRegistrar(options.mcpDeps ?? {})
+    const mcp = await resolveMcpRegistration(ctx, root, { agent, registrar })
     const context = await installProjectContext(ctx, root, options)
     const guard = await registerShellGuard(ctx, options)
 
