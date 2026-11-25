@@ -118,6 +118,7 @@ func (l *stringList) UnmarshalYAML(node *yaml.Node) error {
 type yamlFields struct {
 	ID            string     `yaml:"id"`
 	TaskID        string     `yaml:"task_id"`
+	Parent        string     `yaml:"parent"`
 	Scope         stringList `yaml:"scope"`
 	OwnerFiles    stringList `yaml:"owner_files"`
 	Depends       stringList `yaml:"depends"`
@@ -148,6 +149,7 @@ type epicFields struct {
 
 type taskFields struct {
 	ID            string
+	Parent        string
 	Scope         []string
 	Depends       []string
 	Priority      int
@@ -202,7 +204,7 @@ type PlanParser struct{}
 var _ core.EpicParser = PlanParser{}
 
 func (PlanParser) Children(epic core.Task) []core.Task {
-	return core.ExpandChildren(epic, "")
+	return core.SetParent(core.ExpandChildren(epic, ""), epic.ID)
 }
 
 // ParseTaskFields reads a fenced YAML block and flat Scope/Depends/Priority lines.
@@ -214,6 +216,7 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			slog.Warn("tasksource: malformed YAML field block", "error", err)
 		} else {
 			out.ID = firstNonEmpty(yf.TaskID, yf.ID)
+			out.Parent = strings.TrimSpace(yf.Parent)
 			out.Scope = append(out.Scope, yf.Scope...)
 			out.Scope = append(out.Scope, yf.OwnerFiles...)
 			out.Depends = append(out.Depends, yf.Depends...)
@@ -244,6 +247,8 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			out.RequireReview = normalizeReview(afterColon(line))
 		case strings.HasPrefix(line, "TaskID:"):
 			out.ID = afterColon(line)
+		case strings.HasPrefix(line, "Parent:"), strings.HasPrefix(line, "ParentTask:"):
+			out.Parent = afterColon(line)
 		}
 	}
 	out.Scope = unique(out.Scope)
@@ -262,6 +267,12 @@ func (t taskFields) Scopes(dir string) []core.ScopePath {
 		out = append(out, scopeForPath(p, dir))
 	}
 	return out
+}
+
+// ParentID returns the parsed parent as a task ID. It is empty when the source
+// card has no epic relation.
+func (t taskFields) ParentID() core.TaskID {
+	return core.TaskID(strings.TrimSpace(t.Parent))
 }
 
 func (t taskFields) Dependencies() []core.TaskID {

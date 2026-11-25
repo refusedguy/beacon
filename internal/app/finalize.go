@@ -52,8 +52,9 @@ const epicBranchPrefix = "beacon/"
 
 func epicBranch(id core.TaskID) string { return epicBranchPrefix + string(id) }
 
-// parentEpicID returns the epic ID encoded in a child task ID of the form
-// <epic>-NN. IDs that do not end in a two digit suffix have no parent epic.
+// parentEpicID is the ID-shape check kept for the caller that has no task
+// snapshot. Reconciliation decisions come from TaskTree.Parent; this only
+// recognises legacy generated IDs until that caller moves to the tree.
 func parentEpicID(id core.TaskID) core.TaskID {
 	s := string(id)
 	i := strings.LastIndexByte(s, '-')
@@ -68,20 +69,21 @@ func parentEpicID(id core.TaskID) core.TaskID {
 	return core.TaskID(s[:i])
 }
 
-func (r *Reconciler) taskByID(ctx context.Context, id core.TaskID) (core.Task, bool) {
+// taskTree indexes one source read. Every relation question in reconciliation
+// goes through it, so the parent field is read once instead of scanning IDs.
+func (r *Reconciler) taskTree(ctx context.Context) core.TaskTree {
 	if r.Source == nil {
-		return core.Task{}, false
+		return core.NewTaskTree(nil)
 	}
 	tasks, err := r.Source.ListAvailable(ctx)
 	if err != nil {
-		return core.Task{}, false
+		return core.NewTaskTree(nil)
 	}
-	for _, task := range tasks {
-		if task.ID == id {
-			return task, true
-		}
-	}
-	return core.Task{}, false
+	return core.NewTaskTree(tasks)
+}
+
+func (r *Reconciler) taskByID(ctx context.Context, id core.TaskID) (core.Task, bool) {
+	return r.taskTree(ctx).Task(id)
 }
 
 func (r *Reconciler) epicTask(ctx context.Context, id core.TaskID) (core.Task, bool) {
@@ -92,12 +94,16 @@ func (r *Reconciler) epicTask(ctx context.Context, id core.TaskID) (core.Task, b
 // baseBranchFor returns the branch a run's pull request targets. Children of
 // an epic target the epic branch; other runs target the configured base.
 func (r *Reconciler) baseBranchFor(ctx context.Context, run *core.Run) string {
-	if epicID := parentEpicID(run.TaskID); epicID != "" {
-		if _, ok := r.epicTask(ctx, epicID); ok {
-			return epicBranch(epicID)
-		}
+	tree := r.taskTree(ctx)
+	task, ok := tree.Task(run.TaskID)
+	if !ok {
+		return r.BaseBranch
 	}
-	return r.BaseBranch
+	parent, ok := tree.Parent(task.ID)
+	if !ok || parent.Kind != core.TaskKindEpic {
+		return r.BaseBranch
+	}
+	return epicBranch(parent.ID)
 }
 
 // reconcileEpics opens a pull request for each epic whose children are done.
@@ -107,12 +113,17 @@ func (r *Reconciler) reconcileEpics(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	tree := r.taskTree(ctx)
 	for _, task := range ready {
-		if task.Kind != core.TaskKindEpic {
+		epic, ok := tree.Task(task.ID)
+		if !ok {
+			epic = task
+		}
+		if epic.Kind != core.TaskKindEpic {
 			continue
 		}
-		if err := r.openEpicPR(ctx, task); err != nil {
-			slog.Error("open epic PR", "task", task.ID, "error", err)
+		if err := r.openEpicPR(ctx, epic); err != nil {
+			slog.Error("open epic PR", "task", epic.ID, "error", err)
 		}
 	}
 	return nil

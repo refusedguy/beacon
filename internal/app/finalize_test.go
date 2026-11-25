@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -16,6 +17,22 @@ type failingOpenPRSCM struct {
 
 func (f *failingOpenPRSCM) OpenPR(context.Context, string, string, string) (int, error) {
 	return 0, f.err
+}
+
+func TestBaseBranchFollowsTaskParentNotIDShape(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{
+		Source: &fakeSource{tasks: []core.Task{
+			{ID: "T-EPIC", Kind: core.TaskKindEpic, Status: core.TaskAvailable},
+			{ID: "T-CHILD", Parent: "T-EPIC", Status: core.TaskAvailable},
+		}},
+		BaseBranch: "main",
+	}
+	run := core.NewRun("r1", "T-CHILD", time.Now().UTC())
+
+	if got := r.baseBranchFor(ctx, run); got != "beacon/T-EPIC" {
+		t.Fatalf("base branch = %q, want beacon/T-EPIC", got)
+	}
 }
 
 func TestEpicPRDeliveryReleasedWhenOpenFails(t *testing.T) {
