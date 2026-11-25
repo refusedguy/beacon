@@ -32,7 +32,7 @@ func (e *AppError) Error() string {
 
 func (e *AppError) Unwrap() error { return e.Cause }
 
-func Errorf(code ErrorCode, format string, args ...any) *AppError {
+func Errorf(code ErrorCode, format string, args ...any) error {
 	return &AppError{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
