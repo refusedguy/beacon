@@ -8,7 +8,7 @@ export const DEFAULT_SNAPSHOT_DECISIONS_LIMIT = 20
 export function pluginOptions(ctx) {
   const opts = ctx?.options && typeof ctx.options === "object" ? ctx.options : {}
   const config = ctx?.config && typeof ctx.config === "object" ? ctx.config : {}
-  return { ...opts, ...config }
+  return { ...config, ...opts }
 }
 
 export function boolOption(value, fallback) {
