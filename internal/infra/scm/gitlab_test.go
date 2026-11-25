@@ -124,7 +124,7 @@ func TestGitLabObserveFailedPipelineRedaction(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(strings.Repeat("x", 1400) + " token = " + secret))
 		case strings.HasSuffix(p, "/approvals"):
-			http.NotFound(w, r)
+			glWriteJSON(t, w, map[string]any{})
 		case strings.HasSuffix(p, "/repository/compare"):
 			glWriteJSON(t, w, map[string]any{"behind_by": 0})
 		default:
@@ -270,6 +270,161 @@ func TestGitLabFindOpenPRByBranch(t *testing.T) {
 	_, err = g.FindOpenPRByBranch(context.Background(), "feature/x")
 	if core.CodeOf(err) != core.CodeNotFound {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+// glObserveHandler serves a complete observation. When fail names a provider
+// call, that call answers with HTTP 500.
+func glObserveHandler(t *testing.T, fail string) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		part := ""
+		switch {
+		case strings.HasSuffix(p, "/merge_requests/7"):
+			part = "mr"
+		case strings.HasSuffix(p, "/threads"):
+			part = "threads"
+		case strings.HasSuffix(p, "/approvals"):
+			part = "approvals"
+		case strings.HasSuffix(p, "/pipelines"):
+			part = "pipelines"
+		case strings.HasSuffix(p, "/jobs"):
+			part = "jobs"
+		case strings.HasSuffix(p, "/repository/compare"):
+			part = "compare"
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, p)
+			http.NotFound(w, r)
+			return
+		}
+		if part == fail {
+			http.Error(w, "provider down", http.StatusInternalServerError)
+			return
+		}
+		switch part {
+		case "mr":
+			glWriteJSON(t, w, map[string]any{
+				"iid": 7, "state": "opened", "sha": "head1", "target_branch": "main",
+			})
+		case "threads":
+			glWriteJSON(t, w, []any{})
+		case "approvals":
+			glWriteJSON(t, w, map[string]any{"approved_by": []map[string]any{
+				{"user": map[string]string{"username": "alice"}},
+			}})
+		case "pipelines":
+			glWriteJSON(t, w, []map[string]any{{"id": 11, "sha": "head1", "status": "success"}})
+		case "jobs":
+			glWriteJSON(t, w, []map[string]any{{"id": 110, "name": "build", "status": "success"}})
+		case "compare":
+			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		}
+	})
+}
+
+func TestGitLabObserveCompleteObservationMerges(t *testing.T) {
+	g := glTestServer(t, glObserveHandler(t, ""))
+	o, err := g.Observe(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Incomplete || o.IncompleteReason != "" {
+		t.Fatalf("incomplete = %t, reason = %q; want a complete observation", o.Incomplete, o.IncompleteReason)
+	}
+	if got := core.Decide(o, nil); got.Verdict != core.VerdictMerge {
+		t.Fatalf("decision = %+v, want %s", got, core.VerdictMerge)
+	}
+}
+
+func TestGitLabObserveProviderFailureWaits(t *testing.T) {
+	for _, part := range []string{"threads", "approvals", "pipelines", "jobs", "compare"} {
+		t.Run(part, func(t *testing.T) {
+			g := glTestServer(t, glObserveHandler(t, part))
+			o, err := g.Observe(context.Background(), 7)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !o.Incomplete {
+				t.Fatal("Incomplete = false, want true")
+			}
+			if !strings.Contains(o.IncompleteReason, part) {
+				t.Fatalf("reason = %q, want it to name %q", o.IncompleteReason, part)
+			}
+			if got := core.Decide(o, nil); got.Verdict != core.VerdictWait {
+				t.Fatalf("decision = %+v, want %s", got, core.VerdictWait)
+			}
+		})
+	}
+}
+
+func TestGitLabObserveMalformedJobsWaits(t *testing.T) {
+	good := glObserveHandler(t, "")
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/jobs") {
+			_, _ = w.Write([]byte(`[{"id":`))
+			return
+		}
+		good.ServeHTTP(w, r)
+	}))
+	o, err := g.Observe(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.Incomplete || !strings.Contains(o.IncompleteReason, "jobs") {
+		t.Fatalf("incomplete = %t, reason = %q; want a jobs failure", o.Incomplete, o.IncompleteReason)
+	}
+	if got := core.Decide(o, nil); got.Verdict != core.VerdictWait {
+		t.Fatalf("decision = %+v, want %s", got, core.VerdictWait)
+	}
+}
+
+func TestGitLabObserveMalformedMRFailsClosed(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty object": `{}`,
+		"broken json":  `{"iid": 7,`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			_, err := g.Observe(context.Background(), 7)
+			if core.CodeOf(err) != core.CodeUnavailable {
+				t.Fatalf("err = %v, want unavailable", err)
+			}
+		})
+	}
+}
+
+func TestGitLabUpdateBranchMalformedResponse(t *testing.T) {
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"sha":`))
+	}))
+	_, err := g.UpdateBranch(context.Background(), 9, "old")
+	if core.CodeOf(err) != core.CodeUnavailable {
+		t.Fatalf("err = %v, want unavailable", err)
+	}
+}
+
+func TestGitLabMergeRequiresConfirmedState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		code core.ErrorCode
+	}{
+		{"malformed json", `{"state":`, core.CodeUnavailable},
+		{"no state", `{}`, core.CodeConflict},
+		{"not merged", `{"state":"opened"}`, core.CodeConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			err := g.Merge(context.Background(), 10, "expected", "title")
+			if core.CodeOf(err) != tc.code {
+				t.Fatalf("err = %v, want code %s", err, tc.code)
+			}
+		})
 	}
 }
 

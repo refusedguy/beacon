@@ -25,6 +25,7 @@ func TestDecide(t *testing.T) {
 		want Verdict
 	}{
 		{"merge when rule passes", Observation{PRState: "open", Checks: []CheckResult{{Name: "ci", State: CheckSuccess}}}, fakeCriterion{name: "ok", verdict: VerdictMerge}, VerdictMerge},
+		{"incomplete waits", Observation{PRState: "open", Incomplete: true}, fakeCriterion{name: "ok", verdict: VerdictMerge}, VerdictWait},
 		{"wait when rule waits", Observation{PRState: "open"}, fakeCriterion{name: "checks", verdict: VerdictWait}, VerdictWait},
 		{"conflict wins", Observation{PRState: "open", Conflict: true}, fakeCriterion{verdict: VerdictMerge}, VerdictNeedsAgentFix},
 		{"failed check wins", Observation{PRState: "open", Checks: []CheckResult{{Name: "ci", State: CheckFailure}}}, fakeCriterion{verdict: VerdictMerge}, VerdictNeedsAgentFix},
@@ -41,6 +42,29 @@ func TestDecide(t *testing.T) {
 				t.Fatalf("verdict = %s, want %s", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDecideIncompleteNeverMerges(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		obs  Observation
+	}{
+		{"empty checks", Observation{PRState: "open", Incomplete: true}},
+		{"successful checks", Observation{PRState: "open", Incomplete: true, Checks: []CheckResult{{Name: "ci", State: CheckSuccess}}}},
+		{"with conflict", Observation{PRState: "open", Incomplete: true, Conflict: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Decide(tc.obs, []Criterion{fakeCriterion{name: "ok", verdict: VerdictMerge}})
+			if got.Verdict != VerdictWait {
+				t.Fatalf("verdict = %s, want %s", got.Verdict, VerdictWait)
+			}
+		})
+	}
+	obs := Observation{PRState: "open", Incomplete: true, IncompleteReason: "jobs: provider down"}
+	got := Decide(obs, nil)
+	if got.Criterion != "invariant" || !strings.Contains(got.Reason, "jobs: provider down") {
+		t.Fatalf("decision = %+v, want invariant with the failure reason", got)
 	}
 }
 
@@ -114,7 +138,8 @@ func TestAllRequiredPass(t *testing.T) {
 		names  []string
 		want   bool
 	}{
-		{"no checks, no names", nil, nil, true},
+		{"no checks, no names", nil, nil, false},
+		{"no checks, with names", nil, []string{"ci"}, false},
 		{"all success, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckSuccess}}, nil, true},
 		{"success and skipped, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckSkipped}}, nil, true},
 		{"pending, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckPending}}, nil, false},

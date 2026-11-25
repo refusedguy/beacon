@@ -1,7 +1,7 @@
 ---
 id: T-20261125-feaccbbd
 title: Make GitLab observation fail closed and decode responses safely
-status: available
+status: done
 scope:
     - internal/infra/scm/gitlab_mr.go
     - internal/infra/scm/gitlab_checks.go
