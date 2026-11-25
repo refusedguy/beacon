@@ -84,7 +84,7 @@ var transitions = map[RunState]map[EventKind]RunState{
 	RunRunning:       {EvPRRegistered: RunWaitingCI, EvChecksPending: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvChecksFailed: RunNeedsAgentFix, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
 	RunWaitingCI:     {EvChecksPending: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvChecksFailed: RunNeedsAgentFix, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
 	RunNeedsRebase:   {EvRebased: RunWaitingCI, EvRebaseFailed: RunNeedsAgentFix, EvBlock: RunBlocked, EvCancel: RunClosed},
-	RunNeedsAgentFix: {EvAgentFixed: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
+	RunNeedsAgentFix: {EvAgentFixed: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
 	RunBlocked:       {EvUnblock: RunWaitingCI, EvCancel: RunClosed},
 }
 
@@ -262,6 +262,16 @@ func (r *Run) RetryBlocked(reason string) error {
 	}
 	r.RebaseAttempts = 0
 	r.FixAttempts = 0
+	if r.PRNumber == 0 {
+		// A blocked run without a PR has no PR to reconcile. Returning it to
+		// waiting_ci would park it forever, so re-arm it for a fresh worker.
+		r.State = RunPending
+		r.SessionID = ""
+		r.WorkspacePath = ""
+		r.Reason = reason
+		r.UpdatedAt = time.Now().UTC()
+		return nil
+	}
 	return r.Apply(Event{Kind: EvUnblock, Reason: reason})
 }
 

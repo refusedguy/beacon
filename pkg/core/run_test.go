@@ -16,6 +16,7 @@ func TestRunTransitions(t *testing.T) {
 		{"register pr", RunRunning, EvPRRegistered, RunWaitingCI},
 		{"checks pending after spawn", RunRunning, EvChecksPending, RunWaitingCI},
 		{"behind", RunWaitingCI, EvBehind, RunNeedsRebase},
+		{"behind after agent fix", RunNeedsAgentFix, EvBehind, RunNeedsRebase},
 		{"rebase", RunNeedsRebase, EvRebased, RunWaitingCI},
 		{"failed ci", RunWaitingCI, EvChecksFailed, RunNeedsAgentFix},
 		{"wake", RunNeedsAgentFix, EvAgentFixed, RunWaitingCI},
@@ -141,12 +142,25 @@ func TestReopenWithPRRejectsActiveRun(t *testing.T) {
 }
 
 func TestRetryBlockedRun(t *testing.T) {
-	r := &Run{ID: "r1", State: RunBlocked, RebaseAttempts: 2, FixAttempts: 3}
+	r := &Run{ID: "r1", State: RunBlocked, PRNumber: 42, RebaseAttempts: 2, FixAttempts: 3}
 	if err := r.RetryBlocked("retried by operator"); err != nil {
 		t.Fatal(err)
 	}
 	if r.State != RunWaitingCI || r.RebaseAttempts != 0 || r.FixAttempts != 0 || r.Reason != "retried by operator" {
 		t.Fatalf("run = %+v", r)
+	}
+}
+
+func TestRetryBlockedRunWithoutPRReturnsToPending(t *testing.T) {
+	r := &Run{ID: "r1", State: RunBlocked, SessionID: "sess", WorkspacePath: "/ws/T-1", RebaseAttempts: 2, FixAttempts: 3}
+	if err := r.RetryBlocked("retried by operator"); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != RunPending || r.SessionID != "" || r.WorkspacePath != "" {
+		t.Fatalf("run = %+v, want pending with cleared session and worktree", r)
+	}
+	if r.RebaseAttempts != 0 || r.FixAttempts != 0 || r.Reason != "retried by operator" {
+		t.Fatalf("run = %+v, want reset attempts and retry reason", r)
 	}
 }
 

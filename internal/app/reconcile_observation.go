@@ -69,7 +69,7 @@ func (r *Reconciler) handleNeedsRebase(
 	if sameObservation(run, obs) {
 		return decision, nil
 	}
-	if run.State == core.RunWaitingCI || run.State == core.RunRunning {
+	if run.State == core.RunWaitingCI || run.State == core.RunRunning || run.State == core.RunNeedsAgentFix {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBehind, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}
@@ -137,10 +137,13 @@ func (r *Reconciler) handleNeedsAgentFix(
 }
 
 func (r *Reconciler) handleBlocked(ctx context.Context, run *core.Run, decision core.MergeDecision) (core.MergeDecision, error) {
-	if run.State != core.RunBlocked {
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}, core.Observation{}); err != nil {
-			return decision, err
-		}
+	// A blocked run stays in the active set and is reconciled on every tick.
+	// Only the transition into blocked sends a notification.
+	if run.State == core.RunBlocked {
+		return decision, nil
+	}
+	if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}, core.Observation{}); err != nil {
+		return decision, err
 	}
 	return decision, r.notify(run, "blocked", decision.Reason)
 }

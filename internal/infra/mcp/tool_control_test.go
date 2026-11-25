@@ -372,14 +372,28 @@ func TestControlRetryRearmsRun(t *testing.T) {
 		wantSess  string
 	}{
 		{
-			name: "blocked run resets attempts",
+			name: "blocked run with PR returns to waiting_ci",
 			build: func(t *testing.T) *core.Run {
 				r := controlRunInState(t, "r1",
 					core.Event{Kind: core.EvStart}, core.Event{Kind: core.EvBlock})
+				r.PRNumber = 42
 				r.RebaseAttempts, r.FixAttempts = 2, 2
 				return r
 			},
 			wantState: core.RunWaitingCI,
+			wantPR:    42,
+		},
+		{
+			name: "blocked run without PR returns to pending",
+			build: func(t *testing.T) *core.Run {
+				r := controlRunInState(t, "r1",
+					core.Event{Kind: core.EvStart}, core.Event{Kind: core.EvBlock})
+				r.SessionID = "session-1"
+				r.WorkspacePath = "/tmp/work"
+				r.RebaseAttempts, r.FixAttempts = 2, 2
+				return r
+			},
+			wantState: core.RunPending,
 		},
 		{
 			name: "closed run without PR returns to pending",

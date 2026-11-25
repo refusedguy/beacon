@@ -226,6 +226,46 @@ func TestReconcileWaitingCIToAutoRebase(t *testing.T) {
 	}
 }
 
+func TestBlockedNotificationSentOnce(t *testing.T) {
+	r, store, _, _, _ := newReconciler(t, core.VerdictBlocked, core.Observation{})
+	notifier := &fakeNotifier{}
+	r.Notifier = notifier
+	run := store.runs["r1"]
+	decision := core.MergeDecision{Verdict: core.VerdictBlocked, Reason: "gate is down"}
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.handleBlocked(context.Background(), run, decision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if notifier.count != 1 {
+		t.Fatalf("blocked notifications = %d, want 1", notifier.count)
+	}
+	if run.State != core.RunBlocked {
+		t.Fatalf("state = %s, want blocked", run.State)
+	}
+}
+
+func TestNeedsAgentFixBehindRebases(t *testing.T) {
+	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha1", BaseSHA: "base-new", PRState: "open", Behind: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckFailure}},
+		})
+	store.runs["r1"].State = core.RunNeedsAgentFix
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if scm.rebases != 1 {
+		t.Fatalf("branch updates = %d, want 1", scm.rebases)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunWaitingCI || got.RebaseAttempts != 1 {
+		t.Fatalf("state=%s rebaseAttempts=%d, want waiting_ci/1", got.State, got.RebaseAttempts)
+	}
+}
+
 func TestIndependentBaseChangeDoesNotConsumeRebaseAttempt(t *testing.T) {
 	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
 		core.Observation{
