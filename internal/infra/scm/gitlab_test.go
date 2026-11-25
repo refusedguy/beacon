@@ -272,3 +272,25 @@ func TestGitLabFindOpenPRByBranch(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestGitLabBreakerStopsRepeatedFailures(t *testing.T) {
+	var calls atomic.Int64
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	for i := 0; i < 6; i++ {
+		if _, err := g.request(context.Background(), http.MethodGet, "/fail", nil, nil); err == nil {
+			t.Fatal("failing request returned nil error")
+		}
+	}
+	if got := calls.Load(); got != 6 {
+		t.Fatalf("server calls = %d, want 6", got)
+	}
+	if _, err := g.request(context.Background(), http.MethodGet, "/fail", nil, nil); err == nil {
+		t.Fatal("request after the breaker opened returned nil error")
+	}
+	if got := calls.Load(); got != 6 {
+		t.Fatalf("server calls after open = %d, want 6", got)
+	}
+}
