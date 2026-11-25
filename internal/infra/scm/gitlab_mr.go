@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -68,15 +67,10 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 		Approvals: len(mr.ApprovedBy),
 	}
 
-	var failed []string
-	mark := func(part string, err error) {
-		if err != nil {
-			failed = append(failed, part+": "+err.Error())
-		}
-	}
+	var failed observationErrors
 
 	threads, err := g.unresolvedThreads(ctx, mrIID)
-	mark("threads", err)
+	failed.add("threads", err)
 	if err == nil {
 		o.UnresolvedThreads = threads
 	}
@@ -84,38 +78,18 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 		o.UnresolvedThreads = []string{"blocking discussions are unresolved"}
 	}
 	approvals, err := g.approvals(ctx, mrIID, mr)
-	mark("approvals", err)
+	failed.add("approvals", err)
 	if err == nil {
 		o.Approvals = approvals
 	}
-	pipeline, err := g.latestPipeline(ctx, url.Values{"sha": {o.HeadSHA}})
-	mark("pipelines", err)
-	if err == nil && pipeline.ID != 0 {
-		checks, excerpt, err := g.pipelineChecks(ctx, pipeline.ID)
-		mark("jobs", err)
-		if err == nil {
-			o.Checks = checks
-			if len(o.Checks) == 0 {
-				o.Checks = []core.CheckResult{{Name: "pipeline", State: glCheckState(pipeline.Status, false)}}
-			}
-			o.FailureExcerpt = excerpt
-			if o.FailureExcerpt == "" {
-				if failedCheck, ok := o.Failure(); ok {
-					o.FailureExcerpt = failedCheck.Output
-				}
-			}
-		}
-	}
+	g.observeChecks(ctx, &o, o.HeadSHA, &failed)
 	behind, baseSHA, err := g.behind(ctx, mr)
-	mark("compare", err)
+	failed.add("compare", err)
 	if err == nil {
 		o.Behind = behind
 		o.BaseSHA = baseSHA
 	}
-	if len(failed) > 0 {
-		o.Incomplete = true
-		o.IncompleteReason = gitlabTail(strings.Join(failed, "; "), 1200)
-	}
+	failed.apply(&o)
 	return o, nil
 }
 
