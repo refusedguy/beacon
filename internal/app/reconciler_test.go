@@ -1277,3 +1277,42 @@ func TestGreenBehindRecordsObservationOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestRunReturnsWhenChangesChannelCloses(t *testing.T) {
+	changes := make(chan int)
+	close(changes)
+	r := &Reconciler{Store: newFakeStore(), Interval: time.Hour}
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), changes) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run kept spinning after changes channel closed")
+	}
+}
+
+func TestRunReturnsWhenEventsChannelCloses(t *testing.T) {
+	events := make(chan core.HarnessEvent)
+	close(events)
+	changes := make(chan int)
+	r := &Reconciler{
+		Store: newFakeStore(), Events: events, Changes: changes, Interval: time.Hour,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), changes) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run kept spinning after events channel closed")
+	}
+}
