@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
@@ -386,6 +388,75 @@ func TestGitWorktreeCommitPathRetryKeepsSingleCommit(t *testing.T) {
 	}
 	if count := strings.TrimSpace(gitCmd(t, ws.Path, "rev-list", "--count", "--grep=beacon: create task T-RETRY", "HEAD")); count != "1" {
 		t.Fatalf("card commits = %s, want 1", count)
+	}
+}
+
+func TestGitWorktreeCommitPathPushSurvivesCancellationDuringPush(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-PUSH-CANCEL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cardDir := filepath.Join(ws.Path, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cardDir, "T-PUSH-CANCEL.md"), []byte("card\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The hook parks the push after the commit is durable so the caller can
+	// cancel mid-push and release it. A cancelled caller must not strand the
+	// committed card on the worktree.
+	markerDir := t.TempDir()
+	started := filepath.Join(markerDir, "started")
+	release := filepath.Join(markerDir, "release")
+	hook := fmt.Sprintf("#!/bin/sh\ntouch %q\ni=0\nwhile [ ! -f %q ]; do\n  sleep 0.02\n  i=$((i+1))\n  if [ $i -gt 500 ]; then exit 1; fi\ndone\n", started, release)
+	hooksDir := filepath.Join(repo, ".git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hooksDir, "pre-push"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- wt.CommitPath(ctx, ws, "docs/tasks", "beacon: create task T-PUSH-CANCEL")
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pre-push hook never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	if err := os.WriteFile(release, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("CommitPath() error after caller cancellation: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("CommitPath() did not finish after the push was released")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("test did not cancel the caller during the push")
+	}
+	local := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD"))
+	remote := strings.TrimSpace(gitCmd(t, ws.Path, "ls-remote", "origin", "refs/heads/"+ws.Branch))
+	if remote == "" || !strings.HasPrefix(remote, local) {
+		t.Fatalf("committed card was not pushed: local=%s remote=%q", local, remote)
 	}
 }
 
