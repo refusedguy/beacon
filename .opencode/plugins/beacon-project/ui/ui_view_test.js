@@ -5,8 +5,9 @@ import { NOW, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
-  SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
-  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel, recentRuns, runLineItems, sidebarModel, stateBarItem, truncate,
+  SIDEBAR_OPEN, STATE_BAR_WIDTH, activeRuns, cleanErrorMessage, compactReason, detailActions, detailCommand,
+  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel, recentRuns, renderSnapshotLines,
+  runLineItems, sidebarModel, stateBarItem, truncate,
 } = ui
 
 test("elapsed formats seconds, minutes, hours and days", () => {
@@ -450,5 +451,28 @@ test("an expanded blocked group caps rows and keeps Recent clickable", () => {
   assert.equal(items.find((i) => i.kind === "queue-more").name, "+2 more")
   assert.ok(items.some((i) => i.sectionKey === "recent"))
   assert.ok(items.some((i) => i.recent === true && i.runID === "r1"))
+})
+
+test("one snapshot renders the same through every public entry point", () => {
+  const snapshot = {
+    active: [
+      makeRun({ ID: "a1", State: "running" }),
+      makeRun({ ID: "a2", State: "waiting_ci" }),
+      makeRun({ ID: "a3", State: "blocked", Reason: "dirty worktree" }),
+    ],
+    recent: [makeRun({ ID: "r1", TaskID: "T-R", State: "merged" })],
+    queue: [
+      { id: "T-E", title: "Epic", status: "ready", priority: 9, kind: "epic" },
+      { id: "T-E-1", title: "Child", status: "available", priority: 8 },
+    ],
+    metrics: { merge_count: 12 },
+  }
+  const model = sidebarModel(snapshot, null, NOW)
+  assert.deepEqual(model.active.map((r) => r.id), activeRuns(snapshot).map((r) => r.id))
+  assert.deepEqual(model.recent.map((r) => r.id), recentRuns(snapshot).map((r) => r.id))
+  assert.deepEqual(model.counts, stateBarItem(snapshot).counts)
+  const lines = model.items
+    .map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))
+  assert.deepEqual(lines, renderSnapshotLines(snapshot, null, NOW))
 })
 
