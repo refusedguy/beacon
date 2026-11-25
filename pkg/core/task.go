@@ -183,11 +183,76 @@ type Task struct {
 	Status        TaskStatus
 	SourceRef     string
 	Kind          TaskKind
+	Parent        TaskID // Parent is the epic this task belongs to. Empty for epics and standalone tasks.
 	BaseBranch    string
 	RequireReview ReviewMode
 	WorkerAgent   string
 	WorkerPrompt  string
 	Plan          []ChildSpec
+}
+
+// SetParent stamps every task in a set with the same parent. Epic expansion and
+// the card parser both use it, so a child carries its relation from creation.
+func SetParent(tasks []Task, parent TaskID) []Task {
+	for i := range tasks {
+		tasks[i].Parent = parent
+	}
+	return tasks
+}
+
+// TaskTree indexes one set of tasks by ID and by parent. It is the single
+// authority for parent-child questions: callers ask the index instead of
+// deriving relations from ID shapes again.
+type TaskTree struct {
+	byID     map[TaskID]Task
+	children map[TaskID][]TaskID
+}
+
+// NewTaskTree builds an index from one task snapshot. Child order follows the
+// input order, so callers can keep a stable queue and card layout.
+func NewTaskTree(tasks []Task) TaskTree {
+	tree := TaskTree{
+		byID:     make(map[TaskID]Task, len(tasks)),
+		children: make(map[TaskID][]TaskID),
+	}
+	for _, task := range tasks {
+		tree.byID[task.ID] = task
+	}
+	for _, task := range tasks {
+		if task.Parent == "" {
+			continue
+		}
+		tree.children[task.Parent] = append(tree.children[task.Parent], task.ID)
+	}
+	return tree
+}
+
+// Task returns the task with the given ID from the indexed snapshot.
+func (t TaskTree) Task(id TaskID) (Task, bool) {
+	task, ok := t.byID[id]
+	return task, ok
+}
+
+// Parent returns the parent of a task. It reports false when the task has no
+// parent or the parent is absent from the snapshot.
+func (t TaskTree) Parent(id TaskID) (Task, bool) {
+	task, ok := t.byID[id]
+	if !ok || task.Parent == "" {
+		return Task{}, false
+	}
+	return t.Task(task.Parent)
+}
+
+// Children returns the direct children of a task in snapshot order.
+func (t TaskTree) Children(id TaskID) []Task {
+	ids := t.children[id]
+	out := make([]Task, 0, len(ids))
+	for _, childID := range ids {
+		if child, ok := t.byID[childID]; ok {
+			out = append(out, child)
+		}
+	}
+	return out
 }
 
 func (t Task) DependsOnID(id TaskID) bool {

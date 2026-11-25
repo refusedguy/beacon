@@ -692,7 +692,7 @@ func epicSource(review core.ReviewMode) *fakeSource {
 		{ID: "T-EPIC", Title: "Big epic", Kind: core.TaskKindEpic, Status: core.TaskAvailable,
 			BaseBranch: "main", RequireReview: review},
 		{ID: "T-EPIC-01", Title: "Child one", Kind: core.TaskKindTask, Status: core.TaskAvailable,
-			BaseBranch: "beacon/T-EPIC"},
+			Parent: "T-EPIC", BaseBranch: "beacon/T-EPIC"},
 	}}
 }
 
