@@ -609,6 +609,36 @@ func (c *interruptibleCommitter) CommitPath(context.Context, core.Workspace, str
 	return nil
 }
 
+// retryCtxKey is a caller value the detached retry context must keep.
+type retryCtxKey struct{}
+
+// lateCancelCommitter cancels the caller during the retry push and records
+// whether the retry context observed the cancellation.
+type lateCancelCommitter struct {
+	log      *callLog
+	cancel   context.CancelFunc
+	pushes   int
+	retryErr error
+	retryVal any
+}
+
+func (c *lateCancelCommitter) CommitPath(ctx context.Context, _ core.Workspace, pathspec, _ string) error {
+	c.pushes++
+	c.log.add("commit:" + pathspec)
+	if c.pushes == 1 {
+		return &NonFastForwardError{Err: errors.New("remote ref advanced")}
+	}
+	c.cancel()
+	c.retryErr = ctx.Err()
+	c.retryVal = ctx.Value(retryCtxKey{})
+	return nil
+}
+
+func (c *lateCancelCommitter) RebaseBase(_ context.Context, _ core.Workspace, base string) error {
+	c.log.add("rebase:" + base)
+	return nil
+}
+
 type failOnIDSource struct {
 	*fakeSource
 	failID core.TaskID
@@ -692,6 +722,31 @@ func TestTaskCreatorFinishesPushWhenCancelledAfterCommit(t *testing.T) {
 	}
 	if len(src.removed) != 0 {
 		t.Fatalf("cancelled create removed cards: %v", src.removed)
+	}
+}
+
+func TestTaskCreatorRetrySurvivesCancellationDuringPush(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), retryCtxKey{}, "kept"))
+	defer cancel()
+	ws := &lateCancelCommitter{log: &callLog{}, cancel: cancel}
+	creator := &TaskCreator{Source: &fakeSource{log: &callLog{}}, Workspace: ws,
+		Root: core.Workspace{Path: "/root", Branch: "work"}}
+
+	got, err := creator.Create(ctx, CreateTaskInput{Title: "Retry card"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Pushed || ws.pushes != 2 {
+		t.Fatalf("result = %+v, pushes = %d, want pushed with two attempts", got, ws.pushes)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("test did not cancel the caller during the retry push")
+	}
+	if ws.retryErr != nil {
+		t.Fatalf("retry push saw cancelled context: %v", ws.retryErr)
+	}
+	if ws.retryVal != "kept" {
+		t.Fatalf("retry context value = %v, want kept", ws.retryVal)
 	}
 }
 
