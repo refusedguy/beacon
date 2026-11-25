@@ -34,7 +34,9 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = now
 	}
-	r.UpdatedAt = now
+	if r.UpdatedAt.IsZero() {
+		r.UpdatedAt = now
+	}
 	scope, err := json.Marshal(r.Scope)
 	if err != nil {
 		return err
