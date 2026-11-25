@@ -1,7 +1,7 @@
 ---
 id: T-3bdc4af2
 title: Functional test for monitor render after an event
-status: available
+status: done
 scope:
   - ui/tui/model_test.go
   - docs/research/functional.md
