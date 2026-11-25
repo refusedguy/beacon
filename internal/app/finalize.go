@@ -41,20 +41,11 @@ func compact(s string) string {
 	return string(runes[:1200]) + "\n...[truncated]"
 }
 
-// ReviewRule gates an epic PR on review approval. A missing review mode means
-// the LLM reviewer, matching the default on the task card.
-type ReviewRule struct{ Mode core.ReviewMode }
-
-func (r ReviewRule) Name() string { return "review" }
-
-func (r ReviewRule) Evaluate(o core.Observation) (core.Verdict, string) {
-	if r.Mode == core.ReviewModeNone {
-		return core.VerdictNoop, ""
-	}
-	if o.Approvals > 0 {
-		return core.VerdictNoop, ""
-	}
-	return core.VerdictWait, "epic review approval required"
+// reviewGate is the part of a merge policy that decides whether an epic PR
+// still needs review approval. The policy lives in an outer package, so the
+// reconciler reaches it through this port instead of a concrete rule.
+type reviewGate interface {
+	ReviewRequired(core.ReviewMode, core.Observation) bool
 }
 
 const epicBranchPrefix = "beacon/"
@@ -203,8 +194,14 @@ func (r *Reconciler) guardEpicReview(ctx context.Context, run *core.Run, obs cor
 	if mode == core.ReviewModeLLM {
 		r.maybeSpawnReviewer(ctx, run, obs)
 	}
-	verdict, _ := ReviewRule{Mode: mode}.Evaluate(obs)
-	return verdict == core.VerdictNoop, nil
+	gate, ok := r.Policy.(reviewGate)
+	if !ok {
+		// A policy without a review gate cannot approve an epic review, so
+		// hold the merge rather than dropping the task card's requirement.
+		slog.Warn("merge policy has no epic review gate", "run", run.ID)
+		return false, nil
+	}
+	return !gate.ReviewRequired(mode, obs), nil
 }
 
 // maybeSpawnReviewer starts one LLM review session for an epic commit. The
