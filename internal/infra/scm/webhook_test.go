@@ -114,11 +114,66 @@ func TestWebhookRejectsBadRequest(t *testing.T) {
 func TestWebhookWithoutSecretAcceptsUnsigned(t *testing.T) {
 	ch := make(chan int, 1)
 	w := &Webhook{Changes: ch}
-	rw := serve(w, http.MethodPost, `{"object_attributes":{"iid":5}}`, nil)
+	rw := serve(w, http.MethodPost, `{"object_attributes":{"iid":5}}`, map[string]string{
+		"X-Gitlab-Event": "Merge Request Hook",
+	})
 	if rw.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", rw.Code)
 	}
 	if len(ch) != 1 || <-ch != 5 {
 		t.Fatalf("want MR 5 emitted once, channel len %d", len(ch))
+	}
+}
+
+func TestWebhookProviderHeaderSelectsParser(t *testing.T) {
+	githubFirst := `{"pull_request":{"number":42},"object_attributes":{"iid":77}}`
+	gitlabFirst := `{"object_attributes":{"iid":77},"pull_request":{"number":42}}`
+	tests := []struct {
+		name    string
+		body    string
+		secret  string
+		headers map[string]string
+		want    int
+	}{
+		{"github with auth header", githubFirst, webhookSecret, map[string]string{
+			"X-Hub-Signature-256": githubSignature(webhookSecret, []byte(githubFirst)),
+		}, 42},
+		{"gitlab with auth header", gitlabFirst, webhookSecret, map[string]string{
+			"X-Gitlab-Token": webhookSecret,
+		}, 77},
+		{"github with event header", gitlabFirst, "", map[string]string{
+			"X-GitHub-Event": "pull_request",
+		}, 42},
+		{"gitlab with event header", githubFirst, "", map[string]string{
+			"X-Gitlab-Event": "Merge Request Hook",
+		}, 77},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := make(chan int, 1)
+			w := &Webhook{Secret: tc.secret, Changes: ch}
+			rw := serve(w, http.MethodPost, tc.body, tc.headers)
+			if rw.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202: %s", rw.Code, rw.Body.String())
+			}
+			if len(ch) != 1 || <-ch != tc.want {
+				t.Fatalf("want PR %d emitted once, channel len %d", tc.want, len(ch))
+			}
+		})
+	}
+}
+
+func TestWebhookRejectsUnknownProvider(t *testing.T) {
+	ch := make(chan int, 1)
+	w := &Webhook{Changes: ch}
+	body := `{"pull_request":{"number":42},"object_attributes":{"iid":77}}`
+	rw := serve(w, http.MethodPost, body, map[string]string{
+		"X-Service": "beacon",
+	})
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rw.Code, rw.Body.String())
+	}
+	if len(ch) != 0 {
+		t.Fatalf("unexpected emission: %d", <-ch)
 	}
 }
