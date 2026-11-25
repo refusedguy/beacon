@@ -138,7 +138,7 @@ func TestControlCommandForwardsNudgeMessageToDaemon(t *testing.T) {
 	t.Setenv("BEACON_PROJECT_ROOT", root)
 
 	configPath := ""
-	cmd := newControlCommand(&configPath)
+	cmd := newControlCommand(&configPath, wire)
 	cmd.SetArgs([]string{"--action", "nudge", "--run-id", "r1", "--message", "check the tests"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("cmd.Execute(): %v", err)
@@ -193,7 +193,7 @@ func TestControlCommandForwardsToDaemonAndPrintsJSON(t *testing.T) {
 	t.Setenv("BEACON_PROJECT_ROOT", root)
 
 	configPath := ""
-	cmd := newControlCommand(&configPath)
+	cmd := newControlCommand(&configPath, wire)
 	cmd.SetArgs([]string{"--action", "approve", "--run-id", "r1", "--sha", "abc", "--json"})
 	var execErr error
 	out := captureStdout(t, func() { execErr = cmd.Execute() })
@@ -217,7 +217,7 @@ func TestControlCommandForwardsToDaemonAndPrintsJSON(t *testing.T) {
 
 func TestControlCommandRejectsInvalidAction(t *testing.T) {
 	configPath := ""
-	cmd := newControlCommand(&configPath)
+	cmd := newControlCommand(&configPath, wire)
 	cmd.SetArgs([]string{"--action", "bogus", "--run-id", "r1"})
 	if err := cmd.Execute(); err == nil {
 		t.Fatal("invalid action was accepted")
@@ -253,19 +253,16 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(data)
 }
 
-func captureCLIWire(t *testing.T, stop error) *string {
-	t.Helper()
-	orig := cliWire
-	t.Cleanup(func() { cliWire = orig })
+func captureWire(stop error) (wireFn, *string) {
 	got := new(string)
-	cliWire = func(_ string, parent string) (*wiring, error) {
+	fn := func(_ string, parent string) (*wiring, error) {
 		*got = parent
 		if stop != nil {
 			return nil, stop
 		}
 		return &wiring{}, nil
 	}
-	return got
+	return fn, got
 }
 
 func TestParentSessionFromEnv(t *testing.T) {
@@ -281,8 +278,8 @@ func TestParentSessionFromEnv(t *testing.T) {
 
 func TestWireCLIPassesEnvironmentParent(t *testing.T) {
 	t.Setenv("BEACON_PARENT_SESSION", "ses_cli_parent")
-	got := captureCLIWire(t, nil)
-	if _, err := wireCLI("cfg.yaml"); err != nil {
+	fn, got := captureWire(nil)
+	if _, err := wireCLI(fn, "cfg.yaml"); err != nil {
 		t.Fatalf("wireCLI(\"cfg.yaml\"): %v", err)
 	}
 	if *got != "ses_cli_parent" {
@@ -292,8 +289,8 @@ func TestWireCLIPassesEnvironmentParent(t *testing.T) {
 
 func TestWireCLIAcceptsEmptyEnvironment(t *testing.T) {
 	t.Setenv("BEACON_PARENT_SESSION", "")
-	got := captureCLIWire(t, nil)
-	if _, err := wireCLI("cfg.yaml"); err != nil {
+	fn, got := captureWire(nil)
+	if _, err := wireCLI(fn, "cfg.yaml"); err != nil {
 		t.Fatalf("wireCLI(\"cfg.yaml\"): %v", err)
 	}
 	if *got != "" {
@@ -309,9 +306,9 @@ func TestDispatchCommandWiresWithEnvironmentParent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("BEACON_PARENT_SESSION", tc.env)
 			stop := errors.New("wire stopped")
-			got := captureCLIWire(t, stop)
+			fn, got := captureWire(stop)
 			configPath := ""
-			cmd := newDispatchCommand(&configPath)
+			cmd := newDispatchCommand(&configPath, fn)
 			cmd.SilenceErrors, cmd.SilenceUsage = true, true
 			cmd.SetArgs([]string{"1"})
 			if err := cmd.Execute(); !errors.Is(err, stop) {
@@ -333,9 +330,9 @@ func TestControlFallbackWiresWithEnvironmentParent(t *testing.T) {
 			t.Setenv("BEACON_PROJECT_ROOT", t.TempDir())
 			t.Setenv("BEACON_PARENT_SESSION", tc.env)
 			stop := errors.New("wire stopped")
-			got := captureCLIWire(t, stop)
+			fn, got := captureWire(stop)
 			configPath := ""
-			cmd := newControlCommand(&configPath)
+			cmd := newControlCommand(&configPath, fn)
 			cmd.SilenceErrors, cmd.SilenceUsage = true, true
 			cmd.SetArgs([]string{"--action", "approve", "--run-id", "r1", "--sha", "abc"})
 			if err := cmd.Execute(); !errors.Is(err, stop) {
