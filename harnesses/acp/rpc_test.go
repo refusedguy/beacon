@@ -52,22 +52,43 @@ func runFakeAgent() {
 				"result": map[string]any{"sessionId": "sess_wire"},
 			})
 		case "session/prompt":
+			options := []map[string]any{
+				{"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+			}
+			rejectOnly := os.Getenv("ACP_FAKE_AGENT_REJECT_ONLY") == "1"
+			if rejectOnly {
+				options = []map[string]any{
+					{"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+				}
+			}
 			_ = enc.Encode(map[string]any{
 				"jsonrpc": "2.0", "id": 5, "method": "session/request_permission",
 				"params": map[string]any{
 					"sessionId": "sess_wire",
-					"options": []map[string]any{
-						{"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
-					},
+					"options":   options,
 				},
 			})
+			chunkText := "pull/99"
+			if rejectOnly {
+				var resp struct {
+					Result struct {
+						Outcome struct {
+							Outcome string `json:"outcome"`
+						} `json:"outcome"`
+					} `json:"result"`
+				}
+				if err := dec.Decode(&resp); err != nil {
+					os.Exit(3)
+				}
+				chunkText = "permission:" + resp.Result.Outcome.Outcome
+			}
 			_ = enc.Encode(map[string]any{
 				"jsonrpc": "2.0", "method": "session/update",
 				"params": map[string]any{
 					"sessionId": "sess_wire",
 					"update": map[string]any{
 						"sessionUpdate": "agent_message_chunk",
-						"content":       map[string]string{"type": "text", "text": "pull/99"},
+						"content":       map[string]string{"type": "text", "text": chunkText},
 					},
 				},
 			})
@@ -151,5 +172,73 @@ func TestStdioProcessReportsJSONRPCErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "-32601") {
 		t.Fatalf("error = %q, want JSON-RPC code -32601", err)
+	}
+}
+
+func TestFirstAllowOption(t *testing.T) {
+	tests := []struct {
+		name   string
+		params string
+		want   string
+	}{
+		{
+			name:   "allow option",
+			params: `{"options":[{"optionId":"allow-once","kind":"allow_once"}]}`,
+			want:   "allow-once",
+		},
+		{
+			name:   "reject only",
+			params: `{"options":[{"optionId":"reject-once","kind":"reject_once"},{"optionId":"reject-always","kind":"reject_always"}]}`,
+			want:   "",
+		},
+		{
+			name:   "reject before allow",
+			params: `{"options":[{"optionId":"reject-once","kind":"reject_once"},{"optionId":"allow-once","kind":"allow_once"}]}`,
+			want:   "allow-once",
+		},
+		{
+			name:   "unknown kind",
+			params: `{"options":[{"optionId":"mystery","kind":"custom"}]}`,
+			want:   "",
+		},
+		{
+			name:   "malformed",
+			params: `{`,
+			want:   "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstAllowOption(json.RawMessage(tt.params)); got != tt.want {
+				t.Fatalf("firstAllowOption(%s) = %q, want %q", tt.params, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPermissionWithOnlyRejectOptionsCancels(t *testing.T) {
+	t.Setenv("ACP_FAKE_AGENT", "1")
+	t.Setenv("ACP_FAKE_AGENT_REJECT_ONLY", "1")
+	p, err := startProcess(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var chunks []string
+	err = p.call(ctx, "session/prompt", map[string]any{"sessionId": "sess_wire"}, nil,
+		func(raw json.RawMessage) {
+			if text := collectText(raw); text != "" {
+				chunks = append(chunks, text)
+			}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 || chunks[0] != "permission:cancelled" {
+		t.Fatalf("agent chunks = %v, want [permission:cancelled]", chunks)
 	}
 }
