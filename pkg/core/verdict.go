@@ -71,6 +71,13 @@ type Observation struct {
 	// workflow skipped this diff. Adapters set it only for changes whose paths
 	// the workflow ignores. It is never inferred from an empty check list.
 	WorkflowSkipped bool
+	// Incomplete reports that a provider call failed or its response could not
+	// be trusted. Decide returns VerdictWait for it, so a partial observation
+	// can never produce a merge verdict.
+	Incomplete bool
+	// IncompleteReason names the failed provider calls. It is empty when
+	// Incomplete is false.
+	IncompleteReason string
 }
 
 func (o Observation) Failure() (CheckResult, bool) {
@@ -83,6 +90,9 @@ func (o Observation) Failure() (CheckResult, bool) {
 }
 
 func (o Observation) AllRequiredPass(names []string) bool {
+	if len(o.Checks) == 0 {
+		return false
+	}
 	if len(names) == 0 {
 		for _, c := range o.Checks {
 			if c.State != CheckSuccess && c.State != CheckSkipped {
@@ -138,6 +148,13 @@ func Decide(o Observation, criteria []Criterion) MergeDecision {
 	switch strings.ToLower(o.PRState) {
 	case "closed", "merged":
 		return MergeDecision{Verdict: VerdictNoop, Reason: "pull request is " + o.PRState}
+	}
+	if o.Incomplete {
+		reason := "observation is incomplete"
+		if o.IncompleteReason != "" {
+			reason += ": " + o.IncompleteReason
+		}
+		return MergeDecision{Verdict: VerdictWait, Reason: reason, Criterion: "invariant"}
 	}
 	if o.Conflict {
 		return MergeDecision{Verdict: VerdictNeedsAgentFix, Reason: "merge conflict", Criterion: "invariant"}

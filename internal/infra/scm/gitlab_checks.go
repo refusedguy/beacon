@@ -38,6 +38,24 @@ type glJob struct {
 	FailureReason string `json:"failure_reason"`
 }
 
+// observationErrors collects failed provider calls so an observation can be
+// marked incomplete instead of silently dropping the failures.
+type observationErrors []string
+
+func (e *observationErrors) add(part string, err error) {
+	if err != nil {
+		*e = append(*e, part+": "+err.Error())
+	}
+}
+
+func (e *observationErrors) apply(o *core.Observation) {
+	if len(*e) == 0 {
+		return
+	}
+	o.Incomplete = true
+	o.IncompleteReason = gitlabTail(strings.Join(*e, "; "), 1200)
+}
+
 func glCheckState(status string, allowFailure bool) core.CheckState {
 	switch strings.ToLower(status) {
 	case "success":
@@ -71,6 +89,31 @@ func (g *GitLab) latestPipeline(ctx context.Context, query url.Values) (glPipeli
 		return glPipeline{}, nil
 	}
 	return pipelines[0], nil
+}
+
+// observeChecks fills the check fields from the latest pipeline for sha.
+// Provider failures are reported through failed and leave the checks empty.
+func (g *GitLab) observeChecks(ctx context.Context, o *core.Observation, sha string, failed *observationErrors) {
+	pipeline, err := g.latestPipeline(ctx, url.Values{"sha": {sha}})
+	failed.add("pipelines", err)
+	if err != nil || pipeline.ID == 0 {
+		return
+	}
+	checks, excerpt, err := g.pipelineChecks(ctx, pipeline.ID)
+	failed.add("jobs", err)
+	if err != nil {
+		return
+	}
+	o.Checks = checks
+	if len(checks) == 0 {
+		o.Checks = []core.CheckResult{{Name: "pipeline", State: glCheckState(pipeline.Status, false)}}
+	}
+	o.FailureExcerpt = excerpt
+	if excerpt == "" {
+		if failedCheck, ok := o.Failure(); ok {
+			o.FailureExcerpt = failedCheck.Output
+		}
+	}
 }
 
 func (g *GitLab) pipelineChecks(ctx context.Context, pipelineID int) ([]core.CheckResult, string, error) {
