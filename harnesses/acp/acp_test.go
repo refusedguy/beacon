@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,6 +97,13 @@ func (f *fakeProcess) isClosed() bool {
 	defer f.mu.Unlock()
 	return f.closed
 }
+
+type liveFakeProcess struct {
+	*fakeProcess
+	running atomic.Bool
+}
+
+func (f *liveFakeProcess) alive() bool { return f.running.Load() }
 
 func testHarness(fp process) *Harness {
 	h := New("fake-agent --acp")
@@ -285,6 +293,52 @@ func TestFailedPromptClosesSession(t *testing.T) {
 	}
 	if alive, _ := h.IsAlive(context.Background(), "sess_1"); alive {
 		t.Fatal("failed session still reports alive")
+	}
+}
+
+func TestIsAliveDropsSessionAfterProcessExit(t *testing.T) {
+	fp := &liveFakeProcess{fakeProcess: standardProcess()}
+	fp.running.Store(true)
+	h := testHarness(fp)
+	if _, err := h.Spawn(context.Background(), core.SpawnRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if alive, err := h.IsAlive(context.Background(), "sess_1"); err != nil || !alive {
+		t.Fatalf("IsAlive before exit = %v, %v; want true, nil", alive, err)
+	}
+
+	fp.running.Store(false)
+	if alive, err := h.IsAlive(context.Background(), "sess_1"); err != nil || alive {
+		t.Fatalf("IsAlive after exit = %v, %v; want false, nil", alive, err)
+	}
+
+	fp.running.Store(true)
+	if alive, err := h.IsAlive(context.Background(), "sess_1"); err != nil || alive {
+		t.Fatalf("IsAlive after session removal = %v, %v; want false, nil", alive, err)
+	}
+}
+
+func TestManagedProcessDetectsTerminatedAgent(t *testing.T) {
+	p, err := startManagedProcess("sleep 30", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp := p.(*managedProcess)
+	defer mp.close()
+	if !mp.alive() {
+		t.Fatal("new process is not alive")
+	}
+
+	sp := mp.process.(*stdioProcess)
+	if err := sp.cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill agent: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for mp.alive() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if mp.alive() {
+		t.Fatal("terminated process still reports alive")
 	}
 }
 
