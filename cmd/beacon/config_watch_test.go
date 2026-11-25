@@ -18,6 +18,7 @@ import (
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/refusedguy/beacon/internal/infra/config"
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -166,22 +167,82 @@ func TestConfigReloadNeverLogsToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	next := strings.Replace(string(body), "model: model-a", "model: model-b", 1)
-	next += "concurrency:\n  max_in_flight: 3\n"
-	writeWatchFile(t, path, next)
+	writeWatchFile(t, path, strings.Replace(string(body), "model: model-a", "model: model-b", 1))
 	if !cw.reload() {
 		t.Fatal("reload did not apply the changed config")
 	}
 
-	out := logs.String()
-	if strings.Contains(out, token) {
+	if out := logs.String(); strings.Contains(out, token) {
 		t.Fatalf("token leaked into logs: %s", out)
 	}
+}
+
+func TestConfigReloadRejectsRestartFields(t *testing.T) {
+	const token = "worker-token-do-not-log"
+	logs := captureWatchLogs(t)
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", token)
+	cw, _ := newTestWatcher(t, path)
+	before := cw.live.Load()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mixed := strings.Replace(string(body), "model: model-a", "model: model-b", 1) +
+		"concurrency:\n  max_in_flight: 3\n"
+	writeWatchFile(t, path, mixed)
+	if cw.reload() {
+		t.Fatal("reload with a restart-only field was applied")
+	}
+	if got := cw.live.Load(); got != before {
+		t.Fatal("rejected reload replaced the live state")
+	}
+	if got := before.cfg.Harness.Model; got != "model-a" {
+		t.Fatalf("stored model = %q, want model-a", got)
+	}
+	if got := before.cfg.Concurrency.MaxInFlight; got != 20 {
+		t.Fatalf("stored max_in_flight = %d, want 20", got)
+	}
+
+	out := logs.String()
 	if !strings.Contains(out, "concurrency.max_in_flight") {
 		t.Fatalf("restart warning missing field name: %s", out)
 	}
-	if !strings.Contains(out, "restart beacon mcp") {
+	if !strings.Contains(out, "restart beacon") {
 		t.Fatalf("restart warning missing action: %s", out)
+	}
+	if strings.Contains(out, token) {
+		t.Fatalf("token leaked into logs: %s", out)
+	}
+
+	writeWatchFile(t, path, strings.Replace(string(body), "model: model-a", "model: model-b", 1))
+	if !cw.reload() {
+		t.Fatal("reload without restart fields was rejected")
+	}
+	if got := cw.live.Load().cfg.Harness.Model; got != "model-b" {
+		t.Fatalf("model = %q, want model-b", got)
+	}
+}
+
+func TestConfigReloadKeepsEventRelay(t *testing.T) {
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
+	cw, h := newTestWatcher(t, path)
+	stable := h.Events()
+	before := cw.live.Load().relay
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWatchFile(t, path, strings.Replace(string(body), "model: model-a", "model: model-b", 1))
+	if !cw.reload() {
+		t.Fatal("reload did not apply the changed config")
+	}
+	if got := cw.live.Load().relay; got != before {
+		t.Fatal("reload replaced the event relay")
+	}
+	if got := h.Events(); got != stable {
+		t.Fatal("reload changed the consumer event channel")
 	}
 }
 
@@ -276,5 +337,114 @@ func TestMCPServerKeepsServingDuringReload(t *testing.T) {
 	call()
 	if got := w.watcher.live.Load().cfg.Harness.Model; got != "model-b" {
 		t.Fatalf("model = %q, want model-b", got)
+	}
+}
+
+// relayHarness gives a reload test two distinct event channels and lets it
+// observe which harness the proxy is watching.
+type relayHarness struct {
+	bareHarness
+	events    chan core.HarnessEvent
+	watchCall chan struct{}
+}
+
+func (h *relayHarness) Events() <-chan core.HarnessEvent { return h.events }
+
+func (h *relayHarness) WatchIdle(ctx context.Context) {
+	if h.watchCall != nil {
+		select {
+		case h.watchCall <- struct{}{}:
+		default:
+		}
+	}
+	<-ctx.Done()
+}
+
+func newRelayWatcher(t *testing.T, h core.AgentHarness) (*configWatcher, *reloadableHarness) {
+	t.Helper()
+	state := newLiveState(config.Config{}, h)
+	cw := &configWatcher{interval: time.Hour}
+	cw.live.Store(state)
+	return cw, &reloadableHarness{live: &cw.live, events: h.Events()}
+}
+
+// swapRelayState mirrors the swap a successful reload performs, including the
+// signal that retargets consumers at the new harness.
+func swapRelayState(cw *configWatcher, h core.AgentHarness) {
+	previous := cw.live.Load()
+	next := newLiveState(config.Config{}, h)
+	next.relay = previous.relay
+	cw.live.Store(next)
+	previous.relay.signalReload()
+}
+
+func waitHarnessEvent(t *testing.T, ch <-chan core.HarnessEvent, wantRunID string) {
+	t.Helper()
+	select {
+	case ev := <-ch:
+		if string(ev.RunID) != wantRunID {
+			t.Fatalf("event run id = %q, want %q", ev.RunID, wantRunID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for event %q", wantRunID)
+	}
+}
+
+func waitWatchCall(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for WatchIdle")
+	}
+}
+
+func TestHarnessEventsUseStableChannelAfterReload(t *testing.T) {
+	oldEvents := make(chan core.HarnessEvent, 4)
+	newEvents := make(chan core.HarnessEvent, 4)
+	cw, proxy := newRelayWatcher(t, &relayHarness{events: oldEvents})
+	stable := proxy.Events()
+
+	oldEvents <- core.HarnessEvent{RunID: "before", Kind: "idle"}
+	waitHarnessEvent(t, stable, "before")
+
+	swapRelayState(cw, &relayHarness{events: newEvents})
+	newEvents <- core.HarnessEvent{RunID: "after", Kind: "idle"}
+	waitHarnessEvent(t, stable, "after")
+}
+
+func TestHarnessEventsFromPreviousHarnessSurviveReload(t *testing.T) {
+	oldEvents := make(chan core.HarnessEvent, 4)
+	newEvents := make(chan core.HarnessEvent, 4)
+	cw, proxy := newRelayWatcher(t, &relayHarness{events: oldEvents})
+	stable := proxy.Events()
+
+	swapRelayState(cw, &relayHarness{events: newEvents})
+	oldEvents <- core.HarnessEvent{RunID: "in-flight", Kind: "idle"}
+	waitHarnessEvent(t, stable, "in-flight")
+}
+
+func TestWatchIdleFollowsReloadedHarness(t *testing.T) {
+	oldWatch := make(chan struct{}, 2)
+	newWatch := make(chan struct{}, 2)
+	idleEvents := make(chan core.HarnessEvent, 1)
+	cw, proxy := newRelayWatcher(t, &relayHarness{events: idleEvents, watchCall: oldWatch})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		proxy.WatchIdle(ctx)
+	}()
+
+	waitWatchCall(t, oldWatch)
+	swapRelayState(cw, &relayHarness{events: idleEvents, watchCall: newWatch})
+	waitWatchCall(t, newWatch)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WatchIdle did not stop after context cancel")
 	}
 }
