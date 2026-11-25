@@ -90,18 +90,22 @@ export function heroBadge(run, now = Date.now()) {
   return `${v.marker} ${label}${duration ? ` · ${duration}` : ""}`
 }
 
-export function activeRuns(snapshot = EMPTY_SNAPSHOT) {
+// The helpers below take an already-normalized view. The public entry points
+// normalize once at the boundary and pass the view down, so a composed call
+// no longer normalizes the same snapshot five or more times.
+function activeFromView(view) {
   const seen = new Set()
-  return normalizeSnapshot(snapshot).active.filter((run) => {
+  return view.active.filter((run) => {
     if (!run.id || seen.has(run.id)) return false
     seen.add(run.id)
     return true
   })
 }
-// Repeated closed attempts of one task collapse into its newest terminal run.
-export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
-  const view = normalizeSnapshot(snapshot)
-  const activeTasks = new Set(activeRuns(view).map((r) => str(r.taskID)).filter(Boolean))
+export function activeRuns(snapshot = EMPTY_SNAPSHOT) {
+  return activeFromView(normalizeSnapshot(snapshot))
+}
+function recentFromViewWith(view, active) {
+  const activeTasks = new Set(active.map((r) => str(r.taskID)).filter(Boolean))
   const seenTasks = new Set()
   const seenIDs = new Set()
   return view.recent.filter((run) => {
@@ -112,11 +116,12 @@ export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
     return true
   }).slice(0, RECENT_LIMIT)
 }
-
-export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
-  const view = normalizeSnapshot(snapshot)
-  const active = activeRuns(view)
-  const recent = recentRuns(view)
+function recentFromView(view) { return recentFromViewWith(view, activeFromView(view)) }
+// Repeated closed attempts of one task collapse into its newest terminal run.
+export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
+  return recentFromView(normalizeSnapshot(snapshot))
+}
+function stateBarFromView(view, active = activeFromView(view), recent = recentFromView(view)) {
   const counts = { running: 0, waiting_ci: 0, blocked: 0, merged: 0 }
   for (const run of [...active, ...recent]) {
     const state = str(run.state).toLowerCase()
@@ -147,6 +152,9 @@ export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
     content: `states ${bar} ${legend}`,
     fg: counts.blocked > 0 ? "error" : "base",
   }
+}
+export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
+  return stateBarFromView(normalizeSnapshot(snapshot))
 }
 
 // Two pooled slots per run: identity, then reference and live cause.
@@ -232,9 +240,9 @@ export function toggleAllBlockedGroups(epic, queue = []) {
 
 export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null, blockedOpen = null) {
   const view = normalizeSnapshot(snapshot)
-  const bar = stateBarItem(view)
-  const active = activeRuns(view)
-  const recent = recentRuns(view)
+  const active = activeFromView(view)
+  const recent = recentFromView(view)
+  const bar = stateBarFromView(view, active, recent)
   const items = [
     { marker: "", name: "Beacon", status: bar.summary, color: "action", bold: true },
     { marker: "", name: bar.legend, status: "", color: "muted" },
