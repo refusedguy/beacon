@@ -1,6 +1,9 @@
 package core
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 type ErrorCode string
 
@@ -37,8 +40,9 @@ func CodeOf(err error) ErrorCode {
 	if err == nil {
 		return ""
 	}
-	if e, ok := err.(*AppError); ok {
-		return e.Code
+	var appErr *AppError
+	if errors.As(err, &appErr) {
+		return appErr.Code
 	}
 	return CodeUnavailable
 }

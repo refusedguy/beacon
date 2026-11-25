@@ -26,6 +26,36 @@ type liveState struct {
 	cfg     config.Config
 	harness core.AgentHarness
 	policy  core.MergePolicy
+	relay   *eventRelay
+}
+
+// eventRelay is the one event channel every consumer holds for the life of the
+// proxy. A reload closes changed to wake listeners and then publishes a fresh
+// one, so both the event pump and the idle watcher can retarget themselves.
+type eventRelay struct {
+	out     chan core.HarnessEvent
+	mu      sync.Mutex
+	changed chan struct{}
+}
+
+func newEventRelay() *eventRelay {
+	return &eventRelay{
+		out:     make(chan core.HarnessEvent, 64),
+		changed: make(chan struct{}),
+	}
+}
+
+func (r *eventRelay) reloadSignal() <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.changed
+}
+
+func (r *eventRelay) signalReload() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	close(r.changed)
+	r.changed = make(chan struct{})
 }
 
 type configWatcher struct {
@@ -54,7 +84,7 @@ func newConfigWatcher(path, root, parent string, initial *liveState, interval ti
 }
 
 func newLiveState(cfg config.Config, h core.AgentHarness) *liveState {
-	return &liveState{cfg: cfg, harness: h, policy: mergePolicy(cfg)}
+	return &liveState{cfg: cfg, harness: h, policy: mergePolicy(cfg), relay: newEventRelay()}
 }
 
 // Run watches the config until ctx is cancelled. The MCP stdio session is
@@ -92,16 +122,24 @@ func (cw *configWatcher) reload() bool {
 		slog.Warn("config watch: invalid config ignored", "path", cw.path)
 		return false
 	}
+	previous := cw.live.Load()
+	if changed := restartFields(previous.cfg, cfg); len(changed) > 0 {
+		// The running services were wired with the previous values for these
+		// fields. Storing the new config would make the snapshot disagree with
+		// what the services use, so keep the whole previous config instead.
+		for _, field := range changed {
+			slog.Warn("config watch: change needs restart, kept previous config", "field", field,
+				"action", "restart beacon mcp and reconnect OpenCode")
+		}
+		return false
+	}
 	state := cw.build(cfg, root)
 	if state == nil {
 		return false
 	}
-	previous := cw.live.Load()
+	state.relay = previous.relay
 	cw.live.Store(state)
-	for _, field := range restartFields(previous.cfg, cfg) {
-		slog.Warn("config watch: kept previous value; restart needed", "field", field,
-			"action", "restart beacon mcp and reconnect OpenCode")
-	}
+	state.relay.signalReload()
 	cw.generations++
 	return true
 }
@@ -164,14 +202,60 @@ func restartFields(old, next config.Config) []string {
 }
 
 // reloadableHarness delegates to the current harness. Every service holds one
-// stable wrapper, so a reload never mutates a harness a worker is using.
+// stable wrapper, so a reload never mutates a harness a worker is using. The
+// wrapper owns one event channel and one idle watcher that follow the current
+// harness across reloads.
 type reloadableHarness struct {
-	live   *atomic.Pointer[liveState]
+	live *atomic.Pointer[liveState]
+
+	// events is the source captured at setup. It seeds the relay; a reload
+	// adds the current harness's channel without dropping this one.
 	events <-chan core.HarnessEvent
+
+	once  sync.Once
+	relay *eventRelay
+}
+
+func (h *reloadableHarness) init() {
+	h.once.Do(func() {
+		h.relay = (*h.live).Load().relay
+		go h.pump()
+	})
 }
 
 func (h *reloadableHarness) current() core.AgentHarness {
 	return (*h.live).Load().harness
+}
+
+// pump forwards events from every harness it sees into the stable output
+// channel. A reload builds a fresh harness with a fresh channel, so the pump
+// adds that channel on the reload signal. It keeps the older forwarders too,
+// because sessions started before the reload still publish on the old harness.
+func (h *reloadableHarness) pump() {
+	seen := make(map[<-chan core.HarnessEvent]struct{})
+	forward := func(src <-chan core.HarnessEvent) {
+		if src == nil {
+			return
+		}
+		if _, ok := seen[src]; ok {
+			return
+		}
+		seen[src] = struct{}{}
+		go func() {
+			for ev := range src {
+				select {
+				case h.relay.out <- ev:
+				default:
+				}
+			}
+		}()
+	}
+	forward(h.events)
+	forward(h.current().Events())
+	for {
+		<-h.relay.reloadSignal()
+		forward(h.current().Events())
+	}
 }
 
 func (h *reloadableHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
@@ -195,7 +279,8 @@ func (h *reloadableHarness) NotifyParent(ctx context.Context, session, text stri
 }
 
 func (h *reloadableHarness) Events() <-chan core.HarnessEvent {
-	return h.events
+	h.init()
+	return h.relay.out
 }
 
 func (h *reloadableHarness) RefreshWorktrees(ctx context.Context) error {
@@ -207,8 +292,33 @@ func (h *reloadableHarness) RefreshWorktrees(ctx context.Context) error {
 }
 
 func (h *reloadableHarness) WatchIdle(ctx context.Context) {
-	if watcher, ok := h.current().(idleWatcher); ok {
-		watcher.WatchIdle(ctx)
+	h.init()
+	for {
+		changed := h.relay.reloadSignal()
+		watcher, ok := h.current().(idleWatcher)
+		if !ok {
+			select {
+			case <-ctx.Done():
+				return
+			case <-changed:
+			}
+			continue
+		}
+		child, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			watcher.WatchIdle(child)
+		}()
+		select {
+		case <-ctx.Done():
+			cancel()
+			<-done
+			return
+		case <-changed:
+			cancel()
+			<-done
+		}
 	}
 }
 

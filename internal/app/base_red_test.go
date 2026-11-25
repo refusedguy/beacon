@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -258,6 +260,43 @@ func TestRedEpicBranchBlocksChildrenAndSpawnsFixer(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("fixer prompt missing epic branch: %v", h.prompts)
+	}
+}
+
+func TestSqliteChecksRoundTripsUTF8AndControlCharacters(t *testing.T) {
+	names := []string{"ci\vbuild", "日本語", "quote \" and \\ slash"}
+	raw := sqliteChecks(names)
+	var got []string
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("sqliteChecks produced invalid JSON %q: %v", raw, err)
+	}
+	if !reflect.DeepEqual(got, names) {
+		t.Fatalf("round trip = %q, want %q", got, names)
+	}
+}
+
+func TestFixerPromptCarriesValidFailedCheckJSON(t *testing.T) {
+	names := []string{"ci\vbuild", "日本語"}
+	raw := sqliteChecks(names)
+	base := core.BaseStatus{BaseBranch: "main", FailureExcerpt: "boom"}
+	in := &core.BaseIncident{FailedChecksJSON: raw}
+	prompt := fixerPrompt(base, in, core.Task{}, "")
+
+	const marker = "Failed checks: "
+	i := strings.Index(prompt, marker)
+	if i < 0 {
+		t.Fatalf("prompt missing failed checks: %q", prompt)
+	}
+	line := prompt[i+len(marker):]
+	if end := strings.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	var got []string
+	if err := json.Unmarshal([]byte(line), &got); err != nil {
+		t.Fatalf("fixer prompt JSON %q is invalid: %v", line, err)
+	}
+	if !reflect.DeepEqual(got, names) {
+		t.Fatalf("fixer prompt checks = %q, want %q", got, names)
 	}
 }
 
