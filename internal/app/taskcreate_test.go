@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -924,5 +926,128 @@ func TestTaskCreatorCreateBatchTwentyCardsPublishesOnce(t *testing.T) {
 	last := src.created[19]
 	if !last.DependsOnID("T-BULK-01") || !last.DependsOnID("T-BULK-19") {
 		t.Fatalf("last card depends = %v", last.DependsOn)
+	}
+}
+
+func TestReviewModeMapsIdenticallyOnCreateUpdateAndRead(t *testing.T) {
+	cases := []struct {
+		in   string
+		want core.ReviewMode
+	}{
+		{"", core.ReviewModeLLM},
+		{"llm", core.ReviewModeLLM},
+		{"human", core.ReviewModeHuman},
+		{"manual", core.ReviewModeHuman},
+		{"none", core.ReviewModeNone},
+		{"off", core.ReviewModeNone},
+		{"skip", core.ReviewModeNone},
+	}
+	for _, tc := range cases {
+		if got := core.NormalizeReviewMode(core.ReviewMode(tc.in)); got != tc.want {
+			t.Errorf("read %q = %q, want %q", tc.in, got, tc.want)
+		}
+
+		src := &recordingSource{fakeSource: &fakeSource{log: &callLog{}}}
+		creator := &TaskCreator{Source: src, Workspace: &fakeWorkspace{log: &callLog{}}}
+		if _, err := creator.Create(context.Background(), CreateTaskInput{
+			ID: "T-REVIEW", Title: "Card", RequireReview: core.ReviewMode(tc.in),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := src.created.RequireReview; got != tc.want {
+			t.Errorf("create %q = %q, want %q", tc.in, got, tc.want)
+		}
+
+		review := tc.in
+		if got := applyGraphUpdate(core.Task{ID: "T-REVIEW"}, UpdateInput{RequireReview: &review}); got.RequireReview != tc.want {
+			t.Errorf("graph update %q = %q, want %q", tc.in, got.RequireReview, tc.want)
+		}
+		doc := splitCardDoc("---\nid: T-REVIEW\n---\n")
+		applyFrontmatter(&doc, UpdateInput{RequireReview: &review})
+		wantLine := "require_review: " + string(tc.want)
+		if !strings.Contains(strings.Join(doc.header, "\n"), wantLine) {
+			t.Errorf("frontmatter update %q = %v, want %q", tc.in, doc.header, wantLine)
+		}
+	}
+}
+
+func TestEpicChildrenUseCoreExpansion(t *testing.T) {
+	epic := core.Task{ID: "T-CORE", Plan: epicPlan()}
+	got := epicChildren(epic.ID, epic.Plan)
+	want := core.ExpandChildren(epic, epicBranch(epic.ID))
+	if len(got) != len(want) {
+		t.Fatalf("children = %+v, want %+v", got, want)
+	}
+	for i := range got {
+		if !reflect.DeepEqual(got[i], want[i]) {
+			t.Errorf("child %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+type fixedIDFactory struct{}
+
+func (fixedIDFactory) New() (core.TaskID, error) { return "T-INJECTED", nil }
+
+func (fixedIDFactory) ForEpic(string, []core.ChildSpec) core.TaskID { return "T-EPIC-INJECTED" }
+
+func (fixedIDFactory) ForBatch(_ string, index int) core.TaskID {
+	return core.TaskID(fmt.Sprintf("T-BATCH-%d", index))
+}
+
+type recordingCardWriter struct {
+	inner  CardWriter
+	writes int
+}
+
+func (w *recordingCardWriter) Available(ctx context.Context) ([]core.Task, error) {
+	return w.inner.Available(ctx)
+}
+
+func (w *recordingCardWriter) Write(ctx context.Context, tasks []core.Task) ([]core.Task, error) {
+	w.writes++
+	return w.inner.Write(ctx, tasks)
+}
+
+func (w *recordingCardWriter) Remove(ctx context.Context, ids ...core.TaskID) {
+	w.inner.Remove(ctx, ids...)
+}
+
+type recordingPublisher struct {
+	calls    int
+	pathspec string
+	message  string
+}
+
+func (p *recordingPublisher) Publish(_ context.Context, pathspec, message string) error {
+	p.calls++
+	p.pathspec, p.message = pathspec, message
+	return nil
+}
+
+func TestTaskCreatorUsesInjectedRoles(t *testing.T) {
+	writer := &recordingCardWriter{inner: sourceCardWriter{Source: &fakeSource{log: &callLog{}}}}
+	publisher := &recordingPublisher{}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{
+		Writer: writer, Publisher: publisher, IDs: fixedIDFactory{}, Workspace: ws,
+	}
+
+	got, err := creator.Create(context.Background(), CreateTaskInput{Title: "Injected card"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "T-INJECTED" || !got.Pushed {
+		t.Fatalf("result = %+v", got)
+	}
+	if writer.writes != 1 {
+		t.Fatalf("writer calls = %d, want one write", writer.writes)
+	}
+	if publisher.calls != 1 || publisher.pathspec != cardsPath ||
+		publisher.message != "beacon: create task T-INJECTED" {
+		t.Fatalf("publisher = %+v", publisher)
+	}
+	if len(ws.commits) != 0 {
+		t.Fatalf("injected publisher still used the workspace: %+v", ws.commits)
 	}
 }

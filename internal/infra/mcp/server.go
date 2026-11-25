@@ -22,6 +22,10 @@ func NewServer(sv Services) *msdk.Server {
 	for _, register := range toolRegistrations {
 		register(s, sv)
 	}
+	return s
+}
+
+func registerTaskCreate(s *msdk.Server, sv Services) {
 	// Journal operation ids so an interrupted call can be retried without
 	// writing the same cards twice. The create wrapper also accepts epic fields.
 	journal := newOpJournal()
@@ -33,23 +37,6 @@ func NewServer(sv Services) *msdk.Server {
 			return createTasks(ctx, sv.TaskCreator, a)
 		})
 	})
-	msdk.AddTool(s, taskUpdateTool, func(ctx context.Context, _ *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
-		if sv.TaskUpdater == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "task updater is not configured")
-		}
-		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
-			return updateTasks(ctx, sv.TaskUpdater, a)
-		})
-	})
-	msdk.AddTool(s, taskDeleteTool, func(ctx context.Context, _ *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
-		if sv.TaskDeleter == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "task deleter is not configured")
-		}
-		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
-			return deleteTasks(ctx, sv.TaskDeleter, a)
-		})
-	})
-	return s
 }
 
 func createTasks(ctx context.Context, creator *app.TaskCreator, a epicCreateArgs) (any, error) {
@@ -75,12 +62,36 @@ func createTasks(ctx context.Context, creator *app.TaskCreator, a epicCreateArgs
 	return out, nil
 }
 
+func registerTaskUpdate(s *msdk.Server, sv Services) {
+	journal := newOpJournal()
+	msdk.AddTool(s, catalogTool("beacon_task_update"), func(ctx context.Context, _ *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
+		if sv.TaskUpdater == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "task updater is not configured")
+		}
+		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
+			return updateTasks(ctx, sv.TaskUpdater, a)
+		})
+	})
+}
+
 func updateTasks(ctx context.Context, updater *app.TaskUpdater, a updateTaskArgs) (any, error) {
 	updates := make([]app.UpdateInput, 0, len(a.Updates))
 	for _, item := range a.Updates {
 		updates = append(updates, updateInput(item))
 	}
 	return updater.Update(ctx, updates)
+}
+
+func registerTaskDelete(s *msdk.Server, sv Services) {
+	journal := newOpJournal()
+	msdk.AddTool(s, catalogTool("beacon_task_delete"), func(ctx context.Context, _ *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
+		if sv.TaskDeleter == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "task deleter is not configured")
+		}
+		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
+			return deleteTasks(ctx, sv.TaskDeleter, a)
+		})
+	})
 }
 
 func deleteTasks(ctx context.Context, deleter *app.TaskDeleter, a deleteTaskArgs) (any, error) {
@@ -311,11 +322,6 @@ type updateOneArgs struct {
 	Status        *string         `json:"status,omitempty"` // accepted but ignored: task flow belongs to Beacon
 }
 
-var taskUpdateTool = &msdk.Tool{
-	Name:        "beacon_task_update",
-	Description: "Update task cards in one commit and push. Orchestrator only.",
-}
-
 func updateInput(a updateOneArgs) app.UpdateInput {
 	out := app.UpdateInput{
 		ID: a.ID, Title: a.Title, Body: a.Body, Scope: a.Scope, Depends: a.Depends,
@@ -340,23 +346,13 @@ type deleteTaskArgs struct {
 	OperationID string   `json:"operation_id,omitempty"`
 }
 
-var taskDeleteTool = &msdk.Tool{
-	Name:        "beacon_task_delete",
-	Description: "Delete task cards in one commit and push. Orchestrator only.",
-}
-
 // reconcileArgs is the input schema of beacon_reconcile.
 type reconcileArgs struct {
 	PR int `json:"pr"`
 }
 
-var reconcileTool = &msdk.Tool{
-	Name:        "beacon_reconcile",
-	Description: "Force one reconciler tick for a PR and report its decision. Orchestrator only.",
-}
-
 func registerReconcile(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, reconcileTool, func(ctx context.Context, _ *msdk.CallToolRequest, a reconcileArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_reconcile"), func(ctx context.Context, _ *msdk.CallToolRequest, a reconcileArgs) (*msdk.CallToolResult, any, error) {
 		if sv.Reconcile == nil {
 			return nil, nil, core.Errorf(core.CodeUnavailable, "reconcile service is not configured")
 		}
