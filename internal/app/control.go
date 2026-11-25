@@ -15,6 +15,7 @@ const (
 	controlRetryBase     = 10 * time.Millisecond
 )
 
+// Control applies operator actions to runs and persists the resulting state.
 type Control struct {
 	Store     core.RunStore
 	Harness   core.AgentHarness
@@ -115,6 +116,8 @@ func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 	return nil
 }
 
+// Cancel closes a run, then stops its worker session and removes its workspace.
+// Cleanup failures are logged and do not undo the saved cancellation.
 func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 	var saved *core.Run
 	err := c.write(ctx, func() error {
@@ -149,6 +152,7 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 	return nil
 }
 
+// Unblock moves a blocked run back to waiting_ci.
 func (c *Control) Unblock(ctx context.Context, id core.RunID) error {
 	return c.write(ctx, func() error {
 		run, err := c.get(ctx, id)

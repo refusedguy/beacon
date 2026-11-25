@@ -30,6 +30,8 @@ type DispatchStore interface {
 	SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error
 }
 
+// Dispatcher selects ready cards and starts a worker for each within the
+// configured concurrency and agent-slot limits.
 type Dispatcher struct {
 	Source             core.TaskSource
 	Planner            ConflictPlanner
@@ -52,12 +54,15 @@ type Dispatcher struct {
 
 var _ core.AgentSlots = (*Dispatcher)(nil)
 
+// DispatchResult reports the runs started by one dispatch, the candidates
+// left out and the workers that failed to start.
 type DispatchResult struct {
 	Runs     []*core.Run
 	Skipped  []SkippedTask
 	Failures []DispatchFailure
 }
 
+// DispatchFailure names a task whose worker failed to start and the error.
 type DispatchFailure struct {
 	TaskID core.TaskID
 	Err    string
@@ -71,6 +76,8 @@ func newRunID() core.RunID {
 	return core.RunID("run-" + hex.EncodeToString(b[:]))
 }
 
+// Dispatch starts workers for up to n non-overlapping ready cards and returns
+// the runs it created, the skipped candidates and any start failures.
 func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error) {
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()

@@ -1,7 +1,7 @@
 ---
 id: T-07ca6ccc
 title: Register MCP tools from the catalog and derive control verbs
-status: available
+status: done
 scope:
     - internal/infra/mcp/registry.go
     - internal/infra/mcp/catalog.go

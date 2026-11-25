@@ -25,13 +25,8 @@ type dispatchOutcome struct {
 	Identity string `json:"agent_identity,omitempty"`
 }
 
-var dispatchTool = &msdk.Tool{
-	Name:        "beacon_dispatch",
-	Description: "Pick up to N non-overlapping tasks and start agents.",
-}
-
 func registerDispatch(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, dispatchTool, func(ctx context.Context, req *msdk.CallToolRequest, a DispatchArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_dispatch"), func(ctx context.Context, req *msdk.CallToolRequest, a DispatchArgs) (*msdk.CallToolResult, any, error) {
 		if sv.Dispatcher == nil {
 			return nil, nil, core.Errorf(core.CodeUnavailable, "dispatcher is not configured")
 		}

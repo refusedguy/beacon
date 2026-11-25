@@ -29,7 +29,7 @@ func registerTaskCreate(s *msdk.Server, sv Services) {
 	// Journal operation ids so an interrupted call can be retried without
 	// writing the same cards twice. The create wrapper also accepts epic fields.
 	journal := newOpJournal()
-	msdk.AddTool(s, taskCreateTool, func(ctx context.Context, _ *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_task_create"), func(ctx context.Context, _ *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
 		if sv.TaskCreator == nil {
 			return nil, nil, core.Errorf(core.CodeUnavailable, "task creator is not configured")
 		}
