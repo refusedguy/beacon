@@ -12,13 +12,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Markdown reads and writes task cards in a local directory.
 type Markdown struct {
 	Dir    string
 	Parser core.EpicParser
 }
 
+// NewMarkdown builds a task source rooted at dir.
 func NewMarkdown(dir string) *Markdown { return &Markdown{Dir: dir} }
 
+// parser returns the configured epic parser or the default one.
 func (m *Markdown) parser() core.EpicParser {
 	if m.Parser != nil {
 		return m.Parser
@@ -26,6 +29,7 @@ func (m *Markdown) parser() core.EpicParser {
 	return PlanParser{}
 }
 
+// ListAvailable returns the available cards in the directory.
 func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -53,6 +57,7 @@ func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	return out, nil
 }
 
+// frontmatter is the YAML header of a markdown card.
 type frontmatter struct {
 	ID            string     `yaml:"id"`
 	Title         string     `yaml:"title"`
@@ -71,6 +76,7 @@ type frontmatter struct {
 	Plan          []planSpec `yaml:"plan"`
 }
 
+// splitFrontmatter separates a card's YAML header from its body.
 func splitFrontmatter(s string) (yamlText, body string, ok bool) {
 	lines := strings.Split(strings.ReplaceAll(s, "\r", ""), "\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
@@ -84,6 +90,7 @@ func splitFrontmatter(s string) (yamlText, body string, ok bool) {
 	return "", "", false
 }
 
+// parseCard parses one card's content and records its path.
 func parseCard(content, path string) (core.Task, bool) {
 	dir := filepath.Dir(path)
 	fmText, body, hasFM := splitFrontmatter(content)
@@ -129,6 +136,7 @@ func parseCard(content, path string) (core.Task, bool) {
 	return t, t.ID != ""
 }
 
+// headingID extracts an identifier and title from a card heading.
 func headingID(s string) (core.TaskID, string) {
 	for _, line := range strings.Split(strings.ReplaceAll(s, "\r", ""), "\n") {
 		line = strings.TrimSpace(line)
@@ -143,6 +151,7 @@ func headingID(s string) (core.TaskID, string) {
 	return "", ""
 }
 
+// parseLegacy parses a card that has no YAML frontmatter.
 func parseLegacy(content, dir string) core.Task {
 	t := core.Task{}
 	t.ID, t.Title = headingID(content)
@@ -230,10 +239,12 @@ func rewriteStatus(content, status string, hasFM bool) string {
 	return strings.Join(lines, "\n")
 }
 
+// Claim marks the card for id as in progress.
 func (m *Markdown) Claim(ctx context.Context, id core.TaskID) error {
 	return CardStore{Dir: m.Dir}.PatchStatus(ctx, id, "in_progress")
 }
 
+// Complete marks the card for id as done.
 func (m *Markdown) Complete(ctx context.Context, id core.TaskID) error {
 	return CardStore{Dir: m.Dir}.PatchStatus(ctx, id, "done")
 }
