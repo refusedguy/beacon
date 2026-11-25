@@ -150,7 +150,9 @@ func (r *Reconciler) openEpicPR(ctx context.Context, epic core.Task) error {
 	if run, err := r.Store.FindActiveByTask(ctx, epic.ID); err != nil {
 		return err
 	} else if run != nil {
-		run.PRNumber = pr
+		if err := run.MarkExternal(pr); err != nil {
+			return err
+		}
 		if run.Branch == "" {
 			run.Branch = epicBranch(epic.ID)
 		}
@@ -233,19 +235,9 @@ func (r *Reconciler) mergeIfReviewed(ctx context.Context, run *core.Run, obs cor
 // finalizeExternal closes a run whose PR was merged or closed outside Beacon.
 func (r *Reconciler) finalizeExternal(ctx context.Context, run *core.Run, obs core.Observation) error {
 	merged := obs.PRState == "merged"
-	run.State = core.RunMerged
-	if !merged {
-		run.State = core.RunClosed
+	if err := run.ExternalFinalize(obs); err != nil {
+		return err
 	}
-	if obs.HeadSHA != "" {
-		run.HeadSHA = obs.HeadSHA
-	}
-	if merged {
-		run.Reason = fmt.Sprintf("merged PR #%d via squash", obs.PRNumber)
-	} else {
-		run.Reason = "pull request " + obs.PRState
-	}
-	run.UpdatedAt = time.Now().UTC()
 	if err := r.Store.Save(ctx, run); err != nil {
 		return err
 	}

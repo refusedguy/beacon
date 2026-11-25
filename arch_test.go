@@ -191,6 +191,29 @@ func TestNoSiblingInfraImports(t *testing.T) {
 	}
 }
 
+func TestSingleRedactHandler(t *testing.T) {
+	count := 0
+	for _, path := range goFiles(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "type redactHandler") {
+			continue
+		}
+		count++
+		if path != "internal/infra/shared/logger.go" {
+			t.Errorf("redactHandler declared outside shared in %s", path)
+		}
+	}
+	if count != 1 {
+		t.Errorf("found %d redactHandler declarations, want 1", count)
+	}
+}
+
 func TestSecretPatternsOnlyInShared(t *testing.T) {
 	markers := []string{"gh[pousr]_", "github_pat_", "xox[baprs]", "AIza[A-Za-z0-9", "[0-9]+:[A-Za-z0-9_-]{35}"}
 	for _, path := range goFiles(t) {
