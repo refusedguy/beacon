@@ -14,8 +14,27 @@ import (
 // before its worker session is checked for liveness.
 const defaultOrphanTimeout = 90 * time.Second
 
+// ReconcilerStore is the store surface Reconciler and its helpers use, from
+// reconciliation through incident repair and idle-session wakeups.
+type ReconcilerStore interface {
+	FindByPR(ctx context.Context, pr int) (*core.Run, error)
+	Save(ctx context.Context, run *core.Run) error
+	Approved(ctx context.Context, id core.RunID, sha string) (bool, error)
+	ClaimDelivery(ctx context.Context, key string) (bool, error)
+	ReleaseDelivery(ctx context.Context, key string) error
+	SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error
+	ListActive(ctx context.Context) ([]*core.Run, error)
+	ListReadyTasks(ctx context.Context) ([]core.Task, error)
+	FindActiveByTask(ctx context.Context, task core.TaskID) (*core.Run, error)
+	Get(ctx context.Context, id core.RunID) (*core.Run, error)
+	CreateIncident(ctx context.Context, in *core.BaseIncident) (*core.BaseIncident, error)
+	ListOpenIncidents(ctx context.Context) ([]*core.BaseIncident, error)
+	ListByIncident(ctx context.Context, incidentID string) ([]*core.Run, error)
+	UpdateIncident(ctx context.Context, in *core.BaseIncident) error
+}
+
 type Reconciler struct {
-	Store           core.RunStore
+	Store           ReconcilerStore
 	SCM             core.ScmGateway
 	Policy          core.MergePolicy
 	Harness         core.AgentHarness
