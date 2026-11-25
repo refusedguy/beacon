@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -130,10 +131,16 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 		return err
 	}
 	if saved.SessionID != "" {
-		_ = c.Harness.Stop(ctx, saved.SessionID)
+		if err := c.Harness.Stop(ctx, saved.SessionID); err != nil {
+			slog.Error("cancel session stop", "run", saved.ID, "task", saved.TaskID, "error", err)
+		}
 	}
 	if saved.WorkspacePath != "" {
-		_ = c.Workspace.Remove(ctx, Workspace{Path: saved.WorkspacePath, Branch: saved.Branch})
+		// The cancel is already saved. A failed remove leaves a worktree for the
+		// next cleanup sweep, so it must not turn a successful cancel into an error.
+		if err := c.Workspace.Remove(ctx, Workspace{Path: saved.WorkspacePath, Branch: saved.Branch}); err != nil {
+			slog.Error("cancel workspace remove", "run", saved.ID, "task", saved.TaskID, "error", err)
+		}
 	}
 	return nil
 }
