@@ -125,19 +125,24 @@ func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := core.RunID(in.RunID)
+	action := core.ParseControlAction(in.Action)
+	if !action.Valid() {
+		http.Error(rw, "unknown action", http.StatusBadRequest)
+		return
+	}
 	var err error
-	switch in.Action {
-	case "watch":
+	switch action {
+	case core.ControlWatch:
 		err = a.wiring.control.WatchPR(r.Context(), id, in.PR)
-	case "approve":
+	case core.ControlApprove:
 		err = a.wiring.control.Approve(r.Context(), id, in.SHA)
-	case "unblock":
+	case core.ControlUnblock:
 		err = a.wiring.control.Unblock(r.Context(), id)
-	case "cancel":
+	case core.ControlCancel:
 		err = a.wiring.control.Cancel(r.Context(), id)
-	case "retry":
+	case core.ControlRetry:
 		err = a.wiring.control.Retry(r.Context(), id)
-	case "nudge":
+	case core.ControlNudge:
 		err = a.wiring.control.Nudge(r.Context(), id, in.Message)
 	default:
 		http.Error(rw, "unknown action", http.StatusBadRequest)
