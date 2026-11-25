@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -73,24 +74,39 @@ func doctorHTTPClient() *http.Client {
 	return &http.Client{Timeout: doctorHTTPTimeout}
 }
 
+// exitCoder is implemented by errors that carry a process exit status.
+type exitCoder interface {
+	ExitCode() int
+}
+
+// doctorExitError reports the exit status chosen by the doctor checks.
+type doctorExitError struct{ code int }
+
+func (e *doctorExitError) Error() string { return fmt.Sprintf("doctor exit status %d", e.code) }
+
+func (e *doctorExitError) ExitCode() int { return e.code }
+
 // newDoctorCommand builds the doctor Cobra command.
 func newDoctorCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
-		Use:   "doctor",
-		Short: "Check a Beacon installation and report problems",
-		Args:  cobra.NoArgs,
+		Use:           "doctor",
+		Short:         "Check a Beacon installation and report problems",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client := doctorHTTPClient()
-			if code := runDoctor(cmd.OutOrStdout(), *configPath, client); code != 0 {
-				os.Exit(code)
+			code := runDoctor(cmd.Context(), cmd.OutOrStdout(), *configPath, client)
+			if code == 0 {
+				return nil
 			}
-			return nil
+			return &doctorExitError{code: code}
 		},
 	}
 }
 
 // runDoctor runs all checks and returns the process exit code.
-func runDoctor(out io.Writer, configPath string, client *http.Client) int {
+func runDoctor(ctx context.Context, out io.Writer, configPath string, client *http.Client) int {
 	root, err := projectRoot()
 	if err != nil {
 		printDoctorChecks(out, []doctorCheck{{"project root", checkFail, err.Error()}})
@@ -100,7 +116,7 @@ func runDoctor(out io.Writer, configPath string, client *http.Client) int {
 	cfgChecks, cfg := doctorConfigChecks(root, doctorConfigPath(root, configPath))
 	checks = append(checks, cfgChecks...)
 	checks = append(checks, doctorToolChecks(root, cfg)...)
-	checks = append(checks, doctorNetworkChecks(cfg, client)...)
+	checks = append(checks, doctorNetworkChecks(ctx, cfg, client)...)
 	printDoctorChecks(out, checks)
 	return doctorExitCode(checks)
 }
@@ -326,11 +342,11 @@ func doctorDaemonCheck(cfg config.Config) doctorCheck {
 }
 
 // doctorNetworkChecks probes the OpenCode endpoint and the SCM base branch.
-func doctorNetworkChecks(cfg config.Config, client *http.Client) []doctorCheck {
+func doctorNetworkChecks(ctx context.Context, cfg config.Config, client *http.Client) []doctorCheck {
 	return []doctorCheck{
-		doctorHTTPCheck("opencode endpoint", strings.TrimRight(cfg.Harness.Endpoint, "/")+"/api/project",
+		doctorHTTPCheck(ctx, "opencode endpoint", strings.TrimRight(cfg.Harness.Endpoint, "/")+"/api/project",
 			firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token), shared.ApplyAuth, client),
-		doctorHTTPCheck("scm base branch", scmBranchURL(cfg),
+		doctorHTTPCheck(ctx, "scm base branch", scmBranchURL(cfg),
 			firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token), bearerAuth, client),
 	}
 }
@@ -359,11 +375,11 @@ func scmBranchURL(cfg config.Config) string {
 }
 
 // doctorHTTPCheck performs one network probe and formats its result.
-func doctorHTTPCheck(name, endpoint, token string, auth func(*http.Request, string), client *http.Client) doctorCheck {
+func doctorHTTPCheck(ctx context.Context, name, endpoint, token string, auth func(*http.Request, string), client *http.Client) doctorCheck {
 	if endpoint == "" || endpoint == "/api/project" {
 		return doctorCheck{name, checkWarn, "not configured"}
 	}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return doctorCheck{name, checkWarn, "invalid endpoint"}
 	}
