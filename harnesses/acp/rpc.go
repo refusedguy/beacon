@@ -57,13 +57,40 @@ type process interface {
 // stdin and stdout. Calls are serialized because Beacon drives one turn at a
 // time per worker session.
 type stdioProcess struct {
-	cmd    *exec.Cmd
-	enc    *json.Encoder
-	dec    *json.Decoder
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	mu     sync.Mutex
-	next   int64
+	cmd     *exec.Cmd
+	enc     *json.Encoder
+	dec     *json.Decoder
+	stdin   io.WriteCloser
+	stdout  io.ReadCloser
+	mu      sync.Mutex
+	writeMu sync.Mutex
+	waitMu  sync.Mutex
+	waited  bool
+	waitErr error
+	next    int64
+}
+
+// reap waits for the child exactly once. A managed process reaps it in a
+// watcher goroutine while close also needs the final state, and exec.Cmd.Wait
+// is not safe to call twice.
+func (p *stdioProcess) reap() error {
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
+	if p.waited {
+		return p.waitErr
+	}
+	p.waited = true
+	p.waitErr = p.cmd.Wait()
+	return p.waitErr
+}
+
+// encode serializes writes to stdin. calls are serialized by mu, but a
+// notification such as session/cancel must be able to reach the agent while a
+// long call is waiting for its response.
+func (p *stdioProcess) encode(v any) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	return p.enc.Encode(v)
 }
 
 func startProcess(command, cwd string) (*stdioProcess, error) {
@@ -114,7 +141,7 @@ func (p *stdioProcess) call(
 		}
 	}()
 
-	if err := p.enc.Encode(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
+	if err := p.encode(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
 		return err
 	}
 	for {
@@ -162,7 +189,7 @@ func (p *stdioProcess) answer(id *int64, method string, params json.RawMessage) 
 	} else {
 		resp.Result = map[string]any{"outcome": map[string]string{"outcome": "selected", "optionId": optionID}}
 	}
-	_ = p.enc.Encode(resp)
+	_ = p.encode(resp)
 }
 
 // firstAllowOption returns the ID of the first explicitly allowed option, or
@@ -187,12 +214,10 @@ func firstAllowOption(params json.RawMessage) string {
 }
 
 func (p *stdioProcess) notify(ctx context.Context, method string, params any) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return p.enc.Encode(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+	return p.encode(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
 }
 
 func (p *stdioProcess) close() error {
@@ -201,7 +226,7 @@ func (p *stdioProcess) close() error {
 		_ = p.cmd.Process.Kill()
 	}
 	_ = p.stdout.Close()
-	_ = p.cmd.Wait()
+	_ = p.reap()
 	return nil
 }
 

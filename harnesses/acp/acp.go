@@ -90,7 +90,7 @@ func startManagedProcess(command, cwd string) (process, error) {
 	}
 	m := &managedProcess{process: p}
 	go func() {
-		_ = p.cmd.Wait()
+		_ = p.reap()
 		m.exited.Store(true)
 	}()
 	return m, nil

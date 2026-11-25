@@ -242,3 +242,65 @@ func TestPermissionWithOnlyRejectOptionsCancels(t *testing.T) {
 		t.Fatalf("agent chunks = %v, want [permission:cancelled]", chunks)
 	}
 }
+
+func TestNotifyReachesAgentDuringInFlightCall(t *testing.T) {
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	p := &stdioProcess{
+		enc: json.NewEncoder(inW), dec: json.NewDecoder(outR),
+		stdin: inW, stdout: outR,
+	}
+
+	requests := make(chan string, 2)
+	go func() {
+		dec := json.NewDecoder(inR)
+		for {
+			var msg struct {
+				Method string `json:"method"`
+			}
+			if err := dec.Decode(&msg); err != nil {
+				return
+			}
+			requests <- msg.Method
+		}
+	}()
+
+	callDone := make(chan error, 1)
+	go func() {
+		callDone <- p.call(context.Background(), "session/prompt", nil, nil, nil)
+	}()
+	select {
+	case method := <-requests:
+		if method != "session/prompt" {
+			t.Fatalf("first request = %q", method)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("call did not write its request")
+	}
+
+	notifyDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { notifyDone <- p.notify(ctx, "session/cancel", nil) }()
+
+	select {
+	case err := <-notifyDone:
+		if err != nil {
+			t.Fatalf("notify: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		_ = outW.Close()
+		<-callDone
+		t.Fatal("notify blocked behind the in-flight call")
+	}
+	select {
+	case method := <-requests:
+		if method != "session/cancel" {
+			t.Fatalf("notification = %q, want session/cancel", method)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel notification was not written")
+	}
+	_ = outW.Close()
+	<-callDone
+}
