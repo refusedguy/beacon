@@ -3,10 +3,12 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -497,7 +499,7 @@ func TestTaskCreatorCreateBatch(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("results = %d, want 3", len(got))
 	}
-	if len(src.created) != 3 || len(ws.commits) != 3 {
+	if len(src.created) != 3 || len(ws.commits) != 1 {
 		t.Fatalf("created = %d, commits = %d", len(src.created), len(ws.commits))
 	}
 	for i, item := range got {
@@ -545,7 +547,7 @@ func TestTaskCreatorCreateBatchIsIdempotent(t *testing.T) {
 			t.Fatalf("card %d changed: %+v vs %+v", i, first[i], second[i])
 		}
 	}
-	if len(src.created) != 3 || len(src.log.items) != 3 || len(ws.commits) != 3 {
+	if len(src.created) != 3 || len(src.log.items) != 3 || len(ws.commits) != 1 {
 		t.Fatalf("repeated batch wrote cards = %d, creates = %d, commits = %d",
 			len(src.created), len(src.log.items), len(ws.commits))
 	}
@@ -635,10 +637,10 @@ func TestTaskCreatorCreateBatchRollsBackOnFailure(t *testing.T) {
 	if len(src.removed) != 1 || src.removed[0] != "T-BATCH-A" {
 		t.Fatalf("removed = %v, want the card written before the failure", src.removed)
 	}
-	// The first card publishes before the later card fails, so one commit is
-	// expected. Rollback removes its file but cannot undo that commit.
-	if len(ws.commits) != 1 {
-		t.Fatalf("commits = %d, want the first card's publish only", len(ws.commits))
+	// No card publishes until every file is written, so a failed write leaves
+	// no commit behind.
+	if len(ws.commits) != 0 {
+		t.Fatalf("commits = %d, want none after a failed write", len(ws.commits))
 	}
 }
 
@@ -663,8 +665,8 @@ func TestTaskCreatorCancelBeforeCommitLeavesNoFiles(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("cancelled batch left files: %v", entries)
 	}
-	if len(src.removed) != 1 || src.removed[0] != "T-CANCEL-A" {
-		t.Fatalf("removed = %v, want the one card written before commit", src.removed)
+	if len(src.removed) != 2 || src.removed[0] != "T-CANCEL-B" || src.removed[1] != "T-CANCEL-A" {
+		t.Fatalf("removed = %v, want both cards removed in reverse order", src.removed)
 	}
 	if len(ws.commits) != 0 {
 		t.Fatalf("commits = %d, want none", len(ws.commits))
@@ -817,5 +819,55 @@ func TestTaskCreatorIgnoresNonEpicBaseBranch(t *testing.T) {
 	}
 	if len(ws.branches) != 0 || len(ws.commits) != 1 {
 		t.Fatalf("branches = %v, commits = %d, want no branch work", ws.branches, len(ws.commits))
+	}
+}
+
+// delayedCommitter makes each publish costly, so a test can tell one batch
+// commit apart from one commit per card.
+type delayedCommitter struct {
+	*fakeWorkspace
+	delay time.Duration
+}
+
+func (d *delayedCommitter) CommitPath(ctx context.Context, ws core.Workspace, pathspec, message string) error {
+	time.Sleep(d.delay)
+	return d.fakeWorkspace.CommitPath(ctx, ws, pathspec, message)
+}
+
+func TestTaskCreatorCreateBatchTwentyCardsPublishesOnce(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &delayedCommitter{fakeWorkspace: &fakeWorkspace{log: &callLog{}}, delay: 20 * time.Millisecond}
+	store := &graphStore{}
+	creator := &TaskCreator{Source: src, Workspace: ws, Store: store,
+		Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	inputs := make([]CreateTaskInput, 20)
+	for i := range inputs {
+		inputs[i] = CreateTaskInput{ID: fmt.Sprintf("T-BULK-%02d", i+1), Title: fmt.Sprintf("Card %d", i+1)}
+	}
+	inputs[19].Depends = []string{"@1", "@19"}
+
+	start := time.Now()
+	got, err := creator.CreateBatch(context.Background(), inputs)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("created %d cards in %s", len(got), elapsed)
+	if len(got) != 20 || len(src.created) != 20 {
+		t.Fatalf("results = %d, created = %d", len(got), len(src.created))
+	}
+	if len(ws.commits) != 1 || ws.pushes != 1 {
+		t.Fatalf("commits = %d, pushes = %d, want one of each", len(ws.commits), ws.pushes)
+	}
+	if store.calls != 1 || len(store.tasks) != 20 {
+		t.Fatalf("sync calls = %d, tasks = %d, want one sync of 20 cards", store.calls, len(store.tasks))
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("20 cards took %s, want one publish instead of 20", elapsed)
+	}
+	last := src.created[19]
+	if !last.DependsOnID("T-BULK-01") || !last.DependsOnID("T-BULK-19") {
+		t.Fatalf("last card depends = %v", last.DependsOn)
 	}
 }
