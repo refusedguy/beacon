@@ -84,6 +84,102 @@ func TestRetryRejectsNonClosedRun(t *testing.T) {
 	}
 }
 
+func TestExternalFinalizeMergesRun(t *testing.T) {
+	r := &Run{ID: "r1", State: RunWaitingCI, PRNumber: 42}
+	if err := r.ExternalFinalize(Observation{PRNumber: 42, PRState: "merged", HeadSHA: "sha9"}); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != RunMerged || r.PRNumber != 42 || r.HeadSHA != "sha9" {
+		t.Fatalf("run = %+v", r)
+	}
+	if r.Reason != "merged PR #42 via squash" {
+		t.Fatalf("reason = %q", r.Reason)
+	}
+	if r.UpdatedAt.IsZero() {
+		t.Fatal("updated at not set")
+	}
+}
+
+func TestExternalFinalizeClosesRun(t *testing.T) {
+	r := &Run{ID: "r1", State: RunNeedsRebase, PRNumber: 42}
+	if err := r.ExternalFinalize(Observation{PRNumber: 42, PRState: "closed"}); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != RunClosed || r.Reason != "pull request closed" {
+		t.Fatalf("run = %+v", r)
+	}
+}
+
+func TestExternalFinalizeRejectsTerminalRun(t *testing.T) {
+	r := &Run{ID: "r1", State: RunMerged}
+	if err := r.ExternalFinalize(Observation{PRState: "merged"}); CodeOf(err) != CodeInvalidTransition {
+		t.Fatalf("error = %v, want invalid transition", err)
+	}
+}
+
+func TestReopenWithPR(t *testing.T) {
+	r := &Run{ID: "r1", State: RunClosed, Reason: "workspace: conflict: refusing to remove dirty worktree /ws/T-1"}
+	if err := r.ReopenWithPR(42); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != RunWaitingCI || r.PRNumber != 42 || r.Reason != "" {
+		t.Fatalf("run = %+v", r)
+	}
+	if r.UpdatedAt.IsZero() {
+		t.Fatal("updated at not set")
+	}
+}
+
+func TestReopenWithPRRejectsActiveRun(t *testing.T) {
+	r := &Run{ID: "r1", State: RunWaitingCI}
+	if err := r.ReopenWithPR(42); CodeOf(err) != CodeInvalidTransition {
+		t.Fatalf("error = %v, want invalid transition", err)
+	}
+	if r.State != RunWaitingCI || r.PRNumber != 0 {
+		t.Fatalf("run = %+v", r)
+	}
+}
+
+func TestRetryBlockedRun(t *testing.T) {
+	r := &Run{ID: "r1", State: RunBlocked, RebaseAttempts: 2, FixAttempts: 3}
+	if err := r.RetryBlocked("retried by operator"); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != RunWaitingCI || r.RebaseAttempts != 0 || r.FixAttempts != 0 || r.Reason != "retried by operator" {
+		t.Fatalf("run = %+v", r)
+	}
+}
+
+func TestRetryBlockedRejectsNonBlockedRun(t *testing.T) {
+	r := &Run{ID: "r1", State: RunWaitingCI, RebaseAttempts: 2}
+	if err := r.RetryBlocked("retried by operator"); CodeOf(err) != CodeInvalidTransition {
+		t.Fatalf("error = %v, want invalid transition", err)
+	}
+	if r.RebaseAttempts != 2 {
+		t.Fatalf("attempts reset on rejected retry: %+v", r)
+	}
+}
+
+func TestMarkExternal(t *testing.T) {
+	r := &Run{ID: "r1", State: RunWaitingCI}
+	if err := r.MarkExternal(42); err != nil {
+		t.Fatal(err)
+	}
+	if r.PRNumber != 42 || r.State != RunWaitingCI {
+		t.Fatalf("run = %+v", r)
+	}
+}
+
+func TestMarkExternalRejectsTerminalRun(t *testing.T) {
+	r := &Run{ID: "r1", State: RunClosed}
+	if err := r.MarkExternal(42); CodeOf(err) != CodeInvalidTransition {
+		t.Fatalf("error = %v, want invalid transition", err)
+	}
+	if r.PRNumber != 0 {
+		t.Fatalf("run = %+v", r)
+	}
+}
+
 func TestObserveSHAIsIdempotent(t *testing.T) {
 	r := &Run{ID: "r1"}
 	if !r.ObserveSHA("abc") {

@@ -151,6 +151,61 @@ func (r *Run) Retry(reason string) error {
 	return nil
 }
 
+// ExternalFinalize moves a run to a terminal state after its PR was merged or
+// closed outside Beacon. It keeps the PR number and records the observed SHA.
+func (r *Run) ExternalFinalize(obs Observation) error {
+	if r.State.Terminal() {
+		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("run %s is already %s", r.ID, r.State)}
+	}
+	if obs.PRState == "merged" {
+		r.State = RunMerged
+		r.Reason = fmt.Sprintf("merged PR #%d via squash", obs.PRNumber)
+	} else {
+		r.State = RunClosed
+		r.Reason = "pull request " + obs.PRState
+	}
+	if obs.HeadSHA != "" {
+		r.HeadSHA = obs.HeadSHA
+	}
+	r.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
+// ReopenWithPR reopens a run closed by workspace cleanup and binds the PR that
+// arrived after the cleanup. The reconciler can then finalize the run.
+func (r *Run) ReopenWithPR(pr int) error {
+	if r.State != RunClosed {
+		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot reopen run %s in %s", r.ID, r.State)}
+	}
+	r.State = RunWaitingCI
+	r.Reason = ""
+	r.PRNumber = pr
+	r.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
+// RetryBlocked re-arms a blocked run by clearing its attempt counters and
+// returning it to waiting_ci.
+func (r *Run) RetryBlocked(reason string) error {
+	if r.State != RunBlocked {
+		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot retry run %s in %s", r.ID, r.State)}
+	}
+	r.RebaseAttempts = 0
+	r.FixAttempts = 0
+	return r.Apply(Event{Kind: EvUnblock, Reason: reason})
+}
+
+// MarkExternal records a PR opened outside the run's own spawn path without
+// changing the run's state.
+func (r *Run) MarkExternal(pr int) error {
+	if r.State.Terminal() {
+		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot mark PR on run %s in %s", r.ID, r.State)}
+	}
+	r.PRNumber = pr
+	r.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
 func (r *Run) effectiveMax() int {
 	if r.MaxAttempts <= 0 {
 		return 3
