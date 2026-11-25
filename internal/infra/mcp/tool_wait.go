@@ -15,13 +15,8 @@ type WaitArgs struct {
 	TimeoutMS int    `json:"timeout_ms"`
 }
 
-var waitTool = &msdk.Tool{
-	Name:        "beacon_wait",
-	Description: "Wait for a run to reach an active verdict or a terminal state.",
-}
-
 func registerWait(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, waitTool, func(ctx context.Context, _ *msdk.CallToolRequest, a WaitArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_wait"), func(ctx context.Context, _ *msdk.CallToolRequest, a WaitArgs) (*msdk.CallToolResult, any, error) {
 		if a.TimeoutMS <= 0 || a.TimeoutMS > 600000 {
 			a.TimeoutMS = 60000
 		}
