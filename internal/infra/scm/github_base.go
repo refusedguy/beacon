@@ -29,10 +29,12 @@ func (g *GitHub) BaseBranchStatus(ctx context.Context, base string) (core.BaseSt
 }
 
 func (g *GitHub) FindOpenPRByBranch(ctx context.Context, branch string) (int, error) {
-	prs, _, err := g.Client.PullRequests.List(ctx, g.Owner, g.Repo, &github.PullRequestListOptions{
-		State:       "open",
-		Head:        g.Owner + ":" + branch,
-		ListOptions: github.ListOptions{PerPage: 20},
+	prs, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.PullRequest, *github.Response, error) {
+		return g.Client.PullRequests.List(ctx, g.Owner, g.Repo, &github.PullRequestListOptions{
+			State:       "open",
+			Head:        g.Owner + ":" + branch,
+			ListOptions: *opts,
+		})
 	})
 	if err != nil {
 		return 0, err
