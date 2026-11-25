@@ -20,10 +20,34 @@ func NewGitHubIssues(client *github.Client, owner, repo string) *GitHubIssues {
 	return &GitHubIssues{Client: client, Owner: owner, Repo: repo}
 }
 
+// maxIssuePages caps paginated issue listing so a bad Link header cannot keep
+// the source fetching pages forever. With PerPage=100 it covers 10,000 issues.
+const maxIssuePages = 100
+
+// paginateIssues follows NextPage and accumulates every page of issues.
+func paginateIssues[T any](fetch func(*github.ListOptions) ([]T, *github.Response, error)) ([]T, error) {
+	var all []T
+	opts := github.ListOptions{PerPage: 100}
+	for n := 0; n < maxIssuePages; n++ {
+		items, resp, err := fetch(&opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, items...)
+		if resp == nil || resp.NextPage == 0 {
+			return all, nil
+		}
+		opts.Page = resp.NextPage
+	}
+	return all, nil
+}
+
 func (g *GitHubIssues) ListAvailable(ctx context.Context) ([]core.Task, error) {
-	issues, _, err := g.Client.Issues.ListByRepo(ctx, g.Owner, g.Repo, &github.IssueListByRepoOptions{
-		State:       "open",
-		ListOptions: github.ListOptions{PerPage: 100},
+	issues, err := paginateIssues(func(opts *github.ListOptions) ([]*github.Issue, *github.Response, error) {
+		return g.Client.Issues.ListByRepo(ctx, g.Owner, g.Repo, &github.IssueListByRepoOptions{
+			State:       "open",
+			ListOptions: *opts,
+		})
 	})
 	if err != nil {
 		return nil, err

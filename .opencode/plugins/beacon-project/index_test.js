@@ -8,6 +8,8 @@ import {
   beaconProject,
   buildShellGuardRules,
   commandFromToolInput,
+  commandSegments,
+  commandSubstitutions,
   createRunChangeWatcher,
   currentSessionAgent,
   findShellGuardHit,
@@ -143,6 +145,61 @@ test("targeted commands stay allowed", async () => {
   })
 })
 
+test("commands are split on shell operators and substitutions are walked", () => {
+  const segments = commandSegments("echo ready && FOO=bar find /; grep -r x . || echo done")
+  assert.ok(segments.includes("find /"))
+  assert.ok(segments.includes("grep -r x ."))
+  assert.ok(segments.includes("echo ready"))
+  assert.deepEqual(commandSubstitutions("echo $(find /) `grep -r x .`"), ["find /", "grep -r x ."])
+  assert.deepEqual(commandSubstitutions("echo $(printf '%s' $(find /))"), ["printf '%s' $(find /)", "find /"])
+})
+
+test("recursive grep is blocked in long form, behind operators and in substitutions", () => {
+  const commands = [
+    "grep --recursive PATTERN .",
+    "grep -rn PATTERN .",
+    "echo ready; grep --recursive PATTERN .",
+    "sudo grep --recursive PATTERN .",
+    "echo $(grep --recursive PATTERN .)",
+    "echo `grep -r PATTERN .`",
+  ]
+  for (const command of commands) {
+    assert.equal(findShellGuardHit("bash", command)?.id, "recursive grep", `should guard: ${command}`)
+  }
+  assert.equal(findShellGuardHit("bash", "rg -n PATTERN ./src"), null)
+})
+
+test("root find is blocked with an env prefix, env and sudo", () => {
+  const commands = [
+    "FOO=bar find / -name '*.go'",
+    "env FOO=bar find / -name '*.go'",
+    "sudo find /",
+    "PATH=/bin sudo -u admin find /",
+    "echo $(find / -name '*.go')",
+  ]
+  for (const command of commands) {
+    assert.equal(findShellGuardHit("bash", command)?.id, "root find", `should guard: ${command}`)
+  }
+  assert.equal(findShellGuardHit("bash", "find ./src -name '*.go'"), null)
+})
+
+test("a direct push to main is blocked but a branch named feature/main-fix is allowed", async () => {
+  const ctx = fakeCtx()
+  await registerShellGuard(ctx, {}, {})
+  await withWarnings(() => {
+    for (const command of ["git push origin main", "git push origin master", "git push origin main:main"]) {
+      assert.throws(() => ctx.handler(event(command, "worker")), /direct push to main/, `should guard: ${command}`)
+    }
+    for (const command of [
+      "git push origin feature/main-fix",
+      "git push origin feature/main",
+      "git push -u origin main-fix",
+    ]) {
+      assert.doesNotThrow(() => ctx.handler(event(command, "worker")), `should allow: ${command}`)
+    }
+  })
+})
+
 test("a malformed config rule is logged and skipped without breaking setup", async () => {
   const warnings = []
   const rules = buildShellGuardRules(
@@ -265,13 +322,18 @@ function setupCtx(agent, options = {}, root = "/setup-project") {
   }
 }
 
-test("worker agent names are recognised by substring", () => {
+test("worker agent names must match a configured name exactly", () => {
   assert.equal(isWorkerAgent("worker"), true)
-  assert.equal(isWorkerAgent("beacon-worker"), true)
+  assert.equal(isWorkerAgent(" Worker "), true)
   assert.equal(isWorkerAgent("Worker"), true)
+  assert.equal(isWorkerAgent("beacon-worker"), false)
+  assert.equal(isWorkerAgent("worker-proxy"), false)
+  assert.equal(isWorkerAgent("networker"), false)
   assert.equal(isWorkerAgent("build"), false)
   assert.equal(isWorkerAgent("orchestrator"), false)
   assert.equal(isWorkerAgent(null), false)
+  assert.equal(isWorkerAgent("beacon-worker", { shellGuardAgents: ["worker"] }), false)
+  assert.equal(isWorkerAgent("beacon-worker", { shellGuardAgents: ["beacon-worker"] }), true)
 })
 
 test("currentSessionAgent resolves an explicit session and the newest session", async () => {
@@ -281,8 +343,8 @@ test("currentSessionAgent resolves an explicit session and the newest session", 
   }
   assert.equal(await currentSessionAgent(named), "worker")
 
-  const newest = { session: { list: async () => [{ id: "s2", agent: "beacon-worker" }] } }
-  assert.equal(await currentSessionAgent(newest), "beacon-worker")
+  const newest = { session: { list: async () => [{ id: "s2", agent: "worker" }] } }
+  assert.equal(await currentSessionAgent(newest), "worker")
   assert.equal(isWorkerAgent(await currentSessionAgent(newest)), true)
 })
 
@@ -290,7 +352,7 @@ test("a worker skips MCP config registration and command resolution", async (t) 
   const root = "/worker-no-mcp"
   const calls = []
   const ctx = {
-    agent: "beacon-worker",
+    agent: "worker",
     options: { mcpDeps: { beaconCommand: beaconCommandSpy(calls) } },
   }
   const registration = await resolveMcpRegistration(ctx, root)
