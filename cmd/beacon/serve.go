@@ -50,6 +50,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 
 			ctx, stop := signalContext(cmd.Context())
 			defer stop()
+			go w.watcher.Run(ctx)
 			if watcher, ok := w.harness.(core.IdleWatcher); ok {
 				go watcher.WatchIdle(ctx)
 			}
