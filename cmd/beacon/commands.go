@@ -98,7 +98,10 @@ func newStatusCommand(configPath *string) *cobra.Command {
 		Use:   "status",
 		Short: "Print active runs",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			daemon, _ := cmd.Flags().GetBool("daemon")
+			daemon, err := cmd.Flags().GetBool("daemon")
+			if err != nil {
+				return err
+			}
 			if daemon {
 				cfg, _, err := loadConfig(*configPath)
 				if err != nil {
@@ -111,10 +114,19 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			snapshot, _ := cmd.Flags().GetBool("snapshot")
+			snapshot, err := cmd.Flags().GetBool("snapshot")
+			if err != nil {
+				return err
+			}
 			if snapshot {
-				recentLimit, _ := cmd.Flags().GetInt("recent-limit")
-				decisionsLimit, _ := cmd.Flags().GetInt("decisions-limit")
+				recentLimit, err := cmd.Flags().GetInt("recent-limit")
+				if err != nil {
+					return err
+				}
+				decisionsLimit, err := cmd.Flags().GetInt("decisions-limit")
+				if err != nil {
+					return err
+				}
 				result, err := (app.SnapshotService{
 					Store: store, RecentLimit: recentLimit, DecisionsLimit: decisionsLimit,
 					Repo:   cfg.SCM.Owner + "/" + cfg.SCM.Repo,
@@ -125,7 +137,10 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				}
 				return printJSON(result)
 			}
-			recent, _ := cmd.Flags().GetBool("recent")
+			recent, err := cmd.Flags().GetBool("recent")
+			if err != nil {
+				return err
+			}
 			if recent {
 				runs, err := (app.StatusService{Store: store}).Recent(cmd.Context(), 0)
 				if err != nil {
@@ -224,11 +239,26 @@ func newControlCommand(configPath *string) *cobra.Command {
 		Short: "Control a run: " + strings.Join(core.ControlActionNames(), ", "),
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			action, _ := cmd.Flags().GetString("action")
-			runID, _ := cmd.Flags().GetString("run-id")
-			sha, _ := cmd.Flags().GetString("sha")
-			pr, _ := cmd.Flags().GetInt("pr")
-			message, _ := cmd.Flags().GetString("message")
+			action, err := cmd.Flags().GetString("action")
+			if err != nil {
+				return err
+			}
+			runID, err := cmd.Flags().GetString("run-id")
+			if err != nil {
+				return err
+			}
+			sha, err := cmd.Flags().GetString("sha")
+			if err != nil {
+				return err
+			}
+			pr, err := cmd.Flags().GetInt("pr")
+			if err != nil {
+				return err
+			}
+			message, err := cmd.Flags().GetString("message")
+			if err != nil {
+				return err
+			}
 			if err := validateControl(action, runID, message); err != nil {
 				return err
 			}

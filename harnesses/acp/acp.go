@@ -7,8 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,8 +16,6 @@ import (
 )
 
 const defaultTimeout = 30 * time.Minute
-
-var prPattern = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
 
 // Config is the explicit constructor input. Command is the ACP agent to
 // launch, split on whitespace into an executable and arguments.
@@ -53,23 +49,15 @@ type acpSession struct {
 	proc  process
 }
 
-// New builds a harness. The variadic tail mirrors opencode.New for the
-// composition root: model first, then parent session ID.
-func New(command string, rest ...string) *Harness {
-	h := &Harness{Command: command}
-	if len(rest) > 0 {
-		h.Model = rest[0]
-	}
-	if len(rest) > 1 {
-		h.ParentSessionID = rest[1]
-	}
-	return h
-}
-
+// NewFromConfig is the only constructor. The composition root maps named
+// config fields here instead of passing positional strings.
 func NewFromConfig(cfg Config) *Harness {
-	h := New(cfg.Command, cfg.Model, cfg.ParentSessionID)
-	h.Timeout = cfg.Timeout
-	return h
+	return &Harness{
+		Command:         cfg.Command,
+		Model:           cfg.Model,
+		ParentSessionID: cfg.ParentSessionID,
+		Timeout:         cfg.Timeout,
+	}
 }
 
 func (h *Harness) init() {
@@ -184,7 +172,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 		_ = h.Stop(ctx, id)
 		return core.Session{}, err
 	}
-	return core.Session{ID: id, PR: prFromText(output)}, nil
+	return core.Session{ID: id, PR: core.PRFromText(output)}, nil
 }
 
 // prompt runs one ACP turn and reports idle when the agent stops. It returns
@@ -252,13 +240,8 @@ func (h *Harness) Wake(ctx context.Context, sessionID string, w core.WakeContext
 	}
 	cctx, cancel := context.WithTimeout(ctx, h.Timeout)
 	defer cancel()
-	_, err := h.prompt(cctx, s, wakeText(w))
+	_, err := h.prompt(cctx, s, core.WakeText(w))
 	return err
-}
-
-func wakeText(w core.WakeContext) string {
-	return fmt.Sprintf("Beacon correction for run %s, PR #%d, head %s.\nReason: %s\n%s\nFix the issue, push and open a PR.\n",
-		w.RunID, w.PRNumber, w.HeadSHA, w.Reason, w.Excerpt)
 }
 
 func (h *Harness) Stop(ctx context.Context, sessionID string) error {
@@ -310,18 +293,6 @@ func (h *Harness) emit(run core.RunID, sessionID string) {
 	case h.events <- core.HarnessEvent{RunID: run, SessionID: sessionID, Kind: "idle"}:
 	default:
 	}
-}
-
-func prFromText(s string) int {
-	m := prPattern.FindStringSubmatch(s)
-	if len(m) != 2 {
-		return 0
-	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0
-	}
-	return n
 }
 
 var _ core.AgentHarness = (*Harness)(nil)

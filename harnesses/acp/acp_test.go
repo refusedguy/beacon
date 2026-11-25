@@ -106,7 +106,7 @@ type liveFakeProcess struct {
 func (f *liveFakeProcess) alive() bool { return f.running.Load() }
 
 func testHarness(fp process) *Harness {
-	h := New("fake-agent --acp")
+	h := NewFromConfig(Config{Command: "fake-agent --acp"})
 	h.Timeout = time.Second
 	h.newProcess = func(_, _ string) (process, error) { return fp, nil }
 	return h
@@ -197,7 +197,7 @@ func TestSpawnRejectsUnsupportedProtocolVersion(t *testing.T) {
 }
 
 func TestSpawnRequiresCommand(t *testing.T) {
-	h := New("")
+	h := NewFromConfig(Config{})
 	h.newProcess = func(_, _ string) (process, error) {
 		t.Fatal("process started with empty command")
 		return nil, nil
@@ -358,10 +358,13 @@ func TestCollectTextAndPRExtraction(t *testing.T) {
 	if got := collectText(json.RawMessage(other)); got != "" {
 		t.Fatalf("collectText for tool call = %q, want empty", got)
 	}
-	if got := prFromText("opened pull/17 for review"); got != 17 {
-		t.Fatalf("prFromText = %d, want 17", got)
+	if got := core.PRFromText("opened pull/17 for review"); got != 17 {
+		t.Fatalf("PRFromText = %d, want 17", got)
 	}
-	if got := prFromText("no pr here"); got != 0 {
-		t.Fatalf("prFromText = %d, want 0", got)
+	if got := core.PRFromText(`{"pr": 23}`); got != 23 {
+		t.Fatalf("PRFromText = %d, want 23", got)
+	}
+	if got := core.PRFromText("no pr here"); got != 0 {
+		t.Fatalf("PRFromText = %d, want 0", got)
 	}
 }

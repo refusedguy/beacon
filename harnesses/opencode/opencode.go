@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +21,6 @@ import (
 )
 
 const requestTimeout = 30 * time.Second
-
-var prPattern = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
 
 type Harness struct {
 	Endpoint        string
@@ -136,18 +133,6 @@ func messageID(prefix string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	return fmt.Sprintf("msg_%s_%s_%d", prefix, hex.EncodeToString(b[:]), time.Now().UnixNano())
-}
-
-func prFromText(s string) int {
-	m := prPattern.FindStringSubmatch(s)
-	if len(m) != 2 {
-		return 0
-	}
-	var n int
-	if _, err := fmt.Sscanf(m[1], "%d", &n); err != nil {
-		return 0
-	}
-	return n
 }
 
 func sessionIDFromJSON(data []byte) string {
@@ -305,13 +290,13 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	if err := h.prompt(ctx, id, req.Prompt, messageID("spawn")); err != nil {
 		return core.Session{}, err
 	}
-	return core.Session{ID: id, PR: prFromText(string(data))}, nil
+	return core.Session{ID: id, PR: core.PRFromText(string(data))}, nil
 }
 
 func (h *Harness) Wake(ctx context.Context, sessionID string, w core.WakeContext) error {
 	h.init()
 	h.bind(sessionID, w.RunID)
-	return h.prompt(ctx, sessionID, wakeText(w, h.ExcerptLimit), messageID("wake"))
+	return h.prompt(ctx, sessionID, core.WakeTextLimited(w, h.ExcerptLimit), messageID("wake"))
 }
 
 func (h *Harness) Stop(ctx context.Context, sessionID string) error {
