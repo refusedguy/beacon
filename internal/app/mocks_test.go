@@ -211,6 +211,15 @@ func (f *fakeStore) UpdateIncident(_ context.Context, in *core.BaseIncident) err
 	return nil
 }
 
+var (
+	_ StatusStore     = (*fakeStore)(nil)
+	_ ReconcileStore  = (*fakeStore)(nil)
+	_ WaitStore       = (*fakeStore)(nil)
+	_ core.RunStore   = (*fakeStore)(nil)
+	_ DispatchStore   = (*fakeStore)(nil)
+	_ ReconcilerStore = (*fakeStore)(nil)
+)
+
 type fakeWorkspace struct {
 	removed       int
 	forcedRemoves int

@@ -16,9 +16,9 @@ const (
 )
 
 type Control struct {
-	Store     RunStore
-	Harness   AgentHarness
-	Workspace WorkspaceManager
+	Store     core.RunStore
+	Harness   core.AgentHarness
+	Workspace core.WorkspaceManager
 	OnChange  func(int)
 	writeMu   sync.Mutex
 }
@@ -138,7 +138,7 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 	if saved.WorkspacePath != "" {
 		// The cancel is already saved. A failed remove leaves a worktree for the
 		// next cleanup sweep, so it must not turn a successful cancel into an error.
-		if err := c.Workspace.Remove(ctx, Workspace{Path: saved.WorkspacePath, Branch: saved.Branch}); err != nil {
+		if err := c.Workspace.Remove(ctx, core.Workspace{Path: saved.WorkspacePath, Branch: saved.Branch}); err != nil {
 			slog.Error("cancel workspace remove", "run", saved.ID, "task", saved.TaskID, "error", err)
 		}
 	}

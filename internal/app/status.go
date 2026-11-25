@@ -10,7 +10,13 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-type StatusService struct{ Store RunStore }
+// StatusStore is the run read side StatusService needs.
+type StatusStore interface {
+	ListActive(ctx context.Context) ([]*core.Run, error)
+	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
+}
+
+type StatusService struct{ Store StatusStore }
 
 // DefaultRecentLimit is the number of finished runs returned when no limit is set.
 const DefaultRecentLimit = 20
@@ -61,11 +67,16 @@ type ReconcileResult struct {
 	Error    string            `json:"error,omitempty"`
 }
 
+// ReconcileStore is the run lookup ReconcileService needs for the tick's state.
+type ReconcileStore interface {
+	FindByPR(ctx context.Context, pr int) (*core.Run, error)
+}
+
 // ReconcileService runs one reconciler tick on demand. It captures errors and
 // panics in the result so a forced tick can never stop the daemon loop.
 type ReconcileService struct {
 	Reconciler TickReconciler
-	Store      RunStore
+	Store      ReconcileStore
 }
 
 // Tick forces exactly one reconciler pass for pr and reports what happened. A
@@ -102,8 +113,13 @@ func (s *ReconcileService) Tick(ctx context.Context, pr int) (out ReconcileResul
 	return out
 }
 
+// WaitStore is the run lookup WaitService needs while it polls.
+type WaitStore interface {
+	Get(ctx context.Context, id core.RunID) (*core.Run, error)
+}
+
 type WaitService struct {
-	Store    RunStore
+	Store    WaitStore
 	Interval time.Duration
 }
 
