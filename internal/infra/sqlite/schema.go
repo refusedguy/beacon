@@ -3,11 +3,10 @@ package sqlite
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
-
-	sqliteDriver "modernc.org/sqlite"
 )
 
 const schema = `
@@ -110,19 +109,34 @@ CREATE INDEX IF NOT EXISTS decisions_run_at_idx ON decisions(run_id, at);
 CREATE INDEX IF NOT EXISTS decisions_kind_at_idx ON decisions(kind, at);
 `
 
+// dsn builds a SQLite file URI. The path is escaped as a URL path so a name
+// containing ? or # stays part of the filename instead of becoming a query or
+// fragment delimiter. The composition root registers the driver under "sqlite".
+func dsn(path string) string {
+	params := url.Values{}
+	params.Add("_pragma", "busy_timeout(5000)")
+	params.Add("_pragma", "journal_mode(WAL)")
+	params.Add("_pragma", "foreign_keys(ON)")
+	// BEGIN IMMEDIATE takes the write lock before the first read in a write
+	// transaction. Deferred upgrades can fail with SQLITE_BUSY even after a
+	// busy timeout, which parallel control calls hit.
+	params.Set("_txlock", "immediate")
+	return (&url.URL{
+		Scheme:   "file",
+		OmitHost: true,
+		Path:     path,
+		RawQuery: params.Encode(),
+	}).String()
+}
+
 func openDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	// BEGIN IMMEDIATE takes the write lock before the first read in a write
-	// transaction. Deferred upgrades can fail with SQLITE_BUSY even after a
-	// busy timeout, which parallel control calls hit.
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_txlock=immediate"
-	connector, err := sqliteDriver.NewConnector(dsn)
+	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, err
 	}
-	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(4)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
