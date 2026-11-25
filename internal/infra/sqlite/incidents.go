@@ -108,6 +108,10 @@ UPDATE base_incidents SET failed_checks_json=?, fixer_run_id=?, status=?, attemp
 	return err
 }
 
+// FailedChecksJSON encodes check results for the failed_checks_json column.
+// A check whose start or completion time falls outside years 0 to 9999 makes
+// time.Time.MarshalJSON fail. Log that error and store an empty array so the
+// column still holds valid JSON.
 func FailedChecksJSON(checks []core.CheckResult) string {
 	b, err := json.Marshal(checks)
 	if err != nil {
