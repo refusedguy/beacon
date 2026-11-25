@@ -92,6 +92,77 @@ func TestCancelReturnsPersistentBusyAfterBoundedRetries(t *testing.T) {
 	}
 }
 
+// codedSQLiteError stands in for a driver error that carries a result code
+// instead of relying on its message.
+type codedSQLiteError struct {
+	code int
+	msg  string
+}
+
+func (e codedSQLiteError) Error() string { return e.msg }
+func (e codedSQLiteError) Code() int     { return e.code }
+
+func TestIsBusyUsesResultCodeNotMessage(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"coded busy with changed message", codedSQLiteError{code: sqliteBusyCode, msg: "reworded lock conflict"}, true},
+		{"wrapped coded busy", fmt.Errorf("save: %w", codedSQLiteError{code: sqliteBusyCode, msg: "reworded lock conflict"}), true},
+		{"coded non-busy wins over message", codedSQLiteError{code: 6, msg: "(SQLITE_BUSY) in text"}, false},
+		{"untyped canonical marker", errors.New("database is locked (5) (SQLITE_BUSY)"), true},
+		{"untyped unrelated", errors.New("connection refused"), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isBusy(tc.err); got != tc.want {
+				t.Fatalf("isBusy(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// typedBusyStore fails its first save with a coded busy error whose message
+// contains no SQLite marker. Detection must come from the result code.
+type typedBusyStore struct {
+	*fakeStore
+	fail bool
+}
+
+func (s *typedBusyStore) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
+	run, err := s.fakeStore.Get(ctx, id)
+	if err != nil || run == nil {
+		return run, err
+	}
+	copy := *run
+	return &copy, nil
+}
+
+func (s *typedBusyStore) Save(ctx context.Context, r *core.Run) error {
+	if s.fail {
+		s.fail = false
+		return codedSQLiteError{code: sqliteBusyCode, msg: "reworded lock conflict"}
+	}
+	return s.fakeStore.Save(ctx, r)
+}
+
+func TestCancelRetriesTypedBusyWithChangedMessage(t *testing.T) {
+	ctx := context.Background()
+	store := &typedBusyStore{fakeStore: newFakeStore(), fail: true}
+	if err := store.fakeStore.Save(ctx, core.NewRun("r-typed-busy", "T-1", time.Now())); err != nil {
+		t.Fatalf(`store.fakeStore.Save(ctx, core.NewRun("r-typed-busy", "T-1", time.Now())): %v`, err)
+	}
+	c := &Control{Store: store}
+	if err := c.Cancel(ctx, "r-typed-busy"); err != nil {
+		t.Fatalf(`c.Cancel(ctx, "r-typed-busy"): %v`, err)
+	}
+	if got := store.runs["r-typed-busy"]; got.State != core.RunClosed {
+		t.Fatalf("state = %s, want %s", got.State, core.RunClosed)
+	}
+}
+
 func TestParallelCancelsAllSucceed(t *testing.T) {
 	ctx := context.Background()
 	store := newBusyStore()
