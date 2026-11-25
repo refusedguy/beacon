@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 
@@ -66,12 +67,12 @@ func (s CardStore) find(id core.TaskID) (card, error) {
 		if err != nil {
 			continue
 		}
-		t, ok := parseCard(string(b), path)
+		content := string(b)
+		t, ok, hasFM := parseCardFields(content, path)
 		if !ok || t.ID != id {
 			continue
 		}
-		_, _, hasFM := splitFrontmatter(string(b))
-		return card{path: path, task: t, content: string(b), hasFM: hasFM}, nil
+		return card{path: path, task: t, content: content, hasFM: hasFM}, nil
 	}
 	return card{}, os.ErrNotExist
 }
@@ -217,11 +218,98 @@ func (PlanParser) Children(epic core.Task) []core.Task {
 	return core.SetParent(core.ExpandChildren(epic, ""), epic.ID)
 }
 
-// ParseTaskFields reads a fenced YAML block and flat Scope/Depends/Priority lines.
+// The cache limit keeps one refresh of a large repository from pinning every
+// issue body it has ever seen. Entries are evicted in insertion order.
+const fieldCacheLimit = 256
+
+// parseKey identifies one parse. The source text is part of the key, so an
+// edited card can never return a stale result and dir and depPrefix still
+// produce their own values for the same text.
+type parseKey struct {
+	body      string
+	dir       string
+	depPrefix string
+}
+
+// fieldCache stores the parsed form of unchanged card text. A refresh parses
+// the same bodies repeatedly, so one decode serves every later call for that
+// text.
+type fieldCache struct {
+	mu      sync.RWMutex
+	entries map[parseKey]taskFields
+	order   []parseKey
+	next    int
+}
+
+var cachedFields = fieldCache{entries: make(map[parseKey]taskFields)}
+
+// clone gives each caller its own slices. A cached entry must never be handed
+// out directly, since callers may append to or overwrite the fields they get.
+func (t taskFields) clone() taskFields {
+	out := t
+	if t.Scope != nil {
+		out.Scope = append([]string(nil), t.Scope...)
+	}
+	if t.Depends != nil {
+		out.Depends = append([]string(nil), t.Depends...)
+	}
+	if t.Plan != nil {
+		out.Plan = make([]core.ChildSpec, len(t.Plan))
+		for i, child := range t.Plan {
+			out.Plan[i] = child
+			if child.Scope != nil {
+				out.Plan[i].Scope = append([]core.ScopePath(nil), child.Scope...)
+			}
+			if child.Depends != nil {
+				out.Plan[i].Depends = append([]core.TaskID(nil), child.Depends...)
+			}
+		}
+	}
+	return out
+}
+
+func (c *fieldCache) load(key parseKey) (taskFields, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	fields, ok := c.entries[key]
+	return fields, ok
+}
+
+func (c *fieldCache) store(key parseKey, fields taskFields) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.entries[key]; !exists {
+		if len(c.order) < fieldCacheLimit {
+			c.order = append(c.order, key)
+		} else {
+			oldest := c.order[c.next]
+			delete(c.entries, oldest)
+			c.order[c.next] = key
+			c.next = (c.next + 1) % fieldCacheLimit
+		}
+	}
+	c.entries[key] = fields
+}
+
+// ParseTaskFields reads a fenced YAML block and flat Scope/Depends/Priority
+// lines. Repeated calls with identical text reuse the first parse.
 func ParseTaskFields(body, dir, depPrefix string) taskFields {
+	key := parseKey{body: body, dir: dir, depPrefix: depPrefix}
+	if fields, ok := cachedFields.load(key); ok {
+		return fields.clone()
+	}
+	fields := parseTaskFields(body, dir, depPrefix)
+	cachedFields.store(key, fields.clone())
+	return fields
+}
+
+// parseTaskFields decodes card text without the cache. It keeps field aliases
+// and scope conversion in one place so cached and fresh parses stay identical.
+func parseTaskFields(body, dir, depPrefix string) taskFields {
 	var out taskFields
 	var yf yamlFields
-	if block, ok := yamlBlock(body); ok {
+	lines, block, hasBlock := splitFieldLines(body)
+	if hasBlock {
 		if err := yaml.Unmarshal([]byte(block), &yf); err != nil {
 			slog.Warn("tasksource: malformed YAML field block", "error", err)
 		} else {
@@ -238,7 +326,7 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			out.Plan = childSpecs(yf.Plan, dir)
 		}
 	}
-	for _, line := range strings.Split(strings.ReplaceAll(body, "\r", ""), "\n") {
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(line, "Scope:"), strings.HasPrefix(line, "Владелец файлов:"):
@@ -338,10 +426,12 @@ func afterColon(line string) string {
 	return ""
 }
 
-// yamlBlock returns the contents of the first fenced YAML block.
-func yamlBlock(body string) (string, bool) {
-	lines := strings.Split(strings.ReplaceAll(body, "\r", ""), "\n")
-	var out []string
+// splitFieldLines splits card text once and returns both the lines and the
+// contents of the first fenced YAML block. Callers that need both would
+// otherwise walk the same text twice.
+func splitFieldLines(body string) (lines []string, yamlText string, ok bool) {
+	lines = strings.Split(strings.ReplaceAll(body, "\r", ""), "\n")
+	var block []string
 	inBlock := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -354,9 +444,9 @@ func yamlBlock(body string) (string, bool) {
 		if strings.HasPrefix(trimmed, "```") {
 			break
 		}
-		out = append(out, line)
+		block = append(block, line)
 	}
-	return strings.Join(out, "\n"), len(out) > 0
+	return lines, strings.Join(block, "\n"), len(block) > 0
 }
 
 // splitList splits a comma or semicolon separated list into sorted items.
