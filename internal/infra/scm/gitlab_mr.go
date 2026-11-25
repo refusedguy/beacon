@@ -51,48 +51,45 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 	if err := g.getJSON(ctx, g.mrPath(mrIID), nil, &mr); err != nil {
 		return core.Observation{}, err
 	}
+	headSHA := mr.SHA
+	if headSHA == "" {
+		headSHA = mr.DiffRefs.HeadSHA
+	}
+	if mr.IID == 0 || headSHA == "" {
+		return core.Observation{}, core.Errorf(core.CodeUnavailable, "MR %d response has no iid or head sha", mrIID)
+	}
 	o := core.Observation{
 		PRNumber:  mrIID,
-		HeadSHA:   mr.SHA,
+		HeadSHA:   headSHA,
 		PRState:   mr.State,
 		Conflict:  mr.HasConflicts,
 		Labels:    append([]string(nil), mr.Labels...),
 		Approvals: len(mr.ApprovedBy),
 	}
-	if o.HeadSHA == "" {
-		o.HeadSHA = mr.DiffRefs.HeadSHA
-	}
+
+	var failed observationErrors
+
 	threads, err := g.unresolvedThreads(ctx, mrIID)
+	failed.add("threads", err)
 	if err == nil {
 		o.UnresolvedThreads = threads
 	}
 	if len(o.UnresolvedThreads) == 0 && mr.BlockingDiscussionsResolved != nil && !*mr.BlockingDiscussionsResolved {
 		o.UnresolvedThreads = []string{"blocking discussions are unresolved"}
 	}
-	if approvals, err := g.approvals(ctx, mrIID, mr); err == nil {
+	approvals, err := g.approvals(ctx, mrIID, mr)
+	failed.add("approvals", err)
+	if err == nil {
 		o.Approvals = approvals
 	}
-	if o.HeadSHA != "" {
-		if pipeline, err := g.latestPipeline(ctx, url.Values{"sha": {o.HeadSHA}}); err == nil && pipeline.ID != 0 {
-			checks, excerpt, err := g.pipelineChecks(ctx, pipeline.ID)
-			if err == nil {
-				o.Checks = checks
-				if len(o.Checks) == 0 {
-					o.Checks = []core.CheckResult{{Name: "pipeline", State: glCheckState(pipeline.Status, false)}}
-				}
-				o.FailureExcerpt = excerpt
-				if o.FailureExcerpt == "" {
-					if failed, ok := o.Failure(); ok {
-						o.FailureExcerpt = failed.Output
-					}
-				}
-			}
-		}
-	}
-	if behind, baseSHA, err := g.behind(ctx, mr); err == nil {
+	g.observeChecks(ctx, &o, o.HeadSHA, &failed)
+	behind, baseSHA, err := g.behind(ctx, mr)
+	failed.add("compare", err)
+	if err == nil {
 		o.Behind = behind
 		o.BaseSHA = baseSHA
 	}
+	failed.apply(&o)
 	return o, nil
 }
 
@@ -180,8 +177,8 @@ func (g *GitLab) UpdateBranch(ctx context.Context, mrIID int, expectedSHA string
 		return "", err
 	}
 	var rebased glMR
-	if len(data) > 0 {
-		_ = json.Unmarshal(data, &rebased)
+	if err := json.Unmarshal(data, &rebased); err != nil {
+		return "", core.Errorf(core.CodeUnavailable, "rebase of MR %d returned an invalid response: %v", mrIID, err)
 	}
 	if rebased.SHA != "" && rebased.SHA != expectedSHA {
 		return rebased.SHA, nil
@@ -216,11 +213,11 @@ func (g *GitLab) Merge(ctx context.Context, mrIID int, expectedSHA, title string
 	var result struct {
 		State string `json:"state"`
 	}
-	if len(data) > 0 {
-		_ = json.Unmarshal(data, &result)
+	if err := json.Unmarshal(data, &result); err != nil {
+		return core.Errorf(core.CodeUnavailable, "merge of MR %d returned an invalid response: %v", mrIID, err)
 	}
-	if result.State != "" && result.State != "merged" {
-		return core.Errorf(core.CodeConflict, "merge of MR %d was rejected: %s", mrIID, result.State)
+	if result.State != "merged" {
+		return core.Errorf(core.CodeConflict, "merge of MR %d was not confirmed: state %q", mrIID, result.State)
 	}
 	return nil
 }

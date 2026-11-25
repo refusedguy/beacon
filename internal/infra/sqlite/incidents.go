@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -108,6 +109,10 @@ UPDATE base_incidents SET failed_checks_json=?, fixer_run_id=?, status=?, attemp
 }
 
 func FailedChecksJSON(checks []core.CheckResult) string {
-	b, _ := json.Marshal(checks)
+	b, err := json.Marshal(checks)
+	if err != nil {
+		slog.Error("encode incident failed checks", "error", err)
+		return "[]"
+	}
 	return string(b)
 }
