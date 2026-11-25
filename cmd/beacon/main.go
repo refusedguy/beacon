@@ -171,11 +171,10 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 	if err != nil {
 		return nil, err
 	}
-	h, err := newHarness(cfg, harnessToken, parentSession)
+	h, err := newHarness(cfg, harnessToken, parentSession, root)
 	if err != nil {
 		return nil, err
 	}
-	setHarnessRepo(h, root)
 	wt, err := workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
 	if err != nil {
 		return nil, err
@@ -280,12 +279,13 @@ func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) 
 	return
 }
 
-func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, error) {
+func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarness, error) {
 	parent = firstNonEmpty(parent, cfg.Harness.ParentSessionID)
 	switch strings.ToLower(cfg.Harness.Provider) {
 	case "opencode", "":
 		h := opencode.New(opencode.Config{
 			Endpoint:        cfg.Harness.Endpoint,
+			Repo:            root,
 			Model:           cfg.Harness.Model,
 			Agent:           cfg.Harness.Command,
 			Token:           token,
@@ -353,13 +353,6 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 		ProviderID: info.Data.Model.ProviderID,
 		ID:         info.Data.Model.ID,
 		Variant:    info.Data.Model.Variant,
-	}
-}
-
-// setHarnessRepo points a harness that keeps a project registry at this repo.
-func setHarnessRepo(h core.AgentHarness, root string) {
-	if setter, ok := h.(core.RepoSetter); ok {
-		setter.SetRepo(root)
 	}
 }
 
