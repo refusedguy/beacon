@@ -36,7 +36,9 @@ type GreedyPlanner struct {
 	Overlap core.OverlapChecker
 }
 
-func NewPlanner(checker core.OverlapChecker) GreedyPlanner {
+var _ func(core.OverlapChecker) ConflictPlanner = NewPlanner
+
+func NewPlanner(checker core.OverlapChecker) ConflictPlanner {
 	if checker == nil {
 		checker = core.PathsAndDependencies
 	}
