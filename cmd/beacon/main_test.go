@@ -30,29 +30,6 @@ func (bareHarness) IsAlive(context.Context, string) (bool, error)        { retur
 func (bareHarness) NotifyParent(context.Context, string, string) error   { return nil }
 func (bareHarness) Events() <-chan core.HarnessEvent                     { return nil }
 
-type portHarness struct {
-	bareHarness
-	repo   string
-	models map[string]string
-}
-
-func (h *portHarness) SetRepo(root string) { h.repo = root }
-
-func (h *portHarness) ResolveModel(parent string) map[string]string {
-	return map[string]string{"parent": parent, "id": h.models["id"]}
-}
-
-func (h *portHarness) WatchIdle(context.Context) {}
-
-func TestSetHarnessRepoUsesPort(t *testing.T) {
-	h := &portHarness{}
-	setHarnessRepo(h, "/workspace/repo")
-	if h.repo != "/workspace/repo" {
-		t.Fatalf("repo = %q, want /workspace/repo", h.repo)
-	}
-	setHarnessRepo(bareHarness{}, "/workspace/repo")
-}
-
 func TestProjectRootPrefersEnvironment(t *testing.T) {
 	want := t.TempDir()
 	t.Setenv("BEACON_PROJECT_ROOT", want)
@@ -117,7 +94,7 @@ func TestNewHarnessBuildsACPProvider(t *testing.T) {
 	cfg := config.Config{Harness: config.Harness{
 		Provider: "ACP", Command: "fake-agent --acp", Model: "sonnet",
 	}}
-	h, err := newHarness(cfg, "", "ses_parent")
+	h, err := newHarness(cfg, "", "ses_parent", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,14 +105,11 @@ func TestNewHarnessBuildsACPProvider(t *testing.T) {
 	if ah.Command != "fake-agent --acp" || ah.Model != "sonnet" || ah.ParentSessionID != "ses_parent" {
 		t.Fatalf("acp harness = %+v, want command, model and parent from config", ah)
 	}
-	if _, ok := h.(core.ModelResolver); ok {
-		t.Error("acp harness must not claim the model resolver port")
-	}
 }
 
 func TestNewHarnessACPRequiresCommand(t *testing.T) {
 	cfg := config.Config{Harness: config.Harness{Provider: "acp"}}
-	if _, err := newHarness(cfg, "", ""); err == nil {
+	if _, err := newHarness(cfg, "", "", ""); err == nil {
 		t.Fatal("acp harness without a command should fail")
 	}
 }

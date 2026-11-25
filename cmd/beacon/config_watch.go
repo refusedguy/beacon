@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -146,13 +145,10 @@ func (cw *configWatcher) reload() bool {
 
 func (cw *configWatcher) build(cfg config.Config, root string) *liveState {
 	_, _, token := loadTokens(cfg)
-	h, err := newHarness(cfg, token, cw.parent)
+	h, err := newHarness(cfg, token, cw.parent, root)
 	if err != nil {
 		slog.Warn("config watch: harness change needs restart", "field", "harness.provider")
 		return nil
-	}
-	if oc, ok := h.(*opencode.Harness); ok {
-		oc.Repo = root
 	}
 	return newLiveState(cfg, h)
 }
