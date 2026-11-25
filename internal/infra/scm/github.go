@@ -85,7 +85,10 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 	} else if p.GetMerged() {
 		state = "merged"
 	}
-	conflict := p.GetMergeableState() == "dirty" || (p.Mergeable != nil && !p.GetMergeable())
+	// A false mergeable flag alone does not mean a conflict. GitHub reports it
+	// for PRs blocked by required checks. Only these states describe a dirty
+	// tree; checks stay a policy decision for ChecksRule.
+	conflict := p.GetMergeableState() == "dirty" || p.GetMergeableState() == "conflict"
 	o := core.Observation{
 		PRNumber: pr,
 		HeadSHA:  sha,
