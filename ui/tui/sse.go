@@ -20,17 +20,20 @@ type Event struct {
 	At    string `json:"at"`
 }
 
+// sseFrame is one parsed server-sent event from the daemon.
 type sseFrame struct {
 	id    string
 	event string
 	data  string
 }
 
+// streamMinDelay and streamMaxDelay bound the stream reconnect backoff.
 const (
 	streamMinDelay = 200 * time.Millisecond
 	streamMaxDelay = 5 * time.Second
 )
 
+// streamHTTPClient builds a timeout-free client for the SSE stream.
 func (c *Client) streamHTTPClient() *http.Client {
 	// SSE streams are long-lived, so this client must have no request timeout.
 	// Build a fresh client rather than copying c.HTTP: copying a client after
@@ -42,6 +45,7 @@ func (c *Client) streamHTTPClient() *http.Client {
 	return streamClient
 }
 
+// Stream keeps the event stream open, calling onEvent for each event.
 func (c *Client) Stream(ctx context.Context, onEvent func(Event)) error {
 	delay := streamMinDelay
 	for ctx.Err() == nil {
@@ -69,6 +73,7 @@ func (c *Client) Stream(ctx context.Context, onEvent func(Event)) error {
 	return nil
 }
 
+// streamOnce connects once to the event stream and decodes its events.
 func (c *Client) streamOnce(ctx context.Context, onEvent func(Event)) error {
 	base, err := c.endpoint()
 	if err != nil {
@@ -106,6 +111,7 @@ func (c *Client) streamOnce(ctx context.Context, onEvent func(Event)) error {
 	})
 }
 
+// readSSE parses server-sent event frames from r and calls onFrame for each.
 func readSSE(r io.Reader, onFrame func(sseFrame)) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), responseLimit)

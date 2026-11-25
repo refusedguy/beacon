@@ -13,6 +13,7 @@ import (
 	"time"
 )
 
+// apiRunsPath, apiEventsPath and apiControlPath are the loopback routes; requestTimeout and responseLimit bound requests.
 const (
 	apiRunsPath    = "/api/v1/runs"
 	apiEventsPath  = "/api/v1/events"
@@ -39,6 +40,7 @@ type Run struct {
 // module and cannot import pkg/core, so this list mirrors core.ControlActions.
 type Action string
 
+// ActionApprove and the other constants name every verb in the control vocabulary.
 const (
 	ActionApprove Action = "approve"
 	ActionUnblock Action = "unblock"
@@ -74,6 +76,7 @@ func (a Action) Valid() bool {
 	return false
 }
 
+// ControlRequest is the monitor's copy of the loopback control request.
 type ControlRequest struct {
 	Action Action `json:"action"`
 	RunID  string `json:"run_id"`
@@ -88,12 +91,14 @@ type ControlResult struct {
 	Applied bool   `json:"applied"`
 }
 
+// Client is a loopback HTTP client for the Beacon daemon API.
 type Client struct {
 	Endpoint string
 	Token    string
 	HTTP     *http.Client
 }
 
+// NewClient builds a Client for the loopback endpoint with bearer token auth.
 func NewClient(endpoint, token string) *Client {
 	return &Client{
 		Endpoint: strings.TrimRight(endpoint, "/"),
@@ -102,6 +107,7 @@ func NewClient(endpoint, token string) *Client {
 	}
 }
 
+// endpoint validates the configured endpoint and returns its canonical form.
 func (c *Client) endpoint() (string, error) {
 	u, err := url.Parse(c.Endpoint)
 	if err != nil || u.Scheme != "http" || u.Host == "" || u.User != nil {
@@ -117,6 +123,7 @@ func (c *Client) endpoint() (string, error) {
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
+// do sends an HTTP request to the daemon and returns the response body.
 func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, error) {
 	base, err := c.endpoint()
 	if err != nil {
@@ -159,6 +166,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 	return data, nil
 }
 
+// Runs fetches the current run snapshot from the daemon.
 func (c *Client) Runs(ctx context.Context) ([]Run, error) {
 	data, err := c.do(ctx, http.MethodGet, apiRunsPath, nil)
 	if err != nil {
@@ -177,6 +185,7 @@ func (c *Client) Runs(ctx context.Context) ([]Run, error) {
 	return runs, nil
 }
 
+// Control sends a control action for a run and returns the daemon's answer.
 func (c *Client) Control(ctx context.Context, req ControlRequest) (ControlResult, error) {
 	if !req.Action.Valid() {
 		return ControlResult{}, fmt.Errorf("tui: unknown action %q", req.Action)

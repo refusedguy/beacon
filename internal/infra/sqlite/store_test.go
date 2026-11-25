@@ -17,7 +17,7 @@ import (
 func TestRecursiveReadyTasks(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -31,11 +31,11 @@ func TestRecursiveReadyTasks(t *testing.T) {
 		{ID: "F", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("f.go")}},
 	}
 	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SyncTasks(ctx, tasks): %v", err)
 	}
 	ready, err := store.ListReadyTasks(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListReadyTasks(ctx): %v", err)
 	}
 	if len(ready) != 2 || ready[0].ID != "B" || ready[1].ID != "F" {
 		t.Fatalf("ready = %+v", ready)
@@ -43,11 +43,11 @@ func TestRecursiveReadyTasks(t *testing.T) {
 
 	tasks[1].Status = core.TaskDone
 	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SyncTasks(ctx, tasks): %v", err)
 	}
 	ready, err = store.ListReadyTasks(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListReadyTasks(ctx): %v", err)
 	}
 	found := false
 	for _, r := range ready {
@@ -66,7 +66,7 @@ func TestRecursiveReadyTasks(t *testing.T) {
 func TestSetTaskStatusUnblocksDependent(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -75,21 +75,21 @@ func TestSetTaskStatusUnblocksDependent(t *testing.T) {
 		{ID: "B", Status: core.TaskAvailable, DependsOn: []core.TaskID{"A"}},
 	}
 	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SyncTasks(ctx, tasks): %v", err)
 	}
 	ready, err := store.ListReadyTasks(ctx)
 	if err != nil || len(ready) != 1 || ready[0].ID != "A" {
 		t.Fatalf("before: %+v %v", ready, err)
 	}
 	if err := store.SetTaskStatus(ctx, "A", "claimed"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SetTaskStatus(ctx, \"A\", \"claimed\"): %v", err)
 	}
 	ready, err = store.ListReadyTasks(ctx)
 	if err != nil || len(ready) != 0 {
 		t.Fatalf("after claim: %+v %v", ready, err)
 	}
 	if err := store.SetTaskStatus(ctx, "A", "done"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SetTaskStatus(ctx, \"A\", \"done\"): %v", err)
 	}
 	ready, err = store.ListReadyTasks(ctx)
 	if err != nil || len(ready) != 1 || ready[0].ID != "B" {
@@ -100,7 +100,7 @@ func TestSetTaskStatusUnblocksDependent(t *testing.T) {
 func TestSyncTasksPersistsEpicGraph(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -119,21 +119,21 @@ func TestSyncTasksPersistsEpicGraph(t *testing.T) {
 			Scope: []core.ScopePath{core.ScopeFile("a.go")}},
 	}
 	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SyncTasks(ctx, tasks): %v", err)
 	}
 
 	var kind, base, review, planJSON string
 	if err := store.db.QueryRowContext(ctx,
 		`SELECT kind, base_branch, require_review, plan_json FROM tasks WHERE id='T-EPIC'`,
 	).Scan(&kind, &base, &review, &planJSON); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.db.QueryRowContext(SELECT kind, base_branch, require_review, plan_json FROM tasks WHERE id='T-EPIC').Scan: %v", err)
 	}
 	if kind != "epic" || base != "main" || review != "human" {
 		t.Fatalf("epic fields = %q %q %q", kind, base, review)
 	}
 	var gotPlan []core.ChildSpec
 	if err := json.Unmarshal([]byte(planJSON), &gotPlan); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal([]byte(planJSON), &gotPlan): %v", err)
 	}
 	if len(gotPlan) != 1 || gotPlan[0].Title != "Child one" || len(gotPlan[0].Depends) != 1 {
 		t.Fatalf("plan = %+v", gotPlan)
@@ -143,7 +143,7 @@ func TestSyncTasksPersistsEpicGraph(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx,
 		`SELECT base_branch FROM tasks WHERE id='T-EPIC-01'`,
 	).Scan(&childBase); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.db.QueryRowContext(SELECT base_branch FROM tasks WHERE id='T-EPIC-01').Scan: %v", err)
 	}
 	if childBase != "beacon/T-EPIC" {
 		t.Fatalf("child base = %q", childBase)
@@ -151,7 +151,7 @@ func TestSyncTasksPersistsEpicGraph(t *testing.T) {
 
 	ready, err := store.ListReadyTasks(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListReadyTasks(ctx): %v", err)
 	}
 	found := false
 	for _, task := range ready {
@@ -171,7 +171,7 @@ func TestSyncTasksPersistsEpicGraph(t *testing.T) {
 func TestListRecent(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -195,13 +195,13 @@ func TestListRecent(t *testing.T) {
 		r := core.NewRun(e.id, "T-1", time.Now().UTC())
 		r.State = e.state
 		if err := store.Save(ctx, r); err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.Save(ctx, r): %v", err)
 		}
 	}
 
 	recent, err = store.ListRecent(ctx, 10)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListRecent(ctx, 10): %v", err)
 	}
 	want := []core.RunID{"r3", "r2", "r0"}
 	if len(recent) != len(want) {
@@ -225,7 +225,7 @@ func TestListRecent(t *testing.T) {
 func TestRunScopeAndIncidentPersistence(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -234,7 +234,7 @@ func TestRunScopeAndIncidentPersistence(t *testing.T) {
 	run.ParentSessionID = "sess-parent"
 	run.IsFixer = true
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	got, err := store.Get(ctx, "r1")
 	if err != nil || got == nil {
@@ -247,7 +247,7 @@ func TestRunScopeAndIncidentPersistence(t *testing.T) {
 		Repo: "o/r", BaseBranch: "main", Signature: "sig", FailedChecksJSON: "[]",
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.CreateIncident(Repo: \"o/r\", BaseBranch: \"main\"): %v", err)
 	}
 	again, err := store.CreateIncident(ctx, &core.BaseIncident{
 		Repo: "o/r", BaseBranch: "main", Signature: "sig", FailedChecksJSON: "[]",
@@ -260,7 +260,7 @@ func TestRunScopeAndIncidentPersistence(t *testing.T) {
 func TestCreateIncidentReopensResolvedSignature(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -275,7 +275,7 @@ func TestCreateIncidentReopensResolvedSignature(t *testing.T) {
 	in.Status = "resolved"
 	in.Attempts = 2
 	if err := store.UpdateIncident(ctx, in); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.UpdateIncident(ctx, in): %v", err)
 	}
 	if open, err := store.FindOpenIncident(ctx, "o/r", "main", "sig-a"); err != nil || open != nil {
 		t.Fatalf("resolved incident still open: %+v err=%v", open, err)
@@ -299,7 +299,7 @@ func TestCreateIncidentReopensResolvedSignature(t *testing.T) {
 func TestObservedBaseSHARoundTrip(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -308,7 +308,7 @@ func TestObservedBaseSHARoundTrip(t *testing.T) {
 	run.ObservedSHA = "head-1"
 	run.ObservedBaseSHA = "base-1"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	got, err := store.Get(ctx, "r1")
 	if err != nil || got == nil {
@@ -320,7 +320,7 @@ func TestObservedBaseSHARoundTrip(t *testing.T) {
 
 	run.ObservedBaseSHA = "base-2"
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	got, err = store.Get(ctx, "r1")
 	if err != nil || got == nil {
@@ -335,7 +335,7 @@ func TestObservedBaseSHAMigrationPreservesRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	legacy, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("sql.Open(\"sqlite\", \"file:\"+path): %v", err)
 	}
 	_, err = legacy.Exec(`
 CREATE TABLE runs (
@@ -360,19 +360,19 @@ CREATE TABLE runs (
   updated_at INTEGER NOT NULL
 );`)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy.Exec(CREATE TABLE runs legacy schema): %v", err)
 	}
 	if _, err := legacy.Exec(`INSERT INTO runs (id, task_id, state, observed_sha, created_at, updated_at)
 VALUES ('r1', 'T-1', 'waiting_ci', 'head-1', 1, 2)`); err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy.Exec(`INSERT INTO runs (id, task_id, state, observed_sha, created_at, updated_at): %v", err)
 	}
 	if err := legacy.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy.Close(): %v", err)
 	}
 
 	store, err := Open(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(path): %v", err)
 	}
 	defer store.Close()
 	got, err := store.Get(context.Background(), "r1")
@@ -384,7 +384,7 @@ VALUES ('r1', 'T-1', 'waiting_ci', 'head-1', 1, 2)`); err != nil {
 	}
 	got.ObservedBaseSHA = "base-1"
 	if err := store.Save(context.Background(), got); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(context.Background(), got): %v", err)
 	}
 	got, err = store.Get(context.Background(), "r1")
 	if err != nil || got == nil || got.ObservedBaseSHA != "base-1" {
@@ -395,7 +395,7 @@ VALUES ('r1', 'T-1', 'waiting_ci', 'head-1', 1, 2)`); err != nil {
 func TestRunEventsRecordStateTransitions(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -403,23 +403,23 @@ func TestRunEventsRecordStateTransitions(t *testing.T) {
 	base := time.Now().UTC().Add(-time.Minute)
 	run := core.NewRun("r1", "T-1", base)
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	for i, state := range []core.RunState{core.RunRunning, core.RunWaitingCI, core.RunBlocked} {
 		run.State = state
 		run.UpdatedAt = base.Add(time.Duration(i+1) * time.Second)
 		if err := store.Save(ctx, run); err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.Save(ctx, run): %v", err)
 		}
 	}
 	// Saving without a state change must not pad the timeline.
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 
 	events, err := store.ListRunEvents(ctx, []string{"r1"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListRunEvents(ctx, []string{\"r1\"}): %v", err)
 	}
 	want := []string{"pending", "running", "waiting_ci", "blocked"}
 	if len(events) != len(want) {
@@ -438,7 +438,7 @@ func TestRunEventsRecordStateTransitions(t *testing.T) {
 func TestSavePreservesDomainUpdatedAt(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -447,7 +447,7 @@ func TestSavePreservesDomainUpdatedAt(t *testing.T) {
 	run := core.NewRun("r1", "T-1", stamp.Add(-time.Minute))
 	run.UpdatedAt = stamp
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	if !run.UpdatedAt.Equal(stamp) {
 		t.Fatalf("UpdatedAt after save = %s, want %s", run.UpdatedAt, stamp)
@@ -462,7 +462,7 @@ func TestSavePreservesDomainUpdatedAt(t *testing.T) {
 
 	blank := core.NewRun("r2", "T-1", time.Time{})
 	if err := store.Save(ctx, blank); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, blank): %v", err)
 	}
 	if blank.CreatedAt.IsZero() || blank.UpdatedAt.IsZero() {
 		t.Fatalf("missing timestamps were not stamped: %+v", blank)
@@ -472,7 +472,7 @@ func TestSavePreservesDomainUpdatedAt(t *testing.T) {
 func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -484,7 +484,7 @@ func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 	second.State = core.RunMerged
 	for _, run := range []*core.Run{first, second} {
 		if err := store.Save(ctx, run); err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.Save(ctx, run): %v", err)
 		}
 	}
 	logger.Record(ctx, app.Decision{
@@ -511,7 +511,7 @@ func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 
 	snap, err := (app.SnapshotService{Store: store}).Snapshot(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("(app.SnapshotService{Store: store}).Snapshot(ctx): %v", err)
 	}
 	if len(snap.Active) != 1 || len(snap.Recent) != 1 {
 		t.Fatalf("snapshot runs = %+v", snap)
@@ -533,7 +533,7 @@ func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
 func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -541,7 +541,7 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 
 	run := core.NewRun("r1", "T-1", time.Now().UTC())
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	base := time.Now().UTC().Add(-time.Hour)
 	for i := 0; i < 5; i++ {
@@ -558,7 +558,7 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 
 	decisions, err := store.ListDecisions(ctx, []string{"r1"}, 2, 3)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListDecisions(ctx, []string{\"r1\"}, 2, 3): %v", err)
 	}
 	if len(decisions) != 5 {
 		t.Fatalf("decisions = %d, want 2 per-run + 3 orphan", len(decisions))
@@ -577,7 +577,7 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 
 	counts, err := store.DecisionCounts(ctx, []string{"r1"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.DecisionCounts(ctx, []string{\"r1\"}): %v", err)
 	}
 	totalSkips, totalCycles := 0, 0
 	for _, c := range counts {
@@ -594,7 +594,7 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 
 	snap, err := (app.SnapshotService{Store: store, DecisionsLimit: 2, OrphanDecisionsLimit: 3}).Snapshot(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("(app.SnapshotService{Store: store, DecisionsLimit: 2, OrphanDecisionsLimit: 3}).Snapshot(ctx): %v", err)
 	}
 	if snap.Metrics.SkipCount != 5 || snap.Metrics.DispatchCycles != 7 {
 		t.Fatalf("snapshot metrics = %+v", snap.Metrics)
@@ -607,7 +607,7 @@ func TestListDecisionsCapsHistoryButKeepsMetricTotals(t *testing.T) {
 func TestSnapshotIncludesLocalQueueAndBaseIncident(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -618,7 +618,7 @@ func TestSnapshotIncludesLocalQueueAndBaseIncident(t *testing.T) {
 		{ID: "T-3", Title: "done card", Priority: 9, Status: core.TaskDone},
 	}
 	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SyncTasks(ctx, tasks): %v", err)
 	}
 	incident, err := store.CreateIncident(ctx, &core.BaseIncident{
 		Repo: "owner/repo", BaseBranch: "main", Signature: "sig-1",
@@ -631,12 +631,12 @@ func TestSnapshotIncludesLocalQueueAndBaseIncident(t *testing.T) {
 	run.State = core.RunWaitingCI
 	run.PRNumber = 42
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 
 	snap, err := (app.SnapshotService{Store: store, Repo: "owner/repo"}).Snapshot(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("(app.SnapshotService{Store: store, Repo: \"owner/repo\"}).Snapshot(ctx): %v", err)
 	}
 	if len(snap.Queue) != 2 {
 		t.Fatalf("queue = %+v, want two open cards", snap.Queue)
@@ -664,7 +664,7 @@ func TestSnapshotIncludesLocalQueueAndBaseIncident(t *testing.T) {
 func TestLastDecisionReturnsNewestForRun(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -679,12 +679,12 @@ func TestLastDecisionReturnsNewestForRun(t *testing.T) {
 			Reason: tc.reason, At: base.Add(time.Duration(i) * time.Second),
 			Fields: map[string]any{"head_sha": tc.sha, "state": "waiting_ci"},
 		}); err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.RecordDecision(RunID: \"r1\"): %v", err)
 		}
 	}
 	last, err := store.LastDecision(ctx, "r1")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.LastDecision(ctx, \"r1\"): %v", err)
 	}
 	if last == nil || last.Reason != "second" || last.Fields["head_sha"] != "sha1" {
 		t.Fatalf("last decision = %+v", last)
@@ -695,7 +695,7 @@ func TestRunEventMigrationBackfillsExistingRuns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	legacy, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("sql.Open(\"sqlite\", \"file:\"+path): %v", err)
 	}
 	_, err = legacy.Exec(`
 CREATE TABLE runs (
@@ -721,20 +721,20 @@ CREATE TABLE runs (
 );
 INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r1', 'T-1', 'waiting_ci', 1, 2);`)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy.Exec(INSERT INTO runs ('r1', 'T-1', 'waiting_ci')): %v", err)
 	}
 	if err := legacy.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy.Close(): %v", err)
 	}
 
 	for i := 0; i < 2; i++ {
 		store, err := Open(path)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("Open(path): %v", err)
 		}
 		events, err := store.ListRunEvents(context.Background(), []string{"r1"})
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.ListRunEvents(context.Background(), []string{\"r1\"}): %v", err)
 		}
 		if len(events) != 2 || events[0].State != "pending" || events[1].State != "waiting_ci" {
 			t.Fatalf("open %d: backfilled events = %+v", i, events)
@@ -744,7 +744,7 @@ INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r1', 'T-1
 			t.Fatalf("open %d: run = %+v err=%v", i, run, err)
 		}
 		if err := store.Close(); err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.Close(): %v", err)
 		}
 	}
 }
@@ -752,7 +752,7 @@ INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r1', 'T-1
 func TestListQueueTasksFiltersByStatusAndActiveRuns(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -771,7 +771,7 @@ func TestListQueueTasksFiltersByStatusAndActiveRuns(t *testing.T) {
 			DependsOn: []core.TaskID{"T-READY"}},
 	}
 	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.SyncTasks(ctx, tasks): %v", err)
 	}
 	for _, tc := range []struct {
 		task  string
@@ -785,13 +785,13 @@ func TestListQueueTasksFiltersByStatusAndActiveRuns(t *testing.T) {
 		run := core.NewRun(core.RunID("run-"+tc.task), core.TaskID(tc.task), time.Now().UTC())
 		run.State = tc.state
 		if err := store.Save(ctx, run); err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.Save(ctx, run): %v", err)
 		}
 	}
 
 	queue, err := store.ListQueueTasks(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListQueueTasks(ctx): %v", err)
 	}
 	want := []string{"T-CLOSED", "T-MERGED", "T-READY", "T-TODO", "T-WAITING"}
 	if len(queue) != len(want) {
@@ -814,7 +814,7 @@ func TestListQueueTasksFiltersByStatusAndActiveRuns(t *testing.T) {
 func TestEmptyRunListsEncodeAsArrays(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -847,22 +847,22 @@ func TestEmptyRunListsEncodeAsArrays(t *testing.T) {
 func TestEmptySnapshotJSONHasStableKeysAndArrays(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
 
 	snap, err := (app.SnapshotService{Store: store}).Snapshot(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("(app.SnapshotService{Store: store}).Snapshot(ctx): %v", err)
 	}
 	b, err := json.Marshal(snap)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Marshal(snap): %v", err)
 	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
-		t.Fatal(err)
+		t.Fatalf("json.Unmarshal(b, &raw): %v", err)
 	}
 	for _, key := range []string{"active", "recent", "queue", "daemon", "base_incident"} {
 		if _, ok := raw[key]; !ok {
@@ -885,7 +885,7 @@ func TestEmptySnapshotJSONHasStableKeysAndArrays(t *testing.T) {
 func TestChecksRoundTrip(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -897,7 +897,7 @@ func TestChecksRoundTrip(t *testing.T) {
 		StartedAt: start, CompletedAt: start.Add(28 * time.Second),
 	}}
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	got, err := store.Get(ctx, "r-checks")
 	if err != nil || got == nil || len(got.Checks) != 1 {
@@ -913,7 +913,7 @@ func TestChecksRoundTrip(t *testing.T) {
 
 	run.Checks = nil
 	if err := store.Save(ctx, run); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, run): %v", err)
 	}
 	got, err = store.Get(ctx, "r-checks")
 	if err != nil || got == nil || got.Checks == nil || len(got.Checks) != 0 {
@@ -925,7 +925,7 @@ func TestChecksMigrationPreservesRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	legacy, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("sql.Open(\"sqlite\", \"file:\"+path): %v", err)
 	}
 	_, err = legacy.Exec(`
 CREATE TABLE runs (
@@ -951,15 +951,15 @@ CREATE TABLE runs (
 );
 INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r-old', 'T-1', 'waiting_ci', 1, 2);`)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy.Exec(INSERT INTO runs ('r-old', 'T-1', 'waiting_ci')): %v", err)
 	}
 	if err := legacy.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy.Close(): %v", err)
 	}
 
 	store, err := Open(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(path): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -972,7 +972,7 @@ INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r-old', '
 	}
 	got.Checks = []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
 	if err := store.Save(ctx, got); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.Save(ctx, got): %v", err)
 	}
 	got, err = store.Get(ctx, "r-old")
 	if err != nil || got == nil || len(got.Checks) != 1 || got.Checks[0].State != core.CheckFailure {
@@ -984,7 +984,7 @@ func countStoreRows(t *testing.T, store *Store, query string) int {
 	t.Helper()
 	var n int
 	if err := store.db.QueryRow(query).Scan(&n); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.db.QueryRow(query).Scan(&n): %v", err)
 	}
 	return n
 }
@@ -1001,22 +1001,22 @@ func seedStaleDeliveryRows(t *testing.T, store *Store) {
 	}
 	for _, r := range []struct{ id, sha string }{{"r-old", "old-sha"}, {"r-fresh", "fresh-sha"}} {
 		if err := store.SetApproval(ctx, core.RunID(r.id), r.sha); err != nil {
-			t.Fatal(err)
+			t.Fatalf("store.SetApproval(ctx, core.RunID(r.id), r.sha): %v", err)
 		}
 	}
 	old := nowUnix() - (31 * 24 * time.Hour).Nanoseconds()
 	if _, err := store.db.ExecContext(ctx, `UPDATE deliveries SET created_at=? WHERE key='merge:42:old'`, old); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.db.ExecContext(ctx, `UPDATE deliveries SET created_at=? WHERE key='merge:42:old'`, old): %v", err)
 	}
 	if _, err := store.db.ExecContext(ctx, `UPDATE approvals SET created_at=? WHERE run_id='r-old'`, old); err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.db.ExecContext(ctx, `UPDATE approvals SET created_at=? WHERE run_id='r-old'`, old): %v", err)
 	}
 }
 
 func TestPruneStaleRemovesOldDeliveryAndApprovalRows(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	seedStaleDeliveryRows(t, store)
@@ -1024,7 +1024,7 @@ func TestPruneStaleRemovesOldDeliveryAndApprovalRows(t *testing.T) {
 
 	removed, err := store.PruneStale(ctx, 30*24*time.Hour)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.PruneStale(ctx, 30*24*time.Hour): %v", err)
 	}
 	if removed != 2 {
 		t.Fatalf("removed = %d, want 2 (one delivery, one approval)", removed)
@@ -1059,7 +1059,7 @@ func TestPruneStaleRemovesOldDeliveryAndApprovalRows(t *testing.T) {
 func TestListActivePrunesStaleRowsOnReconcileTick(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	seedStaleDeliveryRows(t, store)
@@ -1068,7 +1068,7 @@ func TestListActivePrunesStaleRowsOnReconcileTick(t *testing.T) {
 	// fixed schedule that keeps the idempotency tables bounded.
 	active, err := store.ListActive(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("store.ListActive(context.Background()): %v", err)
 	}
 	if len(active) != 0 {
 		t.Fatalf("active = %+v, want none", active)
@@ -1084,7 +1084,7 @@ func TestListActivePrunesStaleRowsOnReconcileTick(t *testing.T) {
 func TestConcurrentSavesDoNotReturnBusy(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
@@ -1099,7 +1099,7 @@ func TestConcurrentSavesDoNotReturnBusy(t *testing.T) {
 	}
 	for i := 0; i < n; i++ {
 		if err := <-errs; err != nil {
-			t.Fatal(err)
+			t.Fatalf("concurrent store.Save: %v", err)
 		}
 	}
 	for i := 0; i < n; i++ {
