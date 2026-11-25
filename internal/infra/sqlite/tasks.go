@@ -20,6 +20,7 @@ var taskColumns = []struct{ name, ddl string }{
 	{"worker_prompt", "worker_prompt TEXT NOT NULL DEFAULT ''"},
 }
 
+// ensureTaskColumns adds epic columns to an older tasks table.
 func (s *Store) ensureTaskColumns(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(tasks)`)
 	if err != nil {
@@ -52,6 +53,7 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 	return nil
 }
 
+// SyncTasks replaces the stored cards and dependencies with tasks.
 func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return err
@@ -99,6 +101,7 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, 
 	return tx.Commit()
 }
 
+// readyTasksQuery selects tasks with no unresolved dependencies.
 const readyTasksQuery = `
 WITH RECURSIVE blocked_chain(task_id, origin, depth) AS (
   SELECT d.task_id, d.depends_on, 1
@@ -118,11 +121,13 @@ WHERE status IN ('available', 'todo')
   AND id NOT IN (SELECT task_id FROM blocked_chain)
 ORDER BY priority DESC, id`
 
+// SetTaskStatus sets the status of taskID.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
 	return err
 }
 
+// ListReadyTasks returns the available tasks whose dependencies are resolved.
 func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return nil, err

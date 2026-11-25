@@ -14,8 +14,10 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// Store is the SQLite implementation of the run and decision stores.
 type Store struct{ db *sql.DB }
 
+// Open opens the SQLite state database at path.
 func Open(path string) (*Store, error) {
 	db, err := openDB(path)
 	if err != nil {
@@ -24,12 +26,15 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// Close closes the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// runColumns lists the run fields stored in one row.
 const runColumns = `id, task_id, state, pr_number, head_sha, observed_sha, observed_base_sha, session_id,
  parent_session_id, workspace_path, branch, scope_json, blocked_incident_id, is_fixer,
  rebase_attempts, fix_attempts, max_attempts, reason, checks_json, created_at, updated_at`
 
+// Save inserts or updates r and records a timeline event when the state changes.
 func (s *Store) Save(ctx context.Context, r *core.Run) error {
 	now := time.Now().UTC()
 	if r.CreatedAt.IsZero() {
@@ -119,6 +124,7 @@ func stateEventKind(state core.RunState) string {
 	}
 }
 
+// boolInt converts b to an integer for SQLite storage.
 func boolInt(b bool) int {
 	if b {
 		return 1
@@ -135,14 +141,17 @@ func checksForSave(checks []core.CheckResult) []core.CheckResult {
 	return checks
 }
 
+// Get returns the run with id, or nil when no run has that id.
 func (s *Store) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
 	return s.queryOne(ctx, `SELECT `+runColumns+` FROM runs WHERE id=?`, string(id))
 }
 
+// FindByPR returns the newest active run bound to pull request pr.
 func (s *Store) FindByPR(ctx context.Context, pr int) (*core.Run, error) {
 	return s.queryOne(ctx, `SELECT `+runColumns+` FROM runs WHERE pr_number=? AND state NOT IN ('merged','closed') ORDER BY updated_at DESC LIMIT 1`, pr)
 }
 
+// FindActiveByTask returns the newest nonterminal run for task.
 func (s *Store) FindActiveByTask(ctx context.Context, task core.TaskID) (*core.Run, error) {
 	return s.queryOne(ctx, `SELECT `+runColumns+` FROM runs WHERE task_id=? AND state NOT IN ('merged','closed','dropped') ORDER BY updated_at DESC LIMIT 1`, string(task))
 }
@@ -184,6 +193,7 @@ func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64,
 	return removed, nil
 }
 
+// ListActive returns every run that is not merged or closed.
 func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
 	// The reconciler calls ListActive on every tick. Reclaiming old rows here
 	// puts retention on that fixed schedule without a second goroutine or a
@@ -195,14 +205,17 @@ func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
 	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN ('merged','closed') ORDER BY updated_at`)
 }
 
+// ListRecent returns at most limit finished runs, newest first.
 func (s *Store) ListRecent(ctx context.Context, limit int) ([]*core.Run, error) {
 	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state IN ('merged','closed','dropped') ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
+// ListByIncident returns the runs blocked by incidentID.
 func (s *Store) ListByIncident(ctx context.Context, incidentID string) ([]*core.Run, error) {
 	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE blocked_incident_id=? AND state='blocked'`, incidentID)
 }
 
+// queryAll runs query and scans every returned row into a run.
 func (s *Store) queryAll(ctx context.Context, query string, args ...any) ([]*core.Run, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -220,6 +233,7 @@ func (s *Store) queryAll(ctx context.Context, query string, args ...any) ([]*cor
 	return out, rows.Err()
 }
 
+// queryOne runs query and scans at most one row into a run.
 func (s *Store) queryOne(ctx context.Context, query string, args ...any) (*core.Run, error) {
 	r, err := scanRun(s.db.QueryRowContext(ctx, query, args...))
 	if err == sql.ErrNoRows {
@@ -228,8 +242,10 @@ func (s *Store) queryOne(ctx context.Context, query string, args ...any) (*core.
 	return r, err
 }
 
+// scanner is the row interface shared by QueryRow and Rows.
 type scanner interface{ Scan(...any) error }
 
+// scanRun decodes one database row into a core.Run.
 func scanRun(row scanner) (*core.Run, error) {
 	var r core.Run
 	var id, task, state, scopeJSON, checksJSON string
@@ -258,6 +274,7 @@ func scanRun(row scanner) (*core.Run, error) {
 	return &r, nil
 }
 
+// ClaimDelivery records key and reports whether this call inserted it.
 func (s *Store) ClaimDelivery(ctx context.Context, key string) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO deliveries(key, created_at) VALUES (?, ?)`, key, nowUnix())
 	if err != nil {
@@ -267,16 +284,19 @@ func (s *Store) ClaimDelivery(ctx context.Context, key string) (bool, error) {
 	return n == 1, err
 }
 
+// ReleaseDelivery removes key so it can be claimed again.
 func (s *Store) ReleaseDelivery(ctx context.Context, key string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM deliveries WHERE key=?`, key)
 	return err
 }
 
+// SetApproval records an approval for run id at sha.
 func (s *Store) SetApproval(ctx context.Context, id core.RunID, sha string) error {
 	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO approvals(run_id, sha, created_at) VALUES (?,?,?)`, string(id), sha, nowUnix())
 	return err
 }
 
+// Approved reports whether run id has an approval for sha.
 func (s *Store) Approved(ctx context.Context, id core.RunID, sha string) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM approvals WHERE run_id=? AND sha=?`, string(id), sha).Scan(&n)
@@ -330,6 +350,7 @@ FROM run_events WHERE run_id IN (%s) ORDER BY at, id`, runIDs)
 	return out, rows.Err()
 }
 
+// decisionColumns lists the decision fields stored in one row.
 const decisionColumns = `id, at, cycle_id, kind, run_id, task_id, pr_number, verdict, action, reason, fields_json`
 
 // ListDecisions returns a bounded decision history in one query. Each run keeps
@@ -499,6 +520,7 @@ func (s *Store) CurrentIncident(ctx context.Context) (*core.BaseIncident, error)
 	return current, nil
 }
 
+// inQuery expands the placeholder in template into one slot per id.
 func inQuery(template string, ids []string) (string, []any) {
 	args := make([]any, len(ids))
 	for i, id := range ids {

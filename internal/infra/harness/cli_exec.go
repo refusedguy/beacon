@@ -1,3 +1,4 @@
+// Package harness runs agents through a command-line process.
 package harness
 
 import (
@@ -13,6 +14,7 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// CLIExec spawns an agent by running a shell command.
 type CLIExec struct {
 	Command  string
 	Template string
@@ -20,10 +22,12 @@ type CLIExec struct {
 	events   chan core.HarnessEvent
 }
 
+// NewCLIExec builds a harness that runs command with a prompt template.
 func NewCLIExec(command, tmpl string) *CLIExec {
 	return &CLIExec{Command: command, Template: tmpl, Timeout: 30 * time.Minute, events: make(chan core.HarnessEvent, 16)}
 }
 
+// render applies tmpl to prompt, or returns prompt when tmpl is empty.
 func (c *CLIExec) render(tmpl, prompt string) (string, error) {
 	if strings.TrimSpace(tmpl) == "" {
 		return prompt, nil
@@ -39,6 +43,7 @@ func (c *CLIExec) render(tmpl, prompt string) (string, error) {
 	return b.String(), nil
 }
 
+// run executes the configured command with prompt on stdin.
 func (c *CLIExec) run(ctx context.Context, prompt string, req core.SpawnRequest) (string, error) {
 	text, err := c.render(c.Template, prompt)
 	if err != nil {
@@ -64,6 +69,7 @@ func (c *CLIExec) run(ctx context.Context, prompt string, req core.SpawnRequest)
 	return string(out), nil
 }
 
+// Spawn starts an agent run and reads a pull request number from its output.
 func (c *CLIExec) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
 	out, err := c.run(ctx, req.Prompt, req)
 	if err != nil {
@@ -73,6 +79,7 @@ func (c *CLIExec) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	return core.Session{ID: string(req.RunID), PR: core.PRFromText(out)}, nil
 }
 
+// Wake sends a follow-up prompt to a CLI agent.
 func (c *CLIExec) Wake(ctx context.Context, sessionID string, w core.WakeContext) error {
 	req := core.SpawnRequest{RunID: w.RunID, Workspace: core.Workspace{Path: w.Workspace, Branch: w.Branch}}
 	_, err := c.run(ctx, core.WakeText(w), req)
@@ -82,15 +89,21 @@ func (c *CLIExec) Wake(ctx context.Context, sessionID string, w core.WakeContext
 	return err
 }
 
+// Stop is a no-op because a CLI command runs to completion.
 func (c *CLIExec) Stop(context.Context, string) error { return nil }
 
 // IsAlive reports true because a CLI command runs to completion and leaves no
 // session to inspect. Orphan cleanup closes a run only when its liveness check
 // returns false, so an unverifiable result must never kill a CLI worker.
-func (c *CLIExec) IsAlive(context.Context, string) (bool, error)      { return true, nil }
-func (c *CLIExec) NotifyParent(context.Context, string, string) error { return nil }
-func (c *CLIExec) Events() <-chan core.HarnessEvent                   { return c.events }
+func (c *CLIExec) IsAlive(context.Context, string) (bool, error) { return true, nil }
 
+// NotifyParent is a no-op for CLI agents.
+func (c *CLIExec) NotifyParent(context.Context, string, string) error { return nil }
+
+// Events returns the channel of harness events.
+func (c *CLIExec) Events() <-chan core.HarnessEvent { return c.events }
+
+// emit publishes an idle event for run id without blocking.
 func (c *CLIExec) emit(id core.RunID) {
 	if c.events == nil {
 		return
