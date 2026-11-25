@@ -8,19 +8,27 @@ import (
 	"strings"
 )
 
+// TaskID identifies a task card.
 type TaskID string
 
 // ScopePath describes a file, a directory subtree, a glob or all files.
 type ScopePath string
 
+// ScopeFile builds a scope matching one file.
 func ScopeFile(p string) ScopePath { return ScopePath("f:" + cleanPath(p)) }
-func ScopeDir(p string) ScopePath  { return ScopePath("d:" + cleanPath(p)) }
+
+// ScopeDir builds a scope matching a directory subtree.
+func ScopeDir(p string) ScopePath { return ScopePath("d:" + cleanPath(p)) }
+
+// ScopePattern builds a scope from a glob pattern, or a file scope for a literal path.
 func ScopePattern(p string) ScopePath {
 	if strings.Contains(p, "**") || strings.Contains(p, "*") {
 		return ScopePath("g:" + cleanPath(p))
 	}
 	return ScopeFile(p)
 }
+
+// ScopeAll builds a scope matching every file.
 func ScopeAll() ScopePath { return ScopePath("a:*") }
 
 func cleanPath(p string) string {
@@ -132,19 +140,27 @@ func commonPrefix(a, b string) bool {
 	return true
 }
 
+// TaskStatus is the lifecycle state of a task card.
 type TaskStatus string
 
 const (
+	// TaskAvailable means the task is ready to be claimed.
 	TaskAvailable TaskStatus = "available"
-	TaskClaimed   TaskStatus = "in_progress"
-	TaskDone      TaskStatus = "done"
-	TaskDropped   TaskStatus = "dropped"
+	// TaskClaimed means a run owns the task.
+	TaskClaimed TaskStatus = "in_progress"
+	// TaskDone means the task's pull request merged.
+	TaskDone TaskStatus = "done"
+	// TaskDropped means the task was abandoned.
+	TaskDropped TaskStatus = "dropped"
 )
 
+// TaskKind distinguishes a task from an epic.
 type TaskKind string
 
 const (
+	// TaskKindTask marks a regular task card.
 	TaskKindTask TaskKind = "task"
+	// TaskKindEpic marks an epic card with a child plan.
 	TaskKindEpic TaskKind = "epic"
 )
 
@@ -153,9 +169,12 @@ const (
 type ReviewMode string
 
 const (
-	ReviewModeLLM   ReviewMode = "llm"
+	// ReviewModeLLM requires an LLM review before merge.
+	ReviewModeLLM ReviewMode = "llm"
+	// ReviewModeHuman requires a human approval before merge.
 	ReviewModeHuman ReviewMode = "human"
-	ReviewModeNone  ReviewMode = "none"
+	// ReviewModeNone skips the review requirement.
+	ReviewModeNone ReviewMode = "none"
 )
 
 // ChildSpec is one child declared in an epic's plan.
@@ -173,6 +192,7 @@ func ChildTaskID(epicID TaskID, index int) TaskID {
 	return TaskID(fmt.Sprintf("%s-%02d", epicID, index))
 }
 
+// Task is one parsed task card.
 type Task struct {
 	ID            TaskID
 	Title         string
@@ -255,6 +275,7 @@ func (t TaskTree) Children(id TaskID) []Task {
 	return out
 }
 
+// DependsOnID reports whether the task depends on the given task ID.
 func (t Task) DependsOnID(id TaskID) bool {
 	for _, d := range t.DependsOn {
 		if d == id {
@@ -264,10 +285,12 @@ func (t Task) DependsOnID(id TaskID) bool {
 	return false
 }
 
+// Overlaps reports whether two tasks share work.
 func (t Task) Overlaps(other Task) bool {
 	return t.ID == other.ID || OverlapByDependencies(t, other) || OverlapByPaths(t, other)
 }
 
+// OverlapByPaths reports whether two tasks declare overlapping scopes.
 func OverlapByPaths(a, b Task) bool {
 	for _, x := range a.Scope {
 		for _, y := range b.Scope {
@@ -279,16 +302,20 @@ func OverlapByPaths(a, b Task) bool {
 	return false
 }
 
+// OverlapByDependencies reports whether two tasks depend on each other.
 func OverlapByDependencies(a, b Task) bool {
 	return a.DependsOnID(b.ID) || b.DependsOnID(a.ID)
 }
 
+// OverlapChecker reports whether two tasks overlap.
 type OverlapChecker func(a, b Task) bool
 
+// PathsAndDependencies reports overlap by scope or dependency.
 func PathsAndDependencies(a, b Task) bool {
 	return OverlapByPaths(a, b) || OverlapByDependencies(a, b)
 }
 
+// SortTasks orders tasks by descending priority, then by ID.
 func SortTasks(tasks []Task) {
 	sort.Slice(tasks, func(i, j int) bool {
 		if tasks[i].Priority != tasks[j].Priority {

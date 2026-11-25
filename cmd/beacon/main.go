@@ -376,9 +376,9 @@ func main() {
 
 	root.AddCommand(newInitCommand())
 	root.AddCommand(newDoctorCommand(configPath))
-	root.AddCommand(newDispatchCommand(configPath))
+	root.AddCommand(newDispatchCommand(configPath, wire))
 	root.AddCommand(newStatusCommand(configPath))
-	root.AddCommand(newControlCommand(configPath))
+	root.AddCommand(newControlCommand(configPath, wire))
 	root.AddCommand(newMCPCommand(configPath))
 	root.AddCommand(newServeCommand(configPath))
 	root.AddCommand(newGCCommand(configPath))
