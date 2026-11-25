@@ -1189,3 +1189,18 @@ func TestWakeSkippedWhenAgentSlotsExhausted(t *testing.T) {
 		t.Fatalf("wakes = %d, want none when no agent slot is free", len(h.wakes))
 	}
 }
+
+func TestWakeSkippedWhenSlotStoreFails(t *testing.T) {
+	r, _, _, h, _ := newReconciler(t, core.VerdictNeedsAgentFix,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", FailureExcerpt: "panic: boom"})
+	r.AgentSlots = &Dispatcher{
+		Store:       &listActiveErrorStore{fakeStore: newFakeStore()},
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.wakes) != 0 {
+		t.Fatalf("wakes = %d, want none when the slot store fails", len(h.wakes))
+	}
+}
