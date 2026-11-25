@@ -200,17 +200,91 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 // IDs are derived from the batch contents, so repeating a call returns the
 // same cards instead of creating duplicates. A depends entry of the form @N
 // resolves to the ID of the Nth card in this batch (1-based) and must name an
-// earlier card. If any step fails, every card written by this batch is removed.
+// earlier card.
+//
+// The whole batch is one operation: every file is written first, then one
+// graph is synced and one commit is published. A failure at any stage removes
+// every written card and restores the synced graph, so no partial batch is
+// observable on disk or by the dispatcher.
 func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput) ([]CreatedTask, error) {
 	if len(inputs) == 0 {
 		return nil, nil
 	}
-	for _, in := range inputs {
-		if id := strings.TrimSpace(in.ID); id != "" && !validTaskID(id) {
-			return nil, core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
-		}
+	if err := validateBatchInputs(inputs); err != nil {
+		return nil, err
 	}
 	ids := c.batchIDs(inputs)
+	resolved, err := resolveBatchInputs(inputs, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	available, existing, results := c.existingBatchCards(ctx, ids)
+	graph := make([]core.Task, 0, len(inputs))
+	groups := make([]batchGroup, len(inputs))
+	for i, in := range resolved {
+		if existing[i] {
+			continue
+		}
+		group := batchGroupTasks(in, ids[i])
+		groups[i] = batchGroup{start: len(graph), end: len(graph) + len(group)}
+		graph = append(graph, group...)
+	}
+	if len(graph) == 0 {
+		c.rememberBatch(ids, results)
+		return results, nil
+	}
+	if err := c.ensureBatchBranches(ctx, resolved, ids, existing); err != nil {
+		return nil, err
+	}
+
+	written, err := c.writeTasks(ctx, graph)
+	if err != nil {
+		c.rollbackBatch(ctx, written, available, false)
+		return nil, err
+	}
+	if len(written) != len(graph) {
+		c.rollbackBatch(ctx, written, available, false)
+		return nil, fmt.Errorf("created %d of %d cards", len(written), len(graph))
+	}
+
+	if c.Store != nil {
+		if err := c.Store.SyncTasks(ctx, withCreated(available, written)); err != nil {
+			c.rollbackBatch(ctx, written, available, true)
+			return nil, err
+		}
+	}
+	if err := c.publish(ctx, ids[0]); err != nil {
+		c.rollbackBatch(ctx, written, available, c.Store != nil)
+		return nil, err
+	}
+
+	for i, group := range groups {
+		if existing[i] {
+			continue
+		}
+		results[i] = c.result(written[group.start:group.end])
+	}
+	c.rememberBatch(ids, results)
+	return results, nil
+}
+
+// batchGroup marks the slice of the written graph that belongs to one input.
+type batchGroup struct{ start, end int }
+
+func validateBatchInputs(inputs []CreateTaskInput) error {
+	for _, in := range inputs {
+		if id := strings.TrimSpace(in.ID); id != "" && !validTaskID(id) {
+			return core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
+		}
+		if strings.TrimSpace(in.Title) == "" {
+			return core.Errorf(core.CodeInvalidInput, "task title is required")
+		}
+	}
+	return nil
+}
+
+func resolveBatchInputs(inputs []CreateTaskInput, ids []core.TaskID) ([]CreateTaskInput, error) {
 	resolved := make([]CreateTaskInput, len(inputs))
 	for i, in := range inputs {
 		in.ID = string(ids[i])
@@ -229,29 +303,106 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 		in.Depends = deps
 		resolved[i] = in
 	}
+	return resolved, nil
+}
 
-	created := make([]CreatedTask, 0, len(inputs))
-	written := make([]core.Task, 0, len(inputs))
-	for i, in := range resolved {
-		if existing, ok := c.existingCard(ctx, ids[i]); ok {
-			created = append(created, existing)
+// batchGroupTasks builds the cards for one input. An epic contributes its
+// children followed by the epic, matching the single-card Create flow.
+func batchGroupTasks(in CreateTaskInput, id core.TaskID) []core.Task {
+	kind := normalizeKind(in.Kind)
+	task := core.Task{
+		ID: id, Title: strings.TrimSpace(in.Title), Body: strings.TrimSpace(in.Body),
+		Scope: taskScopes(in.Scope), DependsOn: taskDependencies(in.Depends),
+		Priority: in.Priority, Status: core.TaskAvailable,
+		Kind: kind, BaseBranch: strings.TrimSpace(in.BaseBranch),
+		RequireReview: normalizeReview(in.RequireReview), Plan: in.Plan,
+		SourceRef: cardPath(id),
+	}
+	if kind != core.TaskKindEpic {
+		return []core.Task{task}
+	}
+	children := childTasks(id, in.Plan)
+	for _, child := range children {
+		task.DependsOn = append(task.DependsOn, child.ID)
+	}
+	return append(children, task)
+}
+
+// existingBatchCards resolves all already known cards in one source read.
+func (c *TaskCreator) existingBatchCards(ctx context.Context, ids []core.TaskID) ([]core.Task, []bool, []CreatedTask) {
+	c.mu.Lock()
+	batch := make(map[core.TaskID]CreatedTask, len(ids))
+	for _, id := range ids {
+		if out, ok := c.batch[id]; ok {
+			batch[id] = out
+		}
+	}
+	c.mu.Unlock()
+
+	available, err := c.Source.ListAvailable(ctx)
+	if err != nil {
+		available = nil
+	}
+	byID := make(map[core.TaskID]core.Task, len(available))
+	for _, task := range available {
+		byID[task.ID] = task
+	}
+
+	results := make([]CreatedTask, len(ids))
+	exists := make([]bool, len(ids))
+	for i, id := range ids {
+		if out, ok := batch[id]; ok {
+			results[i], exists[i] = out, true
 			continue
 		}
-		out, err := c.Create(ctx, in)
-		if err != nil {
-			c.rollback(ctx, written)
-			return nil, err
+		if task, ok := byID[id]; ok {
+			path := task.SourceRef
+			if path == "" {
+				path = cardPath(id)
+			}
+			results[i], exists[i] = CreatedTask{ID: string(id), Path: path, Pushed: true}, true
 		}
-		if len(out.IDs) == 0 {
-			written = append(written, core.Task{ID: core.TaskID(out.ID), SourceRef: out.Path})
-		}
-		for _, id := range out.IDs {
-			written = append(written, core.Task{ID: core.TaskID(id), SourceRef: cardPath(core.TaskID(id))})
-		}
-		created = append(created, out)
 	}
-	c.rememberBatch(ids, created)
-	return created, nil
+	return available, exists, results
+}
+
+func (c *TaskCreator) ensureBatchBranches(ctx context.Context, resolved []CreateTaskInput, ids []core.TaskID, existing []bool) error {
+	base := publishBase(c.Root)
+	seen := make(map[string]bool)
+	for i, in := range resolved {
+		if existing[i] || normalizeKind(in.Kind) != core.TaskKindEpic {
+			continue
+		}
+		branch := epicBranch(ids[i])
+		if seen[branch] {
+			continue
+		}
+		seen[branch] = true
+		if err := ensureBranch(ctx, c.Workspace, branch, base); err != nil {
+			return fmt.Errorf("create epic branch: %w", err)
+		}
+	}
+	return nil
+}
+
+// rollbackBatch removes every card written by a failed batch in one pass and
+// unpublishes them from the task graph. There is no commit to undo when the
+// failure happened before publish; restoring the earlier graph keeps the
+// dispatcher from seeing cards whose files are gone.
+func (c *TaskCreator) rollbackBatch(ctx context.Context, written, available []core.Task, synced bool) {
+	if len(written) == 0 {
+		return
+	}
+	opCtx, cancel := detachedContext(ctx)
+	defer cancel()
+	if remover, ok := c.Source.(TaskRemover); ok {
+		for i := len(written) - 1; i >= 0; i-- {
+			_ = remover.Remove(opCtx, written[i].ID)
+		}
+	}
+	if synced && c.Store != nil {
+		_ = c.Store.SyncTasks(opCtx, available)
+	}
 }
 
 // batchIDs assigns a stable ID to each input. An explicit ID wins. An epic
@@ -326,29 +477,6 @@ func localRefIndex(value string) (int, bool) {
 		return 0, false
 	}
 	return n, true
-}
-
-func (c *TaskCreator) existingCard(ctx context.Context, id core.TaskID) (CreatedTask, bool) {
-	c.mu.Lock()
-	out, ok := c.batch[id]
-	c.mu.Unlock()
-	if ok {
-		return out, true
-	}
-	available, err := c.Source.ListAvailable(ctx)
-	if err != nil {
-		return CreatedTask{}, false
-	}
-	for _, task := range available {
-		if task.ID == id {
-			path := task.SourceRef
-			if path == "" {
-				path = cardPath(id)
-			}
-			return CreatedTask{ID: string(id), Path: path, Pushed: true}, true
-		}
-	}
-	return CreatedTask{}, false
 }
 
 func (c *TaskCreator) rememberBatch(ids []core.TaskID, created []CreatedTask) {
