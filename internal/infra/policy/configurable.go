@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -20,8 +19,21 @@ type Config struct {
 	ReviewMode        core.ReviewMode
 }
 
-// ReviewRule gates epic pull requests on review approval.
-type ReviewRule = app.ReviewRule
+// ReviewRule gates epic pull requests on review approval. A missing review
+// mode means the LLM reviewer, matching the default on the task card.
+type ReviewRule struct{ Mode core.ReviewMode }
+
+func (r ReviewRule) Name() string { return "review" }
+
+func (r ReviewRule) Evaluate(o core.Observation) (core.Verdict, string) {
+	if r.Mode == core.ReviewModeNone {
+		return core.VerdictNoop, ""
+	}
+	if o.Approvals > 0 {
+		return core.VerdictNoop, ""
+	}
+	return core.VerdictWait, "epic review approval required"
+}
 
 type Policy struct {
 	criteria []core.Criterion
@@ -49,6 +61,14 @@ func New(cfg Config) *Policy {
 
 func (p *Policy) Evaluate(o core.Observation) core.MergeDecision {
 	return core.Decide(o, p.criteria)
+}
+
+// ReviewRequired reports whether mode still needs review approval for o. It
+// uses the same rule as the review criterion in the policy chain, so the epic
+// guard and the configured policy cannot drift apart.
+func (p *Policy) ReviewRequired(mode core.ReviewMode, o core.Observation) bool {
+	verdict, _ := ReviewRule{Mode: mode}.Evaluate(o)
+	return verdict != core.VerdictNoop
 }
 
 type ChecksRule struct{ Names []string }
@@ -145,4 +165,4 @@ func (r CommandRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	return core.VerdictNoop, ""
 }
 
-var _ app.MergePolicy = (*Policy)(nil)
+var _ core.MergePolicy = (*Policy)(nil)

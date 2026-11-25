@@ -217,6 +217,26 @@ func TestReviewRuleWaitsForApprovalUnlessSkipped(t *testing.T) {
 	}
 }
 
+func TestReviewRequiredUsesReviewRule(t *testing.T) {
+	p := New(Config{})
+	for _, tc := range []struct {
+		mode      core.ReviewMode
+		approvals int
+		want      bool
+	}{
+		{core.ReviewModeLLM, 0, true},
+		{core.ReviewModeHuman, 0, true},
+		{core.ReviewModeLLM, 1, false},
+		{core.ReviewModeHuman, 1, false},
+		{core.ReviewModeNone, 0, false},
+	} {
+		got := p.ReviewRequired(tc.mode, core.Observation{PRState: "open", Approvals: tc.approvals})
+		if got != tc.want {
+			t.Errorf("mode=%s approvals=%d ReviewRequired=%v, want %v", tc.mode, tc.approvals, got, tc.want)
+		}
+	}
+}
+
 func TestConfigReviewModeAddsReviewCriterion(t *testing.T) {
 	for _, mode := range []core.ReviewMode{core.ReviewModeLLM, core.ReviewModeHuman} {
 		got := New(Config{ReviewMode: mode}).Evaluate(core.Observation{PRState: "open"})
