@@ -375,6 +375,15 @@ func TestRunSnapshotJSONChecksContract(t *testing.T) {
 	}
 }
 
+func TestFailedCheckNamesKeepsArbitraryUTF8Names(t *testing.T) {
+	names := []string{"ci\vbuild", "日本語", "emoji 🚀", "quote \" and \\ slash"}
+	raw := sqliteChecks(names)
+	got := failedCheckNames(raw)
+	if !reflect.DeepEqual(got, names) {
+		t.Fatalf("failedCheckNames(%q) = %q, want %q", raw, got, names)
+	}
+}
+
 func TestLaunchSourceCoversMCPCLIUIAndDaemon(t *testing.T) {
 	cases := []struct {
 		raw  string

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -103,16 +104,14 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 }
 
 func sqliteChecks(names []string) string {
-	var b strings.Builder
-	b.WriteByte('[')
-	for i, n := range names {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(fmt.Sprintf("%q", n))
+	if names == nil {
+		names = []string{}
 	}
-	b.WriteByte(']')
-	return b.String()
+	b, err := json.Marshal(names)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }
 
 func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, base core.BaseStatus, origin *core.Run) error {
