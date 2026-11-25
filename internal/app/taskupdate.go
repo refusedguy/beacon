@@ -3,8 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -40,14 +40,18 @@ type UpdateResult struct {
 	OperationID string        `json:"operation_id,omitempty"`
 }
 
-// TaskUpdater edits several task cards in one commit and push.
+// TaskUpdater edits several task cards in one commit and push. Source is
+// optional; when set, the batch rebuilds the SQLite graph in one sync.
 type TaskUpdater struct {
 	Store     ActiveRunFinder
+	Source    TaskLister
 	Workspace PathCommitter
 	Root      core.Workspace
 }
 
-// Update applies all changes and restores cards if publishing fails.
+// Update stages every card change before writing any of them. The whole batch
+// is then applied as one transaction, synced to SQLite once and published in
+// one commit. A failure at any stage restores the cards and the graph.
 func (u *TaskUpdater) Update(ctx context.Context, updates []UpdateInput) (UpdateResult, error) {
 	var out UpdateResult
 	batch, err := normalizeUpdates(updates)
@@ -70,16 +74,21 @@ func (u *TaskUpdater) Update(ctx context.Context, updates []UpdateInput) (Update
 		out.Refused = refused
 		return out, nil
 	}
-	results, saved, err := u.writeUpdates(batch)
+	tx, results, err := u.stageUpdates(batch)
 	if err != nil {
 		return out, err
 	}
 	out.Results = results
-	if len(saved) == 0 {
+	if tx.empty() {
 		return out, nil
 	}
-	if err := publishPath(ctx, u.Workspace, u.Root, "docs/tasks", "beacon: update tasks"); err != nil {
-		restore(saved)
+	g, err := loadGraph(ctx, u.Store, u.Source, func(available []core.Task) []core.Task {
+		return withUpdatedTasks(available, batch)
+	})
+	if err != nil {
+		return out, err
+	}
+	if err := finishMutation(ctx, tx, g, u.Workspace, u.Root, cardsPath, "beacon: update tasks"); err != nil {
 		return UpdateResult{}, err
 	}
 	out.Pushed = true
@@ -104,37 +113,79 @@ func normalizeUpdates(updates []UpdateInput) ([]UpdateInput, error) {
 	return out, nil
 }
 
-func (u *TaskUpdater) writeUpdates(updates []UpdateInput) ([]UpdatedTask, []savedCard, error) {
-	dir := u.Root.Path
-	if dir == "" {
-		dir = "."
-	}
+// stageUpdates reads and stages every changed card before writing any of them,
+// so the batch lands as one transaction.
+func (u *TaskUpdater) stageUpdates(updates []UpdateInput) (*cardTx, []UpdatedTask, error) {
+	tx := &cardTx{}
 	var results []UpdatedTask
-	var saved []savedCard
 	for _, in := range updates {
-		path := filepath.Join(dir, "docs", "tasks", in.ID+".md")
+		path := cardFilePath(u.Root, in.ID)
 		content, err := os.ReadFile(path)
 		if errors.Is(err, os.ErrNotExist) {
 			results = append(results, UpdatedTask{ID: in.ID, Status: "not_found"})
 			continue
 		}
 		if err != nil {
-			restore(saved)
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("read %s: %w", path, err)
 		}
 		next, changed := applyCardUpdate(string(content), in)
 		if !changed {
 			results = append(results, UpdatedTask{ID: in.ID, Status: "unchanged"})
 			continue
 		}
-		if err := os.WriteFile(path, []byte(next), 0o644); err != nil {
-			restore(saved)
-			return nil, nil, err
-		}
-		saved = append(saved, savedCard{path: path, content: content})
+		tx.add(path, content, []byte(next))
 		results = append(results, UpdatedTask{ID: in.ID, Status: "updated"})
 	}
-	return results, saved, nil
+	return tx, results, nil
+}
+
+// withUpdatedTasks carries the batch changes into the graph that is synced to
+// SQLite once. Cards absent from the source graph are left out so a sync never
+// invents an available task from a card the source does not list.
+func withUpdatedTasks(tasks []core.Task, updates []UpdateInput) []core.Task {
+	out := make([]core.Task, len(tasks))
+	copy(out, tasks)
+	for i := range out {
+		for _, in := range updates {
+			if string(out[i].ID) == in.ID {
+				out[i] = applyGraphUpdate(out[i], in)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func applyGraphUpdate(task core.Task, in UpdateInput) core.Task {
+	if in.Title != nil {
+		task.Title = strings.TrimSpace(*in.Title)
+	}
+	if in.Body != nil {
+		task.Body = strings.TrimSpace(*in.Body)
+	}
+	if in.Scope != nil {
+		task.Scope = taskScopes(cleanList(*in.Scope))
+	}
+	if in.Depends != nil {
+		task.DependsOn = taskDependencies(cleanList(*in.Depends))
+	}
+	if in.Priority != nil {
+		task.Priority = *in.Priority
+	}
+	if in.Kind != nil {
+		task.Kind = normalizeKind(core.TaskKind(*in.Kind))
+	}
+	if in.RequireReview != nil {
+		task.RequireReview = normalizeReview(core.ReviewMode(*in.RequireReview))
+	}
+	if in.BaseBranch != nil {
+		task.BaseBranch = strings.TrimSpace(*in.BaseBranch)
+	}
+	if in.Plan != nil {
+		task.Plan = *in.Plan
+	}
+	task.SourceRef = cardPath(task.ID)
+	return task
 }
 
 // cardDoc splits frontmatter from body so unrelated lines stay as is.

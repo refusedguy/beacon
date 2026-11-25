@@ -206,6 +206,81 @@ func TestTaskUpdaterRestoresCardsWhenPublishFails(t *testing.T) {
 	}
 }
 
+func TestTaskUpdaterReportsRollbackFailureWithPath(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpdateCard(t, dir, "T-A", updateCardBody)
+	ws := &rollbackFailWorkspace{
+		fakeWorkspace: &fakeWorkspace{log: &callLog{}},
+		paths:         []string{path},
+		err:           errors.New("push failed"),
+	}
+	updater := newUpdater(dir, newFakeStore(), ws)
+	title := "New title"
+
+	_, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "push failed") {
+		t.Fatalf("original error lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("rollback error did not name %s: %v", path, err)
+	}
+}
+
+func TestTaskUpdaterSyncsGraphOnceWithUpdatedFields(t *testing.T) {
+	dir := t.TempDir()
+	writeUpdateCard(t, dir, "T-A", updateCardBody)
+	source := &cardSource{tasks: []core.Task{{ID: "T-A", Title: "Old title", Priority: 5}}}
+	store := &syncStore{fakeStore: newFakeStore()}
+	ws := &fakeWorkspace{log: &callLog{}}
+	updater := &TaskUpdater{Store: store, Source: source, Workspace: ws, Root: core.Workspace{Path: dir, Branch: "main"}}
+	title, priority := "Renamed", 9
+
+	got, err := updater.Update(context.Background(), []UpdateInput{
+		{ID: "T-A", Title: &title, Priority: &priority},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Pushed {
+		t.Fatalf("result = %+v", got)
+	}
+	if source.calls != 1 || store.calls != 1 {
+		t.Fatalf("source calls = %d, sync calls = %d", source.calls, store.calls)
+	}
+	if len(store.tasks) != 1 || store.tasks[0].Title != "Renamed" || store.tasks[0].Priority != 9 {
+		t.Fatalf("synced graph = %+v", store.tasks)
+	}
+	if len(ws.commits) != 1 {
+		t.Fatalf("commits = %d, want one push", len(ws.commits))
+	}
+}
+
+func TestTaskUpdaterRestoresGraphWhenPublishFails(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpdateCard(t, dir, "T-A", updateCardBody)
+	source := &cardSource{tasks: []core.Task{{ID: "T-A", Title: "Old title"}}}
+	store := &syncStore{fakeStore: newFakeStore()}
+	ws := &failingCommitWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}, err: errors.New("push failed")}
+	updater := &TaskUpdater{Store: store, Source: source, Workspace: ws, Root: core.Workspace{Path: dir, Branch: "main"}}
+	title := "New title"
+
+	if _, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}}); !errors.Is(err, ws.err) {
+		t.Fatalf("error = %v, want %v", err, ws.err)
+	}
+	if store.calls != 2 {
+		t.Fatalf("sync calls = %d, want one sync and one restore", store.calls)
+	}
+	if len(store.tasks) != 1 || store.tasks[0].Title != "Old title" {
+		t.Fatalf("restored graph = %+v", store.tasks)
+	}
+	if readUpdateCard(t, path) != updateCardBody {
+		t.Fatal("failed publish did not restore the card")
+	}
+}
+
 func TestTaskUpdaterUpdatesPlanAndBody(t *testing.T) {
 	dir := t.TempDir()
 	path := writeUpdateCard(t, dir, "T-A", "---\nid: T-A\n---\nold body\n")
