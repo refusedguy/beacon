@@ -56,14 +56,13 @@ type wiring struct {
 
 // wiredInfra holds the adapters shared by every application service.
 type wiredInfra struct {
-	store        *sqlite.Store
-	source       core.TaskSource
-	harness      core.AgentHarness
-	workspace    *workspace.GitWorktree
-	scm          core.ScmGateway
-	changes      chan int
-	resolveModel app.ModelResolver
-	decisions    app.DecisionLogger
+	store     *sqlite.Store
+	source    core.TaskSource
+	harness   core.AgentHarness
+	workspace *workspace.GitWorktree
+	scm       core.ScmGateway
+	changes   chan int
+	decisions app.DecisionLogger
 }
 
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
@@ -128,26 +127,13 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := wireServices(cfg, root, parentSession, infra)
 	cw := newConfigWatcher(resolvedConfigPath(path, root), root, parentSession,
 		newLiveState(cfg, infra.harness), configWatchInterval)
+	h := &reloadableHarness{live: &cw.live, events: infra.harness.Events()}
+	p := &reloadablePolicy{live: &cw.live}
+	w := wireServices(cfg, root, parentSession, infra, h, p, cw.modelResolver)
 	w.watcher = cw
-	installLiveState(w, cw)
 	return w, nil
-}
-
-// installLiveState puts stable wrappers between the MCP services and the
-// config-backed adapters. Tool handlers keep the same pointers across reloads.
-func installLiveState(w *wiring, cw *configWatcher) {
-	initial := cw.live.Load().harness
-	h := &reloadableHarness{live: &cw.live, events: initial.Events()}
-	w.harness = h
-	w.dispatcher.Harness = h
-	w.control.Harness = h
-	w.recon.Harness = h
-	w.workspace.Refresher = h
-	w.dispatcher.ResolveModel = cw.modelResolver
-	w.recon.Policy = &reloadablePolicy{live: &cw.live}
 }
 
 // wireInfra builds the adapters. It has no dependency on the service layer.
@@ -179,23 +165,20 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 	if err != nil {
 		return nil, err
 	}
-	if refresher, ok := h.(core.WorktreeRefresher); ok {
-		wt.Refresher = refresher
-	}
 	infra := &wiredInfra{store: store, source: source, harness: h,
 		workspace: wt, scm: scmGW, changes: make(chan int, 64),
 		decisions: app.DecisionLogger{Sink: store}}
-	// resolveModel closes over the wired endpoint and token so a dispatch can
-	// look up the parent session's model even when no parent was known at start.
-	infra.resolveModel = func(parent string) core.ModelRef {
-		return resolveModel(cfg, harnessToken, parent)
-	}
 	return infra, nil
 }
 
-// wireServices builds the application services on top of the adapters.
-func wireServices(cfg config.Config, root, parentSession string, infra *wiredInfra) *wiring {
+// wireServices builds the application services on top of the adapters. The
+// reloadable wrappers are injected here so no service is built with an
+// original adapter and patched afterwards.
+func wireServices(cfg config.Config, root, parentSession string, infra *wiredInfra, h core.AgentHarness, p core.MergePolicy, resolveModel app.ModelResolver) *wiring {
 	workspaceRoot := core.Workspace{Path: root, Branch: cfg.BaseBranch}
+	if refresher, ok := h.(core.WorktreeRefresher); ok {
+		infra.workspace.Refresher = refresher
+	}
 	creator := &app.TaskCreator{
 		Store: infra.store, Source: infra.source,
 		Workspace: infra.workspace, Root: workspaceRoot,
@@ -209,28 +192,28 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 	disp := &app.Dispatcher{
 		Source:    infra.source,
 		Planner:   planner.New(planner.Options{ByPath: true, ByDependency: true, Strict: cfg.StrictScope}),
-		Workspace: infra.workspace, Harness: infra.harness, Store: infra.store,
+		Workspace: infra.workspace, Harness: h, Store: infra.store,
 		Concurrency:        core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
 		StrictScope:        cfg.StrictScope,
 		MaxAttempts:        cfg.Merge.MaxAttempts,
 		ParentSessionID:    firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
 		WorkerInstructions: cfg.Harness.WorkerInstructions,
-		ResolveModel:       infra.resolveModel,
+		ResolveModel:       resolveModel,
 		Decisions:          infra.decisions,
 	}
-	ctrl := &app.Control{Store: infra.store, Harness: infra.harness, Workspace: infra.workspace, OnChange: func(pr int) {
+	ctrl := &app.Control{Store: infra.store, Harness: h, Workspace: infra.workspace, OnChange: func(pr int) {
 		select {
 		case infra.changes <- pr:
 		default:
 		}
 	}}
-	recon := newReconciler(cfg, infra.store, infra.scm, infra.harness,
+	recon := newReconciler(cfg, infra.store, infra.scm, h, p,
 		infra.source, infra.workspace, disp, infra.changes,
 		firstNonEmpty(parentSession, cfg.Harness.ParentSessionID))
 	recon.Decisions = infra.decisions
 	return &wiring{
-		cfg: cfg, store: infra.store, source: infra.source, harness: infra.harness,
-		workspace: infra.workspace, scm: infra.scm, policy: recon.Policy,
+		cfg: cfg, store: infra.store, source: infra.source, harness: h,
+		workspace: infra.workspace, scm: infra.scm, policy: p,
 		changes: infra.changes, dispatcher: disp, control: ctrl,
 		status:      app.StatusService{Store: infra.store},
 		wait:        app.WaitService{Store: infra.store, Interval: time.Second},
@@ -251,6 +234,7 @@ func newReconciler(
 	store *sqlite.Store,
 	scmGW core.ScmGateway,
 	h core.AgentHarness,
+	p core.MergePolicy,
 	source core.TaskSource,
 	wt *workspace.GitWorktree,
 	disp *app.Dispatcher,
@@ -258,7 +242,7 @@ func newReconciler(
 	parentSession string,
 ) *app.Reconciler {
 	return &app.Reconciler{
-		Store: store, SCM: scmGW, Policy: mergePolicy(cfg), Harness: h,
+		Store: store, SCM: scmGW, Policy: p, Harness: h,
 		Source: source, Workspace: wt,
 		Notifier:   notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
 		Dispatcher: disp, Changes: changes, Repo: cfg.SCM.Owner + "/" + cfg.SCM.Repo,
