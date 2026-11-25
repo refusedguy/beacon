@@ -33,11 +33,11 @@ func writeUpdateCard(t *testing.T, dir, id, content string) string {
 	t.Helper()
 	cards := filepath.Join(dir, "docs", "tasks")
 	if err := os.MkdirAll(cards, 0o755); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`os.MkdirAll(cards, 0o755): %v`, err)
 	}
 	path := filepath.Join(cards, id+".md")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`os.WriteFile(path, []byte(content), 0o644): %v`, err)
 	}
 	return path
 }
@@ -46,7 +46,7 @@ func readUpdateCard(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`os.ReadFile(path): %v`, err)
 	}
 	return string(b)
 }
@@ -64,7 +64,7 @@ func TestTaskUpdaterPreservesFrontmatter(t *testing.T) {
 
 	got, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}}): %v`, err)
 	}
 	if !got.Pushed || len(got.Results) != 1 || got.Results[0].Status != "updated" {
 		t.Fatalf("result = %+v", got)
@@ -104,7 +104,7 @@ func TestTaskUpdaterBatchCommitsOnce(t *testing.T) {
 		{ID: "T-B", Priority: &priority},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`updater.Update(context.Background(), []UpdateInput{ {ID: "T-A", Title: &title}, {ID: "T-B", Priority: &priority}, }): %v`, err)
 	}
 	if !got.Pushed || len(got.Results) != 2 ||
 		got.Results[0].Status != "updated" || got.Results[1].Status != "updated" {
@@ -126,7 +126,7 @@ func TestTaskUpdaterReportsNotFoundWithoutPublishing(t *testing.T) {
 
 	got, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-MISSING"}})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`updater.Update(context.Background(), []UpdateInput{{ID: "T-MISSING"}}): %v`, err)
 	}
 	if got.Pushed || len(got.Results) != 1 || got.Results[0].Status != "not_found" {
 		t.Fatalf("result = %+v", got)
@@ -145,7 +145,7 @@ func TestTaskUpdaterReportsUnchangedWithoutPublishing(t *testing.T) {
 
 	got, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}}): %v`, err)
 	}
 	if got.Pushed || len(got.Results) != 1 || got.Results[0].Status != "unchanged" {
 		t.Fatalf("result = %+v", got)
@@ -164,7 +164,7 @@ func TestTaskUpdaterRefusesActiveRunBatch(t *testing.T) {
 	b := writeUpdateCard(t, dir, "T-B", "---\nid: T-B\n---\nbody\n")
 	store := newFakeStore()
 	if err := store.Save(context.Background(), core.NewRun("run-1", "T-B", time.Now().UTC())); err != nil {
-		t.Fatal(err)
+		t.Fatalf(`store.Save(context.Background(), core.NewRun("run-1", "T-B", time.Now().UTC())): %v`, err)
 	}
 	ws := &fakeWorkspace{log: &callLog{}}
 	updater := newUpdater(dir, store, ws)
@@ -174,7 +174,7 @@ func TestTaskUpdaterRefusesActiveRunBatch(t *testing.T) {
 		{ID: "T-A", Title: &title}, {ID: "T-B", Title: &title},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`updater.Update(context.Background(), []UpdateInput{ {ID: "T-A", Title: &title}, {ID: "T-B", Title: &title}, }): %v`, err)
 	}
 	if len(got.Refused) != 1 || got.Refused[0] != "T-B" || got.Pushed {
 		t.Fatalf("result = %+v", got)
@@ -242,7 +242,7 @@ func TestTaskUpdaterSyncsGraphOnceWithUpdatedFields(t *testing.T) {
 		{ID: "T-A", Title: &title, Priority: &priority},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`updater.Update(context.Background(), []UpdateInput{ {ID: "T-A", Title: &title, Priority: &priority}, }): %v`, err)
 	}
 	if !got.Pushed {
 		t.Fatalf("result = %+v", got)
@@ -298,7 +298,7 @@ func TestTaskUpdaterUpdatesPlanAndBody(t *testing.T) {
 		ID: "T-A", Body: &body, Plan: &plan,
 	}})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`updater.Update(context.Background(), []UpdateInput{{ ID: "T-A", Body: &body, Plan: &plan, }}): %v`, err)
 	}
 	if !got.Pushed || got.Results[0].Status != "updated" {
 		t.Fatalf("result = %+v", got)
