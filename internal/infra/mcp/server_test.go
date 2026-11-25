@@ -72,6 +72,19 @@ func TestToolCatalogMatchesRegisteredTools(t *testing.T) {
 	}
 }
 
+func TestToolRegistrationsCoverCatalog(t *testing.T) {
+	catalog := ToolCatalog()
+	if len(toolRegistrations) != len(catalog) {
+		t.Fatalf("toolRegistrations has %d entries, ToolCatalog has %d", len(toolRegistrations), len(catalog))
+	}
+	for _, spec := range catalog {
+		tool := catalogTool(spec.Name)
+		if tool.Name != spec.Name || tool.Description != spec.Description {
+			t.Fatalf("catalogTool(%q) = %+v, want name %q and description %q", spec.Name, tool, spec.Name, spec.Description)
+		}
+	}
+}
+
 type epicGraphStore struct{ calls int }
 
 func (s *epicGraphStore) SyncTasks(context.Context, []core.Task) error {
