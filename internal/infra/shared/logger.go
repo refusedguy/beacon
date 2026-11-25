@@ -6,6 +6,7 @@ import (
 	"os"
 )
 
+// NewLogger returns a JSON logger that redacts secrets from messages and attributes.
 func NewLogger(level string) *slog.Logger {
 	var l slog.Level
 	switch level {
@@ -18,33 +19,54 @@ func NewLogger(level string) *slog.Logger {
 	default:
 		l = slog.LevelInfo
 	}
-	return slog.New(redactHandler{slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l})})
+	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l})
+	return slog.New(redactHandler{h})
 }
 
+// redactHandler is the single slog handler that applies Redact to log output.
 type redactHandler struct{ slog.Handler }
 
 func (h redactHandler) Handle(ctx context.Context, r slog.Record) error {
-	nr := slog.NewRecord(r.Time, r.Level, slog.StringValue(Redact(r.Message)).String(), r.PC)
+	nr := slog.NewRecord(r.Time, r.Level, Redact(r.Message), r.PC)
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Value.Kind() == slog.KindString {
-			a.Value = slog.StringValue(Redact(a.Value.String()))
-		}
-		if e, ok := a.Value.Any().(error); ok {
-			a.Value = slog.StringValue(Redact(e.Error()))
-		}
-		nr.AddAttrs(a)
+		nr.AddAttrs(redactAttr(a))
 		return true
 	})
 	return h.Handler.Handle(ctx, nr)
 }
 
 func (h redactHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	clean := make([]slog.Attr, 0, len(attrs))
-	for _, a := range attrs {
-		if a.Value.Kind() == slog.KindString {
-			a.Value = slog.StringValue(Redact(a.Value.String()))
-		}
-		clean = append(clean, a)
+	clean := make([]slog.Attr, len(attrs))
+	for i, a := range attrs {
+		clean[i] = redactAttr(a)
 	}
 	return redactHandler{h.Handler.WithAttrs(clean)}
+}
+
+func (h redactHandler) WithGroup(name string) slog.Handler {
+	return redactHandler{h.Handler.WithGroup(name)}
+}
+
+func redactAttr(a slog.Attr) slog.Attr {
+	a.Value = redactValue(a.Value)
+	return a
+}
+
+func redactValue(v slog.Value) slog.Value {
+	switch v.Kind() {
+	case slog.KindString:
+		return slog.StringValue(Redact(v.String()))
+	case slog.KindAny:
+		if err, ok := v.Any().(error); ok {
+			return slog.StringValue(Redact(err.Error()))
+		}
+	case slog.KindGroup:
+		attrs := v.Group()
+		clean := make([]slog.Attr, len(attrs))
+		for i, a := range attrs {
+			clean[i] = redactAttr(a)
+		}
+		return slog.GroupValue(clean...)
+	}
+	return v
 }
