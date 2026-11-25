@@ -400,12 +400,14 @@ func TestRunEventsRecordStateTransitions(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	run := core.NewRun("r1", "T-1", time.Now().UTC().Add(-time.Minute))
+	base := time.Now().UTC().Add(-time.Minute)
+	run := core.NewRun("r1", "T-1", base)
 	if err := store.Save(ctx, run); err != nil {
 		t.Fatal(err)
 	}
-	for _, state := range []core.RunState{core.RunRunning, core.RunWaitingCI, core.RunBlocked} {
+	for i, state := range []core.RunState{core.RunRunning, core.RunWaitingCI, core.RunBlocked} {
 		run.State = state
+		run.UpdatedAt = base.Add(time.Duration(i+1) * time.Second)
 		if err := store.Save(ctx, run); err != nil {
 			t.Fatal(err)
 		}
@@ -430,6 +432,40 @@ func TestRunEventsRecordStateTransitions(t *testing.T) {
 		if i > 0 && !events[i].At.After(events[i-1].At) {
 			t.Errorf("event[%d] time %s is not after %s", i, events[i].At, events[i-1].At)
 		}
+	}
+}
+
+func TestSavePreservesDomainUpdatedAt(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	stamp := time.Date(2026, 11, 25, 10, 30, 0, 123456789, time.UTC)
+	run := core.NewRun("r1", "T-1", stamp.Add(-time.Minute))
+	run.UpdatedAt = stamp
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if !run.UpdatedAt.Equal(stamp) {
+		t.Fatalf("UpdatedAt after save = %s, want %s", run.UpdatedAt, stamp)
+	}
+	got, err := store.Get(ctx, "r1")
+	if err != nil || got == nil {
+		t.Fatalf("get = %+v err=%v", got, err)
+	}
+	if !got.UpdatedAt.Equal(stamp) {
+		t.Fatalf("stored UpdatedAt = %s, want %s", got.UpdatedAt, stamp)
+	}
+
+	blank := core.NewRun("r2", "T-1", time.Time{})
+	if err := store.Save(ctx, blank); err != nil {
+		t.Fatal(err)
+	}
+	if blank.CreatedAt.IsZero() || blank.UpdatedAt.IsZero() {
+		t.Fatalf("missing timestamps were not stamped: %+v", blank)
 	}
 }
 
