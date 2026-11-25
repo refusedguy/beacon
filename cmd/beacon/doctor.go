@@ -140,7 +140,7 @@ func doctorConfigChecks(root, path string) ([]doctorCheck, config.Config) {
 	} else {
 		checks = append(checks, doctorCheck{"harness.command", checkOK, "worker"})
 	}
-	checks = append(checks, doctorTokenCheck(cfg))
+	checks = append(checks, doctorTokenCheck(cfg), doctorWebhookCheck(cfg))
 	if len(cfg.Merge.RequiredChecks) == 0 {
 		checks = append(checks, doctorCheck{"required_checks", checkWarn, "none configured"})
 	} else {
@@ -166,6 +166,16 @@ func doctorTokenCheck(cfg config.Config) doctorCheck {
 		return doctorCheck{"scm token", checkOK, "present via env or config"}
 	}
 	return doctorCheck{"scm token", checkWarn, "not set; export " + cfg.SCM.TokenEnv}
+}
+
+func doctorWebhookCheck(cfg config.Config) doctorCheck {
+	if !cfg.Webhook.Enabled {
+		return doctorCheck{"webhook", checkOK, "disabled"}
+	}
+	if cfg.Webhook.Secret == "" {
+		return doctorCheck{"webhook", checkFail, "enabled without a secret; set webhook.secret or webhook.secret_env"}
+	}
+	return doctorCheck{"webhook", checkOK, "enabled with a secret"}
 }
 
 func doctorTasksCheck(root string) doctorCheck {

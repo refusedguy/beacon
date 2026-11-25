@@ -111,17 +111,53 @@ func TestWebhookRejectsBadRequest(t *testing.T) {
 	}
 }
 
-func TestWebhookWithoutSecretAcceptsUnsigned(t *testing.T) {
+func TestWebhookWithoutSecretRejectsUnsigned(t *testing.T) {
 	ch := make(chan int, 1)
 	w := &Webhook{Changes: ch}
 	rw := serve(w, http.MethodPost, `{"object_attributes":{"iid":5}}`, map[string]string{
 		"X-Gitlab-Event": "Merge Request Hook",
 	})
-	if rw.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202", rw.Code)
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rw.Code)
 	}
-	if len(ch) != 1 || <-ch != 5 {
-		t.Fatalf("want MR 5 emitted once, channel len %d", len(ch))
+	if len(ch) != 0 {
+		t.Fatalf("unexpected emission: %d", <-ch)
+	}
+	if w.valid(httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader("{}")), []byte("{}")) {
+		t.Fatal("valid accepted a request without a secret")
+	}
+}
+
+func TestWebhookSignedAndUnsignedPosts(t *testing.T) {
+	body := `{"number":42,"pull_request":{"number":42},"object_attributes":{"iid":42}}`
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    int
+	}{
+		{"github signed", map[string]string{
+			"X-Hub-Signature-256": githubSignature(webhookSecret, []byte(body)),
+		}, http.StatusAccepted},
+		{"github unsigned", nil, http.StatusUnauthorized},
+		{"gitlab signed", map[string]string{"X-Gitlab-Token": webhookSecret}, http.StatusAccepted},
+		{"gitlab unsigned", map[string]string{"X-Gitlab-Event": "Merge Request Hook"}, http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := make(chan int, 1)
+			w := &Webhook{Secret: webhookSecret, Changes: ch}
+			rw := serve(w, http.MethodPost, body, tc.headers)
+			if rw.Code != tc.want {
+				t.Fatalf("status = %d, want %d: %s", rw.Code, tc.want, rw.Body.String())
+			}
+			if tc.want == http.StatusAccepted {
+				if len(ch) != 1 || <-ch != 42 {
+					t.Fatalf("want PR 42 emitted once, channel len %d", len(ch))
+				}
+			} else if len(ch) != 0 {
+				t.Fatalf("unexpected emission: %d", <-ch)
+			}
+		})
 	}
 }
 
@@ -131,27 +167,24 @@ func TestWebhookProviderHeaderSelectsParser(t *testing.T) {
 	tests := []struct {
 		name    string
 		body    string
-		secret  string
 		headers map[string]string
 		want    int
 	}{
-		{"github with auth header", githubFirst, webhookSecret, map[string]string{
+		{"github with auth header", githubFirst, map[string]string{
 			"X-Hub-Signature-256": githubSignature(webhookSecret, []byte(githubFirst)),
 		}, 42},
-		{"gitlab with auth header", gitlabFirst, webhookSecret, map[string]string{
+		{"gitlab with auth header", gitlabFirst, map[string]string{
 			"X-Gitlab-Token": webhookSecret,
 		}, 77},
-		{"github with event header", gitlabFirst, "", map[string]string{
+		{"github event before gitlab token", gitlabFirst, map[string]string{
 			"X-GitHub-Event": "pull_request",
+			"X-Gitlab-Token": webhookSecret,
 		}, 42},
-		{"gitlab with event header", githubFirst, "", map[string]string{
-			"X-Gitlab-Event": "Merge Request Hook",
-		}, 77},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ch := make(chan int, 1)
-			w := &Webhook{Secret: tc.secret, Changes: ch}
+			w := &Webhook{Secret: webhookSecret, Changes: ch}
 			rw := serve(w, http.MethodPost, tc.body, tc.headers)
 			if rw.Code != http.StatusAccepted {
 				t.Fatalf("status = %d, want 202: %s", rw.Code, rw.Body.String())
@@ -163,17 +196,38 @@ func TestWebhookProviderHeaderSelectsParser(t *testing.T) {
 	}
 }
 
-func TestWebhookRejectsUnknownProvider(t *testing.T) {
-	ch := make(chan int, 1)
-	w := &Webhook{Changes: ch}
-	body := `{"pull_request":{"number":42},"object_attributes":{"iid":77}}`
-	rw := serve(w, http.MethodPost, body, map[string]string{
-		"X-Service": "beacon",
-	})
-	if rw.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: %s", rw.Code, rw.Body.String())
+func TestSelectPayloadAdapterEventHeaders(t *testing.T) {
+	body := []byte(`{"pull_request":{"number":42},"object_attributes":{"iid":77}}`)
+	cases := []struct {
+		header string
+		want   int
+	}{
+		{"X-GitHub-Event", 42},
+		{"X-Gitlab-Event", 77},
 	}
-	if len(ch) != 0 {
-		t.Fatalf("unexpected emission: %d", <-ch)
+	for _, tc := range cases {
+		t.Run(tc.header, func(t *testing.T) {
+			h := http.Header{}
+			h.Set(tc.header, "event")
+			adapter := selectPayloadAdapter(h)
+			if adapter == nil {
+				t.Fatal("no adapter selected")
+			}
+			got, err := adapter(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("PR = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSelectPayloadAdapterRejectsUnknownProvider(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Service", "beacon")
+	if adapter := selectPayloadAdapter(h); adapter != nil {
+		t.Fatal("unknown provider selected an adapter")
 	}
 }
