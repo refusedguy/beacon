@@ -16,6 +16,7 @@ type StatusStore interface {
 	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
 }
 
+// StatusService lists active and recently finished runs from a store.
 type StatusService struct{ Store StatusStore }
 
 // DefaultRecentLimit is the number of finished runs returned when no limit is set.
@@ -36,10 +37,12 @@ type DecisionCount struct {
 	Count   int
 }
 
+// Active returns the runs that have not reached a terminal state.
 func (s StatusService) Active(ctx context.Context) ([]*core.Run, error) {
 	return s.Store.ListActive(ctx)
 }
 
+// Recent returns finished runs, using DefaultRecentLimit when limit is not positive.
 func (s StatusService) Recent(ctx context.Context, limit int) ([]*core.Run, error) {
 	if limit <= 0 {
 		limit = DefaultRecentLimit
@@ -118,6 +121,7 @@ type WaitStore interface {
 	Get(ctx context.Context, id core.RunID) (*core.Run, error)
 }
 
+// WaitService polls one run until it reaches a verdict or a terminal state.
 type WaitService struct {
 	Store    WaitStore
 	Interval time.Duration
@@ -289,6 +293,7 @@ type SnapshotStore interface {
 	DecisionCounts(ctx context.Context, runIDs []string) ([]DecisionCount, error)
 }
 
+// SnapshotService builds the operator panel's response from batched store reads.
 type SnapshotService struct {
 	Store                SnapshotStore
 	RecentLimit          int
