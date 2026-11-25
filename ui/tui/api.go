@@ -21,6 +21,9 @@ const (
 	responseLimit  = 4 << 20
 )
 
+// Run is the monitor's copy of the daemon's loopback wire run. The TUI is a
+// separate module and cannot import pkg/core, so these field names must stay
+// in sync with the DTO the daemon emits.
 type Run struct {
 	ID        string `json:"id"`
 	TaskID    string `json:"task_id"`
@@ -77,6 +80,7 @@ type ControlRequest struct {
 	SHA    string `json:"sha,omitempty"`
 }
 
+// ControlResult is the monitor's copy of the daemon's loopback control answer.
 type ControlResult struct {
 	OK      bool   `json:"ok"`
 	RunID   string `json:"run_id"`
