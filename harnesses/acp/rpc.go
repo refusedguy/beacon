@@ -64,6 +64,60 @@ type stdioProcess struct {
 	stdout io.ReadCloser
 	mu     sync.Mutex
 	next   int64
+	buf    json.RawMessage
+}
+
+// maxWatchers caps the cancellation watcher goroutines shared by every stdio
+// process. A call borrows one watcher for its lifetime instead of starting a
+// goroutine per RPC.
+const maxWatchers = 8
+
+type watchJob struct {
+	ctx  context.Context
+	done <-chan struct{}
+	kill func()
+}
+
+type rpcPool struct {
+	once sync.Once
+	jobs chan watchJob
+	sem  chan struct{}
+}
+
+var watchers rpcPool
+
+func (p *rpcPool) init() {
+	p.once.Do(func() {
+		p.jobs = make(chan watchJob, maxWatchers)
+		p.sem = make(chan struct{}, maxWatchers)
+		for i := 0; i < maxWatchers; i++ {
+			go func() {
+				for job := range p.jobs {
+					select {
+					case <-job.ctx.Done():
+						job.kill()
+					case <-job.done:
+					}
+				}
+			}()
+		}
+	})
+}
+
+// watch borrows a watcher that kills the process if ctx ends before the call
+// finishes. The returned function ends the watch and frees the slot.
+func (p *rpcPool) watch(ctx context.Context, kill func()) func() {
+	p.init()
+	p.sem <- struct{}{}
+	done := make(chan struct{})
+	p.jobs <- watchJob{ctx: ctx, done: done, kill: kill}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			<-p.sem
+		})
+	}
 }
 
 func startProcess(command, cwd string) (*stdioProcess, error) {
@@ -104,26 +158,30 @@ func (p *stdioProcess) call(
 	defer p.mu.Unlock()
 
 	id := atomic.AddInt64(&p.next, 1)
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = p.cmd.Process.Kill()
-		case <-done:
-		}
-	}()
+	release := watchers.watch(ctx, func() { _ = p.cmd.Process.Kill() })
+	defer release()
 
 	if err := p.enc.Encode(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
 		return err
 	}
 	for {
-		var raw json.RawMessage
-		if err := p.dec.Decode(&raw); err != nil {
+		if err := p.dec.Decode(&p.buf); err != nil {
 			return err
 		}
+		raw := p.buf
 		var env rpcEnvelope
 		if err := json.Unmarshal(raw, &env); err != nil {
+			continue
+		}
+		// A message with a method is a request or notification from the
+		// agent, never the response to this call. Its ID may collide with
+		// ours, so check the method before matching IDs.
+		if env.Method != "" {
+			if env.ID != nil {
+				p.answer(env.ID, env.Method, env.Params)
+			} else if onNote != nil {
+				onNote(raw)
+			}
 			continue
 		}
 		if env.ID != nil && *env.ID == id {
@@ -137,13 +195,6 @@ func (p *stdioProcess) call(
 				return json.Unmarshal(env.Result, out)
 			}
 			return nil
-		}
-		if env.ID != nil && env.Method != "" {
-			p.answer(env.ID, env.Method, env.Params)
-			continue
-		}
-		if onNote != nil && env.Method != "" {
-			onNote(raw)
 		}
 	}
 }

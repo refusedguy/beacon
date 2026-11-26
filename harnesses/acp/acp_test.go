@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -346,6 +348,52 @@ func TestNotifyParentIsNoop(t *testing.T) {
 	h := testHarness(standardProcess())
 	if err := h.NotifyParent(context.Background(), "sess_1", "hello"); err != nil {
 		t.Fatalf("notify parent: %v", err)
+	}
+}
+
+func TestOneProcessHandlesManyIdenticalRPCs(t *testing.T) {
+	t.Setenv("ACP_FAKE_AGENT", "1")
+	var starts atomic.Int64
+	h := NewFromConfig(Config{Command: "fake-agent", Timeout: 5 * time.Second})
+	h.newProcess = func(_, cwd string) (process, error) {
+		starts.Add(1)
+		return startProcess(os.Args[0], cwd)
+	}
+
+	ctx := context.Background()
+	sess, err := h.Spawn(ctx, core.SpawnRequest{
+		RunID:     "run_many",
+		Workspace: core.Workspace{Path: t.TempDir()},
+		Prompt:    "do the work",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.PR != 99 {
+		t.Fatalf("spawn PR = %d, want 99", sess.PR)
+	}
+	s, ok := h.session(sess.ID)
+	if !ok {
+		t.Fatalf("session %q not found", sess.ID)
+	}
+
+	baseline := runtime.NumGoroutine()
+	for i := 0; i < 999; i++ {
+		out, err := h.prompt(ctx, s, "same message")
+		if err != nil {
+			t.Fatalf("rpc %d: %v", i, err)
+		}
+		if out != "pull/99" {
+			t.Fatalf("rpc %d output = %q, want pull/99", i, out)
+		}
+	}
+	runtime.Gosched()
+
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("process starts = %d, want 1", got)
+	}
+	if grew := runtime.NumGoroutine() - baseline; grew > maxWatchers+8 {
+		t.Fatalf("goroutines grew by %d, want at most %d", grew, maxWatchers+8)
 	}
 }
 
