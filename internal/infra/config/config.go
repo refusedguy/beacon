@@ -221,6 +221,15 @@ func Load(path string) (Config, error) {
 	if err := c.validate(); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
+	applyDefaults(&c)
+	resolveRequiredChecks(&c, path)
+	return c, nil
+}
+
+// applyDefaults fills unset scalar settings after validation. Load calls it
+// so every caller gets the same values, including the rebase cap that used to
+// live in the reconciler.
+func applyDefaults(c *Config) {
 	if c.StateDB == "" {
 		c.StateDB = ".beacon/state.db"
 	}
@@ -251,8 +260,6 @@ func Load(path string) (Config, error) {
 	if c.Harness.WorkerInstructions == "" {
 		c.Harness.WorkerInstructions = DefaultWorkerInstructions
 	}
-	resolveRequiredChecks(&c, path)
-	return c, nil
 }
 
 // resolveRequiredChecks replaces the configured names with the job names in
