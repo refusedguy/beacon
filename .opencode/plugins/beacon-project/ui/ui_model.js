@@ -411,6 +411,10 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
   const explicit = root ?? deps.root ?? null
   const exists = deps.existsSync ?? fsExistsSync
   let current = null, cli = null, verified = false, filterRoot = null, lastDispatch = null
+  // One verified source serves a dispatch click and its follow-up read. The
+  // dispatch owns the only CLI process; the refresh reuses the runs it returned
+  // and the last snapshot instead of spawning beacon status again.
+  let lastSnapshot = null, dispatchRuns = null, dispatching = false
   const rootOf = () => {
     const located = explicit ?? projectRoot(ctx)
     const next = located ?? process.cwd()
@@ -436,6 +440,28 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
     if (!project) return view
     return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
   }
+  // The CLI already loaded the task cards when it dispatched. Take the titles
+  // from the queue in the last snapshot instead of reading the cards again, and
+  // keep the wire shape unchanged.
+  const adoptDispatch = (result) => {
+    const runs = list(pick(result, ["Runs", "runs", "startedRuns"]), normalizeRun)
+    if (!runs.length) return
+    const titles = new Map()
+    for (const item of list(lastSnapshot?.queue, (q) => q)) if (item.id && item.title) titles.set(item.id, item.title)
+    dispatchRuns = runs.map((run) => (!run.title && titles.has(run.taskID)
+      ? { ...run, title: titles.get(run.taskID) } : run))
+  }
+  const mergeDispatch = (base) => {
+    const incoming = dispatchRuns ?? []
+    dispatchRuns = null
+    if (!incoming.length) return base
+    const ids = new Set(incoming.map((run) => run.id).filter(Boolean))
+    return {
+      ...(base ?? normalizeSnapshot({})),
+      active: [...incoming, ...list(base?.active, (r) => r).filter((r) => !ids.has(r.id))],
+      recent: list(base?.recent, (r) => r).filter((r) => !ids.has(r.id)),
+    }
+  }
   const fallback = async (name, input, timing = null) => {
     rootOf()
     const project = filterRoot, isVerified = verified
@@ -445,6 +471,9 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
     // cwd guess stays behind RPC. RPC remains the accelerator for control and
     // dispatch.
     if (name === "snapshot" && isVerified) {
+      // A dispatch in flight will hand back its new runs. Rendering the last
+      // snapshot now keeps the click at one CLI process lifetime.
+      if (dispatching) return snapshotView(lastSnapshot ?? normalizeSnapshot({}), project)
       try { return snapshotView(await cli.snapshot(input, timing), project) } catch {}
     }
     let value, usedRPC = false
@@ -461,7 +490,14 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
       const id = requestId("snapshot", input ?? limits)
       const chain = parent ? ` parent=${parent.id} clickElapsedMs=${elapsedMs(now(), parent.startedAt)}` : ""
       try {
-        const value = await fallback("snapshot", input)
+        let value
+        if (dispatchRuns?.length) {
+          value = mergeDispatch(lastSnapshot)
+          log(`beacon status refresh from dispatch id=${id}${chain}`)
+        } else {
+          value = await fallback("snapshot", input)
+        }
+        lastSnapshot = value
         log(`beacon status refresh ok id=${id}${chain} durationMs=${elapsedMs(now(), startedAt)}`)
         return value
       } catch (error) {
@@ -473,8 +509,12 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
     dispatch: (input) => {
       const timing = { id: requestId("dispatch", input), startedAt: now() }
       lastDispatch = timing
+      dispatching = true
       log(`beacon dispatch click id=${timing.id}`)
-      return fallback("dispatch", input, timing)
+      return fallback("dispatch", input, timing).then(
+        (result) => { dispatching = false; adoptDispatch(result); return result },
+        (error) => { dispatching = false; throw error },
+      )
     },
     root: rootOf, verified: () => verified,
   }

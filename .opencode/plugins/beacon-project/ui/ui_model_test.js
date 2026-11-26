@@ -460,3 +460,59 @@ test("one check-state map drives row labels and summary buckets", () => {
   assert.equal(checkRow({ name: "ci" }).name, "ci")
   assert.equal(checksSummary([{ name: "ci" }]), "0/1 · 1 pending")
 })
+
+test("a dispatch click uses one CLI process and shows the dispatched run", async () => {
+  const calls = []
+  const execFile = async (program, args) => {
+    calls.push([program, ...args])
+    if (args[0] === "status") {
+      return { stdout: JSON.stringify({ active: [], recent: [], queue: [{ id: "T-1", title: "Queued title", status: "ready" }] }) }
+    }
+    return { stdout: JSON.stringify({ Runs: [{ ID: "run-1", TaskID: "T-1", State: "running", HeadSHA: "abc" }] }) }
+  }
+  const deps = {
+    command: () => ["/bin/beacon"], execFile,
+    existsSync: () => true,
+    readFileSync: () => "---\nid: T-1\ntitle: Queued title\nstatus: todo\n---\n",
+  }
+  const source = createStatusSource({ location: { project: { canonical: "/p" } } }, { root: "/p", deps })
+  await source.snapshot()
+  assert.equal(source.verified(), true)
+  assert.deepEqual(calls, [["/bin/beacon", "status", "--snapshot"]])
+  calls.length = 0
+
+  const dispatched = source.dispatch({ n: 1 })
+  const early = source.snapshot()
+  const result = await dispatched
+  const baseline = await early
+  assert.equal(baseline.active.length, 0, "the early read is the pre-dispatch snapshot")
+  assert.deepEqual(calls, [["/bin/beacon", "dispatch", "1"]], "the early read starts no second process")
+
+  const next = await source.snapshot()
+  assert.deepEqual(calls, [["/bin/beacon", "dispatch", "1"]], "the follow-up read starts no second process")
+  assert.equal(result.Runs.length, 1)
+  assert.equal(next.active.length, 1)
+  assert.equal(next.active[0].id, "run-1")
+  assert.equal(next.active[0].title, "Queued title", "the title comes from the queue already loaded")
+})
+
+test("a dispatch without run data still reads the snapshot on refresh", async () => {
+  const calls = []
+  const execFile = async (program, args) => {
+    calls.push([program, ...args])
+    return { stdout: args[0] === "dispatch" ? '{"started":1}' : '{"active":[],"recent":[]}' }
+  }
+  const source = createStatusSource({ location: { project: { canonical: "/p" } } }, {
+    root: "/p",
+    deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => true, readFileSync: () => "" },
+  })
+  await source.snapshot()
+  calls.length = 0
+  await source.dispatch({ n: 1 })
+  const next = await source.snapshot()
+  assert.deepEqual(calls, [
+    ["/bin/beacon", "dispatch", "1"],
+    ["/bin/beacon", "status", "--snapshot"],
+  ])
+  assert.deepEqual(next.active, [])
+})
