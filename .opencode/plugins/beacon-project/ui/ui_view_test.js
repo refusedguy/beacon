@@ -5,8 +5,8 @@ import { NOW, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
-  SIDEBAR_OPEN, STATE_BAR_WIDTH, activeRuns, cleanErrorMessage, compactReason, detailActions, detailCommand,
-  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel, recentRuns, renderSnapshotLines,
+  SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
+  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel, renderSnapshotLines,
   runLineItems, sidebarModel, stateBarItem, truncate,
 } = ui
 
@@ -138,7 +138,7 @@ test("recent shows one terminal run per task and skips tasks active again", () =
       makeRun({ ID: "r4", TaskID: "T-C", State: "merged", Reason: "automatic rebase" }),
     ],
   }
-  const recent = recentRuns(snapshot)
+  const recent = sidebarModel(snapshot, null, NOW).recent
   assert.deepEqual(recent.map((r) => r.id), ["r2", "r4"], "the newest cause survives and active tasks are hidden")
   const items = sidebarModel(snapshot, null, NOW).items
   assert.ok(items.some((i) => i.status === "dirty worktree"))
@@ -555,8 +555,8 @@ test("one snapshot renders the same through every public entry point", () => {
     metrics: { merge_count: 12 },
   }
   const model = sidebarModel(snapshot, null, NOW)
-  assert.deepEqual(model.active.map((r) => r.id), activeRuns(snapshot).map((r) => r.id))
-  assert.deepEqual(model.recent.map((r) => r.id), recentRuns(snapshot).map((r) => r.id))
+  assert.deepEqual(model.active.map((r) => r.id), ["a1", "a2", "a3"])
+  assert.deepEqual(model.recent.map((r) => r.id), ["r1"])
   assert.deepEqual(model.counts, stateBarItem(snapshot).counts)
   const lines = model.items
     .map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))

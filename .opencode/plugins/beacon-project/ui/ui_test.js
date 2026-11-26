@@ -4,7 +4,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   ACTION_NAMES, DECISION_LIMIT, PANEL_NAME, beaconStatusDefinition,
-  createDetailMount, createRowMount, defineBeaconStatus, detailLines, normalizeRun, snapshotLineItems,
+  createDetailMount, createLineMount, defineBeaconStatus, detailLines, normalizeRun, snapshotLineItems,
 } from "./ui.js"
 import { NOW, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -21,10 +21,9 @@ function signals() {
 }
 
 test("rendered rows use native flex primitives with no mid-word wrap", () => {
-  const mount = createRowMount(solidModule(), { color: (k) => `theme.${k}`, BOLD: 1 })
-  const container = { children: [], tag: "box" }
-  mount(container, () => snapshotLineItems({ active: [makeRun()], recent: [] }, null, NOW), 8)
-  const row = container.children.find((box) => box.item?.runID === "run-1")
+  const mount = createLineMount(solidModule(), { color: (k) => `theme.${k}`, BOLD: 1, maxLines: 8 })
+  mount.apply(snapshotLineItems({ active: [makeRun()], recent: [] }, null, NOW))
+  const row = mount.node.find((box) => box.item?.runID === "run-1")
   assert.equal(row.props.flexDirection, "row")
   assert.equal(row.props.gap, 1)
   assert.equal(row.props.minWidth, 0)
@@ -51,10 +50,9 @@ test("compact header carries the human summary and all eight state counters", ()
   assert.equal(items[0].name, "Beacon")
   assert.equal(items[0].status, "1 running · 1 blocked")
   assert.equal(items[1].name, "P0 R1 C0 E0 F0 B1 M0 X0")
-  const mount = createRowMount(solidModule(), { color: (k) => `theme.${k}`, BOLD: 1 })
-  const container = { children: [], tag: "box" }
-  mount(container, () => items, 8)
-  assert.equal(container.children[0].children[2].props.content, "1 running · 1 blocked")
+  const mount = createLineMount(solidModule(), { color: (k) => `theme.${k}`, BOLD: 1, maxLines: 8 })
+  mount.apply(items)
+  assert.equal(mount.node[0].children[2].props.content, "1 running · 1 blocked")
 })
 
 test("detail hero wraps the full title and reasons, and exposes fixed action buttons", () => {

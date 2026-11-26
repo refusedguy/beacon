@@ -4,7 +4,7 @@ import assert from "node:assert/strict"
 import { solidModule, themeStub, signalStub } from "./ui_test_helpers.js"
 import {
   DETAIL_LINES, FOOTER_ROWS, PANEL_NAME, beaconStatusDefinition,
-  createCliStatusSource, createDetailMount, createRowMount,
+  createCliStatusSource, createDetailMount, createLineMount,
 } from "./ui.js"
 
 test("CLI source forwards snapshot limits as flags", async () => {
@@ -73,8 +73,7 @@ test("row mount accepts a per-slot row budget", () => {
   const color = () => "base"
   const makeMount = (limit) => {
     const created = []
-    const mount = createRowMount(solidModule(created), { color })
-    mount({ children: [] }, () => [], limit)
+    createLineMount(solidModule(created), { color, maxLines: limit })
     return created.length
   }
   const footer = makeMount(FOOTER_ROWS)

@@ -6,14 +6,14 @@ import * as ui from "./ui.js"
 const {
   BeaconStatusRpc, CliStatusSource, EMPTY_SNAPSHOT, RECENT_LIMIT,
   cleanErrorMessage, createCliStatusSource, createStatusSource,
-  defineBeaconStatusPlugin, errorMessage, normalizeRun, normalizeSnapshot,
+  defineBeaconStatus, errorMessage, normalizeRun, normalizeSnapshot,
   parseSnapshot, renderSnapshotLines, default: beaconStatus,
   beaconStatusDefinition,
 } = ui
 
 test("default export is a Plugin.define definition", () => {
   let received = null
-  const result = defineBeaconStatusPlugin({ define: (definition) => { received = definition; return definition } })
+  const result = defineBeaconStatus((definition) => { received = definition; return definition })
   assert.equal(received, result)
   assert.equal(received, beaconStatusDefinition)
   assert.equal(beaconStatus.id, "beacon-project-status")

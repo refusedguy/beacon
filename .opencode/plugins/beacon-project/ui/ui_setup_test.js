@@ -3,7 +3,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { NOW, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
-const { EMPTY_SNAPSHOT, beaconStatusDefinition, createRowMount, snapshotLineItems, stateBarItem } = ui
+const { EMPTY_SNAPSHOT, beaconStatusDefinition, createLineMount, snapshotLineItems, stateBarItem } = ui
 
 function barNode(container) {
   return container.children.find((child) =>
@@ -88,21 +88,20 @@ test("row mount reuses nodes across refreshes and keeps the click handler", () =
     setProp: (node, name, value) => { node.props[name] = value },
   }
   const picked = []
-  const mount = createRowMount(uiApi, {
-    color: (key) => `theme.${key}`, BOLD: 1, onRow: (item) => picked.push(item), hoverBg: "theme.hover",
-    maxRows: 8,
+  const mount = createLineMount(uiApi, {
+    color: (key) => `theme.${key}`, BOLD: 1, onItem: (item) => picked.push(item), hoverBg: "theme.hover",
+    maxLines: 12,
   })
-  const container = { children: [], tag: "box" }
   let items = snapshotLineItems({ active: [makeRun({ title: "First" })], recent: [] }, null, NOW)
-  const apply = mount(container, () => items, 12)
+  mount.apply(items)
   const afterFirst = created.length
-  const row = container.children.find((box) => box.item?.runID === "run-1")
+  const row = mount.node.find((box) => box.item?.runID === "run-1")
   const handler = row.props.onMouseDown
 
   items = snapshotLineItems({ active: [makeRun({ State: "blocked", title: "Second" })], recent: [] }, null, NOW)
-  apply()
+  mount.apply(items)
   assert.equal(created.length, afterFirst, "refresh must not create nodes")
-  assert.equal(container.children.find((box) => box.item?.runID === "run-1"), row, "row identity is stable")
+  assert.equal(mount.node.find((box) => box.item?.runID === "run-1"), row, "row identity is stable")
   assert.equal(row.props.onMouseDown, handler, "click handler survives")
   assert.equal(row.children[1].props.content, "Second")
   assert.equal(row.children[1].props.fg, "theme.error", "the name follows the state color")
@@ -112,11 +111,11 @@ test("row mount reuses nodes across refreshes and keeps the click handler", () =
   assert.equal(picked.length, 1)
   assert.equal(picked[0].runID, "run-1")
 
-  const beforeHide = container.children.filter((box) => box.props.visible === true).length
+  const beforeHide = mount.node.filter((box) => box.props.visible === true).length
   items = snapshotLineItems(EMPTY_SNAPSHOT, null, NOW)
-  apply()
+  mount.apply(items)
   assert.equal(created.length, afterFirst, "hiding rows must not create nodes")
-  assert.ok(container.children.filter((box) => box.props.visible === true).length < beforeHide)
+  assert.ok(mount.node.filter((box) => box.props.visible === true).length < beforeHide)
 })
 
 test("setup defers every createElement to a slot render callback", async () => {

@@ -37,16 +37,6 @@ import { projectRoot } from "../state/location.js"
 import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "../state/options.js"
 
 export const FOOTER_ROWS = 1
-// Compatibility adapter for tests and callers that drive one pooled row list.
-export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg, maxRows }) {
-  return (container, items, rowLimit = maxRows) => {
-    const mount = createLineMount(ui, { color, BOLD, onItem: onRow, hoverBg, maxLines: rowLimit })
-    mount.node.forEach((node) => ui.insert(container, node))
-    const apply = () => mount.apply(items())
-    apply()
-    return apply
-  }
-}
 
 // One notification per run that reaches a terminal or blocked state. The
 // caller owns the state map so each setup keeps its own first-render baseline.
@@ -356,5 +346,4 @@ export const beaconStatusDefinition = { id: "beacon-project-status", setup }
 // The caller supplies define so tests can build the plugin with a double. The
 // host supplies Plugin here, so its own OpenTUI and Solid instances are used.
 export function defineBeaconStatus(define) { return define(beaconStatusDefinition) }
-export function defineBeaconStatusPlugin(Plugin) { return defineBeaconStatus(Plugin.define) }
 export default Plugin.define(beaconStatusDefinition)

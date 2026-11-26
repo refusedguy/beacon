@@ -1,7 +1,7 @@
 // Pure view helpers for the Beacon panels. No TUI imports live here so these
 // functions stay testable with plain Node and shared by every slot.
 import {
-  DECISION_LIMIT, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH, RECENT_LIMIT,
+  DECISION_LIMIT, PANEL_NAME, REASON_WIDTH, RECENT_LIMIT,
   normalizeSnapshot, str,
 } from "./ui_model.js"
 import {
@@ -111,9 +111,6 @@ function activeFromView(view) {
     return true
   })
 }
-export function activeRuns(snapshot = EMPTY_SNAPSHOT) {
-  return activeFromView(normalizeSnapshot(snapshot))
-}
 function recentFromViewWith(view, active) {
   const activeTasks = new Set(active.map((r) => str(r.taskID)).filter(Boolean))
   const seenTasks = new Set()
@@ -127,10 +124,6 @@ function recentFromViewWith(view, active) {
   }).slice(0, RECENT_LIMIT)
 }
 function recentFromView(view) { return recentFromViewWith(view, activeFromView(view)) }
-// Repeated closed attempts of one task collapse into its newest terminal run.
-export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
-  return recentFromView(normalizeSnapshot(snapshot))
-}
 function stateBarFromView(view, active = activeFromView(view), recent = recentFromView(view)) {
   const counts = Object.fromEntries(STATE_BAR_KEYS.map((key) => [key, 0]))
   for (const run of [...active, ...recent]) {
