@@ -1,7 +1,7 @@
 ---
 id: T-dedcd9d0
 title: Delete one-use aliases and template parameter
-status: available
+status: done
 scope:
     - cmd/beacon/serve.go
     - cmd/beacon/config_watch.go
