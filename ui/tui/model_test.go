@@ -444,9 +444,11 @@ func TestNewerSnapshotWins(t *testing.T) {
 
 // controlFixture serves a run list and one control response, counting every
 // control POST. It drives apply() from a selected run to the rendered status.
+// A non-zero status makes the control response a refusal on the wire.
 type controlFixture struct {
 	server  *httptest.Server
 	control string
+	status  int
 	posts   *int64
 }
 
@@ -463,6 +465,9 @@ func newControlFixture(t *testing.T, runID, controlBody string) *controlFixture 
 		case apiControlPath:
 			atomic.AddInt64(&posts, 1)
 			w.Header().Set("Content-Type", "application/json")
+			if f.status != 0 {
+				w.WriteHeader(f.status)
+			}
 			_, _ = io.WriteString(w, f.control)
 		default:
 			http.NotFound(w, r)
@@ -478,11 +483,12 @@ func (f *controlFixture) loaded(t *testing.T) model {
 	return m
 }
 
-// TestRefusalRendersReason is the task check. A control refusal carrying a
-// daemon reason renders that reason in the status line.
+// TestRefusalRendersReason is the task check. A control refusal arrives as a
+// 409 with the daemon's reason on the wire, and the panel shows that reason.
 func TestRefusalRendersReason(t *testing.T) {
 	const reason = "run is closed"
-	f := newControlFixture(t, "run-control", `{"ok":false,"reason":"`+reason+`"}`)
+	f := newControlFixture(t, "run-control", `{"ok":false,"action":"approve","run_id":"run-control","applied":false,"reason":"`+reason+`"}`)
+	f.status = http.StatusConflict
 	m := f.loaded(t)
 
 	raw := m.apply(ActionApprove)()
@@ -492,6 +498,9 @@ func TestRefusalRendersReason(t *testing.T) {
 	}
 	if msg.err != nil {
 		t.Fatalf("apply: %v", msg.err)
+	}
+	if msg.result.OK || msg.result.Reason != reason {
+		t.Fatalf("refusal result = %+v, want OK false and reason %q", msg.result, reason)
 	}
 	next, followUp := m.Update(msg)
 	if followUp != nil {
@@ -529,16 +538,13 @@ func TestApprovedKeepsDisplay(t *testing.T) {
 	}
 }
 
-// TestMissingAppliedUsesOK proves an omitted applied field does not turn an
-// accepted response into a refusal.
+// TestMissingAppliedUsesOK proves ok alone decides an accepted response. An
+// omitted applied field does not turn it into a refusal.
 func TestMissingAppliedUsesOK(t *testing.T) {
 	f := newControlFixture(t, "run-control", `{"ok":true,"action":"approve","run_id":"run-control"}`)
 	m := f.loaded(t)
 
 	msg := m.apply(ActionApprove)().(actionMsg)
-	if msg.applied != nil {
-		t.Fatalf("omitted applied decoded as %v, want nil", *msg.applied)
-	}
 	next, followUp := m.Update(msg)
 	if followUp == nil {
 		t.Fatal("ok true with no applied must be treated as applied")
@@ -546,27 +552,6 @@ func TestMissingAppliedUsesOK(t *testing.T) {
 	view := next.(model).View()
 	if !strings.Contains(view, "approve run-control: applied") || strings.Contains(view, "refused") {
 		t.Fatalf("view for missing applied:\n%s", view)
-	}
-}
-
-// TestAppliedFalseRendersReason proves an explicit applied false is a refusal,
-// even when ok is true, and shows the daemon reason.
-func TestAppliedFalseRendersReason(t *testing.T) {
-	const reason = "blocked by policy"
-	f := newControlFixture(t, "run-control", `{"ok":true,"applied":false,"reason":"`+reason+`"}`)
-	m := f.loaded(t)
-
-	msg := m.apply(ActionApprove)().(actionMsg)
-	if msg.applied == nil || *msg.applied {
-		t.Fatalf("applied = %v, want explicit false", msg.applied)
-	}
-	next, followUp := m.Update(msg)
-	if followUp != nil {
-		t.Fatal("refusal must not schedule a reload")
-	}
-	view := next.(model).View()
-	if !strings.Contains(view, "refused") || !strings.Contains(view, reason) {
-		t.Fatalf("view missing refusal reason %q:\n%s", reason, view)
 	}
 }
 

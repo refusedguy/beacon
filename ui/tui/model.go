@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -72,25 +70,12 @@ type runsMsg struct {
 	stale bool
 }
 
-// controlReply is the daemon's control answer as the monitor reads it. Applied
-// is a pointer so an omitted field is not read as a refusal, and Reason carries
-// the daemon's explanation when an action is refused.
-type controlReply struct {
-	OK      bool   `json:"ok"`
-	RunID   string `json:"run_id"`
-	Action  string `json:"action"`
-	Applied *bool  `json:"applied"`
-	Reason  string `json:"reason"`
-}
-
 // actionMsg carries the result of a control action.
 type actionMsg struct {
-	action  Action
-	runID   string
-	result  ControlResult
-	reason  string
-	applied *bool
-	err     error
+	action Action
+	runID  string
+	result ControlResult
+	err    error
 }
 
 // refreshMsg requests a refresh after an event. The event is a notification:
@@ -168,26 +153,12 @@ func (m model) apply(action Action) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
 		defer cancel()
-		data, err := m.client.do(ctx, http.MethodPost, apiControlPath, ControlRequest{
+		result, err := m.client.Control(ctx, ControlRequest{
 			Action: action,
 			RunID:  run.ID,
 			SHA:    run.HeadSHA,
 		})
-		if err != nil {
-			return actionMsg{action: action, runID: run.ID, err: err}
-		}
-		var reply controlReply
-		if err := json.Unmarshal(data, &reply); err != nil {
-			return actionMsg{action: action, runID: run.ID, err: fmt.Errorf("control: decode reply: %w", err)}
-		}
-		result := ControlResult{OK: reply.OK, RunID: reply.RunID, Action: reply.Action}
-		return actionMsg{
-			action:  action,
-			runID:   run.ID,
-			result:  result,
-			reason:  reply.Reason,
-			applied: reply.Applied,
-		}
+		return actionMsg{action: action, runID: run.ID, result: result, err: err}
 	}
 }
 
@@ -227,11 +198,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case msg.err != nil:
 			m.status = string(msg.action) + " " + msg.runID + ": " + msg.err.Error()
-		case !msg.result.OK || (msg.applied != nil && !*msg.applied):
+		case !msg.result.OK:
 			m.failed = true
 			m.status = string(msg.action) + " " + msg.runID + ": refused"
-			if msg.reason != "" {
-				m.status += ": " + msg.reason
+			if msg.result.Reason != "" {
+				m.status += ": " + msg.result.Reason
 			}
 		default:
 			m.status = string(msg.action) + " " + msg.runID + ": applied"

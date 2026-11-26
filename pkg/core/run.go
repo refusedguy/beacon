@@ -224,17 +224,25 @@ func NewWireEvent(ev HarnessEvent) WireEvent {
 }
 
 // WireControlResult is the loopback answer to a control request. Applied is
-// true when the action was accepted by the daemon.
+// true when the action was accepted by the daemon. Reason explains a refusal
+// and is absent on an applied result.
 type WireControlResult struct {
 	OK      bool   `json:"ok"`
 	Action  string `json:"action"`
 	RunID   string `json:"run_id"`
 	Applied bool   `json:"applied"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // NewWireControlResult reports an applied control action.
 func NewWireControlResult(action ControlAction, id RunID) WireControlResult {
 	return WireControlResult{OK: true, Action: action.String(), RunID: string(id), Applied: true}
+}
+
+// NewWireControlRefusal reports a control action the daemon refused. Reason is
+// the daemon's explanation for the monitor's status line.
+func NewWireControlRefusal(action ControlAction, id RunID, reason string) WireControlResult {
+	return WireControlResult{OK: false, Action: action.String(), RunID: string(id), Applied: false, Reason: reason}
 }
 
 // NewRun creates a pending run with the default attempt budget.
