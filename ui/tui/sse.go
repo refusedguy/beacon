@@ -22,7 +22,6 @@ type Event struct {
 
 // sseFrame is one parsed server-sent event from the daemon.
 type sseFrame struct {
-	id    string
 	event string
 	data  string
 }
@@ -119,7 +118,7 @@ func readSSE(r io.Reader, onFrame func(sseFrame)) error {
 	for scanner.Scan() {
 		line := strings.TrimSuffix(scanner.Text(), "\r")
 		if line == "" {
-			if frame.event != "" || frame.data != "" || frame.id != "" {
+			if frame.event != "" || frame.data != "" {
 				onFrame(frame)
 			}
 			frame = sseFrame{}
@@ -133,8 +132,6 @@ func readSSE(r io.Reader, onFrame func(sseFrame)) error {
 			field, value = line[:i], strings.TrimPrefix(line[i+1:], " ")
 		}
 		switch field {
-		case "id":
-			frame.id = value
 		case "event":
 			frame.event = value
 		case "data":
@@ -144,7 +141,7 @@ func readSSE(r io.Reader, onFrame func(sseFrame)) error {
 			frame.data += value
 		}
 	}
-	if frame.event != "" || frame.data != "" || frame.id != "" {
+	if frame.event != "" || frame.data != "" {
 		onFrame(frame)
 	}
 	return scanner.Err()
