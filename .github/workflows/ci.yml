@@ -16,12 +16,18 @@ on:
 permissions:
   contents: read
 
+# One dependency list keeps every Go job on the same setup-go cache.
+env:
+  GO_CACHE_DEPS: |
+    go.sum
+    ui/tui/go.sum
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  verify:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,9 +36,7 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
+          cache-dependency-path: ${{ env.GO_CACHE_DEPS }}
 
       - name: Build root module
         run: go build ./...
@@ -47,6 +51,17 @@ jobs:
           go build ./...
           rm -f tui
 
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: ${{ env.GO_CACHE_DEPS }}
+
       - name: Vet root module
         run: go vet ./...
 
@@ -57,6 +72,17 @@ jobs:
       - name: Vet TUI module
         working-directory: ui/tui
         run: go vet ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: ${{ env.GO_CACHE_DEPS }}
 
       - name: Format check
         run: test -z "$(gofmt -l cmd internal pkg harnesses ui arch_test.go)"
@@ -78,24 +104,6 @@ jobs:
 
       - name: Plugin tests
         run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test ".opencode/plugins/beacon-project/**/*_test.js"
-
-  build:
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "build passed in verify"
-
-  vet:
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "vet passed in verify"
-
-  lint:
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "lint passed in verify"
 
   test-modules:
     runs-on: ubuntu-latest
@@ -125,9 +133,7 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
+          cache-dependency-path: ${{ env.GO_CACHE_DEPS }}
 
       - name: Test ${{ matrix.module }} module
         working-directory: ${{ matrix.dir }}
@@ -178,9 +184,7 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
+          cache-dependency-path: ${{ env.GO_CACHE_DEPS }}
 
       # No timing gate. A slow runner fails this step, not the pull request.
       - name: Bounded benchmark smoke
@@ -200,7 +204,7 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-          cache-dependency-path: go.sum
+          cache-dependency-path: ${{ env.GO_CACHE_DEPS }}
 
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
