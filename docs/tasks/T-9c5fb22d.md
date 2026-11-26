@@ -1,7 +1,7 @@
 ---
 id: T-9c5fb22d
 title: Avoid full TUI reload per event
-status: available
+status: done
 scope:
     - ui/tui/model.go
     - ui/tui/model_test.go

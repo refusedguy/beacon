@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -162,4 +163,110 @@ func TestEventRefreshesRenderedRuns(t *testing.T) {
 	t.Logf("event id=%d type=%s run_id=%s", ev.ID, ev.Type, ev.RunID)
 	t.Logf("reload command returned runsMsg with %d run(s)", len(msg.runs))
 	t.Logf("rendered line: %q", strings.Split(view, "\n")[1])
+}
+
+// deltaFixture serves one runs response and counts every GET. The recorded
+// hits let a test prove that an event for a known run needs no second read.
+type deltaFixture struct {
+	server *httptest.Server
+	hits   *int64
+}
+
+func newDeltaFixture(t *testing.T, runID string) *deltaFixture {
+	t.Helper()
+	var hits int64
+	body := `{"runs":[{"id":"` + runID + `","task_id":"T-delta","state":"waiting_ci","pr":42,"updated_at":"2026-11-26T10:00:00Z"}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case apiRunsPath:
+			atomic.AddInt64(&hits, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return &deltaFixture{server: srv, hits: &hits}
+}
+
+func (f *deltaFixture) getCount() int64 {
+	return atomic.LoadInt64(f.hits)
+}
+
+// loadedModel builds a model that has completed one initial runs read. The
+// returned view is the baseline a local delta must reproduce byte for byte.
+func loadedModel(t *testing.T, c *Client) (model, string) {
+	t.Helper()
+	m := newModel(c)
+	raw := m.reload()()
+	msg, ok := raw.(runsMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("initial reload = %T %v, want runsMsg with no error", raw, msg.err)
+	}
+	next, cmd := m.Update(msg)
+	if cmd != nil {
+		t.Fatalf("runsMsg returned an unexpected command: %v", cmd)
+	}
+	loaded, ok := next.(model)
+	if !ok {
+		t.Fatalf("Update(runsMsg) returned %T, want model", next)
+	}
+	return loaded, loaded.View()
+}
+
+// TestKnownEventDeltaSkipsRunsRead proves the indexed map folds a notification
+// for one run without another GET and without changing the rendered text.
+func TestKnownEventDeltaSkipsRunsRead(t *testing.T) {
+	const runID = "run-delta"
+	f := newDeltaFixture(t, runID)
+	m, before := loadedModel(t, NewClient(f.server.URL, "tok"))
+	if got := f.getCount(); got != 1 {
+		t.Fatalf("runs GETs after load = %d, want 1", got)
+	}
+
+	ev := Event{ID: 9, Type: "idle", RunID: runID, At: "2026-11-26T11:00:00Z"}
+	next, cmd := m.Update(refreshMsg{event: ev})
+	if cmd != nil {
+		t.Fatal("a known-run event must not return a reload command")
+	}
+	if got := f.getCount(); got != 1 {
+		t.Fatalf("event caused %d runs GETs, want 1", got)
+	}
+
+	final, ok := next.(model)
+	if !ok {
+		t.Fatalf("Update(refreshMsg) returned %T, want model", next)
+	}
+	if got := final.View(); got != before {
+		t.Fatalf("delta changed the view:\nbefore:\n%s\nafter:\n%s", before, got)
+	}
+	if i, ok := final.byID[runID]; !ok || final.runs[i].UpdatedAt != ev.At {
+		t.Fatalf("delta not applied to indexed run: index=%v run=%+v", ok, final.runs[i])
+	}
+}
+
+// TestUnknownEventFallsBackToReload proves a notification that cannot be
+// applied to a known run still triggers a full runs read.
+func TestUnknownEventFallsBackToReload(t *testing.T) {
+	f := newDeltaFixture(t, "run-known")
+	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
+
+	for _, ev := range []Event{
+		{ID: 1, Type: "ping"},
+		{ID: 2, Type: "pr_changed", RunID: "run-not-loaded"},
+	} {
+		_, cmd := m.Update(refreshMsg{event: ev})
+		if cmd == nil {
+			t.Fatalf("event %+v must fall back to a reload", ev)
+		}
+		raw := cmd()
+		msg, ok := raw.(runsMsg)
+		if !ok || msg.err != nil {
+			t.Fatalf("fallback command = %T %v, want runsMsg with no error", raw, msg.err)
+		}
+		if got := f.getCount(); got < 2 {
+			t.Fatalf("fallback did not request /api/v1/runs: GETs = %d", got)
+		}
+	}
 }
