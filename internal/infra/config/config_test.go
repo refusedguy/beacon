@@ -589,6 +589,46 @@ func TestLoadWorkflowRequiredChecksFallsBackToExplicitList(t *testing.T) {
 	}
 }
 
+func TestLoadWorkflowModeUsesDetectedNamesOverConfiguredFallback(t *testing.T) {
+	// The live config selects workflow mode and keeps build/vet/test/lint only
+	// as a fallback. With a workflow present, detection wins and the fallback
+	// names stop satisfying the policy. Names are read from the workflow, so
+	// this test never pins a particular CI job name.
+	fallback := []string{"build", "vet", "test", "lint"}
+	const workflow = "name: CI\njobs:\n" +
+		"  gate:\n    runs-on: ubuntu-latest\n" +
+		"  suite:\n    runs-on: ubuntu-latest\n"
+	path := writeWorkflowConfig(t,
+		"merge:\n  required_checks_mode: workflow\n  required_checks: [build, vet, test, lint]\n",
+		workflow)
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	if c.Merge.RequiredChecksMode != RequiredChecksWorkflow {
+		t.Fatalf("required_checks_mode = %q, want %q", c.Merge.RequiredChecksMode, RequiredChecksWorkflow)
+	}
+	want := DetectRequiredChecks(projectRootFromConfigPath(path))
+	if !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
+		t.Fatalf("required_checks = %v, want detected %v", c.Merge.RequiredChecks, want)
+	}
+	if reflect.DeepEqual(c.Merge.RequiredChecks, fallback) {
+		t.Fatalf("configured fallback was used despite workflow detection: %v", c.Merge.RequiredChecks)
+	}
+
+	p := policy.New(policy.Config{RequiredChecks: c.Merge.RequiredChecks})
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "build", State: core.CheckSuccess},
+		{Name: "vet", State: core.CheckSuccess},
+		{Name: "test", State: core.CheckSuccess},
+		{Name: "lint", State: core.CheckSuccess},
+	}}
+	if got := p.Evaluate(obs); got.Verdict != core.VerdictWait || got.Criterion != "required_checks" {
+		t.Fatalf("stale fallback names satisfied the policy: %+v", got)
+	}
+}
+
 func TestLoadRejectsUnknownRequiredChecksMode(t *testing.T) {
 	_, err := Load(writeConfig(t, "merge:\n  required_checks_mode: magic\n"))
 	if err == nil {
