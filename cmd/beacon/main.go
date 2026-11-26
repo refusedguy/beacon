@@ -139,6 +139,7 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
+	parentSession = firstNonEmpty(parentSession, cfg.Harness.ParentSessionID)
 	infra, err := wireInfra(cfg, root, parentSession)
 	if err != nil {
 		return nil, err
@@ -244,6 +245,9 @@ func buildInfra(c infraConstructors) (*wiredInfra, error) {
 // reloadable wrappers are injected here so no service is built with an
 // original adapter and patched afterwards.
 func wireServices(cfg config.Config, root, parentSession string, infra *wiredInfra, h core.AgentHarness, p core.MergePolicy, resolveModel app.ModelResolver) *wiring {
+	// wire passes the resolved parent, but direct callers may supply only the
+	// environment value. Resolve once here so both services agree on it.
+	parentSession = firstNonEmpty(parentSession, cfg.Harness.ParentSessionID)
 	workspaceRoot := core.Workspace{Path: root, Branch: cfg.BaseBranch}
 	if refresher, ok := h.(core.WorktreeRefresher); ok {
 		infra.workspace.Refresher = refresher
@@ -265,7 +269,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		Concurrency:        core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
 		StrictScope:        cfg.StrictScope,
 		MaxAttempts:        cfg.Merge.MaxAttempts,
-		ParentSessionID:    firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
+		ParentSessionID:    parentSession,
 		WorkerInstructions: cfg.Harness.WorkerInstructions,
 		ResolveModel:       resolveModel,
 		Decisions:          infra.decisions,
@@ -277,8 +281,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		}
 	}}
 	recon := newReconciler(cfg, infra.store, infra.scm, h, p,
-		infra.source, infra.workspace, disp, infra.changes,
-		firstNonEmpty(parentSession, cfg.Harness.ParentSessionID))
+		infra.source, infra.workspace, disp, infra.changes, parentSession)
 	recon.Decisions = infra.decisions
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: h,
@@ -320,7 +323,7 @@ func newReconciler(
 		Store: store, SCM: scmGW, Policy: p, Harness: h,
 		Source: source, Workspace: wt,
 		Notifier:   notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
-		Dispatcher: disp, Changes: changes, Repo: cfg.SCM.Owner + "/" + cfg.SCM.Repo,
+		Dispatcher: disp, Changes: changes, Repo: cfg.RepoSlug(),
 		BaseBranch: cfg.BaseBranch, BaseRedMode: cfg.OnBaseRed.Mode,
 		MaxFixTries: cfg.OnBaseRed.MaxFixAttempts, ParentSessionID: parentSession,
 		Interval:   cfg.Interval(),
@@ -339,7 +342,6 @@ func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) 
 }
 
 func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarness, error) {
-	parent = firstNonEmpty(parent, cfg.Harness.ParentSessionID)
 	switch strings.ToLower(cfg.Harness.Provider) {
 	case "opencode", "":
 		h := opencode.New(opencode.Config{

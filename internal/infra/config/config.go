@@ -156,6 +156,11 @@ func (c Config) Interval() time.Duration {
 	return d
 }
 
+// RepoSlug returns the owner/repo pair used in notifications and snapshots.
+func (c Config) RepoSlug() string {
+	return c.SCM.Owner + "/" + c.SCM.Repo
+}
+
 // validate rejects a config that cannot drive the daemon. An absent SCM
 // section is left to Complete to reject on reload; a partial one fails here
 // with a clear message. A malformed poll interval surfaces the ParseDuration

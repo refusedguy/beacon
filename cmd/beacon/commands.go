@@ -134,7 +134,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 			if f.snapshot {
 				result, err := (app.SnapshotService{
 					Store: store, RecentLimit: f.recentLimit, DecisionsLimit: f.decisionsLimit,
-					Repo:   cfg.SCM.Owner + "/" + cfg.SCM.Repo,
+					Repo:   cfg.RepoSlug(),
 					Daemon: daemonSnapshot(readDaemonStatus(filepath.Dir(cfg.StateDB))),
 				}).Snapshot(cmd.Context())
 				if err != nil {
