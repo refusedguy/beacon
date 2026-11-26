@@ -232,11 +232,6 @@ func rewriteStatus(content, status string, hasFM bool) string {
 	return strings.Join(lines, "\n")
 }
 
-// Claim marks the card for id as in progress.
-func (m *Markdown) Claim(ctx context.Context, id core.TaskID) error {
-	return CardStore{Dir: m.Dir}.indexedPatchStatus(ctx, id, "in_progress")
-}
-
 // Complete marks the card for id as done.
 func (m *Markdown) Complete(ctx context.Context, id core.TaskID) error {
 	return CardStore{Dir: m.Dir}.indexedPatchStatus(ctx, id, "done")

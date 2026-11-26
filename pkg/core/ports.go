@@ -2,10 +2,9 @@ package core
 
 import "context"
 
-// TaskSource is the port for reading and claiming task cards.
+// TaskSource is the port for reading and updating task cards.
 type TaskSource interface {
 	ListAvailable(ctx context.Context) ([]Task, error)
-	Claim(ctx context.Context, id TaskID) error
 	Complete(ctx context.Context, id TaskID) error
 	MarkInWorkspace(ctx context.Context, id TaskID, workspacePath, status string) error
 	Create(ctx context.Context, task Task) (Task, error)

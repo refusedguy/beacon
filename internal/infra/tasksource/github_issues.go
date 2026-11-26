@@ -87,15 +87,6 @@ func githubIssueRecord(issue *github.Issue) issueRecord {
 	}
 }
 
-func (g *GitHubIssues) Claim(ctx context.Context, id core.TaskID) error {
-	n, err := issueNumber(id, "GH-")
-	if err != nil {
-		return err
-	}
-	_, _, err = g.Client.Issues.AddLabelsToIssue(ctx, g.Owner, g.Repo, n, []string{"beacon/claimed"})
-	return err
-}
-
 func (g *GitHubIssues) Complete(ctx context.Context, id core.TaskID) error {
 	n, err := issueNumber(id, "GH-")
 	if err != nil {
@@ -110,8 +101,8 @@ func (g *GitHubIssues) MarkInWorkspace(context.Context, core.TaskID, string, str
 	return nil
 }
 
-// Create opens a GitHub issue. The issue number becomes the task ID so the
-// Claim and Complete calls can address it.
+// Create opens a GitHub issue. The issue number becomes the task ID so a
+// Complete call can address it.
 func (g *GitHubIssues) Create(ctx context.Context, task core.Task) (core.Task, error) {
 	body, err := issueBody(task)
 	if err != nil {
