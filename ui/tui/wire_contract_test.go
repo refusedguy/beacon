@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"reflect"
@@ -18,16 +19,37 @@ type wireContractPayload struct {
 	Control ControlResult `json:"control"`
 }
 
+// wirePingPayload and wirePRChangedPayload are the data shapes of the two
+// non-harness events the events route emits. The harness event shape is pinned
+// by the Event field of wireContractPayload.
+type wirePingPayload struct {
+	Time string `json:"time"`
+}
+
+type wirePRChangedPayload struct {
+	PR int `json:"pr"`
+}
+
+// decodeWireStrict rejects unknown keys. json.Unmarshal silently ignores a
+// field the target does not name, so a daemon-side field addition would pass
+// this contract unnoticed. The decoder is shared by every fixture below.
+func decodeWireStrict(data []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	return dec.Decode(dst)
+}
+
 // TestWireContractDecode proves the monitor reads every field the daemon
 // emits. If a core wire tag is renamed, the core test regenerates the file and
-// this test fails on the fields it can no longer decode.
+// this test fails on the fields it can no longer decode. If a field is added,
+// the strict decoder rejects it until the monitor learns the field too.
 func TestWireContractDecode(t *testing.T) {
 	data, err := os.ReadFile(wireContractPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", wireContractPath, err)
 	}
 	var got wireContractPayload
-	if err := json.Unmarshal(data, &got); err != nil {
+	if err := decodeWireStrict(data, &got); err != nil {
 		t.Fatalf("decode wire contract: %v", err)
 	}
 
@@ -58,4 +80,31 @@ func TestWireContractDecode(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("wire contract decoded as %+v, want %+v", got, want)
 	}
+}
+
+// TestWireEventPayloadFixtures pins the data lines of the ping and pr_changed
+// frames. Each fixture uses the strict decoder, so a new key in a daemon event
+// payload fails the test instead of being ignored.
+func TestWireEventPayloadFixtures(t *testing.T) {
+	t.Run("ping", func(t *testing.T) {
+		var got wirePingPayload
+		if err := decodeWireStrict([]byte(`{"time":"2026-11-25T10:00:00Z"}`), &got); err != nil {
+			t.Fatalf("decode ping fixture: %v", err)
+		}
+		want := wirePingPayload{Time: "2026-11-25T10:00:00Z"}
+		if got != want {
+			t.Fatalf("ping fixture decoded as %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("pr_changed", func(t *testing.T) {
+		var got wirePRChangedPayload
+		if err := decodeWireStrict([]byte(`{"pr":42}`), &got); err != nil {
+			t.Fatalf("decode pr_changed fixture: %v", err)
+		}
+		want := wirePRChangedPayload{PR: 42}
+		if got != want {
+			t.Fatalf("pr_changed fixture decoded as %+v, want %+v", got, want)
+		}
+	})
 }
