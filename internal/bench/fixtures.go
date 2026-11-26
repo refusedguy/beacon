@@ -3,12 +3,30 @@ package bench
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// smokeEnv is the env override CI sets for a short benchmark run.
+const smokeEnv = "BEACON_BENCH_SMOKE"
+
+// smokeMode reports whether the harness should run one bounded pass per
+// benchmark. CI uses it for a smoke check with no timing gate. Fixture sizes,
+// report format and work/error counts are the same in both modes; only the
+// warm-up work before the measured pass is skipped.
+func smokeMode() bool {
+	v := os.Getenv(smokeEnv)
+	if v == "" {
+		return false
+	}
+	on, err := strconv.ParseBool(v)
+	return err == nil && on
+}
 
 // Fixture sizes are fixed and seeded so two runs on the same machine measure
 // the same amount of work.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -18,16 +19,62 @@ import (
 // the other monitors or the broadcaster.
 const subscriberBuffer = 16
 
+// runsCache holds the serialized runs response for one change generation. A
+// generation ends when the harness or a pull request changes. Every runs GET
+// in a generation reads the same bytes, so eight monitors reacting to one
+// notification cause one status.Active call instead of eight.
+//
+// The mutex is held while the snapshot is built. That serializes concurrent
+// GETs and guarantees a single store read per generation.
+type runsCache struct {
+	mu   sync.Mutex
+	body []byte
+}
+
+// invalidate ends the current generation. The next runs GET rebuilds the
+// snapshot from the store.
+func (c *runsCache) invalidate() {
+	c.mu.Lock()
+	c.body = nil
+	c.mu.Unlock()
+}
+
+// snapshot returns the cached JSON for the current generation, building it
+// once when the cache is empty. The bytes match writeJSON exactly, including
+// the trailing newline from json.Encoder.
+func (c *runsCache) snapshot(ctx context.Context, status apiStatus) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.body != nil {
+		return c.body, nil
+	}
+	runs, err := status.Active(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(core.NewWireRuns(runs)); err != nil {
+		return nil, err
+	}
+	c.body = buf.Bytes()
+	return c.body, nil
+}
+
 // changeSubscribers broadcasts PR change numbers to one channel per SSE
 // connection. Each connection owns its channel, so every monitor sees every
-// change.
+// change. It also owns the runs snapshot, because it sees each PR change once
+// at the source and can end the generation before the monitors react.
 type changeSubscribers struct {
-	mu   sync.Mutex
-	subs map[chan int]struct{}
+	mu       sync.Mutex
+	subs     map[chan int]struct{}
+	snapshot *runsCache
 }
 
 func newChangeSubscribers() *changeSubscribers {
-	return &changeSubscribers{subs: make(map[chan int]struct{})}
+	return &changeSubscribers{
+		subs:     make(map[chan int]struct{}),
+		snapshot: &runsCache{},
+	}
 }
 
 // subscribe adds a connection and returns its channel plus an unsubscribe
@@ -52,6 +99,7 @@ func (s *changeSubscribers) run(ctx context.Context, src <-chan int) {
 		case <-ctx.Done():
 			return
 		case pr := <-src:
+			s.snapshot.invalidate()
 			s.mu.Lock()
 			for ch := range s.subs {
 				select {
@@ -96,7 +144,12 @@ type apiServer struct {
 // startAPIServer serves the loopback API until ctx ends and reports its exit
 // on errCh. It owns the server lifecycle so the serve command stays short.
 func startAPIServer(ctx context.Context, services apiServices, token string, events <-chan core.HarnessEvent, changes *changeSubscribers, addr string, errCh chan<- error) {
-	api := &apiServer{services: services, token: token, eventStream: events, changes: changes}
+	// One view feeds the SSE handlers and one ends the snapshot generation.
+	// A single consumer owns the invalidation view, so one harness event
+	// invalidates once no matter how many monitors are connected.
+	views := fanout(ctx, events, 2)
+	go invalidateOnHarness(ctx, views[1], changes.snapshot)
+	api := &apiServer{services: services, token: token, eventStream: views[0], changes: changes}
 	srv := &http.Server{Addr: addr, Handler: api.handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -105,6 +158,23 @@ func startAPIServer(ctx context.Context, services apiServices, token string, eve
 		_ = srv.Shutdown(shutdown)
 	}()
 	go func() { errCh <- srv.ListenAndServe() }()
+}
+
+// invalidateOnHarness ends the current snapshot generation whenever the
+// harness reports an event. The caller runs one copy of this loop so each
+// event ends exactly one generation.
+func invalidateOnHarness(ctx context.Context, events <-chan core.HarnessEvent, cache *runsCache) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-events:
+			if !ok {
+				return
+			}
+			cache.invalidate()
+		}
+	}
 }
 
 func (a *apiServer) handler() http.Handler {
@@ -136,12 +206,15 @@ func (a *apiServer) runs(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	runs, err := a.services.status.Active(r.Context())
+	// A disconnecting monitor must not discard the shared snapshot, so the
+	// store read runs outside the request's cancellation.
+	body, err := a.changes.snapshot.snapshot(context.WithoutCancel(r.Context()), a.services.status)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(rw, core.NewWireRuns(runs))
+	rw.Header().Set("Content-Type", "application/json")
+	_, _ = rw.Write(body)
 }
 
 func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {

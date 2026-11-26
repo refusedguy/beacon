@@ -104,19 +104,31 @@ export function createMcpRegistrar(deps = defaultDeps) {
   const registrations = new Map()
   const rebuilds = new WeakMap()
 
-  // Call-level deps override the deps this registrar was created with.
+  // Resolve each caller's deps once. beaconServerConfig hands the resolved
+  // object to beaconCommand, which uses it as its memo key. A fresh object on
+  // every config request would miss the memo and rewalk the source tree.
+  const resolvedDeps = new WeakMap()
+
+  // Call-level deps override the deps this registrar was created with. The
+  // result belongs to this registrar and stays stable for the same deps object.
   function resolveDeps(callDeps) {
-    return { ...baseDeps, ...(callDeps && typeof callDeps === "object" ? callDeps : {}) }
+    const source = callDeps && typeof callDeps === "object" ? callDeps : baseDeps
+    let effective = resolvedDeps.get(source)
+    if (!effective) {
+      effective = { ...baseDeps, ...source }
+      resolvedDeps.set(source, effective)
+    }
+    return effective
   }
 
   // One rebuild attempt per root and binary mtime. A successful build changes
   // the binary mtime, so a later resolution checks the new build. Until then,
   // repeated resolutions reuse the decision instead of racing with the script.
-  function rebuildLocalIfStale(root, local, effective, cacheDeps) {
+  function rebuildLocalIfStale(root, local, effective, memoKey) {
     let mtime
     try { mtime = effective.statSync(local).mtimeMs } catch { mtime = null }
-    let checked = rebuilds.get(cacheDeps)
-    if (!checked) { checked = new Set(); rebuilds.set(cacheDeps, checked) }
+    let checked = rebuilds.get(memoKey)
+    if (!checked) { checked = new Set(); rebuilds.set(memoKey, checked) }
     const key = `${root}\u0000${mtime}`
     if (checked.has(key)) return
     checked.add(key)
@@ -124,14 +136,14 @@ export function createMcpRegistrar(deps = defaultDeps) {
   }
 
   function beaconCommand(root, callDeps = baseDeps) {
-    const cacheDeps = callDeps && typeof callDeps === "object" ? callDeps : baseDeps
+    const memoKey = callDeps && typeof callDeps === "object" ? callDeps : baseDeps
     const effective = resolveDeps(callDeps)
     const explicit = effective.env.BEACON_BIN
     if (explicit && effective.existsSync(explicit)) return [explicit, "mcp"]
 
     const local = join(root, ".opencode", "bin", "beacon")
     if (effective.existsSync(local)) {
-      rebuildLocalIfStale(root, local, effective, cacheDeps)
+      rebuildLocalIfStale(root, local, effective, memoKey)
       return [local, "mcp"]
     }
 
