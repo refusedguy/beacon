@@ -146,11 +146,39 @@ func wire(path, parentSession string) (*wiring, error) {
 	}
 	cw := newConfigWatcher(resolvedConfigPath(path, root), root, parentSession,
 		newLiveState(cfg, infra.harness), configWatchInterval)
+	seedParentModel(cw, parentSession, startupModel(infra.harness, cfg, parentSession))
 	h := &reloadableHarness{live: &cw.live, events: infra.harness.Events()}
 	p := &reloadablePolicy{live: &cw.live}
 	w := wireServices(cfg, root, parentSession, infra, h, p, cw.modelResolver)
 	w.watcher = cw
 	return w, nil
+}
+
+// startupModel returns the model already resolved for the fixed parent when
+// the harness was built. The OpenCode harness resolves it during wireInfra, so
+// reusing that value keeps the parent session GET off the first dispatch.
+// Providers without a harness-level model resolve it here instead.
+func startupModel(h core.AgentHarness, cfg config.Config, parent string) core.ModelRef {
+	if oh, ok := h.(*opencode.Harness); ok {
+		return oh.ModelRef
+	}
+	_, _, token := loadTokens(cfg)
+	return resolveModel(cfg, token, parent)
+}
+
+// seedParentModel primes the watcher's resolver cache with the model resolved at
+// composition time. The first dispatch for the fixed parent reuses it instead
+// of paying a parent session GET. Other parents still resolve through the
+// watcher, and a config reload advances the generation so the cache refreshes.
+func seedParentModel(cw *configWatcher, parent string, ref core.ModelRef) {
+	state := cw.live.Load()
+	cw.modelMu.Lock()
+	defer cw.modelMu.Unlock()
+	if cw.models == nil {
+		cw.models = make(map[string]core.ModelRef)
+	}
+	cw.models[parent] = ref
+	cw.modelGeneration = state.generation
 }
 
 // wireInfra builds the adapters. It has no dependency on the service layer.

@@ -42,23 +42,32 @@ export function noopMcpRegistration() {
   })
 }
 
-// Every returned registrar owns its registration map. A caller that passes
-// different deps to two registrars gets two independent caches.
+// Every returned registrar owns its registration and command caches. A caller
+// that passes different deps to two registrars gets two independent caches.
 export function createMcpRegistrar(deps = defaultDeps) {
   const baseDeps = normalizeDeps(deps)
   const registrations = new Map()
+  const resolvedDeps = new WeakMap()
+  const commands = new WeakMap()
 
-  // Call-level deps override the deps this registrar was created with.
+  // Resolve each caller's deps once. The status panel and dispatch call reuse
+  // the same deps object, so the effective object stays stable and can key the
+  // command memo. A fresh deps object is a new generation with its own memo.
   function resolveDeps(callDeps) {
-    return callDeps && typeof callDeps === "object" ? { ...baseDeps, ...callDeps } : baseDeps
+    const source = callDeps && typeof callDeps === "object" ? callDeps : baseDeps
+    let effective = resolvedDeps.get(source)
+    if (!effective) {
+      effective = { ...baseDeps, ...source }
+      resolvedDeps.set(source, effective)
+    }
+    return effective
   }
 
   // Resolve the binary location only. A stale local binary is reported by the
   // operator reminder and rebuilt with the explicit script at development time.
   // Nothing here reads source files or starts a subprocess, so a dispatch call
   // never waits on a build.
-  function beaconCommand(root, callDeps = baseDeps) {
-    const effective = resolveDeps(callDeps)
+  function resolveBeaconCommand(root, effective) {
     const explicit = effective.env.BEACON_BIN
     if (explicit && effective.existsSync(explicit)) return [explicit, "mcp"]
 
@@ -75,6 +84,32 @@ export function createMcpRegistrar(deps = defaultDeps) {
       return ["go", "run", "./cmd/beacon", "mcp"]
     }
     throw new Error("beacon MCP: no beacon binary and no cmd/beacon/main.go in project root")
+  }
+
+  // Environment values that can change inside one process are part of the
+  // memo entry. A changed BEACON_BIN or PATH forces a fresh resolution without
+  // probing the filesystem on a cache hit.
+  function envKey(effective) {
+    const env = effective.env ?? {}
+    return `${env.BEACON_BIN ?? ""}\u0000${env.PATH ?? ""}`
+  }
+
+  // One resolved command per canonical root and deps generation. Sequential
+  // CLI calls pay for a single path resolution. A new deps object (a new local
+  // binary) or a changed BEACON_BIN/PATH invalidates the entry.
+  function beaconCommand(root, callDeps = baseDeps) {
+    const effective = resolveDeps(callDeps)
+    let byRoot = commands.get(effective)
+    if (!byRoot) {
+      byRoot = new Map()
+      commands.set(effective, byRoot)
+    }
+    const key = envKey(effective)
+    const cached = byRoot.get(root)
+    if (cached && cached.key === key) return cached.command
+    const command = resolveBeaconCommand(root, effective)
+    byRoot.set(root, { command, key })
+    return command
   }
 
   function beaconServerConfig(root, callDeps = baseDeps, sessionID = "") {

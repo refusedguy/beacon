@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 
 	"github.com/spf13/cobra"
 
+	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/internal/infra/scm"
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -25,8 +25,8 @@ func newServeCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer w.close()
-			if w.cfg.Webhook.Enabled && w.cfg.Webhook.Secret == "" {
-				return fmt.Errorf("webhook.enabled requires webhook.secret or webhook.secret_env")
+			if err := config.ValidateWebhook(w.cfg.Webhook); err != nil {
+				return err
 			}
 			dir := stateDir(w.cfg)
 			lock, err := acquireLock(dir)
