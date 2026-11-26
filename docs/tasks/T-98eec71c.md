@@ -1,7 +1,7 @@
 ---
 id: T-98eec71c
 title: Collapse queue parent derivation in the plugin
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_alerts.js
     - .opencode/plugins/beacon-project/ui/ui_alerts_test.js

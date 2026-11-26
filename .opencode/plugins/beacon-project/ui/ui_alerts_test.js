@@ -5,7 +5,7 @@ import assert from "node:assert/strict"
 import {
   PANEL_NAME, beaconStatusDefinition, collectTransitionToasts,
   createDetailMount, createSidebarMount, detailModel, launchSourceText,
-  metricsLine, normalizeRun, shortTaskID, sidebarModel, taskTree,
+  metricsLine, normalizeRun, queueGroups, shortTaskID, sidebarModel, taskTree,
 } from "./ui.js"
 import { NOW, hostModule, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -363,4 +363,28 @@ test("task tree takes the longest existing prefix and indexes every epic once", 
   assert.equal(tree.epic.has("T-A-B"), true, "a parent counts as an epic without the kind field")
   assert.equal(tree.epic.has("T-LONELY"), true, "an explicit epic stays one with no children")
   assert.equal(tree.epic.has("T-A-B-C"), false, "a leaf is not an epic")
+})
+
+test("queue groups expose parent, child and epic membership for the queue rows", () => {
+  const queue = [
+    { id: "T-EPIC", kind: "epic", title: "Epic" },
+    { id: "T-EPIC-01", title: "Child one" },
+    { id: "T-EPIC-02", title: "Child two" },
+  ]
+  const groups = queueGroups(queue)
+  assert.equal(groups.parentOf("T-EPIC-01"), "T-EPIC")
+  assert.equal(groups.parentOf("T-EPIC"), "")
+  assert.deepEqual(groups.childrenOf("T-EPIC"), ["T-EPIC-01", "T-EPIC-02"])
+  assert.deepEqual(groups.childrenOf("T-EPIC-01"), [])
+  assert.equal(groups.isEpic("T-EPIC"), true)
+  assert.equal(groups.isEpic("T-EPIC-01"), false)
+
+  const tree = taskTree([
+    { id: "T-EPIC", kind: "epic" },
+    { id: "T-OTHER", kind: "epic" },
+    { id: "T-EPIC-01", parent: "T-OTHER" },
+  ])
+  const shared = queueGroups(queue, null, tree)
+  assert.equal(shared.parentOf("T-EPIC-01"), "T-OTHER", "a supplied tree stays authoritative")
+  assert.deepEqual(shared.childrenOf("T-OTHER"), ["T-EPIC-01"])
 })
