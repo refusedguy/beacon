@@ -22,7 +22,8 @@ func TestWorkflowNamesParsesJobNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Names: %v", err)
 	}
-	if want := []string{"test", "verify"}; !reflect.DeepEqual(got, want) {
+	// The matrix job is omitted: GitHub reports only expanded cell names.
+	if want := []string{"verify"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Names = %v, want %v", got, want)
 	}
 }
