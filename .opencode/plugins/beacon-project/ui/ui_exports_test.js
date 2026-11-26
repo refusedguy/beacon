@@ -1,5 +1,6 @@
-// Run: node --test .opencode/plugins/beacon-project/ui_exports_test.js
+// Run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test .opencode/plugins/beacon-project/ui_exports_test.js
 // Guards the ui_model / ui_view / ui_bridge split against broken cross-module imports.
+import { readFileSync } from "node:fs"
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
@@ -39,4 +40,12 @@ test("the default plugin export resolves", async () => {
   const [, , , , index] = await importAll()
   assert.ok(index.default)
   assert.equal(typeof index.beaconProject, "object")
+})
+
+test("entry modules take Plugin from the host without an identity fallback", () => {
+  for (const file of ["../index.js", "./ui.js"]) {
+    const src = readFileSync(new URL(file, import.meta.url), "utf8")
+    assert.match(src, /import\s*\{\s*Plugin\s*\}\s*from\s*"@opencode\/plugin/)
+    assert.equal(src.includes("catch(() => (definition) => definition)"), false, file)
+  }
 })

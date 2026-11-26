@@ -179,6 +179,12 @@ go test ./...
 (cd ui/tui && go build ./... && go vet ./... && go test ./...)
 ```
 
+The plugin entry modules import `Plugin` from `@opencode/plugin` and `@opencode/plugin/tui` so the host supplies one OpenTUI and Solid instance. Installing those peers into the plugin directory creates a second Solid context and fails with `No renderer found`. Plugin tests resolve the two imports to local doubles instead:
+
+```sh
+node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test .opencode/plugins/beacon-project
+```
+
 The lint job checks `gofmt -l cmd internal pkg harnesses ui arch_test.go` and runs golangci-lint v2.15. The advisory job runs `bash scripts/ci-advisory.sh`.
 
 ## Notes and decisions
