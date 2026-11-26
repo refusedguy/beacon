@@ -459,8 +459,8 @@ The cold compile is the stage that crosses 30 s. The perf-smoke job restores the
 Go build cache with `cache-dependency-path: go.sum`, while build, vet, test and
 lint use `go.sum` plus `ui/tui/go.sum`. The two cache keys never match, so
 perf-smoke cannot reuse their objects and recompiles the dependency graph,
-including `modernc.org/sqlite`. That workflow change belongs to T-42ae53b1 and
-is not made here.
+including `modernc.org/sqlite`. That cache path is a workflow change and is not
+made here. It already landed on main in PR #2620.
 
 The script had a smaller defect of its own. T-c894c2fa added the
 `BEACON_BENCH_SMOKE` override so each benchmark skips its warm-up pass, and both
