@@ -1,7 +1,7 @@
 ---
 id: T-c575dc9b
 title: Cache the build script existence check per root
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/rules/context.js
     - .opencode/plugins/beacon-project/rules/context_test.js
