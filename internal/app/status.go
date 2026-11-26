@@ -346,20 +346,22 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if daemon == nil {
 		daemon = &DaemonSnapshot{State: "absent"}
 	}
+	activeSnapshots := make([]RunSnapshot, 0, len(active))
+	for _, run := range active {
+		activeSnapshots = append(activeSnapshots, makeRunSnapshot(run, timeline, histories, now, s.Repo))
+	}
+	recentSnapshots := make([]RunSnapshot, 0, len(recent))
+	for _, run := range recent {
+		recentSnapshots = append(recentSnapshots, makeRunSnapshot(run, timeline, histories, now, s.Repo))
+	}
 	out := &Snapshot{
 		GeneratedAt:  now,
-		Active:       make([]RunSnapshot, 0, len(active)),
-		Recent:       make([]RunSnapshot, 0, len(recent)),
+		Active:       activeSnapshots,
+		Recent:       recentSnapshots,
 		Queue:        makeQueue(queue),
 		BaseIncident: makeBaseIncident(incident),
 		Daemon:       daemon,
-		Metrics:      makeMetrics(active, recent, timeline, histories, counts, now),
-	}
-	for _, run := range active {
-		out.Active = append(out.Active, makeRunSnapshot(run, timeline, histories, now, s.Repo))
-	}
-	for _, run := range recent {
-		out.Recent = append(out.Recent, makeRunSnapshot(run, timeline, histories, now, s.Repo))
+		Metrics:      makeMetrics(activeSnapshots, recentSnapshots, timeline, histories, counts),
 	}
 	return out, nil
 }
@@ -568,16 +570,15 @@ func addDuration(out *Durations, state core.RunState, seconds int64) {
 }
 
 func makeMetrics(
-	active, recent []*core.Run,
+	active, recent []RunSnapshot,
 	timeline map[string][]RunEvent,
 	histories map[string][]Decision,
 	counts []DecisionCount,
-	now time.Time,
 ) Metrics {
 	m := Metrics{Skips: map[string]int{}, Blocked: map[string]int{}, LaunchSources: map[string]int{}}
 	merged := make(map[string]bool)
 	blocked := make(map[string]bool)
-	addRunMetrics(&m, active, recent, timeline, merged, blocked, now)
+	addRunMetrics(&m, active, recent, merged, blocked)
 	addLaunchMetrics(&m, active, recent)
 	for _, events := range timeline {
 		for _, event := range events {
@@ -636,17 +637,20 @@ func blockedReasonCategory(reason string) string {
 	}
 }
 
-func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][]RunEvent, merged, blocked map[string]bool, now time.Time) {
-	for _, group := range [][]*core.Run{active, recent} {
-		for _, run := range group {
-			m.CIWaitSeconds += deriveDurations(run, timeline[string(run.ID)], now).WaitingCI
-			id := string(run.ID)
-			if run.State == core.RunMerged {
+// addRunMetrics folds the durations already computed for each run snapshot into
+// the totals. It never walks a timeline again, so each timeline is measured
+// exactly once by makeRunSnapshot.
+func addRunMetrics(m *Metrics, active, recent []RunSnapshot, merged, blocked map[string]bool) {
+	for _, group := range [][]RunSnapshot{active, recent} {
+		for _, snap := range group {
+			m.CIWaitSeconds += snap.Durations.WaitingCI
+			id := snap.ID
+			if snap.State == string(core.RunMerged) {
 				merged[id] = true
 			}
-			if run.State == core.RunBlocked && !blocked[id] {
+			if snap.State == string(core.RunBlocked) && !blocked[id] {
 				blocked[id] = true
-				m.Blocked[blockedReasonCategory(run.Reason)]++
+				m.Blocked[blockedReasonCategory(snap.Reason)]++
 				m.BlockedCount++
 			}
 		}
@@ -657,13 +661,13 @@ func addRunMetrics(m *Metrics, active, recent []*core.Run, timeline map[string][
 
 // addLaunchMetrics counts runs by the path that started them. A run with no
 // recorded source came from an automatic path, so it counts as daemon.
-func addLaunchMetrics(m *Metrics, active, recent []*core.Run) {
+func addLaunchMetrics(m *Metrics, active, recent []RunSnapshot) {
 	if m.LaunchSources == nil {
 		m.LaunchSources = map[string]int{}
 	}
-	for _, group := range [][]*core.Run{active, recent} {
-		for _, run := range group {
-			source := core.ParseLaunchSource(string(run.LaunchSource))
+	for _, group := range [][]RunSnapshot{active, recent} {
+		for _, snap := range group {
+			source := core.ParseLaunchSource(snap.LaunchSource)
 			m.LaunchSources[string(source)]++
 		}
 	}
