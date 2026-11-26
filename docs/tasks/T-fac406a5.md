@@ -1,7 +1,7 @@
 ---
 id: T-fac406a5
 title: Run local format and tests before opening a PR
-status: available
+status: done
 scope:
     - internal/app/dispatcher.go
     - harnesses/opencode/prompt_text.go
