@@ -71,15 +71,28 @@ export function roleFor(agent, config = {}) {
 }
 
 // The build script only exists in the Beacon repo. Other projects get the same
-// universal rules without a reminder to run a script they do not have.
-export async function sessionInstructions(ctx, event, config = {}, root = "") {
+// universal rules without a reminder to run a script they do not have. The
+// context hook fires on every event, so keep the existence answer for one root
+// and stat again only when the root changes.
+let cachedRoot = null
+let cachedBuildScript = false
+
+function hasBuildScript(root, existsSync) {
+  if (cachedRoot === root) return cachedBuildScript
+  cachedRoot = root
+  cachedBuildScript = !!existsSync(join(root, "scripts", "build-beacon.sh"))
+  return cachedBuildScript
+}
+
+export async function sessionInstructions(ctx, event, config = {}, root = "", deps = {}) {
   const options = contextOptions(config)
   if (!options.enabled) return null
   const role = roleFor(await resolvedAgent(ctx, event), config)
   if (role !== "worker" && role !== "orchestrator") return null
   let value = role === "orchestrator" ? options.orchestratorRules : options.workerRules
+  const existsSync = deps.existsSync ?? fsExistsSync
   if (role === "orchestrator" && typeof root === "string" && root
-      && fsExistsSync(join(root, "scripts", "build-beacon.sh"))) {
+      && hasBuildScript(root, existsSync)) {
     value = `${value}\n${BUILD_REMINDER}`
   }
   return {

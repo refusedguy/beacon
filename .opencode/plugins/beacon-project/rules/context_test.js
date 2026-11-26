@@ -199,3 +199,54 @@ test("survivalRulesEnabled false disables role instruction injection", async () 
   const wanted = await sessionInstructions(ctx, { sessionID: SESSION }, { survivalRulesEnabled: false })
   assert.equal(wanted, null)
 })
+
+test("a 10,000-event fixture stats the build script once with identical output", async (t) => {
+  const root = projectRoot(true)
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const ctx = fakeCtx()
+  const event = { sessionID: SESSION, agent: "orchestrator" }
+  let stats = 0
+  const deps = {
+    existsSync: (path) => {
+      stats += 1
+      return path === join(root, "scripts", "build-beacon.sh")
+    },
+  }
+  const expected = {
+    key: ORCHESTRATOR_KEY,
+    value: `${ORCHESTRATOR_RULES}\n${BUILD_REMINDER}`,
+    sessionID: SESSION,
+  }
+  for (let i = 0; i < 10000; i += 1) {
+    assert.deepEqual(await sessionInstructions(ctx, event, {}, root, deps), expected)
+  }
+  assert.equal(stats, 1, "the build script path is statted once for the whole root")
+})
+
+test("changing the root invalidates the cached build script check", async (t) => {
+  const withScript = projectRoot(true)
+  const withoutScript = projectRoot(false)
+  t.after(() => {
+    rmSync(withScript, { recursive: true, force: true })
+    rmSync(withoutScript, { recursive: true, force: true })
+  })
+  const ctx = fakeCtx()
+  const event = { sessionID: SESSION, agent: "orchestrator" }
+  const stats = []
+  const deps = {
+    existsSync: (path) => {
+      stats.push(path)
+      return path === join(withScript, "scripts", "build-beacon.sh")
+    },
+  }
+  const first = await sessionInstructions(ctx, event, {}, withScript, deps)
+  assert.equal(first.value, `${ORCHESTRATOR_RULES}\n${BUILD_REMINDER}`)
+  const repeated = await sessionInstructions(ctx, event, {}, withScript, deps)
+  assert.deepEqual(repeated, first)
+  assert.equal(stats.length, 1, "the same root reuses the cached boolean")
+
+  const other = await sessionInstructions(ctx, event, {}, withoutScript, deps)
+  assert.equal(other.value, ORCHESTRATOR_RULES, "an ordinary project gets no build reminder")
+  assert.equal(stats.length, 2, "a new root rechecks the build script")
+  assert.equal(stats[1], join(withoutScript, "scripts", "build-beacon.sh"))
+})
