@@ -32,6 +32,14 @@ type ReconcilerStore interface {
 	UpdateIncident(ctx context.Context, in *core.BaseIncident) error
 }
 
+// stalePruner is the optional store capability for reclaiming old delivery and
+// approval rows. The reconciler type-asserts its store so adapters without
+// retention support keep working, and keeps the store ports free of a method
+// that only the daemon tick needs.
+type stalePruner interface {
+	PruneStale(ctx context.Context, retention time.Duration) (int64, error)
+}
+
 // Reconciler observes pull requests, applies merge policy to their runs and
 // drains the harness and timer events that drive the daemon loop.
 type Reconciler struct {
@@ -268,6 +276,14 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 			}
 			r.HandleHarnessEvent(ctx, event)
 		case <-ticker.C:
+			// Retention runs on this fixed schedule rather than on ListActive,
+			// so status, dispatch and MCP reads stay free of DELETE statements.
+			// Cleanup is best effort: a failed prune must not stop the tick.
+			if pruner, ok := r.Store.(stalePruner); ok {
+				if _, err := pruner.PruneStale(ctx, 0); err != nil {
+					slog.Warn("prune stale delivery rows", "error", err)
+				}
+			}
 			if err := r.checkBaseRecovery(ctx); err != nil {
 				slog.Error("base recovery", "error", err)
 			}

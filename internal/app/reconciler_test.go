@@ -1362,3 +1362,39 @@ func TestRunReturnsWhenEventsChannelCloses(t *testing.T) {
 		t.Fatal("Run kept spinning after events channel closed")
 	}
 }
+
+// pruningStore adds the optional retention capability to the shared fake.
+type pruningStore struct {
+	*fakeStore
+	pruned chan time.Duration
+}
+
+func (s *pruningStore) PruneStale(_ context.Context, retention time.Duration) (int64, error) {
+	select {
+	case s.pruned <- retention:
+	default:
+	}
+	return 0, nil
+}
+
+func TestRunPrunesStaleRowsOnTicker(t *testing.T) {
+	store := &pruningStore{fakeStore: newFakeStore(), pruned: make(chan time.Duration, 1)}
+	changes := make(chan int)
+	r := &Reconciler{Store: store, Interval: time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx, changes) }()
+
+	select {
+	case retention := <-store.pruned:
+		if retention != 0 {
+			t.Fatalf("prune retention = %v, want 0 (store default)", retention)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconciler ticker did not prune stale rows")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+}
