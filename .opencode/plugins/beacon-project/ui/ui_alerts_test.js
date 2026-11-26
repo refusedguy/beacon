@@ -128,7 +128,7 @@ test("three tasks sharing a blocker get one header and three title rows", () => 
   const recentAt = items.findIndex((i) => i.sectionKey === "recent")
   assert.equal(items[recentAt - 1].kind, "spacer", "Recent is separated from the queue")
   assert.ok(items.some((i) => i.recent === true && i.runID === "r1"), "Recent stays clickable")
-  assert.ok(items.some((i) => i.name === "Idle · no ready tasks"), "an all-blocked queue stays honest")
+  assert.ok(items.some((i) => i.name === "No active runs"), "an all-blocked queue stays honest")
   const collapsed = sidebarModel(snap, null, NOW, { active: true, queue: false, recent: true }).listItems
   assert.equal(collapsed.some((i) => i.kind === "queue-blocker"), false)
 })

@@ -177,15 +177,55 @@ test("a sanitized stale line keeps the prefix and never shows help text", () => 
   assert.ok(stale.name.length <= 9 + REASON_WIDTH)
 })
 
-test("empty snapshot shows one idle line and counted headers", () => {
+test("empty snapshot shows one queue line and counted headers", () => {
   const items = sidebarModel(EMPTY_SNAPSHOT, null, NOW).items
   assert.deepEqual(items.map((i) => i.name), [
-    "Beacon", "P0 R0 C0 E0 F0 B0 M0 X0", "Active", "Idle · no ready tasks",
+    "Beacon", "P0 R0 C0 E0 F0 B0 M0 X0", "Active", "No active runs",
     "Queue", "Recent", "No recent runs",
   ])
   assert.deepEqual(items.filter((i) => i.sectionKey).map((i) => [i.name, i.status]), [
-    ["Active", "0"], ["Queue", "0"], ["Recent", "0"],
+    ["Active", "0"], ["Recent", "0"],
   ])
+})
+
+test("an empty queue collapses into one non-expandable line", () => {
+  for (const snapshot of [EMPTY_SNAPSHOT, { active: [makeRun()], recent: [], queue: [] }]) {
+    const items = sidebarModel(snapshot, null, NOW).items
+    const queueLines = items.filter((i) => /queue|ready/i.test(`${i.name} ${i.status}`))
+    assert.deepEqual(queueLines.map((i) => [i.name, i.status]), [["Queue", "no tasks ready"]])
+    assert.equal(queueLines[0].sectionKey, undefined, "an empty queue cannot be expanded")
+    assert.equal(queueLines[0].marker, "", "no chevron sits on a line that cannot open")
+    const rendered = renderSnapshotLines(snapshot, null, NOW).filter((line) => /queue|ready/i.test(line))
+    assert.deepEqual(rendered, ["Queue no tasks ready"])
+  }
+})
+
+test("ready tasks keep the expandable queue section and its count", () => {
+  const snapshot = {
+    active: [], recent: [],
+    queue: [
+      { id: "T-1", title: "Ready one", status: "ready", priority: 2 },
+      { id: "T-2", title: "Blocked one", status: "waiting_deps", priority: 1 },
+    ],
+  }
+  const collapsed = sidebarModel(snapshot, null, NOW).listItems
+  const header = collapsed.find((i) => i.sectionKey === "queue")
+  assert.deepEqual([header.name, header.status, header.marker], ["Queue", "2", "▶"])
+  assert.ok(collapsed.some((i) => i.action === "dispatch"))
+  const open = sidebarModel(snapshot, null, NOW, { active: true, queue: true, recent: true }).listItems
+  assert.equal(open.find((i) => i.sectionKey === "queue").marker, "▼")
+  assert.ok(open.some((i) => i.kind === "queue-title"))
+})
+
+test("a blocked queue stays expandable without a standalone ready row", () => {
+  const snapshot = {
+    active: [], recent: [],
+    queue: [{ id: "T-1", title: "Blocked", status: "waiting_deps", priority: 1, depends_on: ["T-B"] }],
+  }
+  const items = sidebarModel(snapshot, null, NOW).listItems
+  const header = items.find((i) => i.sectionKey === "queue")
+  assert.deepEqual([header.name, header.status], ["Queue", "1"])
+  assert.deepEqual(items.filter((i) => /ready/i.test(`${i.name} ${i.status}`)), [])
 })
 
 test("detail model uses four sections with full wrapping text", () => {
