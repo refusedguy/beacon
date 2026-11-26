@@ -29,13 +29,7 @@ func main() {
 
 	program := tea.NewProgram(newModel(client))
 	go func() {
-		_ = client.Stream(ctx, func(Event) {
-			select {
-			case <-ctx.Done():
-			default:
-				program.Send(refreshMsg{})
-			}
-		})
+		_ = forwardEvents(ctx, client, program)
 	}()
 
 	if _, err := program.Run(); err != nil {
@@ -44,4 +38,21 @@ func main() {
 		os.Exit(1)
 	}
 	stop()
+}
+
+// msgSender is the part of a Bubble Tea program that the stream needs.
+type msgSender interface {
+	Send(tea.Msg)
+}
+
+// forwardEvents streams events from c and forwards each decoded event into p
+// as a refreshMsg. Events that arrive after ctx is cancelled are dropped.
+func forwardEvents(ctx context.Context, c *Client, p msgSender) error {
+	return c.Stream(ctx, func(ev Event) {
+		select {
+		case <-ctx.Done():
+		default:
+			p.Send(refreshMsg{event: ev})
+		}
+	})
 }
