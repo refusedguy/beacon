@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -30,6 +31,10 @@ func glIssueServer(t *testing.T) *GitLabIssues {
 			}
 			if r.URL.Query().Get("state") != "opened" || r.URL.Query().Get("per_page") != "100" {
 				t.Errorf("query = %v", r.URL.Query())
+			}
+			if r.URL.Query().Get("page") != "1" {
+				glIssueWriteJSON(t, w, []map[string]any{})
+				return
 			}
 			glIssueWriteJSON(t, w, []map[string]any{
 				{"iid": 8, "title": "Claimed", "labels": []string{"beacon/claimed"}, "description": "Scope: skip.go"},
@@ -69,7 +74,11 @@ func glIssueServer(t *testing.T) *GitLabIssues {
 }
 
 func TestGitLabIssuesPrefersBodyID(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") != "1" {
+			glIssueWriteJSON(t, w, []map[string]any{})
+			return
+		}
 		glIssueWriteJSON(t, w, []map[string]any{
 			{"iid": 9, "title": "Body id", "description": sharedIssueBody, "web_url": "https://gitlab.example/o/r/-/issues/9"},
 		})
@@ -131,5 +140,113 @@ func TestGitLabIssuesInvalidID(t *testing.T) {
 	}
 	if err := s.Complete(context.Background(), "GH-9"); core.CodeOf(err) != core.CodeInvalidInput {
 		t.Fatalf("complete error = %v", err)
+	}
+}
+
+func glPagedIssues(t *testing.T, page, total int) []map[string]any {
+	t.Helper()
+	start := (page - 1) * gitlabIssuesPerPage
+	items := make([]map[string]any, 0, gitlabIssuesPerPage)
+	for i := start; i < start+gitlabIssuesPerPage && i < total; i++ {
+		items = append(items, map[string]any{
+			"iid":   i + 1,
+			"title": strconv.Itoa(i + 1),
+		})
+	}
+	return items
+}
+
+func TestGitLabIssuesPaginates(t *testing.T) {
+	const total = 250
+	var gets int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets++
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s", r.Method)
+		}
+		if got := r.URL.Query().Get("per_page"); got != strconv.Itoa(gitlabIssuesPerPage) {
+			t.Errorf("per_page = %q", got)
+		}
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if err != nil || page < 1 {
+			t.Errorf("page = %q", r.URL.Query().Get("page"))
+			page = 1
+		}
+		glIssueWriteJSON(t, w, glPagedIssues(t, page, total))
+	}))
+	defer srv.Close()
+	s := NewGitLabIssues(srv.URL+"/api/v4/", "tok", "o", "r")
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != total {
+		t.Fatalf("tasks = %d, want %d", len(tasks), total)
+	}
+	seen := make(map[core.TaskID]bool, total)
+	for _, task := range tasks {
+		seen[task.ID] = true
+	}
+	for i := 1; i <= total; i++ {
+		if !seen[core.TaskID("GL-"+strconv.Itoa(i))] {
+			t.Fatalf("missing GL-%d", i)
+		}
+	}
+	// Three full pages plus the empty page that ends the walk.
+	if gets != 4 {
+		t.Fatalf("GETs = %d, want 4", gets)
+	}
+}
+
+func TestGitLabIssuesPaginatesKeepsParsing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			glIssueWriteJSON(t, w, []map[string]any{
+				{"iid": 1, "title": "First"},
+			})
+		case "2":
+			glIssueWriteJSON(t, w, []map[string]any{
+				{"iid": 101, "title": "Claimed", "labels": []string{"beacon/claimed"}},
+				{"iid": 102, "title": "Body id", "description": sharedIssueBody},
+			})
+		default:
+			glIssueWriteJSON(t, w, []map[string]any{})
+		}
+	}))
+	defer srv.Close()
+	s := NewGitLabIssues(srv.URL+"/api/v4/", "tok", "o", "r")
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("tasks = %+v", tasks)
+	}
+	// sharedIssueBody carries priority 3, so it sorts first.
+	assertSharedIssueFields(t, tasks[0], "GL-7")
+	if tasks[1].ID != "GL-1" {
+		t.Fatalf("second task = %+v", tasks[1])
+	}
+}
+
+func TestGitLabIssuesStopsAtPageCap(t *testing.T) {
+	var gets int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets++
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if err != nil || page < 1 {
+			t.Errorf("page = %q", r.URL.Query().Get("page"))
+			page = 1
+		}
+		glIssueWriteJSON(t, w, glPagedIssues(t, page, maxIssuePages*gitlabIssuesPerPage))
+	}))
+	defer srv.Close()
+	s := NewGitLabIssues(srv.URL+"/api/v4/", "tok", "o", "r")
+	if _, err := s.ListAvailable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gets != maxIssuePages {
+		t.Fatalf("GETs = %d, want %d", gets, maxIssuePages)
 	}
 }
