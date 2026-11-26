@@ -42,11 +42,13 @@ type DecisionLookup interface {
 }
 
 // DecisionLogger writes decisions to an injected sink. A nil sink disables
-// persistence without touching the stderr log. The reconcile cache lives
-// behind a pointer so Record can create and retain it across calls.
+// persistence without touching the stderr log. The reconcile cache and the
+// deferred dispatch queue live behind pointers so a logger can create and
+// retain them across calls.
 type DecisionLogger struct {
-	Sink  DecisionSink
-	cache *decisionCache
+	Sink     DecisionSink
+	cache    *decisionCache
+	deferred *deferredDecisions
 }
 
 // decisionCache holds the last written reconcile signature for each run. A
@@ -73,20 +75,120 @@ func (c *decisionCache) set(runID, sig string) {
 	c.sigs[runID] = sig
 }
 
-// decisionCacheInitMu guards the lazy creation of cache on a DecisionLogger.
-var decisionCacheInitMu sync.Mutex
+// decisionStateInitMu guards the lazy creation of cache and deferred on a
+// DecisionLogger. Both live behind pointers so a logger retains them across
+// calls on its value copy.
+var decisionStateInitMu sync.Mutex
 
 func (l *DecisionLogger) cacheFor() *decisionCache {
-	decisionCacheInitMu.Lock()
-	defer decisionCacheInitMu.Unlock()
+	decisionStateInitMu.Lock()
+	defer decisionStateInitMu.Unlock()
 	if l.cache == nil {
 		l.cache = &decisionCache{}
 	}
 	return l.cache
 }
 
-// Record forwards a decision to the logger's sink.
+func (l *DecisionLogger) deferredFor() *deferredDecisions {
+	decisionStateInitMu.Lock()
+	defer decisionStateInitMu.Unlock()
+	if l.deferred == nil {
+		l.deferred = &deferredDecisions{}
+	}
+	return l.deferred
+}
+
+// deferredDecision is one audit row held until the caller has built its
+// response. The context keeps the cycle ID and other values while dropping
+// cancellation, so a cancelled tool call cannot discard the record.
+type deferredDecision struct {
+	ctx   context.Context
+	d     Decision
+	write func(context.Context, Decision)
+}
+
+// deferredDecisions buffers dispatch audit rows and writes them after the
+// caller returns. One goroutine drains one batch in emission order, which
+// keeps the rows for a run ordered. Wait drains every queued batch so a
+// shutdown can persist all records before exit.
+type deferredDecisions struct {
+	mu      sync.Mutex
+	pending []deferredDecision
+	wg      sync.WaitGroup
+}
+
+func (q *deferredDecisions) append(item deferredDecision) {
+	q.mu.Lock()
+	q.pending = append(q.pending, item)
+	q.wg.Add(1)
+	q.mu.Unlock()
+}
+
+func (q *deferredDecisions) flush() {
+	q.mu.Lock()
+	batch := q.pending
+	q.pending = nil
+	q.mu.Unlock()
+	if len(batch) == 0 {
+		return
+	}
+	go func() {
+		for _, item := range batch {
+			item.write(item.ctx, item.d)
+			q.wg.Done()
+		}
+	}()
+}
+
+func (q *deferredDecisions) Wait() {
+	q.wg.Wait()
+}
+
+// Record forwards a decision to the logger's sink without delay.
 func (l *DecisionLogger) Record(ctx context.Context, d Decision) {
+	l.recordNow(ctx, d)
+}
+
+// deferRecord queues an audit row for a write after the caller has built its
+// response. Sink IO never happens on the caller's path, and the detached
+// context keeps the row even when the caller is cancelled.
+func (l *DecisionLogger) deferRecord(ctx context.Context, d Decision) {
+	if l.Sink == nil {
+		return
+	}
+	l.deferredFor().append(deferredDecision{
+		ctx:   context.WithoutCancel(ctx),
+		d:     d,
+		write: l.recordNow,
+	})
+}
+
+// flushDeferred starts the queued writes and returns immediately. A caller
+// invokes it once its response is built, so a slow sink cannot hold up the
+// worker launch path.
+func (l *DecisionLogger) flushDeferred() {
+	decisionStateInitMu.Lock()
+	q := l.deferred
+	decisionStateInitMu.Unlock()
+	if q != nil {
+		q.flush()
+	}
+}
+
+// Wait flushes any queued rows and blocks until every deferred row for this
+// logger reaches the sink. A shutdown calls it to persist the full audit trail.
+func (l *DecisionLogger) Wait() {
+	decisionStateInitMu.Lock()
+	q := l.deferred
+	decisionStateInitMu.Unlock()
+	if q != nil {
+		q.flush()
+		q.Wait()
+	}
+}
+
+// recordNow is the shared sink write behind Record and the deferred flush.
+func (l *DecisionLogger) recordNow(ctx context.Context, d Decision) {
 	sink := l.Sink
 	if sink == nil {
 		return
@@ -193,7 +295,7 @@ func (l *DecisionLogger) logDispatchCandidates(ctx context.Context, candidates, 
 		"limit", limit,
 		"budget", budget,
 	)...)
-	l.Record(ctx, Decision{
+	l.deferRecord(ctx, Decision{
 		CycleID: cycleID(ctx), Kind: "dispatch.candidates",
 		Fields: map[string]any{
 			"candidates": candidates, "active": active, "limit": limit, "budget": budget,
@@ -210,7 +312,7 @@ func (l *DecisionLogger) logDispatchSkip(ctx context.Context, s SkippedTask) {
 		"overlap", joinLogPaths(s.Overlap),
 		"reason", shortLogReason(s.Reason),
 	)...)
-	l.Record(ctx, Decision{
+	l.deferRecord(ctx, Decision{
 		CycleID: cycleID(ctx), Kind: "dispatch.skip",
 		TaskID: string(s.TaskID), RunID: string(s.BlockedByRun),
 		Verdict: string(s.Code), Action: string(s.BlockedBy), Reason: s.Reason,
@@ -265,11 +367,25 @@ type transitionExtras struct {
 	fields map[string]any
 }
 
+// decisionWrite is the sink path a transition uses. Dispatch transitions queue
+// their rows; every other transition writes them before returning.
+type decisionWrite func(context.Context, Decision)
+
 // emitTransition writes the shared slog record and Decision for a run
 // transition. An empty result leaves out the result attribute and Action field,
 // which keeps watch_pr's decision shape unchanged. A zero PR leaves out the pr
 // attribute, which keeps spawn's log shape unchanged.
 func (l *DecisionLogger) emitTransition(ctx context.Context, kind string, runID core.RunID, pr int, result string, extra transitionExtras) {
+	l.emitTransitionTo(ctx, kind, runID, pr, result, extra, l.Record)
+}
+
+// emitTransitionDeferred logs a dispatch transition now and queues its Decision
+// until the caller has built its response.
+func (l *DecisionLogger) emitTransitionDeferred(ctx context.Context, kind string, runID core.RunID, pr int, result string, extra transitionExtras) {
+	l.emitTransitionTo(ctx, kind, runID, pr, result, extra, l.deferRecord)
+}
+
+func (l *DecisionLogger) emitTransitionTo(ctx context.Context, kind string, runID core.RunID, pr int, result string, extra transitionExtras, write decisionWrite) {
 	attrs := decisionAttrs(ctx, "run_id", string(runID))
 	if pr != 0 {
 		attrs = append(attrs, "pr", pr)
@@ -284,11 +400,11 @@ func (l *DecisionLogger) emitTransition(ctx context.Context, kind string, runID 
 		Action: result, Fields: extra.fields,
 	}
 	slog.InfoContext(ctx, kind, attrs...)
-	l.Record(ctx, d)
+	write(ctx, d)
 }
 
 func (l *DecisionLogger) logTransitionSpawn(ctx context.Context, runID core.RunID, taskID core.TaskID, branch string) {
-	l.emitTransition(ctx, "transition.spawn", runID, 0, "", transitionExtras{
+	l.emitTransitionDeferred(ctx, "transition.spawn", runID, 0, "", transitionExtras{
 		taskID: taskID,
 		attrs:  []any{"task_id", string(taskID), "branch", branch},
 		fields: map[string]any{"branch": branch},
@@ -296,7 +412,7 @@ func (l *DecisionLogger) logTransitionSpawn(ctx context.Context, runID core.RunI
 }
 
 func (l *DecisionLogger) logTransitionWatchPR(ctx context.Context, runID core.RunID, pr int) {
-	l.emitTransition(ctx, "transition.watch_pr", runID, pr, "", transitionExtras{})
+	l.emitTransitionDeferred(ctx, "transition.watch_pr", runID, pr, "", transitionExtras{})
 }
 
 func (l *DecisionLogger) logTransitionRebase(ctx context.Context, runID core.RunID, pr, attempt int, newSHA, result string) {
