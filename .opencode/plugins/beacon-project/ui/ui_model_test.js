@@ -230,37 +230,50 @@ test("CLI dispatch runs beacon dispatch 1 through the same resolver", async () =
   assert.equal(result.started, 1)
 })
 
-test("status source uses RPC for snapshot, control and dispatch and falls back when it throws", async () => {
+test("status source reads snapshot from CLI and keeps RPC for control and dispatch", async () => {
   const calls = []
   const rpc = {
-    snapshot: async () => ({ active: [makeRun({ title: "From RPC" })], recent: [] }),
+    snapshot: async () => { throw new Error("stale RPC") },
     control: async (input) => { calls.push(["control", input]); return { ok: true } },
     dispatch: async (input) => { calls.push(["dispatch", input]); return { started: 1 } },
   }
-  const good = createStatusSource({ client: { rpc: () => rpc }, location: { project: { canonical: "/p" } } })
-  assert.equal((await good.snapshot()).active[0].title, "From RPC")
-  assert.deepEqual(await good.control({ action: "retry", runID: "run-1" }), { ok: true })
-  assert.deepEqual(await good.dispatch({ n: 1 }), { started: 1 })
-  assert.deepEqual(calls, [["control", { action: "retry", runID: "run-1" }], ["dispatch", { n: 1 }]])
-
+  const ctx = { client: { rpc: () => rpc }, location: { project: { canonical: "/p" } } }
   const cliCalls = []
-  const bad = { client: { rpc: () => { throw new Error("no rpc") } }, location: { project: { canonical: "/p" } } }
   const deps = {
     command: () => ["/bin/beacon"],
     execFile: async (program, args) => {
       cliCalls.push([program, ...args])
-      return { stdout: JSON.stringify({ active: [makeRun({ TaskID: "T-7", title: "From CLI" })], recent: [] }) }
+      if (args[0] === "status") {
+        return { stdout: JSON.stringify({ active: [makeRun({ TaskID: "T-7", title: "From CLI" })], recent: [] }) }
+      }
+      return { stdout: args[0] === "dispatch" ? '{"started":1}' : '{"ok":true}' }
     },
     existsSync: () => false,
   }
-  const fallback = await createStatusSource(bad, { deps }).snapshot()
-  assert.equal(fallback.active[0].title, "From CLI")
+  const good = createStatusSource(ctx, { deps })
+  assert.equal((await good.snapshot()).active[0].title, "From CLI")
+  assert.deepEqual(await good.control({ action: "retry", runID: "run-1" }), { ok: true })
+  assert.deepEqual(await good.dispatch({ n: 1 }), { started: 1 })
+  assert.deepEqual(calls, [["control", { action: "retry", runID: "run-1" }], ["dispatch", { n: 1 }]])
   assert.deepEqual(cliCalls, [["/bin/beacon", "status", "--snapshot"]])
+
+  const throwing = { control: async () => { throw new Error("no rpc") }, dispatch: async () => { throw new Error("no rpc") } }
+  const bad = createStatusSource({ client: { rpc: () => throwing }, location: { project: { canonical: "/p" } } }, { deps })
+  assert.deepEqual(await bad.control({ action: "retry", runID: "run-2" }), { ok: true })
+  assert.deepEqual(await bad.dispatch({ n: 2 }), { started: 1 })
+  assert.deepEqual(cliCalls.slice(1), [
+    ["/bin/beacon", "control", "--action", "retry", "--run-id", "run-2", "--json"],
+    ["/bin/beacon", "dispatch", "2"],
+  ])
 })
 
 test("an unverified root keeps every queue card instead of filtering them all", async () => {
-  const rpc = { snapshot: async () => ({ active: [], recent: [], queue: [{ id: "T-A" }, { id: "T-B" }] }) }
-  const source = createStatusSource({ client: { rpc: () => rpc } }, {})
+  const deps = {
+    command: () => ["/bin/beacon"],
+    execFile: async () => ({ stdout: JSON.stringify({ active: [], recent: [], queue: [{ id: "T-A" }, { id: "T-B" }] }) }),
+    existsSync: () => false,
+  }
+  const source = createStatusSource({}, { deps })
   const snap = await source.snapshot()
   assert.equal(source.verified(), false)
   assert.deepEqual(snap.queue.map((q) => q.id), ["T-A", "T-B"])
@@ -272,9 +285,14 @@ test("a late location verifies the root and drops only missing or done cards", a
     [`${root}/docs/tasks/T-A.md`]: "---\ntitle: Alpha\nstatus: todo\n---\n",
     [`${root}/docs/tasks/T-B.md`]: "---\ntitle: Beta\nstatus: done\n---\n",
   }
-  const deps = { existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p] }
-  const rpc = { snapshot: async () => ({ active: [], recent: [], queue: [{ id: "T-A" }, { id: "T-B" }, { id: "T-GONE" }] }) }
-  const ctx = { client: { rpc: () => rpc } }
+  const deps = {
+    command: () => ["/bin/beacon"],
+    execFile: async () => ({ stdout: JSON.stringify({
+      active: [], recent: [], queue: [{ id: "T-A" }, { id: "T-B" }, { id: "T-GONE" }],
+    }) }),
+    existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p],
+  }
+  const ctx = {}
   const source = createStatusSource(ctx, { deps })
   assert.equal((await source.snapshot()).queue.length, 3, "no verified root keeps all cards")
   ctx.location = { project: { canonical: root } }
@@ -282,6 +300,35 @@ test("a late location verifies the root and drops only missing or done cards", a
   assert.equal(source.verified(), true)
   assert.equal(source.root(), root)
   assert.deepEqual(snap.queue.map((q) => q.id), ["T-A"])
+})
+
+test("a stale RPC empty queue cannot hide CLI ready cards in the panel", async () => {
+  const root = "/work/project"
+  const files = {
+    [`${root}/docs/tasks/T-1.md`]: "---\nid: T-1\ntitle: Alpha\nstatus: todo\n---\n",
+    [`${root}/docs/tasks/T-2.md`]: "---\nid: T-2\ntitle: Beta\nstatus: todo\n---\n",
+  }
+  const deps = {
+    command: () => ["/bin/beacon"],
+    execFile: async () => ({ stdout: JSON.stringify({
+      active: [], recent: [],
+      queue: [
+        { id: "T-1", title: "Alpha", status: "ready", priority: 2 },
+        { id: "T-2", title: "Beta", status: "ready", priority: 1 },
+      ],
+    }) }),
+    existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p],
+  }
+  let rpcSnapshots = 0
+  const rpc = { snapshot: async () => { rpcSnapshots++; return { active: [], recent: [], queue: [] } } }
+  const source = createStatusSource({ client: { rpc: () => rpc }, location: { project: { canonical: root } } }, { deps })
+  const snap = await source.snapshot()
+  assert.equal(rpcSnapshots, 0, "the stale RPC snapshot is not consulted")
+  assert.deepEqual(snap.queue.map((q) => q.id), ["T-1", "T-2"])
+  const rendered = renderSnapshotLines(snap)
+  assert.ok(rendered.includes("▶ Queue 2"), "the queue header counts the ready cards")
+  assert.ok(rendered.includes("▶ Dispatch (2 ready)"), "the Dispatch plate shows the ready count")
+  assert.equal(rendered.includes("Queue no tasks ready"), false)
 })
 
 test("RPC definition validates snapshot, control and dispatch shapes", () => {

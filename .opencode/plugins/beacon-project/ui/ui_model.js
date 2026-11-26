@@ -335,14 +335,26 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
     return next
   }
   const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits }) : null
+  const snapshotView = (value, project) => {
+    const view = normalizeSnapshot(value)
+    if (!verified) return view
+    return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
+  }
   const fallback = async (name, input) => {
     const project = rootOf()
+    // A verified root lets the CLI read this project's store on this call. An
+    // RPC snapshot can be stale or partially initialised and return an empty
+    // queue without throwing, so it must not hide ready cards. An unverified
+    // cwd guess stays behind RPC. RPC remains the accelerator for control and
+    // dispatch.
+    if (name === "snapshot" && verified) {
+      try { return snapshotView(await cli.snapshot(input), project) } catch {}
+    }
     let value, usedRPC = false
     if (rpc) { try { value = await rpc[name](input); usedRPC = true } catch {} }
     if (!usedRPC) value = await cli[name](input)
     if (name !== "snapshot") return value
-    const view = normalizeSnapshot(value); if (!verified) return view
-    return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
+    return snapshotView(value, project)
   }
   return {
     snapshot: (input = limits) => fallback("snapshot", input),
