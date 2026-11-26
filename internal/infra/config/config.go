@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
 	"gopkg.in/yaml.v3"
@@ -20,9 +21,10 @@ const (
 	RequiredChecksWorkflow = "workflow"
 )
 
-// defaultMaxAutoRebases is the automatic rebase cap used when
-// merge.max_auto_rebases is unset. It preserves the old hardcoded value.
-const defaultMaxAutoRebases = 2
+// DefaultMaxAutoRebases is the automatic rebase cap used when
+// merge.max_auto_rebases is unset. It shares the reconciler's exported
+// fallback so the configured and test-built paths cannot drift.
+const DefaultMaxAutoRebases = app.DefaultMaxAutoRebases
 
 // defaultPollInterval is the silent fallback for code-built configs that
 // never passed through Load.
@@ -271,7 +273,7 @@ func applyDefaults(c *Config) {
 		c.Merge.MaxAttempts = 12
 	}
 	if c.Merge.MaxAutoRebases <= 0 {
-		c.Merge.MaxAutoRebases = defaultMaxAutoRebases
+		c.Merge.MaxAutoRebases = DefaultMaxAutoRebases
 	}
 	if c.Concurrency.MaxInFlight <= 0 {
 		c.Concurrency.MaxInFlight = 20
@@ -349,7 +351,7 @@ func defaults() Config {
 		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
 		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
 		Harness:      Harness{WorkerInstructions: DefaultWorkerInstructions},
-		Merge:        Merge{MaxAttempts: 12, MaxAutoRebases: defaultMaxAutoRebases, AutoRebase: true},
+		Merge:        Merge{MaxAttempts: 12, MaxAutoRebases: DefaultMaxAutoRebases, AutoRebase: true},
 		OnBaseRed:    OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
 }

@@ -13,11 +13,15 @@ func sameObservation(run *core.Run, obs core.Observation) bool {
 	return run.ObservedSHA == obs.HeadSHA && run.ObservedBaseSHA == obs.BaseSHA
 }
 
-// maxAutoRebases is the fallback automatic branch-update cap for Reconcilers
-// built without a configured value. Rebases get their own small budget so a
-// moving base cannot spend the whole fix budget before a real check failure is
-// handled. Configured Reconcilers use autoRebaseCap instead.
-const maxAutoRebases = 2
+// DefaultMaxAutoRebases is the fallback automatic branch-update cap for
+// Reconcilers built without a configured value. Rebases get their own small
+// budget so a moving base cannot spend the whole fix budget before a real
+// check failure is handled. Config shares this value for merge.max_auto_rebases.
+const DefaultMaxAutoRebases = 2
+
+// maxAutoRebases keeps the package-local name used by the fallback tests. It
+// aliases the exported default so the value is defined once.
+const maxAutoRebases = DefaultMaxAutoRebases
 
 // autoRebaseCap returns the configured automatic rebase cap. A Reconciler
 // built directly in a test keeps the fallback, so no caller can accidentally
@@ -26,7 +30,7 @@ func (r *Reconciler) autoRebaseCap() int {
 	if r.MaxAutoRebases > 0 {
 		return r.MaxAutoRebases
 	}
-	return maxAutoRebases
+	return DefaultMaxAutoRebases
 }
 
 // recordObservation stores the head and base SHA pair the reconciler has just
