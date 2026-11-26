@@ -187,7 +187,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 			run.MaxAttempts = d.MaxAttempts
 		}
 		run.Scope = task.Scope
-		run.ParentSessionID = firstNonEmptyLocal(parentSession(ctx), d.ParentSessionID)
+		run.ParentSessionID = core.FirstNonEmpty(parentSession(ctx), d.ParentSessionID)
 		if err := d.Store.Save(ctx, run); err != nil {
 			return out, err
 		}
@@ -439,15 +439,6 @@ func (d *Dispatcher) Available(ctx context.Context) int {
 		return 0
 	}
 	return free
-}
-
-func firstNonEmptyLocal(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 // modelRef resolves the worker model from the run's parent session. The MCP
