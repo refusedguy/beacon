@@ -1,7 +1,7 @@
 ---
 id: T-ffd3f9b0
 title: Split workspace Create lifecycle
-status: available
+status: done
 scope:
     - internal/infra/workspace/git_worktree.go
 priority: 68

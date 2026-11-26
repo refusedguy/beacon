@@ -136,10 +136,15 @@ func (g *GitWorktree) cardOnlyDirt(ctx context.Context, path string) (dirty, onl
 	return true, all == inside, nil
 }
 
-// Create checks out a fresh worktree for task.
-func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspace, error) {
-	branch := branchName(task.ID)
-	path := filepath.Join(g.Dir, unsafeBranchChars.ReplaceAllString(string(task.ID), "-"))
+// createTarget names the branch, worktree path and base ref for a task.
+type createTarget struct {
+	branch string
+	path   string
+	base   string
+}
+
+// targetFor resolves the branch, path and base a task's worktree is built from.
+func (g *GitWorktree) targetFor(task core.Task) createTarget {
 	base := task.BaseBranch
 	if base == "" {
 		base = g.Base
@@ -147,51 +152,83 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	if base == "" {
 		base = "main"
 	}
-	if err := os.MkdirAll(g.Dir, 0o755); err != nil {
-		return core.Workspace{}, err
+	return createTarget{
+		branch: branchName(task.ID),
+		path:   filepath.Join(g.Dir, unsafeBranchChars.ReplaceAllString(string(task.ID), "-")),
+		base:   base,
 	}
-	if _, err := g.run(ctx, "fetch", "origin", base); err != nil {
-		return core.Workspace{}, err
-	}
+}
+
+// clearStalePath removes a leftover worktree at path. A failed spawn can leave
+// only the card status marker behind, which belongs to Beacon and must not
+// block the next dispatch. Real agent code still stops the create with a
+// conflict. The stale path is removed quietly; the editor refresh belongs to
+// public removal, since Create re-adds this path immediately.
+func (g *GitWorktree) clearStalePath(ctx context.Context, path string) error {
 	if _, err := os.Stat(path); err == nil {
-		// A failed spawn can leave only the card status marker behind. That
-		// dirt belongs to Beacon and must not block the next dispatch. Real
-		// agent code still stops the create with a conflict. The stale path is
-		// removed quietly; the editor refresh belongs to public removal, since
-		// this path is immediately re-added below.
 		dirty, onlyCards, err := g.cardOnlyDirt(ctx, path)
 		if err != nil {
-			return core.Workspace{}, err
+			return err
 		}
 		if dirty && !onlyCards {
-			return core.Workspace{}, core.WorkspaceConflict(path)
+			return core.WorkspaceConflict(path)
 		}
-		if err := g.removeForce(ctx, core.Workspace{Path: path}); err != nil {
-			return core.Workspace{}, err
-		}
+		return g.removeForce(ctx, core.Workspace{Path: path})
 	} else if !os.IsNotExist(err) {
-		return core.Workspace{}, err
+		return err
 	}
-	// The branch name is unique per task, so add -B can create or reset it in
-	// one call instead of probing show-ref and deleting the branch first.
-	if _, err := g.run(ctx, "worktree", "add", "-B", branch, path, "origin/"+base); err != nil {
-		// A directory removed outside this process can leave a dead
-		// administrative entry that blocks the add. Prune only after a failure
-		// so a clean path does not pay for it on every card.
+	return nil
+}
+
+// addWorktree checks branch out at path from origin/base. The branch name is
+// unique per task, so add -B can create or reset it in one call instead of
+// probing show-ref and deleting the branch first. A directory removed outside
+// this process can leave a dead administrative entry that blocks the add, so a
+// failed add is retried once after a prune.
+func (g *GitWorktree) addWorktree(ctx context.Context, t createTarget) error {
+	if _, err := g.run(ctx, "worktree", "add", "-B", t.branch, t.path, "origin/"+t.base); err != nil {
 		if _, pruneErr := g.run(ctx, "worktree", "prune"); pruneErr != nil {
 			slog.Warn("worktree prune failed", "error", pruneErr)
 		}
-		if _, retryErr := g.run(ctx, "worktree", "add", "-B", branch, path, "origin/"+base); retryErr != nil {
-			return core.Workspace{}, err
+		if _, retryErr := g.run(ctx, "worktree", "add", "-B", t.branch, t.path, "origin/"+t.base); retryErr != nil {
+			return err
 		}
 	}
-	mergeBase, err := g.run(ctx, "merge-base", "origin/"+base, branch)
+	return nil
+}
+
+// worktreeBase resolves the merge base and removes the worktree if that fails.
+// The cleanup keeps a failed create from leaving a worktree behind.
+func (g *GitWorktree) worktreeBase(ctx context.Context, t createTarget) (string, error) {
+	mergeBase, err := g.run(ctx, "merge-base", "origin/"+t.base, t.branch)
 	if err != nil {
-		_, cleanupErr := g.run(ctx, "worktree", "remove", path)
+		_, cleanupErr := g.run(ctx, "worktree", "remove", t.path)
 		g.refresh(ctx)
-		return core.Workspace{}, core.JoinWith(err, "remove worktree after failed merge-base", cleanupErr)
+		return "", core.JoinWith(err, "remove worktree after failed merge-base", cleanupErr)
 	}
-	return core.Workspace{Path: path, Branch: branch, Base: strings.TrimSpace(mergeBase)}, nil
+	return strings.TrimSpace(mergeBase), nil
+}
+
+// Create checks out a fresh worktree for task.
+func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspace, error) {
+	t := g.targetFor(task)
+	if err := os.MkdirAll(g.Dir, 0o755); err != nil {
+		return core.Workspace{}, err
+	}
+	if _, err := g.run(ctx, "fetch", "origin", t.base); err != nil {
+		return core.Workspace{}, err
+	}
+	if err := g.clearStalePath(ctx, t.path); err != nil {
+		return core.Workspace{}, err
+	}
+	if err := g.addWorktree(ctx, t); err != nil {
+		return core.Workspace{}, err
+	}
+	base, err := g.worktreeBase(ctx, t)
+	if err != nil {
+		return core.Workspace{}, err
+	}
+	return core.Workspace{Path: t.path, Branch: t.branch, Base: base}, nil
 }
 
 // EnsureBranch publishes branch from origin/base when it is missing on origin.
