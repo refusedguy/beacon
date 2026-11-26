@@ -313,3 +313,61 @@ func TestTaskUpdaterUpdatesPlanAndBody(t *testing.T) {
 		t.Errorf("old body still present:\n%s", updated)
 	}
 }
+
+func TestTaskUpdaterNormalizesPaddedAndDuplicateIDs(t *testing.T) {
+	dir := t.TempDir()
+	a := writeUpdateCard(t, dir, "T-A", updateCardBody)
+	b := writeUpdateCard(t, dir, "T-B", "---\nid: T-B\n---\nbody\n")
+	ws := &fakeWorkspace{log: &callLog{}}
+	updater := newUpdater(dir, newFakeStore(), ws)
+	first, second := "First title", "Second title"
+
+	got, err := updater.Update(context.Background(), []UpdateInput{
+		{ID: " T-A ", Title: &first},
+		{ID: "T-A", Title: &second},
+		{ID: "   ", Title: &second},
+		{ID: " T-B ", Title: &second},
+	})
+	if err != nil {
+		t.Fatalf("updater.Update with padded and duplicate ids: %v", err)
+	}
+	if !got.Pushed || len(got.Results) != 2 {
+		t.Fatalf("result = %+v", got)
+	}
+	if got.Results[0].ID != "T-A" || got.Results[0].Status != "updated" ||
+		got.Results[1].ID != "T-B" || got.Results[1].Status != "updated" {
+		t.Fatalf("results = %+v", got.Results)
+	}
+	if updated := readUpdateCard(t, a); !strings.Contains(updated, "title: First title") ||
+		strings.Contains(updated, "Second title") {
+		t.Fatalf("duplicate id did not keep the first update:\n%s", updated)
+	}
+	if updated := readUpdateCard(t, b); !strings.Contains(updated, "title: Second title") {
+		t.Fatalf("padded id did not update the card:\n%s", updated)
+	}
+	if len(ws.commits) != 1 {
+		t.Fatalf("commits = %d, want one push", len(ws.commits))
+	}
+}
+
+func TestTaskUpdaterRejectsInvalidIDBeforeTouchingCards(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpdateCard(t, dir, "T-A", updateCardBody)
+	ws := &fakeWorkspace{log: &callLog{}}
+	updater := newUpdater(dir, newFakeStore(), ws)
+	title := "Should not land"
+
+	_, err := updater.Update(context.Background(), []UpdateInput{
+		{ID: "T-A", Title: &title},
+		{ID: " T-B/escape ", Title: &title},
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v, want invalid input", err)
+	}
+	if readUpdateCard(t, path) != updateCardBody {
+		t.Fatal("invalid id batch changed a card")
+	}
+	if len(ws.commits) != 0 {
+		t.Fatalf("commits = %d, want none", len(ws.commits))
+	}
+}
