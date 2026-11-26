@@ -1,7 +1,7 @@
 ---
 id: T-be8aa55b
 title: Diagnose perf-smoke 30s timeout
-status: in_progress
+status: done
 scope:
     - scripts/bench-e2e.sh
     - scripts/check-bench-regression.sh
