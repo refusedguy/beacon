@@ -13,6 +13,7 @@ import {
   registerBeaconMcp,
   BEACON_SERVER,
   BEACON_PROJECT_ROOT_ENV,
+  BEACON_PARENT_SESSION_ENV,
   BEACON_BUILD_SCRIPT,
 } from "./mcp.js"
 
@@ -306,8 +307,24 @@ test("server config carries the project root and enables the server", () => {
   assert.deepEqual(config.command, [local, "mcp"])
   assert.equal(config.cwd, ROOT)
   assert.equal(config.environment[BEACON_PROJECT_ROOT_ENV], ROOT)
+  assert.equal(BEACON_PARENT_SESSION_ENV in config.environment, false)
   assert.equal(config.disabled, false)
   assert.throws(() => beaconServerConfig("", deps), /project root is required/)
+})
+
+test("server config carries the operator session for the daemon fallback", () => {
+  const config = beaconServerConfig(ROOT, localBinaryDeps(), "ses_operator")
+
+  assert.equal(config.environment[BEACON_PROJECT_ROOT_ENV], ROOT)
+  assert.equal(config.environment[BEACON_PARENT_SESSION_ENV], "ses_operator")
+})
+
+test("registration reads the session id from the plugin context", async (t) => {
+  const ctx = { ...fakeCtx(), sessionID: "ses_operator" }
+  const registration = await registerBeaconMcp(ctx, ROOT, localBinaryDeps())
+  t.after(() => registration.dispose())
+
+  assert.equal(registration.config.environment[BEACON_PARENT_SESSION_ENV], "ses_operator")
 })
 
 test("500 config requests over a 2000-file source tree keep using the local binary", () => {
