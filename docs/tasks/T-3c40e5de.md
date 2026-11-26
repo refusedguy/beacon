@@ -1,7 +1,7 @@
 ---
 id: T-3c40e5de
 title: Fetch independent PR signals concurrently
-status: available
+status: done
 scope:
     - internal/infra/scm/github.go
     - internal/infra/scm/gitlab_mr.go
