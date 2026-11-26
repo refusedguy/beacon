@@ -253,76 +253,70 @@ func (l *DecisionLogger) logReconcileDecisionDeferred(ctx context.Context, pr in
 	}
 }
 
-func (l *DecisionLogger) logTransitionSpawn(ctx context.Context, runID core.RunID, taskID core.TaskID, branch string) {
-	slog.InfoContext(ctx, "transition.spawn", decisionAttrs(ctx,
-		"run_id", string(runID),
-		"task_id", string(taskID),
-		"branch", branch,
-	)...)
-	l.Record(ctx, Decision{
-		CycleID: cycleID(ctx), Kind: "transition.spawn",
-		RunID: string(runID), TaskID: string(taskID),
-		Fields: map[string]any{"branch": branch},
-	})
+// transitionExtras carries the attributes and Decision fields that one
+// transition adds on top of the shared run_id, pr and result core.
+type transitionExtras struct {
+	taskID core.TaskID
+	attrs  []any
+	fields map[string]any
 }
 
 // emitTransition writes the shared slog record and Decision for a run
 // transition. An empty result leaves out the result attribute and Action field,
-// which keeps watch_pr's decision shape unchanged.
-func (l *DecisionLogger) emitTransition(ctx context.Context, kind string, runID core.RunID, pr int, result string) {
-	attrs := decisionAttrs(ctx, "run_id", string(runID), "pr", pr)
-	d := Decision{
-		CycleID: cycleID(ctx), Kind: kind,
-		RunID: string(runID), PRNumber: pr,
+// which keeps watch_pr's decision shape unchanged. A zero PR leaves out the pr
+// attribute, which keeps spawn's log shape unchanged.
+func (l *DecisionLogger) emitTransition(ctx context.Context, kind string, runID core.RunID, pr int, result string, extra transitionExtras) {
+	attrs := decisionAttrs(ctx, "run_id", string(runID))
+	if pr != 0 {
+		attrs = append(attrs, "pr", pr)
 	}
+	attrs = append(attrs, extra.attrs...)
 	if result != "" {
 		attrs = append(attrs, "result", result)
-		d.Action = result
+	}
+	d := Decision{
+		CycleID: cycleID(ctx), Kind: kind,
+		RunID: string(runID), TaskID: string(extra.taskID), PRNumber: pr,
+		Action: result, Fields: extra.fields,
 	}
 	slog.InfoContext(ctx, kind, attrs...)
 	l.Record(ctx, d)
 }
 
+func (l *DecisionLogger) logTransitionSpawn(ctx context.Context, runID core.RunID, taskID core.TaskID, branch string) {
+	l.emitTransition(ctx, "transition.spawn", runID, 0, "", transitionExtras{
+		taskID: taskID,
+		attrs:  []any{"task_id", string(taskID), "branch", branch},
+		fields: map[string]any{"branch": branch},
+	})
+}
+
 func (l *DecisionLogger) logTransitionWatchPR(ctx context.Context, runID core.RunID, pr int) {
-	l.emitTransition(ctx, "transition.watch_pr", runID, pr, "")
+	l.emitTransition(ctx, "transition.watch_pr", runID, pr, "", transitionExtras{})
 }
 
 func (l *DecisionLogger) logTransitionRebase(ctx context.Context, runID core.RunID, pr, attempt int, newSHA, result string) {
-	slog.InfoContext(ctx, "transition.rebase", decisionAttrs(ctx,
-		"run_id", string(runID),
-		"pr", pr,
-		"attempt", attempt,
-		"new_sha", newSHA,
-		"result", result,
-	)...)
-	l.Record(ctx, Decision{
-		CycleID: cycleID(ctx), Kind: "transition.rebase",
-		RunID: string(runID), PRNumber: pr, Action: result,
-		Fields: map[string]any{"attempt": attempt, "new_sha": newSHA},
+	l.emitTransition(ctx, "transition.rebase", runID, pr, result, transitionExtras{
+		attrs:  []any{"attempt", attempt, "new_sha", newSHA},
+		fields: map[string]any{"attempt": attempt, "new_sha": newSHA},
 	})
 }
 
 func (l *DecisionLogger) logTransitionWake(ctx context.Context, runID core.RunID, pr int, result string) {
-	l.emitTransition(ctx, "transition.wake", runID, pr, result)
+	l.emitTransition(ctx, "transition.wake", runID, pr, result, transitionExtras{})
 }
 
 func (l *DecisionLogger) logTransitionMerge(ctx context.Context, runID core.RunID, pr int, result string) {
-	l.emitTransition(ctx, "transition.merge", runID, pr, result)
+	l.emitTransition(ctx, "transition.merge", runID, pr, result, transitionExtras{})
 }
 
 func (l *DecisionLogger) logTransitionDeliveryClaim(ctx context.Context, runID core.RunID, pr int, claimed bool) {
-	slog.InfoContext(ctx, "transition.delivery_claim", decisionAttrs(ctx,
-		"run_id", string(runID),
-		"pr", pr,
-		"claimed", claimed,
-	)...)
-	l.Record(ctx, Decision{
-		CycleID: cycleID(ctx), Kind: "transition.delivery_claim",
-		RunID: string(runID), PRNumber: pr,
-		Fields: map[string]any{"claimed": claimed},
+	l.emitTransition(ctx, "transition.delivery_claim", runID, pr, "", transitionExtras{
+		attrs:  []any{"claimed", claimed},
+		fields: map[string]any{"claimed": claimed},
 	})
 }
 
 func (l *DecisionLogger) logTransitionParentNotify(ctx context.Context, runID core.RunID, pr int, result string) {
-	l.emitTransition(ctx, "transition.parent_notify", runID, pr, result)
+	l.emitTransition(ctx, "transition.parent_notify", runID, pr, result, transitionExtras{})
 }

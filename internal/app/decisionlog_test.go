@@ -200,6 +200,68 @@ func TestDecisionLogTransitionDecisionFields(t *testing.T) {
 	}
 }
 
+func TestDecisionLogTransitionExtraDecisionFields(t *testing.T) {
+	h := captureDecisions(t)
+	sink := &memoryDecisionSink{}
+	logger := DecisionLogger{Sink: sink}
+	ctx := WithCycleID(context.Background(), "run-9")
+
+	logger.logTransitionSpawn(ctx, "run-9", "T-9", "beacon/T-9")
+	logger.logTransitionRebase(ctx, "run-9", 77, 2, "sha-new", "rebased")
+	logger.logTransitionDeliveryClaim(ctx, "run-9", 77, true)
+
+	logWant := []struct {
+		message string
+		fields  map[string]any
+	}{
+		{"transition.spawn", map[string]any{"cycle_id": "run-9", "run_id": "run-9", "task_id": "T-9", "branch": "beacon/T-9"}},
+		{"transition.rebase", map[string]any{"cycle_id": "run-9", "run_id": "run-9", "pr": 77, "attempt": 2, "new_sha": "sha-new", "result": "rebased"}},
+		{"transition.delivery_claim", map[string]any{"cycle_id": "run-9", "run_id": "run-9", "pr": 77, "claimed": true}},
+	}
+	for _, w := range logWant {
+		got := decisionFields(decisionRecord(t, h, w.message))
+		if len(got) != len(w.fields) {
+			t.Errorf("%s log fields = %+v, want %+v", w.message, got, w.fields)
+			continue
+		}
+		for key, value := range w.fields {
+			if got[key] != value {
+				t.Errorf("%s log field %s = %#v, want %#v", w.message, key, got[key], value)
+			}
+		}
+	}
+
+	want := []struct {
+		kind   string
+		taskID string
+		pr     int
+		action string
+		fields map[string]any
+	}{
+		{"transition.spawn", "T-9", 0, "", map[string]any{"branch": "beacon/T-9"}},
+		{"transition.rebase", "", 77, "rebased", map[string]any{"attempt": 2, "new_sha": "sha-new"}},
+		{"transition.delivery_claim", "", 77, "", map[string]any{"claimed": true}},
+	}
+	if len(sink.decisions) != len(want) {
+		t.Fatalf("recorded %d decisions, want %d", len(sink.decisions), len(want))
+	}
+	for i, d := range sink.decisions {
+		w := want[i]
+		if d.Kind != w.kind || d.TaskID != w.taskID || d.PRNumber != w.pr || d.Action != w.action {
+			t.Errorf("decision %d = %+v, want kind=%q task=%q pr=%d action=%q", i, d, w.kind, w.taskID, w.pr, w.action)
+		}
+		if len(d.Fields) != len(w.fields) {
+			t.Errorf("decision %d fields = %+v, want %+v", i, d.Fields, w.fields)
+			continue
+		}
+		for key, value := range w.fields {
+			if d.Fields[key] != value {
+				t.Errorf("decision %d field %s = %#v, want %#v", i, key, d.Fields[key], value)
+			}
+		}
+	}
+}
+
 func TestCycleIDContext(t *testing.T) {
 	if got := cycleID(context.Background()); got != "" {
 		t.Fatalf("empty context cycle id = %q", got)
