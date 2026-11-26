@@ -471,20 +471,30 @@ ORDER BY at, id`
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var d app.Decision
-		var at int64
-		var fields string
-		if err := rows.Scan(&d.ID, &at, &d.CycleID, &d.Kind, &d.RunID, &d.TaskID,
-			&d.PRNumber, &d.Verdict, &d.Action, &d.Reason, &fields); err != nil {
+		d, err := scanDecision(rows)
+		if err != nil {
 			return nil, err
 		}
-		d.At = time.Unix(0, at).UTC()
-		if err := json.Unmarshal([]byte(fields), &d.Fields); err != nil {
-			return nil, fmt.Errorf("fields_json: %w", err)
-		}
-		out = append(out, d)
+		out = append(out, *d)
 	}
 	return out, rows.Err()
+}
+
+// scanDecision decodes one decision row into an app.Decision. Row-level errors,
+// including sql.ErrNoRows, are returned to the caller to handle.
+func scanDecision(row scanner) (*app.Decision, error) {
+	var d app.Decision
+	var at int64
+	var fields string
+	if err := row.Scan(&d.ID, &at, &d.CycleID, &d.Kind, &d.RunID, &d.TaskID,
+		&d.PRNumber, &d.Verdict, &d.Action, &d.Reason, &fields); err != nil {
+		return nil, err
+	}
+	d.At = time.Unix(0, at).UTC()
+	if err := json.Unmarshal([]byte(fields), &d.Fields); err != nil {
+		return nil, fmt.Errorf("fields_json: %w", err)
+	}
+	return &d, nil
 }
 
 // DecisionCounts aggregates every decision into a handful of rows. It keeps
@@ -524,22 +534,11 @@ GROUP BY kind, verdict, action ORDER BY kind, verdict, action`
 func (s *Store) LastDecision(ctx context.Context, runID string) (*app.Decision, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+decisionColumns+`
 FROM decisions WHERE run_id=? ORDER BY at DESC, id DESC LIMIT 1`, runID)
-	var d app.Decision
-	var at int64
-	var fields string
-	err := row.Scan(&d.ID, &at, &d.CycleID, &d.Kind, &d.RunID, &d.TaskID,
-		&d.PRNumber, &d.Verdict, &d.Action, &d.Reason, &fields)
+	d, err := scanDecision(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	d.At = time.Unix(0, at).UTC()
-	if err := json.Unmarshal([]byte(fields), &d.Fields); err != nil {
-		return nil, fmt.Errorf("fields_json: %w", err)
-	}
-	return &d, nil
+	return d, err
 }
 
 // ListQueueTasks reads local task cards and their unresolved dependencies

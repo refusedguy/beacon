@@ -692,6 +692,50 @@ func TestLastDecisionReturnsNewestForRun(t *testing.T) {
 	}
 }
 
+// TestDecisionReadersDecodeIdentically checks that ListDecisions and
+// LastDecision share one row decoder. The same stored decision must come back
+// byte-identical from both readers, including its timestamp and fields.
+func TestDecisionReadersDecodeIdentically(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	want := app.Decision{
+		ID: 1, At: at, CycleID: "cycle-1", Kind: "reconcile.decision",
+		RunID: "r1", TaskID: "T-1", PRNumber: 42, Verdict: "wait",
+		Action: "retry", Reason: "waiting on CI",
+		Fields: map[string]any{"head_sha": "sha1", "state": "waiting_ci", "n": float64(3)},
+	}
+	if err := store.RecordDecision(ctx, want); err != nil {
+		t.Fatalf("store.RecordDecision: %v", err)
+	}
+
+	listed, err := store.ListDecisions(ctx, []string{"r1"}, 0, 0)
+	if err != nil {
+		t.Fatalf("store.ListDecisions: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("decisions = %d, want 1", len(listed))
+	}
+	last, err := store.LastDecision(ctx, "r1")
+	if err != nil {
+		t.Fatalf("store.LastDecision: %v", err)
+	}
+	if last == nil {
+		t.Fatal("LastDecision returned nil, want one decision")
+	}
+	if !reflect.DeepEqual(listed[0], *last) {
+		t.Fatalf("decoded decisions differ:\nListDecisions: %+v\nLastDecision: %+v", listed[0], *last)
+	}
+	if !listed[0].At.Equal(at) || listed[0].Fields["head_sha"] != "sha1" {
+		t.Fatalf("decoded decision lost data: %+v", listed[0])
+	}
+}
+
 func TestRunEventMigrationBackfillsExistingRuns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	legacy, err := sql.Open("sqlite", "file:"+path)
