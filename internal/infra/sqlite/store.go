@@ -218,6 +218,32 @@ func (s *Store) FindActiveByTask(ctx context.Context, task core.TaskID) (*core.R
 	return s.queryOne(ctx, `SELECT `+runColumns+` FROM runs WHERE task_id=? AND state NOT IN ('merged','closed','dropped') ORDER BY updated_at DESC LIMIT 1`, string(task))
 }
 
+// ActiveTaskIDs returns the state of one nonterminal run for each requested
+// task. Tasks without a run in flight are absent from the result. The query
+// reads only task_id and state, so callers that just need to know whether a
+// task is busy do not decode full runs and their JSON columns.
+func (s *Store) ActiveTaskIDs(ctx context.Context, taskIDs []string) (map[string]core.RunState, error) {
+	out := make(map[string]core.RunState)
+	if len(taskIDs) == 0 {
+		return out, nil
+	}
+	query, args := inQuery(`SELECT task_id, state FROM runs WHERE task_id IN (%s)
+AND state NOT IN ('merged','closed','dropped')`, taskIDs)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var task, state string
+		if err := rows.Scan(&task, &state); err != nil {
+			return nil, err
+		}
+		out[task] = core.RunState(state)
+	}
+	return out, rows.Err()
+}
+
 // deliveryRetention bounds how long delivery keys and approvals stay in the
 // state database. Both are idempotency markers for a specific SHA, so a row
 // older than this window can never affect a new decision.
@@ -621,6 +647,7 @@ func inQuery(template string, ids []string) (string, []any) {
 }
 
 var _ core.RunStore = (*Store)(nil)
+var _ app.ActiveTaskFinder = (*Store)(nil)
 var _ app.DecisionSink = (*Store)(nil)
 var _ app.DecisionLookup = (*Store)(nil)
 var _ app.SnapshotStore = (*Store)(nil)

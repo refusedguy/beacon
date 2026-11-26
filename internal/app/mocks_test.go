@@ -108,6 +108,18 @@ func (f *fakeStore) FindActiveByTask(_ context.Context, id core.TaskID) (*core.R
 	}
 	return nil, nil
 }
+func (f *fakeStore) ActiveTaskIDs(_ context.Context, ids []string) (map[string]core.RunState, error) {
+	out := make(map[string]core.RunState)
+	for _, id := range ids {
+		for _, r := range f.runs {
+			if string(r.TaskID) == id && !r.State.Terminal() {
+				out[id] = r.State
+				break
+			}
+		}
+	}
+	return out, nil
+}
 func (f *fakeStore) ListActive(context.Context) ([]*core.Run, error) {
 	var out []*core.Run
 	for _, r := range f.runs {
@@ -212,12 +224,13 @@ func (f *fakeStore) UpdateIncident(_ context.Context, in *core.BaseIncident) err
 }
 
 var (
-	_ StatusStore     = (*fakeStore)(nil)
-	_ ReconcileStore  = (*fakeStore)(nil)
-	_ WaitStore       = (*fakeStore)(nil)
-	_ core.RunStore   = (*fakeStore)(nil)
-	_ DispatchStore   = (*fakeStore)(nil)
-	_ ReconcilerStore = (*fakeStore)(nil)
+	_ StatusStore      = (*fakeStore)(nil)
+	_ ReconcileStore   = (*fakeStore)(nil)
+	_ WaitStore        = (*fakeStore)(nil)
+	_ core.RunStore    = (*fakeStore)(nil)
+	_ DispatchStore    = (*fakeStore)(nil)
+	_ ReconcilerStore  = (*fakeStore)(nil)
+	_ ActiveTaskFinder = (*fakeStore)(nil)
 )
 
 type fakeWorkspace struct {

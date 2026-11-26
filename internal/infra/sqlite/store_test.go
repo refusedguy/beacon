@@ -1273,3 +1273,61 @@ func TestDecisionSummaryBackfillOnOpen(t *testing.T) {
 		t.Fatalf("counts after backfill = %+v, want %+v", counts, want)
 	}
 }
+
+// TestActiveTaskIDsProjectsOnlyTaskAndState checks the narrow read against the
+// same nonterminal rule FindActiveByTask uses. A row with unreadable JSON proves
+// the projection does not decode full runs.
+func TestActiveTaskIDsProjectsOnlyTaskAndState(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	states := map[string]core.RunState{
+		"r1": core.RunRunning,
+		"r2": core.RunBlocked,
+		"r3": core.RunClosed,
+		"r4": core.RunState("dropped"),
+		"r5": core.RunWaitingCI,
+		"r6": core.RunMerged,
+	}
+	tasks := map[string]core.TaskID{
+		"r1": "T-1", "r2": "T-2", "r3": "T-3", "r4": "T-4", "r5": "T-5", "r6": "T-6",
+	}
+	for id, state := range states {
+		run := core.NewRun(core.RunID(id), tasks[id], time.Now().UTC())
+		run.State = state
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatalf("Save(%s): %v", id, err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE runs SET scope_json='{', checks_json='{' WHERE id='r5'`); err != nil {
+		t.Fatalf("corrupt JSON columns: %v", err)
+	}
+
+	got, err := store.ActiveTaskIDs(ctx, []string{"T-1", "T-2", "T-3", "T-4", "T-5", "T-6", "T-none"})
+	if err != nil {
+		t.Fatalf("ActiveTaskIDs: %v", err)
+	}
+	want := map[string]core.RunState{
+		"T-1": core.RunRunning,
+		"T-2": core.RunBlocked,
+		"T-5": core.RunWaitingCI,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ActiveTaskIDs = %+v, want %+v", got, want)
+	}
+	if _, err := store.FindActiveByTask(ctx, "T-5"); err == nil {
+		t.Fatal("FindActiveByTask decoded the unreadable JSON, so the narrow read did not stay narrow")
+	}
+
+	empty, err := store.ActiveTaskIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("ActiveTaskIDs(nil): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ActiveTaskIDs(nil) = %+v, want empty", empty)
+	}
+}

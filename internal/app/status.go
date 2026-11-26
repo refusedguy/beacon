@@ -292,6 +292,37 @@ type IncidentStore interface {
 	CurrentIncident(ctx context.Context) (*core.BaseIncident, error)
 }
 
+// ActiveTaskFinder is the batched read side for tasks with work in flight.
+// A task with no active run is absent from the returned map.
+type ActiveTaskFinder interface {
+	ActiveTaskIDs(ctx context.Context, taskIDs []string) (map[string]core.RunState, error)
+}
+
+// activeTaskStates answers which of ids have an active run in one store call.
+// The fallback keeps narrow store fakes and adapters without the projection
+// working; the rule stays the same because it delegates to FindActiveByTask.
+func activeTaskStates(ctx context.Context, store any, ids []string) (map[string]core.RunState, error) {
+	active := make(map[string]core.RunState)
+	if store == nil || len(ids) == 0 {
+		return active, nil
+	}
+	if finder, ok := store.(ActiveTaskFinder); ok {
+		return finder.ActiveTaskIDs(ctx, ids)
+	}
+	if finder, ok := store.(ActiveRunFinder); ok {
+		for _, id := range ids {
+			run, err := finder.FindActiveByTask(ctx, core.TaskID(id))
+			if err != nil {
+				return nil, err
+			}
+			if run != nil {
+				active[id] = run.State
+			}
+		}
+	}
+	return active, nil
+}
+
 // SnapshotStore is the batched read side of a snapshot. History queries take
 // all run IDs at once so a growing run count adds no calls.
 type SnapshotStore interface {

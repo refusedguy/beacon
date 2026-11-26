@@ -236,16 +236,16 @@ func (d *TaskDeleter) Delete(ctx context.Context, ids []string) (DeleteResult, e
 
 // refused checks every id before the tree is touched so a refusal changes nothing.
 func (d *TaskDeleter) refused(ctx context.Context, ids []string) ([]string, error) {
-	var out []string
 	if d.Store == nil {
-		return out, nil
+		return nil, nil
 	}
+	active, err := activeTaskStates(ctx, d.Store, ids)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
 	for _, id := range ids {
-		run, err := d.Store.FindActiveByTask(ctx, core.TaskID(id))
-		if err != nil {
-			return nil, err
-		}
-		if run != nil {
+		if _, ok := active[id]; ok {
 			out = append(out, id)
 		}
 	}
