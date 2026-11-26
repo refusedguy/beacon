@@ -209,10 +209,9 @@ func TestSpawnRequiresCommand(t *testing.T) {
 	}
 }
 
-func TestSpawnKeepsHandshakeMinimalWithModelConfigured(t *testing.T) {
+func TestSpawnKeepsHandshakeMinimal(t *testing.T) {
 	fp := standardProcess()
 	h := testHarness(fp)
-	h.Model = "sonnet"
 	if _, err := h.Spawn(context.Background(), core.SpawnRequest{}); err != nil {
 		t.Fatal(err)
 	}

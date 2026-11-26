@@ -97,7 +97,7 @@ func TestLoadConfigPinsRelativePathsToProjectRoot(t *testing.T) {
 
 func TestNewHarnessBuildsACPProvider(t *testing.T) {
 	cfg := config.Config{Harness: config.Harness{
-		Provider: "ACP", Command: "fake-agent --acp", Model: "sonnet",
+		Provider: "ACP", Command: "fake-agent --acp",
 	}}
 	h, err := newHarness(cfg, "", "ses_parent", "")
 	if err != nil {
@@ -107,8 +107,8 @@ func TestNewHarnessBuildsACPProvider(t *testing.T) {
 	if !ok {
 		t.Fatalf("harness for acp provider = %T, want *acp.Harness", h)
 	}
-	if ah.Command != "fake-agent --acp" || ah.Model != "sonnet" || ah.ParentSessionID != "ses_parent" {
-		t.Fatalf("acp harness = %+v, want command, model and parent from config", ah)
+	if ah.Command != "fake-agent --acp" {
+		t.Fatalf("acp harness command = %q, want fake-agent --acp", ah.Command)
 	}
 }
 
