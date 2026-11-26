@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -67,9 +68,44 @@ type ReviewGate interface {
 	ReviewRequired(core.ReviewMode, core.Observation) bool
 }
 
-const epicBranchPrefix = "beacon/"
+// BeaconBranchPrefix is the namespace every Beacon branch lives under.
+const BeaconBranchPrefix = "beacon/"
 
-func epicBranch(id core.TaskID) string { return epicBranchPrefix + string(id) }
+// epicBranchPrefix keeps the former name for callers that still use it.
+const epicBranchPrefix = BeaconBranchPrefix
+
+// unsafeBranchChars matches characters a git ref may not contain. Every
+// generated ref passes through one sanitizer so the names stay byte identical.
+var unsafeBranchChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+
+// BranchSanitize sets the sanitize scope for BeaconBranch. Epic callers build a
+// raw ref and rely on the workspace to sanitize it before publishing, so the
+// scope has to be explicit at each call site.
+type BranchSanitize bool
+
+const (
+	// RawBranch keeps the id verbatim.
+	RawBranch BranchSanitize = false
+	// SafeBranch replaces characters a git ref rejects with dashes.
+	SafeBranch BranchSanitize = true
+)
+
+// BeaconBranch prefixes id with beacon/ and, when the scope is SafeBranch,
+// sanitizes id. The prefix is added here so no caller can forget it.
+func BeaconBranch(id string, sanitize BranchSanitize) string {
+	if sanitize == SafeBranch {
+		id = unsafeBranchChars.ReplaceAllString(id, "-")
+	}
+	return BeaconBranchPrefix + id
+}
+
+// IsEpicBranch reports whether branch names a Beacon epic or child ref. Tasks
+// on the configured base carry no prefix and need no branch publish.
+func IsEpicBranch(branch string) bool {
+	return strings.HasPrefix(strings.TrimSpace(branch), BeaconBranchPrefix)
+}
+
+func epicBranch(id core.TaskID) string { return BeaconBranch(string(id), RawBranch) }
 
 // parentEpicID is the ID-shape check kept for the caller that has no task
 // snapshot. Reconciliation decisions come from TaskTree.Parent; this only
