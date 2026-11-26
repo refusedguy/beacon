@@ -10,6 +10,14 @@ import (
 
 var prPattern = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
 
+// WeakMachineVerificationRule is the single statement of the verification rule
+// shared by config defaults, init stack variants and the spawn prompt. Heavy
+// verification is advisory on a weak machine and runs in CI; the local format
+// and targeted tests stay required. A full machine runs the full suite before
+// reporting done. Callers append their own language-specific check command
+// instead of restating the rule, so one prompt cannot carry opposing advice.
+const WeakMachineVerificationRule = "On a weak machine, the full test suite, the full build and repository linters are advisory. Leave them to CI. A weak PC runs the local format and targeted tests instead; those checks are required on every machine. On a full machine, run the full test suite, the full build and the repository linters before reporting done."
+
 // PRFromText returns the pull request number an agent printed. Both the URL
 // shape (pull/17) and the JSON shape ("pr": 17) are accepted. It returns zero
 // when the text contains no number.
