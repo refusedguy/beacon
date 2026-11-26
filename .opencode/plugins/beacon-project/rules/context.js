@@ -1,6 +1,6 @@
 import { existsSync as fsExistsSync } from "node:fs"
 import { join } from "node:path"
-import { agentIdentity } from "../state/session_identity.js"
+import { agentIdentity, agentRole } from "../state/session_identity.js"
 
 export const SURVIVAL_KEY = "beacon/survival-rules"
 export const ORCHESTRATOR_KEY = "beacon/orchestrator-rules"
@@ -63,16 +63,11 @@ async function resolvedAgent(ctx, event) {
   }
 }
 
-// Read-only research agents need no commit or card rules. An unknown agent
-// gets nothing rather than the worker rules, because the default OpenCode
-// agent is `build`, which is the operator's orchestration session.
-export function roleFor(agent) {
-  if (typeof agent !== "string" || !agent.trim()) return null
-  const name = agent.trim().toLowerCase()
-  if (name.includes("issue-scout")) return "none"
-  if (name.includes("worker")) return "worker"
-  if (name.includes("orchestrator") || name.includes("build")) return "orchestrator"
-  return null
+// Rules follow the same classifier as the shell guard and MCP. Read-only
+// research agents and unknown names get no commit or card rules. The default
+// OpenCode agent is `build`, which is the operator's orchestration session.
+export function roleFor(agent, config = {}) {
+  return agentRole(agent, config)
 }
 
 // The build script only exists in the Beacon repo. Other projects get the same
@@ -80,7 +75,7 @@ export function roleFor(agent) {
 export async function sessionInstructions(ctx, event, config = {}, root = "") {
   const options = contextOptions(config)
   if (!options.enabled) return null
-  const role = roleFor(await resolvedAgent(ctx, event))
+  const role = roleFor(await resolvedAgent(ctx, event), config)
   if (role !== "worker" && role !== "orchestrator") return null
   let value = role === "orchestrator" ? options.orchestratorRules : options.workerRules
   if (role === "orchestrator" && typeof root === "string" && root

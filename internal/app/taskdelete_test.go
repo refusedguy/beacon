@@ -318,3 +318,46 @@ func TestTaskDeleterRestoresGraphWhenPublishFails(t *testing.T) {
 		t.Fatal("failed publish did not restore the card")
 	}
 }
+
+func TestTaskDeleterNormalizesPaddedAndDuplicateIDs(t *testing.T) {
+	dir := t.TempDir()
+	writeCards(t, dir, "T-A", "T-B", "T-KEEP")
+	ws := &fakeWorkspace{log: &callLog{}}
+	deleter := newDeleter(dir, newFakeStore(), ws)
+
+	got, err := deleter.Delete(context.Background(), []string{"  T-A ", "T-A", "", " T-B  "})
+	if err != nil {
+		t.Fatalf("deleter.Delete with padded and duplicate ids: %v", err)
+	}
+	if !got.Pushed || len(got.Results) != 2 {
+		t.Fatalf("result = %+v", got)
+	}
+	if got.Results[0].ID != "T-A" || got.Results[0].Status != "deleted" ||
+		got.Results[1].ID != "T-B" || got.Results[1].Status != "deleted" {
+		t.Fatalf("results = %+v", got.Results)
+	}
+	if cardExists(t, dir, "T-A") || cardExists(t, dir, "T-B") || !cardExists(t, dir, "T-KEEP") {
+		t.Fatal("normalized ids removed the wrong cards")
+	}
+	if len(ws.commits) != 1 {
+		t.Fatalf("commits = %d, want one push", len(ws.commits))
+	}
+}
+
+func TestTaskDeleterRejectsInvalidIDBeforeTouchingCards(t *testing.T) {
+	dir := t.TempDir()
+	writeCards(t, dir, "T-A")
+	ws := &fakeWorkspace{log: &callLog{}}
+	deleter := newDeleter(dir, newFakeStore(), ws)
+
+	_, err := deleter.Delete(context.Background(), []string{"T-A", " T-B/escape "})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v, want invalid input", err)
+	}
+	if !cardExists(t, dir, "T-A") {
+		t.Fatal("invalid id batch removed a card")
+	}
+	if len(ws.commits) != 0 {
+		t.Fatalf("commits = %d, want none", len(ws.commits))
+	}
+}

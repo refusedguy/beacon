@@ -1,0 +1,26 @@
+{
+  "runs": [
+    {
+      "id": "run-contract-1",
+      "task_id": "T-CONTRACT",
+      "state": "waiting_ci",
+      "pr": 42,
+      "head_sha": "deadbeef",
+      "branch": "beacon/T-CONTRACT",
+      "reason": "checking CI",
+      "updated_at": "2026-11-25T10:00:00Z"
+    }
+  ],
+  "event": {
+    "id": 17,
+    "type": "idle",
+    "run_id": "run-contract-1",
+    "at": "2026-11-25T10:00:00Z"
+  },
+  "control": {
+    "ok": true,
+    "action": "approve",
+    "run_id": "run-contract-1",
+    "applied": true
+  }
+}

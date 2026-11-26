@@ -1,7 +1,7 @@
 ---
 id: T-f7ab5ca6
 title: Unify plugin agent resolution and classification
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/rules/context.js
     - .opencode/plugins/beacon-project/rules/context_test.js

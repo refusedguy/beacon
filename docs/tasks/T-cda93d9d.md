@@ -1,7 +1,7 @@
 ---
 id: T-cda93d9d
 title: Unify TUI request plumbing
-status: available
+status: done
 scope:
     - ui/tui/api.go
     - ui/tui/sse.go
