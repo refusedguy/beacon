@@ -294,7 +294,7 @@ test("alert, queue and detail rows work on a host without box children", () => {
 
 test("launch source shows in the metrics line and the technical line", () => {
   const line = metricsLine({ active: [], recent: [], metrics: { launch_sources: { mcp: 2, cli: 1 } } })
-  assert.deepEqual([line.marker, line.status], ["", "R0 C0 B0 M0 · mcp:2 cli:1"])
+  assert.deepEqual([line.marker, line.status], ["", "P0 R0 C0 E0 F0 B0 M0 X0 · mcp:2 cli:1"])
   assert.equal(launchSourceText({ launchSources: { ui: 3 } }), "ui:3")
   const run = Object.assign(normalizeRun(makeRun()), { launchSource: "mcp", agentIdentity: "operator" })
   const names = detailModel(run, {}, NOW, { technical: true }).rows.map((i) => i.name)

@@ -40,7 +40,7 @@ test("rendered rows use native flex primitives with no mid-word wrap", () => {
   assert.equal(status.props.flexShrink, 0)
 })
 
-test("compact header carries the human summary and R C B M counters", () => {
+test("compact header carries the human summary and all eight state counters", () => {
   const snapshot = {
     active: [makeRun({ ID: "run-1", State: "blocked" }), makeRun({ ID: "run-2" })],
     recent: [],
@@ -50,7 +50,7 @@ test("compact header carries the human summary and R C B M counters", () => {
   const items = snapshotLineItems(snapshot, null, NOW)
   assert.equal(items[0].name, "Beacon")
   assert.equal(items[0].status, "1 running · 1 blocked")
-  assert.equal(items[1].name, "R1 C0 B1 M0")
+  assert.equal(items[1].name, "P0 R1 C0 E0 F0 B1 M0 X0")
   const mount = createRowMount(solidModule(), { color: (k) => `theme.${k}`, BOLD: 1 })
   const container = { children: [], tag: "box" }
   mount(container, () => items, 8)

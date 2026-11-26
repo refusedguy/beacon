@@ -50,6 +50,11 @@ type Dispatcher struct {
 	// caller holds it from the Available check until every agent it starts is
 	// saved as active, so a concurrent path sees the updated store state.
 	slotsMu sync.Mutex
+
+	// modelRefs caches the resolved model per parent session for one batch.
+	// Every access happens under slotsMu, and each batch clears it so a config
+	// reload takes effect on the next dispatch.
+	modelRefs map[string]core.ModelRef
 }
 
 var _ core.AgentSlots = (*Dispatcher)(nil)
@@ -81,6 +86,7 @@ func newRunID() core.RunID {
 func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error) {
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()
+	d.modelRefs = nil
 
 	var out DispatchResult
 	tasks, err := d.Source.ListAvailable(ctx)
@@ -160,6 +166,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()
+	d.modelRefs = nil
 
 	active, err := d.Store.ListActive(ctx)
 	if err != nil {
@@ -345,12 +352,21 @@ func firstNonEmptyLocal(values ...string) string {
 
 // modelRef resolves the worker model from the run's parent session. The MCP
 // daemon has no BEACON_PARENT_SESSION, so the parent arrives per dispatch in
-// the request metadata and must be resolved here, not at process start.
+// the request metadata and must be resolved here, not at process start. Every
+// card in a batch shares one parent, so the first lookup serves the rest.
 func (d *Dispatcher) modelRef(parent string) core.ModelRef {
 	if d.ResolveModel == nil || parent == "" {
 		return core.ModelRef{}
 	}
-	return d.ResolveModel(parent)
+	if d.modelRefs == nil {
+		d.modelRefs = make(map[string]core.ModelRef)
+	}
+	if ref, ok := d.modelRefs[parent]; ok {
+		return ref
+	}
+	ref := d.ResolveModel(parent)
+	d.modelRefs[parent] = ref
+	return ref
 }
 
 func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {

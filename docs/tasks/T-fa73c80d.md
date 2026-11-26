@@ -1,7 +1,7 @@
 ---
 id: T-fa73c80d
 title: Cut per-card dispatch git and model calls
-status: available
+status: done
 scope:
     - cmd/beacon/main.go
     - cmd/beacon/config_watch.go

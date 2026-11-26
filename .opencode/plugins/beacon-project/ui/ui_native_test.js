@@ -36,12 +36,12 @@ function signals() {
   return { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } }
 }
 
-test("state bar fills 30 cells with thin glyphs and a compact R C B M legend", () => {
+test("state bar fills 30 cells with solid glyphs and an eight-state legend", () => {
   assert.equal(STATE_BAR_WIDTH, 30)
   const item = stateBarItem({ active: [], recent: [], metrics: { merge_count: 51 } })
   assert.equal(item.bar.length, 30)
   assert.equal(item.segments.at(-1).text, "─".repeat(30))
-  assert.equal(item.legend, "R0 C0 B0 M51")
+  assert.equal(item.legend, "P0 R0 C0 E0 F0 B0 M51 X0")
 })
 
 test("Beacon header sits at column 0 and every Recent row is unbolded", () => {
