@@ -491,6 +491,29 @@ func TestDispatchWithoutWorkerInstructionsKeepsStockPrompt(t *testing.T) {
 	}
 }
 
+func TestSpawnPromptRequiresPrePRFormatAndTestCheck(t *testing.T) {
+	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	d := newInstructionDispatcher(h, "")
+	if _, err := d.Dispatch(context.Background(), 1); err != nil {
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
+	}
+	if len(h.requests) != 1 {
+		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
+	}
+	prompt := h.requests[0].Prompt
+	for _, want := range []string{
+		"gofmt -l",
+		"go test",
+		"Do not open a pull request",
+		"Report the exact command you ran and its full output",
+		"advisory",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("spawn prompt missing %q: %s", want, prompt)
+		}
+	}
+}
+
 func TestDispatchResolvesModelFromParentSession(t *testing.T) {
 	ref := core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode"}
 	var parents []string
