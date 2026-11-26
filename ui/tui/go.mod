@@ -5,7 +5,10 @@ go 1.26.0
 require (
 	github.com/charmbracelet/bubbletea v1.3.4
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
+	github.com/refusedguy/beacon v0.0.0
 )
+
+replace github.com/refusedguy/beacon => ../..
 
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect

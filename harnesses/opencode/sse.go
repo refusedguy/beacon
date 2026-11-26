@@ -1,7 +1,6 @@
 package opencode
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,11 +12,8 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// sseFrame is one parsed server-sent event from the OpenCode event stream.
-type sseFrame struct {
-	event string
-	data  string
-}
+// sseFrame names the shared frame type for the OpenCode stream callback.
+type sseFrame = core.SSEFrame
 
 // WatchIdle starts the idle stream watcher in the background.
 func (h *Harness) WatchIdle(ctx context.Context) {
@@ -87,10 +83,10 @@ func (h *Harness) streamIdle(ctx context.Context) error {
 		return fmt.Errorf("opencode event stream: status %d", resp.StatusCode)
 	}
 	return readSSE(resp.Body, func(f sseFrame) {
-		if f.event != "session.idle" {
+		if f.Event != "session.idle" {
 			return
 		}
-		session := sessionIDFromData(f.data)
+		session := sessionIDFromData(f.Data)
 		if session == "" {
 			return
 		}
@@ -105,41 +101,10 @@ func (h *Harness) streamIdle(ctx context.Context) error {
 	})
 }
 
-// readSSE parses server-sent event frames from r and calls onFrame for each.
+// readSSE parses the OpenCode stream. Unlike the loopback stream, this stream
+// ends with a frame that has no trailing blank line, so the final frame is kept.
 func readSSE(r io.Reader, onFrame func(sseFrame)) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	var frame sseFrame
-	for scanner.Scan() {
-		line := strings.TrimSuffix(scanner.Text(), "\r")
-		if line == "" {
-			if frame.event != "" || frame.data != "" {
-				onFrame(frame)
-			}
-			frame = sseFrame{}
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		field, value := line, ""
-		if i := strings.IndexByte(line, ':'); i >= 0 {
-			field, value = line[:i], strings.TrimPrefix(line[i+1:], " ")
-		}
-		switch field {
-		case "event":
-			frame.event = value
-		case "data":
-			if frame.data != "" {
-				frame.data += "\n"
-			}
-			frame.data += value
-		}
-	}
-	if frame.event != "" || frame.data != "" {
-		onFrame(frame)
-	}
-	return scanner.Err()
+	return core.ParseSSE(r, core.SSEKeepPartial, onFrame)
 }
 
 // sessionIDFromData extracts a session id from an event payload.
