@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,10 +12,17 @@ import (
 )
 
 // loadTimeout bounds API calls; visibleRows caps the number of displayed runs.
+// refreshDebounce is the quiet window used to coalesce a burst of events into
+// one runs read.
 const (
-	loadTimeout = 5 * time.Second
-	visibleRows = 20
+	loadTimeout     = 5 * time.Second
+	visibleRows     = 20
+	refreshDebounce = 200 * time.Millisecond
 )
+
+// pingEvent is the daemon's keepalive event. It carries no run state, so it
+// never schedules a refresh.
+const pingEvent = "ping"
 
 // cursorStyle, headerStyle and errorStyle color the run list and status line.
 var (
@@ -25,18 +33,23 @@ var (
 
 // model is the Bubble Tea state for the run monitor.
 type model struct {
-	client *Client
-	runs   []Run
-	cursor int
-	status string
-	failed bool
-	width  int
+	client     *Client
+	runs       []Run
+	cursor     int
+	status     string
+	failed     bool
+	width      int
+	debounce   time.Duration
+	refreshGen *atomic.Uint64
 }
 
-// runsMsg carries a fetched run snapshot or its error.
+// runsMsg carries a fetched run snapshot or its error. gen orders responses
+// so a late reply from a superseded read cannot overwrite a newer snapshot.
 type runsMsg struct {
-	runs []Run
-	err  error
+	runs  []Run
+	err   error
+	gen   uint64
+	stale bool
 }
 
 // actionMsg carries the result of a control action.
@@ -55,7 +68,12 @@ type refreshMsg struct {
 
 // newModel builds the initial monitor model for c.
 func newModel(c *Client) model {
-	return model{client: c, status: "loading runs from " + c.Endpoint}
+	return model{
+		client:     c,
+		status:     "loading runs from " + c.Endpoint,
+		debounce:   refreshDebounce,
+		refreshGen: &atomic.Uint64{},
+	}
 }
 
 // Init starts the first run fetch.
@@ -65,19 +83,36 @@ func (m model) Init() tea.Cmd {
 
 // reload returns a command that fetches the current run snapshot.
 func (m model) reload() tea.Cmd {
+	gen := m.refreshGen.Load()
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
 		defer cancel()
 		runs, err := m.client.Runs(ctx)
-		return runsMsg{runs: runs, err: err}
+		return runsMsg{runs: runs, err: err, gen: gen}
 	}
 }
 
-// onRefresh treats every event as a notification and schedules a runs read.
-// The event payload cannot carry run state, so a known run is refreshed from
-// the API like any other run.
-func (m model) onRefresh(_ Event) (tea.Model, tea.Cmd) {
-	return m, m.reload()
+// onRefresh coalesces a burst of notifications into one runs read. A ping is
+// dropped because it carries no state. Every other event advances the shared
+// generation; after the debounce window only the newest generation performs a
+// read, so no notification is lost and one GET serves the whole burst.
+func (m model) onRefresh(ev Event) (tea.Model, tea.Cmd) {
+	if ev.Type == pingEvent {
+		return m, nil
+	}
+	gen := m.refreshGen.Add(1)
+	genPtr := m.refreshGen
+	wait := m.debounce
+	return m, func() tea.Msg {
+		time.Sleep(wait)
+		if gen != genPtr.Load() {
+			return runsMsg{gen: gen, stale: true}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
+		defer cancel()
+		runs, err := m.client.Runs(ctx)
+		return runsMsg{runs: runs, err: err, gen: gen}
+	}
 }
 
 // selected returns the run under the cursor.
@@ -121,6 +156,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case Event:
 		return m.onRefresh(msg)
 	case runsMsg:
+		if msg.stale || msg.gen < m.refreshGen.Load() {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.failed = true
 			m.status = "runs: " + msg.err.Error()

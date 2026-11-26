@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestTruncateRunes(t *testing.T) {
@@ -60,6 +63,17 @@ func TestStreamHTTPClientIsFresh(t *testing.T) {
 	}
 }
 
+// testDebounce keeps the coalescing window short so tests resolve refresh
+// commands quickly without changing the production default.
+const testDebounce = time.Millisecond
+
+// fastModel returns a model with a short debounce window.
+func fastModel(c *Client) model {
+	m := newModel(c)
+	m.debounce = testDebounce
+	return m
+}
+
 // TestEventRefreshesRenderedRuns drives the path main.go wires together. A
 // real SSE event becomes a refreshMsg, the reload command fetches runs, and
 // the resulting runsMsg renders the run in View.
@@ -93,7 +107,7 @@ func TestEventRefreshesRenderedRuns(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "tok")
-	m := newModel(client)
+	m := fastModel(client)
 
 	events := make(chan Event, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -210,7 +224,7 @@ func (f *deltaFixture) getCount() int64 {
 // returned view is the baseline a refresh must replace with fresh state.
 func loadedModel(t *testing.T, c *Client) (model, string) {
 	t.Helper()
-	m := newModel(c)
+	m := fastModel(c)
 	raw := m.reload()()
 	msg, ok := raw.(runsMsg)
 	if !ok || msg.err != nil {
@@ -251,8 +265,8 @@ func TestKnownEventTriggersRunsRead(t *testing.T) {
 	}
 	raw := cmd()
 	msg, ok := raw.(runsMsg)
-	if !ok || msg.err != nil {
-		t.Fatalf("reload command = %T %v, want runsMsg with no error", raw, msg.err)
+	if !ok || msg.err != nil || msg.stale {
+		t.Fatalf("reload command = %T %v stale=%v, want fresh runsMsg", raw, msg.err, msg.stale)
 	}
 	if got := f.getCount(); got != 2 {
 		t.Fatalf("known-run event caused %d runs GETs, want 2", got)
@@ -281,9 +295,10 @@ func TestUnknownEventFallsBackToReload(t *testing.T) {
 	f := newDeltaFixture(t, "run-known")
 	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
 
+	want := int64(2)
 	for _, ev := range []Event{
-		{ID: 1, Type: "ping"},
 		{ID: 2, Type: "pr_changed", RunID: "run-not-loaded"},
+		{ID: 3, Type: "run.updated", RunID: "run-also-not-loaded"},
 	} {
 		_, cmd := m.Update(refreshMsg{event: ev})
 		if cmd == nil {
@@ -291,11 +306,138 @@ func TestUnknownEventFallsBackToReload(t *testing.T) {
 		}
 		raw := cmd()
 		msg, ok := raw.(runsMsg)
-		if !ok || msg.err != nil {
-			t.Fatalf("fallback command = %T %v, want runsMsg with no error", raw, msg.err)
+		if !ok || msg.err != nil || msg.stale {
+			t.Fatalf("fallback command = %T %v stale=%v, want fresh runsMsg", raw, msg.err, msg.stale)
 		}
-		if got := f.getCount(); got < 2 {
-			t.Fatalf("fallback did not request /api/v1/runs: GETs = %d", got)
+		if got := f.getCount(); got != want {
+			t.Fatalf("fallback did not request /api/v1/runs: GETs = %d, want %d", got, want)
 		}
+		want++
+	}
+}
+
+// TestPingDoesNotScheduleRefresh proves the daemon's keepalive is dropped
+// before a refresh is scheduled. A ping carries no run state, so it neither
+// advances the generation nor issues a read.
+func TestPingDoesNotScheduleRefresh(t *testing.T) {
+	f := newDeltaFixture(t, "run-ping")
+	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
+	base := f.getCount()
+	gen := m.refreshGen.Load()
+
+	for _, msg := range []tea.Msg{
+		refreshMsg{event: Event{ID: 1, Type: "ping"}},
+		Event{ID: 2, Type: "ping"},
+	} {
+		next, cmd := m.Update(msg)
+		if cmd != nil {
+			t.Fatalf("ping must not schedule a refresh, got %v", cmd)
+		}
+		if got := next.(model).refreshGen.Load(); got != gen {
+			t.Fatalf("ping advanced generation to %d, want %d", got, gen)
+		}
+	}
+	if got := f.getCount(); got != base {
+		t.Fatalf("pings caused %d runs GETs, want %d", got, base)
+	}
+}
+
+// TestBurstDebouncedToSingleReload is the task check: five events arriving in
+// a burst issue one runs read and the view shows the newest snapshot.
+func TestBurstDebouncedToSingleReload(t *testing.T) {
+	const runID = "run-burst"
+	f := newDeltaFixture(t, runID)
+	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
+	base := f.getCount()
+
+	var cmds []tea.Cmd
+	for i := 0; i < 5; i++ {
+		f.setBody(runsBody(runID, fmt.Sprintf("state-%d", i)))
+		ev := Event{ID: int64(i + 1), Type: "pr_changed", RunID: runID}
+		_, cmd := m.Update(refreshMsg{event: ev})
+		if cmd == nil {
+			t.Fatalf("event %d did not schedule a refresh", i)
+		}
+		cmds = append(cmds, cmd)
+	}
+
+	var latest runsMsg
+	reads := 0
+	for i, cmd := range cmds {
+		raw := cmd()
+		msg, ok := raw.(runsMsg)
+		if !ok {
+			t.Fatalf("refresh %d returned %T, want runsMsg", i, raw)
+		}
+		if msg.err != nil {
+			t.Fatalf("refresh %d: %v", i, msg.err)
+		}
+		if !msg.stale {
+			reads++
+			latest = msg
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("burst issued %d runs reads, want 1", reads)
+	}
+	if got := f.getCount(); got != base+1 {
+		t.Fatalf("burst caused %d total runs GETs, want %d", got, base+1)
+	}
+
+	final, followUp := m.Update(latest)
+	if followUp != nil {
+		t.Fatalf("runsMsg returned an unexpected command: %v", followUp)
+	}
+	updated, ok := final.(model)
+	if !ok {
+		t.Fatalf("Update(runsMsg) returned %T, want model", final)
+	}
+	view := updated.View()
+	if !strings.Contains(view, "state-4") {
+		t.Fatalf("view does not show newest snapshot state-4:\n%s", view)
+	}
+	for i := 0; i < 4; i++ {
+		if strings.Contains(view, fmt.Sprintf("state-%d", i)) {
+			t.Fatalf("view shows superseded state-%d:\n%s", i, view)
+		}
+	}
+}
+
+// TestNewerSnapshotWins proves a late reply from a superseded read cannot
+// overwrite a newer snapshot in the view.
+func TestNewerSnapshotWins(t *testing.T) {
+	const runID = "run-order"
+	f := newDeltaFixture(t, runID)
+	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
+
+	f.setBody(runsBody(runID, "older-state"))
+	_, firstCmd := m.Update(refreshMsg{event: Event{ID: 1, Type: "run.updated", RunID: runID}})
+	firstRaw := firstCmd()
+	older, ok := firstRaw.(runsMsg)
+	if !ok || older.err != nil || older.stale {
+		t.Fatalf("first refresh = %T %v stale=%v, want fresh runsMsg", firstRaw, older.err, older.stale)
+	}
+
+	f.setBody(runsBody(runID, "newer-state"))
+	_, secondCmd := m.Update(refreshMsg{event: Event{ID: 2, Type: "run.updated", RunID: runID}})
+	secondRaw := secondCmd()
+	newer, ok := secondRaw.(runsMsg)
+	if !ok || newer.err != nil || newer.stale {
+		t.Fatalf("second refresh = %T %v stale=%v, want fresh runsMsg", secondRaw, newer.err, newer.stale)
+	}
+
+	afterNewer, _ := m.Update(newer)
+	want := afterNewer.(model).View()
+	if !strings.Contains(want, "newer-state") {
+		t.Fatalf("view missing newer snapshot:\n%s", want)
+	}
+
+	afterOlder, followUp := afterNewer.Update(older)
+	if followUp != nil {
+		t.Fatalf("stale runsMsg returned an unexpected command: %v", followUp)
+	}
+	got := afterOlder.(model).View()
+	if got != want {
+		t.Fatalf("late response overwrote newer snapshot:\n%s\nwant:\n%s", got, want)
 	}
 }
