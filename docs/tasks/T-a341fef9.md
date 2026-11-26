@@ -1,7 +1,7 @@
 ---
 id: T-a341fef9
 title: Remove Redact pass-through wrapper
-status: available
+status: done
 scope:
     - internal/infra/shared/redact.go
     - internal/infra/notify/telegram.go
