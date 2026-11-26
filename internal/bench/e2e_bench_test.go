@@ -413,6 +413,13 @@ func printE2EReport(w io.Writer, sums []e2eSummary, total time.Duration, pairs i
 // measures reconcile first, pair one dispatch first, and so on, so a change in
 // machine load cannot always favour the same path. Each pair gets two fresh
 // state databases, built outside the timed section.
+//
+// CI runs a bounded smoke pass with BEACON_BENCH_SMOKE=1 and -benchtime=1x:
+//
+//	BEACON_BENCH_SMOKE=1 GOMAXPROCS=1 go test -run '^$' -bench '^BenchmarkE2EOperatorPaths$' -benchtime=1x -count=1 ./internal/bench/
+//
+// Smoke mode skips the two warm-up environments. The pair, its substeps and
+// every count are unchanged, so errs stay zero and work stays positive.
 func BenchmarkE2EOperatorPaths(b *testing.B) {
 	previousLog := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -420,10 +427,12 @@ func BenchmarkE2EOperatorPaths(b *testing.B) {
 	previousProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previousProcs)
 
-	warm := newE2EEnv(b)
-	_, _ = warm.reconcileTick()
-	warm = newE2EEnv(b)
-	_, _ = warm.dispatchCall()
+	if !smokeMode() {
+		warm := newE2EEnv(b)
+		_, _ = warm.reconcileTick()
+		warm = newE2EEnv(b)
+		_, _ = warm.dispatchCall()
+	}
 
 	samples := make([]sample, 0, b.N*2)
 	var reconSubs, dispSubs substepTotals

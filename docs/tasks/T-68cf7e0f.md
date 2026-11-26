@@ -1,7 +1,7 @@
 ---
 id: T-68cf7e0f
 title: Cache task tree across red-base lookups
-status: available
+status: done
 scope:
     - internal/app/finalize.go
     - internal/app/finalize_test.go
