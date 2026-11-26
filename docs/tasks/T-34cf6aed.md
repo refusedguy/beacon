@@ -9,7 +9,7 @@ scope:
     - internal/app/status.go
     - pkg/core/run_test.go
 depends:
-    - T-PLACEHOLDER2
+  - T-e86b55f7
 priority: 74
 kind: task
 require_review: llm

@@ -5,7 +5,7 @@ status: available
 scope:
     - go.mod
 depends:
-    - T-PLACEHOLDER6
+  - T-d12d266a
 priority: 60
 kind: task
 require_review: llm

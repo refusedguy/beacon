@@ -5,7 +5,7 @@ status: available
 scope:
     - .github/workflows/ci.yml
 depends:
-    - T-PLACEHOLDER7
+  - T-98604b3c
 priority: 78
 kind: task
 require_review: llm
