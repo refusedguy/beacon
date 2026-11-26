@@ -11,13 +11,21 @@ import {
 export { shortTaskID }
 
 export const STATE_BAR_WIDTH = 30
-// If the host font lacks U+2501, switch FILLED to █ here. Nothing else needs
-// to change because every filled segment reads this constant.
-export const STATE_BAR_FILLED = "━"
+// A solid block stays visible in every host font. Every filled segment reads
+// this constant, so the bar needs no other change when the host font differs.
+export const STATE_BAR_FILLED = "█"
 export const STATE_BAR_EMPTY = "─"
-export const STATE_BAR_KEYS = Object.freeze(["running", "waiting_ci", "blocked", "merged"])
-const STATE_BAR_COLOR = Object.freeze({ running: "success", waiting_ci: "info", blocked: "error", merged: "success" })
-const STATE_BAR_LETTER = Object.freeze({ running: "R", waiting_ci: "C", blocked: "B", merged: "M" })
+export const STATE_BAR_KEYS = Object.freeze([
+  "pending", "running", "waiting_ci", "needs_rebase", "needs_agent_fix", "blocked", "merged", "closed",
+])
+const STATE_BAR_COLOR = Object.freeze({
+  pending: "muted", running: "success", waiting_ci: "info", needs_rebase: "warning",
+  needs_agent_fix: "warning", blocked: "error", merged: "success", closed: "muted",
+})
+const STATE_BAR_LETTER = Object.freeze({
+  pending: "P", running: "R", waiting_ci: "C", needs_rebase: "E",
+  needs_agent_fix: "F", blocked: "B", merged: "M", closed: "X",
+})
 
 const STATE_VIEW = Object.freeze({
   pending: { marker: "○", color: "muted", label: "PEND" },
@@ -122,7 +130,7 @@ export function recentRuns(snapshot = EMPTY_SNAPSHOT) {
   return recentFromView(normalizeSnapshot(snapshot))
 }
 function stateBarFromView(view, active = activeFromView(view), recent = recentFromView(view)) {
-  const counts = { running: 0, waiting_ci: 0, blocked: 0, merged: 0 }
+  const counts = Object.fromEntries(STATE_BAR_KEYS.map((key) => [key, 0]))
   for (const run of [...active, ...recent]) {
     const state = str(run.state).toLowerCase()
     if (Object.hasOwn(counts, state)) counts[state] += 1

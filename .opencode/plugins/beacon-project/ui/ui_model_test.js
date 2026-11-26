@@ -40,7 +40,7 @@ test("sidebar renders a flat header, state bar legend and two lines per run", ()
     recent: [],
   }, null, NOW)
   assert.equal(result[0], "Beacon 1 blocked")
-  assert.equal(result[1], "R0 C0 B1 M0")
+  assert.equal(result[1], "P0 R0 C0 E0 F0 B1 M0 X0")
   assert.equal(result[2], "▼ Active 1")
   assert.equal(result[3], "▲ T-1 BLK")
   assert.equal(result[4], "#42 3m dirty worktree")
@@ -338,7 +338,7 @@ test("cleanErrorMessage keeps readable text, strips escapes and caps length", ()
 
 test("empty snapshot renders both sections with an honest dispatch label", () => {
   assert.deepEqual(renderSnapshotLines(EMPTY_SNAPSHOT), [
-    "Beacon 0 active", "R0 C0 B0 M0", "▼ Active 0", "Idle · no ready tasks",
+    "Beacon 0 active", "P0 R0 C0 E0 F0 B0 M0 X0", "▼ Active 0", "Idle · no ready tasks",
     "▶ Queue 0", "▼ Recent 0", "No recent runs",
   ])
 })
