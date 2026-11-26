@@ -5,9 +5,9 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createLineMount } from "./ui_nodes.js"
-import { createSidebarMount } from "./ui_sidebar.js"
-import { sidebarModel } from "./ui_view.js"
-import { EMPTY_SNAPSHOT, NOW, hostModule, makeRun } from "./ui_test_helpers.js"
+import { createSidebarMount, sidebarPresentation } from "./ui_sidebar.js"
+import { runLineItems, sidebarModel } from "./ui_view.js"
+import { EMPTY_SNAPSHOT, NOW, hostModule, makeRun, normalizeRun, solidModule } from "./ui_test_helpers.js"
 
 const deps = {
   color: (key) => `theme.${key}`,
@@ -33,6 +33,26 @@ test("line mount applies cells when boxes have no children array", () => {
   ])
   assert.equal(cells[1].props.fg, "theme.success")
   assert.equal(cells[4].props.attributes, 1, "bold item sets the name attribute")
+})
+
+test("a long CI wait keeps minute precision and anchors its status at the panel edge", () => {
+  const created = []
+  const mount = createLineMount(solidModule(created), { ...deps, maxLines: 2 })
+  const run = normalizeRun(makeRun({
+    ID: "r-long", State: "waiting_ci",
+    Durations: { waiting_ci_seconds: 5467, running_seconds: 5, blocked_seconds: 0 },
+  }))
+  const items = sidebarPresentation(runLineItems(run, NOW))
+  assert.equal(items[1].name, "CI wait 1h 31m", "the second line keeps the leftover minutes")
+  mount.apply(items)
+  const row = mount.node.find((box) => box.item === items[1])
+  const [marker, name, status] = row.children
+  assert.equal(marker.props.content, "#42 ", "markerSpace still pads the second line")
+  assert.equal(name.props.content, "CI wait 1h 31m")
+  assert.equal(status.props.content, "waiting CI")
+  assert.equal(status.props.flexGrow, 1, "the status cell takes the remaining width")
+  assert.equal(status.props.textAlign, "right", "the status text ends at the panel right edge")
+  assert.equal(status.props.minWidth, 0)
 })
 
 test("line mount hides empty rows against a host without box.children", () => {

@@ -13,7 +13,8 @@ export function timeOf(v) {
   return Number.isFinite(t) ? t : 0
 }
 
-// Render a duration in the smallest readable unit.
+// Render a duration in the smallest readable unit. Hour-long waits keep the
+// leftover minutes so 5467 seconds reads "1h 31m" instead of "1h".
 export function elapsed(ms) {
   if (!Number.isFinite(ms) || ms < 0) return ""
   const s = Math.floor(ms / 1000)
@@ -21,7 +22,9 @@ export function elapsed(ms) {
   const m = Math.floor(s / 60)
   if (m < 60) return `${m}m`
   const h = Math.floor(m / 60)
-  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`
+  if (h >= 24) return `${Math.floor(h / 24)}d`
+  const mins = m % 60
+  return mins ? `${h}h ${mins}m` : `${h}h`
 }
 
 // Take the HH:MM:SS part of a timestamp. Short values stay unchanged.
