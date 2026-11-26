@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -32,13 +33,31 @@ func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, st
 	r.Decisions.logTransitionParentNotify(ctx, run.ID, pr, "notified")
 }
 
+// compact trims s and caps it at 1200 runes. A byte length check handles short
+// bodies without a rune slice, and long valid UTF-8 is walked to the cap.
+// Invalid UTF-8 keeps the eager conversion so the output stays byte identical.
 func compact(s string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\r", ""))
-	runes := []rune(s)
-	if len(runes) <= 1200 {
+	if len(s) <= 1200 {
 		return s
 	}
-	return string(runes[:1200]) + "\n...[truncated]"
+	if !utf8.ValidString(s) {
+		r := []rune(s)
+		if len(r) <= 1200 {
+			return s
+		}
+		return string(r[:1200]) + "\n...[truncated]"
+	}
+	i, n := 0, 0
+	for i < len(s) && n < 1200 {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		n++
+	}
+	if i == len(s) {
+		return s
+	}
+	return s[:i] + "\n...[truncated]"
 }
 
 // reviewGate is the part of a merge policy that decides whether an epic PR

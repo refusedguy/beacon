@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
 
@@ -15,12 +16,30 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// gitlabTail keeps the last max runes of s. The byte check avoids a rune slice
+// for short strings, and valid UTF-8 is walked backwards from the end. Invalid
+// UTF-8 keeps the eager conversion so the output stays byte identical.
 func gitlabTail(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
+	if len(s) <= max {
 		return strings.TrimSpace(s)
 	}
-	return strings.TrimSpace(string(r[len(r)-max:]))
+	if max <= 0 || !utf8.ValidString(s) {
+		r := []rune(s)
+		if len(r) <= max {
+			return strings.TrimSpace(s)
+		}
+		return strings.TrimSpace(string(r[len(r)-max:]))
+	}
+	i, n := len(s), 0
+	for i > 0 && n < max {
+		_, size := utf8.DecodeLastRuneInString(s[:i])
+		i -= size
+		n++
+	}
+	if i == 0 {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(s[i:])
 }
 
 type glPipeline struct {
