@@ -140,6 +140,34 @@ func TestControlCommandForwardsToDaemonAndPrintsJSON(t *testing.T) {
 	}
 }
 
+func TestRemoteClientControlPostsControlRequest(t *testing.T) {
+	var got controlRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/control" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("content-type = %q", ct)
+		}
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := &remoteClient{info: &connectionInfo{Addr: srv.URL, Token: "tok"}, http: srv.Client()}
+	if err := client.call(context.Background(), "retry", "r1", 7, "abc"); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if got.Action != "retry" || got.RunID != "r1" || got.SHA != "abc" || got.PR != 7 {
+		t.Fatalf("forwarded = %+v", got)
+	}
+}
+
 func TestControlCommandRejectsInvalidAction(t *testing.T) {
 	configPath := ""
 	cmd := newControlCommand(&configPath, wire)

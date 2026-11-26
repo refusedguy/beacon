@@ -355,14 +355,20 @@ func postControlWithPR(ctx context.Context, info *connectionInfo, action, runID,
 	if err != nil {
 		return err
 	}
+	return postControlJSON(ctx, info, payload, &http.Client{Timeout: 5 * time.Second})
+}
+
+// postControlJSON sends a marshaled control body to the daemon's loopback
+// endpoint. Callers build their own payload so the wire contract stays visible
+// at the call site.
+func postControlJSON(ctx context.Context, info *connectionInfo, body []byte, client *http.Client) error {
 	addr := strings.TrimSuffix(info.Addr, "/") + "/api/v1/control"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, addr, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, addr, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+info.Token)
-	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

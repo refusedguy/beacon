@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -89,22 +87,7 @@ func (c *remoteClient) call(ctx context.Context, action, runID string, pr int, s
 	if err != nil {
 		return err
 	}
-	addr := strings.TrimSuffix(c.info.Addr, "/") + "/api/v1/control"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, addr, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.info.Token)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("beacon API status %d", resp.StatusCode)
-	}
-	return nil
+	return postControlJSON(ctx, c.info, payload, c.http)
 }
 
 func daemonAlive(stateDB string) bool {

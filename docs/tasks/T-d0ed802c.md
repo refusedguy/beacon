@@ -1,7 +1,7 @@
 ---
 id: T-d0ed802c
 title: Centralize loopback control POST
-status: available
+status: done
 scope:
     - cmd/beacon/commands.go
     - cmd/beacon/mcp.go
