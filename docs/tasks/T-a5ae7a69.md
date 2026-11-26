@@ -1,7 +1,7 @@
 ---
 id: T-a5ae7a69
 title: Bound decision and event tables
-status: available
+status: done
 scope:
     - internal/infra/sqlite/schema.go
     - internal/infra/sqlite/store.go
