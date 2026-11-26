@@ -32,6 +32,34 @@ func TestParseSSEFrames(t *testing.T) {
 	}
 }
 
+func TestParseSSEDataLinesAcrossFrames(t *testing.T) {
+	stream := strings.Join([]string{
+		"data: one",
+		"data: two",
+		"data: three",
+		"",
+		"event: done",
+		"data: four",
+		"",
+		"data: five",
+		"",
+	}, "\n")
+	frames := parseFrames(t, stream, SSEKeepPartial)
+	want := []SSEFrame{
+		{Data: "one\ntwo\nthree"},
+		{Event: "done", Data: "four"},
+		{Data: "five"},
+	}
+	if len(frames) != len(want) {
+		t.Fatalf("frames: %d: %+v", len(frames), frames)
+	}
+	for i := range want {
+		if frames[i] != want[i] {
+			t.Fatalf("frame %d = %+v, want %+v", i, frames[i], want[i])
+		}
+	}
+}
+
 func TestParseSSEEOFPolicy(t *testing.T) {
 	stream := "id: 4\ndata: {\"type\":\"complete\"}\n\nid: 5\ndata: {\"type\":\"partial\"}"
 	for _, tc := range []struct {
