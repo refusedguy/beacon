@@ -1,7 +1,7 @@
 ---
 id: T-4dbbf135
 title: Consolidate weak-machine verification rule
-status: available
+status: done
 scope:
     - pkg/core/prompt_text.go
     - internal/app/dispatcher.go
