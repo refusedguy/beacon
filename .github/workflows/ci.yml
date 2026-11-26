@@ -121,5 +121,12 @@ jobs:
       - name: Production file size advisory
         run: bash scripts/ci-advisory.sh
 
+      - name: Plugin syntax check
+        run: |
+          node --check .opencode/plugins/beacon-project/ui/ui_runtime.js
+          node --check .opencode/plugins/beacon-project/ui/ui.js
+          node --check .opencode/plugins/beacon-project/test_support/plugin_loader.js
+          node --check .opencode/plugins/beacon-project/test_support/register_plugin_doubles.js
+
       - name: Plugin tests
         run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test ".opencode/plugins/beacon-project/**/*_test.js"

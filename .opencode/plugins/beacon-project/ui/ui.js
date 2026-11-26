@@ -1,6 +1,7 @@
 // Beacon status panel and run detail for the OpenCode TUI. The view model,
 // node pools and action handlers live in sibling files so each stays small.
 import { Plugin } from "@opencode/plugin/tui"
+import { runtimeImport } from "./ui_runtime.js"
 
 export * from "./ui_model.js"
 export * from "./ui_view.js"
@@ -68,15 +69,7 @@ export function collectTransitionToasts(previous, snapshot) {
 async function setup(ctx, deps = {}) {
   const options = deps.options ?? pluginOptions(ctx)
   if (!statusPanelEnabled(options)) return () => {}
-  // Keep imports literal: the OpenCode rewriter cannot see computed specifiers,
-  // and this directory has no node_modules for Bun to resolve TUI peers.
-  const defaultImport = (specifier) => {
-    if (specifier === "@opentui/solid") return import("@opentui/solid")
-    if (specifier === "solid-js") return import("solid-js")
-    if (specifier === "@opentui/core") return import("@opentui/core")
-    throw new Error(`unexpected import: ${specifier}`)
-  }
-  const load = deps.import ?? defaultImport
+  const load = deps.import ?? runtimeImport
   const [{ createElement, insert, setProp }, { createSignal }] = await Promise.all([
     load("@opentui/solid"), load("solid-js"),
   ])
