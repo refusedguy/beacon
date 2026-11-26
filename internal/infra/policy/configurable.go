@@ -12,14 +12,16 @@ import (
 )
 
 // Config holds the merge criteria that build a Policy. RequiredChecks is the
-// resolved list of check names. The config layer fills it from an explicit
-// list or from workflow job names on load and on every watcher reload.
+// resolved list of check names kept for callers that have no source yet. When
+// RequiredCheckSource is set it takes precedence, so the policy reads names
+// through the port instead of a static slice.
 type Config struct {
-	RequiredChecks    []string
-	RequiredApprovals int
-	Labels            []string
-	CommandGate       string
-	ReviewMode        core.ReviewMode
+	RequiredChecks      []string
+	RequiredCheckSource core.RequiredCheckSource
+	RequiredApprovals   int
+	Labels              []string
+	CommandGate         string
+	ReviewMode          core.ReviewMode
 }
 
 // ReviewRule gates epic pull requests on review approval. A missing review
@@ -45,10 +47,13 @@ type Policy struct {
 	criteria []core.Criterion
 }
 
-// New builds a Policy from the criteria enabled in cfg.
+// New builds a Policy from the criteria enabled in cfg. A source takes
+// precedence over the static list, so swapping sources needs no change here.
 func New(cfg Config) *Policy {
 	var rules []core.Criterion
-	if len(cfg.RequiredChecks) > 0 {
+	if cfg.RequiredCheckSource != nil {
+		rules = append(rules, SourceChecksRule{Source: cfg.RequiredCheckSource})
+	} else if len(cfg.RequiredChecks) > 0 {
 		rules = append(rules, ChecksRule{Names: cfg.RequiredChecks})
 	}
 	if cfg.RequiredApprovals > 0 {
@@ -79,7 +84,7 @@ func (p *Policy) ReviewRequired(mode core.ReviewMode, o core.Observation) bool {
 	return verdict != core.VerdictNoop
 }
 
-// ChecksRule gates a merge on required checks passing.
+// ChecksRule gates a merge on a fixed list of required checks.
 type ChecksRule struct{ Names []string }
 
 // Name returns the required checks criterion name.
@@ -87,7 +92,39 @@ func (r ChecksRule) Name() string { return "required_checks" }
 
 // Evaluate reports which required checks have not passed.
 func (r ChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
-	if o.AllRequiredPass(r.Names) {
+	return evaluateChecks(r.Names, o)
+}
+
+// SourceChecksRule gates a merge on the names reported by a source. Names are
+// resolved on each evaluation, so a source that changes its answer is honoured
+// without rebuilding the policy.
+type SourceChecksRule struct {
+	Source core.RequiredCheckSource
+}
+
+// Name returns the required checks criterion name.
+func (r SourceChecksRule) Name() string { return "required_checks" }
+
+// Evaluate resolves the source's names and applies the same check gate. A
+// source that cannot be read fails closed with a wait verdict.
+func (r SourceChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
+	if r.Source == nil {
+		return evaluateChecks(nil, o)
+	}
+	names, err := r.Source.Names(context.Background())
+	if err != nil {
+		return core.VerdictWait, "required checks unavailable: " + err.Error()
+	}
+	return evaluateChecks(names, o)
+}
+
+// evaluateChecks is the shared gate for a resolved list of names. An empty
+// list means no checks are required, so it never blocks a merge.
+func evaluateChecks(names []string, o core.Observation) (core.Verdict, string) {
+	if len(names) == 0 {
+		return core.VerdictNoop, ""
+	}
+	if o.AllRequiredPass(names) {
 		return core.VerdictNoop, ""
 	}
 	if o.WorkflowSkipped {
@@ -96,7 +133,7 @@ func (r ChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
 		}
 	}
 	var notPassed []string
-	for _, want := range r.Names {
+	for _, want := range names {
 		state := "missing"
 		for _, c := range o.Checks {
 			if strings.EqualFold(c.Name, want) {

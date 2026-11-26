@@ -1,11 +1,24 @@
 package policy
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// fakeCheckSource returns a fixed list of names, with an optional error. It
+// stands in for any provider implementation of the port.
+type fakeCheckSource struct {
+	names []string
+	err   error
+}
+
+func (f fakeCheckSource) Names(ctx context.Context) ([]string, error) {
+	return f.names, f.err
+}
 
 func TestEvaluateAllGreenReturnsMerge(t *testing.T) {
 	cfg := Config{
@@ -315,5 +328,57 @@ func TestChecksRuleAcceptsResolvedWorkflowNames(t *testing.T) {
 	stale := New(Config{RequiredChecks: []string{"build", "vet", "test", "lint"}}).Evaluate(obs)
 	if stale.Verdict != core.VerdictWait || stale.Criterion != "required_checks" {
 		t.Fatalf("verdict with stale names = %+v, want required_checks wait", stale)
+	}
+}
+
+// TestPolicyHonoursSwappedSources proves the policy follows whichever names a
+// source returns with no policy edit between the two evaluations.
+func TestPolicyHonoursSwappedSources(t *testing.T) {
+	obs := core.Observation{
+		PRState: "open",
+		Checks: []core.CheckResult{
+			{Name: "verify", State: core.CheckSuccess},
+			{Name: "test", State: core.CheckSuccess},
+		},
+	}
+	first := New(Config{RequiredCheckSource: fakeCheckSource{names: []string{"verify"}}}).Evaluate(obs)
+	if first.Verdict != core.VerdictMerge {
+		t.Fatalf("first source decision = %+v, want merge", first)
+	}
+	second := New(Config{RequiredCheckSource: fakeCheckSource{names: []string{"legacy"}}}).Evaluate(obs)
+	if second.Verdict != core.VerdictWait || second.Criterion != "required_checks" {
+		t.Fatalf("second source decision = %+v, want required_checks wait", second)
+	}
+}
+
+func TestPolicySourceTakesPrecedenceOverStaticNames(t *testing.T) {
+	obs := core.Observation{
+		PRState: "open",
+		Checks:  []core.CheckResult{{Name: "verify", State: core.CheckSuccess}},
+	}
+	p := New(Config{
+		RequiredChecks:      []string{"legacy"},
+		RequiredCheckSource: fakeCheckSource{names: []string{"verify"}},
+	})
+	if got := p.Evaluate(obs); got.Verdict != core.VerdictMerge {
+		t.Fatalf("decision = %+v, want source names to override the static list", got)
+	}
+}
+
+func TestPolicySourceErrorFailsClosed(t *testing.T) {
+	p := New(Config{RequiredCheckSource: fakeCheckSource{err: errors.New("provider down")}})
+	got := p.Evaluate(core.Observation{PRState: "open"})
+	if got.Verdict != core.VerdictWait || got.Criterion != "required_checks" {
+		t.Fatalf("decision = %+v, want required_checks wait", got)
+	}
+	if !strings.Contains(got.Reason, "provider down") {
+		t.Fatalf("reason = %q, want the source error", got.Reason)
+	}
+}
+
+func TestPolicyEmptySourceAddsNoGate(t *testing.T) {
+	p := New(Config{RequiredCheckSource: fakeCheckSource{}})
+	if got := p.Evaluate(core.Observation{PRState: "open"}); got.Verdict != core.VerdictMerge {
+		t.Fatalf("decision = %+v, want merge with no required checks", got)
 	}
 }
