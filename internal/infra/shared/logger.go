@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 // NewLogger returns a JSON logger that redacts secrets from messages and attributes.
@@ -27,6 +29,9 @@ func NewLogger(level string) *slog.Logger {
 type redactHandler struct{ slog.Handler }
 
 func (h redactHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.NumAttrs() == 0 && !redact.HasCandidate(r.Message) {
+		return h.Handler.Handle(ctx, r)
+	}
 	nr := slog.NewRecord(r.Time, r.Level, Redact(r.Message), r.PC)
 	r.Attrs(func(a slog.Attr) bool {
 		nr.AddAttrs(redactAttr(a))
