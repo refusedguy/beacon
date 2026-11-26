@@ -13,6 +13,7 @@ import {
 } from "./ui/status_rpc.js"
 import { createRunChangeWatcher } from "./run_watcher.js"
 import { isWorkerAgent, registerShellGuard } from "./shell_guard.js"
+import { cleanupWrapper } from "./ui/ui_test_helpers.js"
 
 // OpenCode does not hand a session ID to plugin setup. Read the agent from the
 // setup context through the shared adapter, then from the session domain. An
@@ -99,11 +100,7 @@ export const beaconProjectDefinition = {
     }
 
     return async () => {
-      const cleanup = async (label, dispose) => {
-        try { await dispose?.() } catch (error) {
-          console.debug(`beacon plugin: ${label} cleanup failed: ${error?.message ?? error}`)
-        }
-      }
+      const cleanup = cleanupWrapper("beacon plugin: ")
       await cleanup("run watcher", () => watcher?.stop())
       await cleanup("shell guard", () => guard?.dispose?.())
       await cleanup("project context", context)

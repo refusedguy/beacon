@@ -51,6 +51,21 @@ export function hostModule(created = []) {
   }
 }
 
+// Share the teardown wrapper between plugin setup and the status panel. A
+// failing disposer is logged and skipped so the rest of cleanup still runs.
+// The returned wrapper handles both sync and promise-returning disposers.
+export function cleanupWrapper(prefix) {
+  return (label, dispose) => {
+    const failed = (error) => console.debug(`${prefix}${label} cleanup failed: ${error?.message ?? error}`)
+    try {
+      const result = dispose?.()
+      if (result && typeof result.then === "function") return result.catch(failed)
+    } catch (error) {
+      failed(error)
+    }
+  }
+}
+
 // Host adapters are optional in test doubles. These helpers keep the fallback
 // path identical for every mount and action runner.
 export function propSetter(source) {
