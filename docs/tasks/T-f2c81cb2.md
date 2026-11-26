@@ -1,7 +1,7 @@
 ---
 id: T-f2c81cb2
 title: Unify excerpt truncators
-status: in_progress
+status: done
 scope:
     - pkg/core/prompt_text.go
     - internal/app/base_red.go
