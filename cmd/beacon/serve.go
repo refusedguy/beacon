@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -77,8 +76,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 				}
 				mux := http.NewServeMux()
 				mux.Handle("/webhook", (&scm.Webhook{Secret: w.cfg.Webhook.Secret, Changes: w.changes}).Handler())
-				hook := &http.Server{Addr: hookAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-				go func() { errCh <- hook.ListenAndServe() }()
+				runHTTP(ctx, errCh, hookAddr, mux)
 			}
 
 			select {
