@@ -15,7 +15,7 @@ const toastShow = (ctx, toast) =>
 // A mouse gesture on the Dispatch row reaches both onMouseDown and onMouseUp.
 // Equal bodies inside this window come from one gesture, so they share one
 // request and one POST. The hash makes the duplicate visible in the log.
-export const DISPATCH_DEDUPE_MS = 250
+const DISPATCH_DEDUPE_MS = 250
 
 // Shared OSC52 copier. The toast reports the clipboard result, never a guess.
 export function clipboardCopier(ctx, toast) {

@@ -1,9 +1,9 @@
 // Plugin settings come from userConfig under ctx.options, with the full config
 // object as a fallback for older OpenCode versions. Keep every value optional
 // so a missing field never changes behaviour.
-export const DEFAULT_STATUS_POLL_MS = 10000
-export const DEFAULT_SNAPSHOT_RECENT_LIMIT = 5
-export const DEFAULT_SNAPSHOT_DECISIONS_LIMIT = 20
+const DEFAULT_STATUS_POLL_MS = 10000
+const DEFAULT_SNAPSHOT_RECENT_LIMIT = 5
+const DEFAULT_SNAPSHOT_DECISIONS_LIMIT = 20
 
 export function pluginOptions(ctx) {
   const opts = ctx?.options && typeof ctx.options === "object" ? ctx.options : {}
@@ -11,11 +11,11 @@ export function pluginOptions(ctx) {
   return { ...config, ...opts }
 }
 
-export function boolOption(value, fallback) {
+function boolOption(value, fallback) {
   return typeof value === "boolean" ? value : fallback
 }
 
-export function positiveInt(value, fallback) {
+function positiveInt(value, fallback) {
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
 }

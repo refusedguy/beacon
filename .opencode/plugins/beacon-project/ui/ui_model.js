@@ -9,8 +9,8 @@ import { locationInfo, projectRoot } from "../state/location.js"
 import { cliEnv } from "../state/session_identity.js"
 const execFileAsync = promisify(nodeExecFile)
 export const REFRESH_MS = 5000
-export const RPC_TIMEOUT_MS = 10000
-export const BEACON_STATUS_RPC_ID = "beacon.project.status"
+const RPC_TIMEOUT_MS = 10000
+const BEACON_STATUS_RPC_ID = "beacon.project.status"
 export const PANEL_NAME = "beacon.detail"
 export const RUN_CHANGED_EVENT = "runChanged"
 export const EVENT_IDLE_MS = 30000
@@ -163,7 +163,7 @@ const counts = (v) => {
   for (const [k, n] of Object.entries(s)) out[k] = num(n)
   return out
 }
-export function normalizeMetrics(v) {
+function normalizeMetrics(v) {
   const s = v && typeof v === "object" && !Array.isArray(v) ? v : {}
   const out = { skips: counts(pick(s, ["skips", "Skips"])), blocked: counts(pick(s, ["blocked", "Blocked"])) }
   for (const [key, name] of Object.entries(METRIC_KEYS)) out[key] = num(pick(s, [name, key]))
@@ -268,11 +268,11 @@ export function readCard(root, id, deps = {}) {
   }
 }
 export const readTitle = (root, taskID, deps = {}) => readCard(root, taskID, deps)?.title || str(taskID)
-export const cardIsPending = (root, id, deps = {}) => {
+const cardIsPending = (root, id, deps = {}) => {
   const card = readCard(root, id, deps)
   return Boolean(card) && !["done", "dropped"].includes(str(card.status).toLowerCase())
 }
-export function enrichRuns(root, runs, deps = {}) {
+function enrichRuns(root, runs, deps = {}) {
   return list(runs, (run) => (run.title ? run : { ...run, title: readTitle(root, run.taskID, deps) }))
 }
 
@@ -339,7 +339,7 @@ const schema = (check) => ({ "~standard": { version: 1, vendor: "beacon", valida
   const issue = check(v); return issue ? { issues: [{ message: issue }] } : { value: v }
 } } })
 const objectInput = (check) => schema((v) => v == null ? null : (typeof v !== "object" || Array.isArray(v)) ? "input must be an object" : check ? check(v) : null)
-export const RunChangedEvent = Object.freeze({
+const RunChangedEvent = Object.freeze({
   schema: schema((v) => {
     if (!v || typeof v !== "object" || Array.isArray(v)) return "event must be an object"
     if (typeof v.id !== "string" || !v.id) return "event.id must be a non-empty string"
@@ -382,7 +382,7 @@ export const BeaconStatusRpc = Object.freeze({
     }),
   }),
 })
-export class RpcStatusSource {
+class RpcStatusSource {
   constructor(ctx, { timeout = RPC_TIMEOUT_MS, limits = {}, log = console.debug, now = () => Date.now() } = {}) {
     this.ctx = ctx; this.timeout = timeout; this.limits = limits; this.log = log; this.now = now
   }
