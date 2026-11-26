@@ -134,7 +134,7 @@ func TestBlockRunsOnRedBaseReadsSourceOnce(t *testing.T) {
 	r, source, _ := redBaseTreeReconciler(t, 1000, 500)
 	in := &core.BaseIncident{ID: "inc-1"}
 	failed := []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
-	if err := r.blockRunsOnRedBase(ctx, in, "main", failed); err != nil {
+	if err := r.blockRunsOnRedBaseNames(ctx, in, "main", failedNames(failed)); err != nil {
 		t.Fatal(err)
 	}
 	if source.lists != 1 {
@@ -156,7 +156,7 @@ func BenchmarkBlockRunsOnRedBaseOneTreeBuild(b *testing.B) {
 			run.BlockedIncidentID = ""
 		}
 		source.lists = 0
-		if err := r.blockRunsOnRedBase(ctx, in, "main", failed); err != nil {
+		if err := r.blockRunsOnRedBaseNames(ctx, in, "main", failedNames(failed)); err != nil {
 			b.Fatal(err)
 		}
 		if source.lists != 1 {

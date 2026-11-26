@@ -18,7 +18,7 @@ unknown_key: ignored
 ---
 # T-WORKER. Override worker
 `
-	got, ok := parseCard(card, filepath.Join(t.TempDir(), "T-WORKER.md"))
+	got, ok, _ := parseCardFields(card, filepath.Join(t.TempDir(), "T-WORKER.md"))
 	if !ok {
 		t.Fatal("card not parsed")
 	}
@@ -41,7 +41,7 @@ another_unknown: [a, b]
 ---
 # T-PLAIN. Plain worker
 `
-	got, ok := parseCard(card, filepath.Join(t.TempDir(), "T-PLAIN.md"))
+	got, ok, _ := parseCardFields(card, filepath.Join(t.TempDir(), "T-PLAIN.md"))
 	if !ok {
 		t.Fatal("card with unknown keys was not parsed")
 	}
