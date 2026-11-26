@@ -1,7 +1,7 @@
 ---
 id: T-624ffbf6
 title: Unify transition logging
-status: available
+status: done
 scope:
     - internal/app/decisionlog.go
     - internal/app/decisionlog_test.go
