@@ -130,3 +130,21 @@ jobs:
 
       - name: Plugin tests
         run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test ".opencode/plugins/beacon-project/**/*_test.js"
+
+  plugin-tui-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install the supported OpenCode CLI
+        run: |
+          VERSION="$(node -p "require('./.opencode/plugins/beacon-project/supported-cli.json').cliVersion")"
+          curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "$VERSION" --no-modify-path
+
+      - name: Boot OpenCode TUI with the Beacon plugin
+        run: bash scripts/plugin-tui-smoke.sh
