@@ -1,0 +1,8 @@
+{
+  "cliVersion": "2.4.2",
+  "peers": {
+    "@opentui/core": "0.9.9",
+    "@opentui/solid": "0.9.9",
+    "solid-js": "1.9.16"
+  }
+}

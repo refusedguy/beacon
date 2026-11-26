@@ -1,7 +1,7 @@
 ---
 id: T-ea8169ba
 title: Pin plugin TUI peers to the supported CLI
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/package.json
     - .opencode/plugins/beacon-project/supported-cli.json
