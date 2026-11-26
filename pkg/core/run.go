@@ -230,11 +230,24 @@ func (r *Run) RecordLaunch(source LaunchSource, agent string) {
 	r.AgentIdentity = strings.TrimSpace(agent)
 }
 
+// RebaseBudgetExhausted reports whether the run has spent its rebase budget
+// under cap. The run's own transitions pass effectiveMax, while the reconciler
+// passes its smaller automatic-rebase cap. Keeping cap at the call site keeps
+// both budgets separate.
+func (r *Run) RebaseBudgetExhausted(cap int) bool { return r.RebaseAttempts >= cap }
+
 // CanRebase reports whether the run has a rebase attempt left.
-func (r *Run) CanRebase() bool { return r.RebaseAttempts < r.effectiveMax() }
+func (r *Run) CanRebase() bool { return !r.RebaseBudgetExhausted(r.effectiveMax()) }
 
 // CanWake reports whether the run has an agent fix attempt left.
 func (r *Run) CanWake() bool { return r.FixAttempts < r.effectiveMax() }
+
+// ResetAttempts clears the rebase and fix counters. Re-arming a run calls this
+// so no path clears the counters one field at a time.
+func (r *Run) ResetAttempts() {
+	r.RebaseAttempts = 0
+	r.FixAttempts = 0
+}
 
 // Retry re-arms a closed run. A run that already has a PR returns to
 // waiting_ci so the reconciler can finalize it. A run without a PR returns to
@@ -244,8 +257,7 @@ func (r *Run) Retry(reason string) error {
 	if r.State != RunClosed {
 		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot retry run %s in %s", r.ID, r.State)}
 	}
-	r.RebaseAttempts = 0
-	r.FixAttempts = 0
+	r.ResetAttempts()
 	if r.PRNumber > 0 {
 		r.State = RunWaitingCI
 	} else {
@@ -297,8 +309,7 @@ func (r *Run) RetryBlocked(reason string) error {
 	if r.State != RunBlocked {
 		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot retry run %s in %s", r.ID, r.State)}
 	}
-	r.RebaseAttempts = 0
-	r.FixAttempts = 0
+	r.ResetAttempts()
 	return r.Apply(Event{Kind: EvUnblock, Reason: reason})
 }
 

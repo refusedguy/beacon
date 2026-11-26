@@ -53,6 +53,31 @@ func TestRunRejectsInvalidAndExhausted(t *testing.T) {
 	}
 }
 
+func TestRebaseBudgetExhaustedHonorsCap(t *testing.T) {
+	r := &Run{ID: "r1", MaxAttempts: 3, RebaseAttempts: 2}
+	if !r.RebaseBudgetExhausted(2) {
+		t.Fatal("two attempts should exhaust a cap of two")
+	}
+	if r.RebaseBudgetExhausted(3) {
+		t.Fatal("two attempts should not exhaust a cap of three")
+	}
+	if !r.CanRebase() {
+		t.Fatal("the run budget should still use MaxAttempts")
+	}
+	r.RebaseAttempts = 3
+	if !r.RebaseBudgetExhausted(3) || r.CanRebase() {
+		t.Fatal("three attempts should exhaust both the explicit cap and the run budget")
+	}
+}
+
+func TestResetAttemptsClearsBothCounters(t *testing.T) {
+	r := &Run{ID: "r1", RebaseAttempts: 2, FixAttempts: 1}
+	r.ResetAttempts()
+	if r.RebaseAttempts != 0 || r.FixAttempts != 0 {
+		t.Fatalf("attempts = %d/%d, want 0/0", r.RebaseAttempts, r.FixAttempts)
+	}
+}
+
 func TestRetryClosedRunWithPRReturnsToWaitingCI(t *testing.T) {
 	r := &Run{ID: "r1", State: RunClosed, PRNumber: 42, Reason: "worker session exited",
 		SessionID: "sess", WorkspacePath: "/ws/T-1", FixAttempts: 2, RebaseAttempts: 1}
