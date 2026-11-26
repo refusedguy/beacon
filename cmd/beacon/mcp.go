@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,9 +32,8 @@ func newMCPCommand(configPath *string) *cobra.Command {
 			go w.watcher.Run(ctx)
 
 			services := mcpServices(w)
-			dir := filepath.Dir(w.cfg.StateDB)
-			info, connErr := readConnection(dir)
-			if connErr == nil && daemonAlive(w.cfg.StateDB) {
+			dir := stateDir(w.cfg)
+			if info, ok := liveDaemon(w.cfg); ok {
 				client := &remoteClient{info: info, http: &http.Client{Timeout: 5 * time.Second}}
 				services.Remote = client.call
 			} else if lock, err := acquireLock(dir); err != nil {
@@ -89,9 +87,8 @@ func (c *remoteClient) call(ctx context.Context, action, runID string, pr int, s
 	return postControlJSON(ctx, c.info, payload, c.http)
 }
 
-func daemonAlive(stateDB string) bool {
-	info, err := readConnection(filepath.Dir(stateDB))
-	if err != nil || info.Addr == "" {
+func daemonAlive(info *connectionInfo) bool {
+	if info == nil || info.Addr == "" {
 		return false
 	}
 	addr := strings.TrimPrefix(info.Addr, "http://")
