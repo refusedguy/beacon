@@ -165,3 +165,104 @@ func runFanout(e *env) (int64, int64) {
 	dropped := events - (len(e.fanout.views[2]) - slowBefore)
 	return events * int64(len(e.fanout.views)), int64(dropped)
 }
+
+// fakeSnapshotStore carries rows read once from SQLite so the assembly phase
+// can be timed without paying for SQL again. It implements app.SnapshotStore.
+// Queue and incident reads are intentionally absent, which matches the deep
+// fixture: it seeds no task cards and no base incident.
+type fakeSnapshotStore struct {
+	active    []*core.Run
+	recent    []*core.Run
+	events    []app.RunEvent
+	decisions []app.Decision
+	counts    []app.DecisionCount
+}
+
+func (f fakeSnapshotStore) ListActive(context.Context) ([]*core.Run, error) {
+	return f.active, nil
+}
+
+func (f fakeSnapshotStore) ListRecent(context.Context, int) ([]*core.Run, error) {
+	return f.recent, nil
+}
+
+func (f fakeSnapshotStore) ListRunEvents(context.Context, []string) ([]app.RunEvent, error) {
+	return f.events, nil
+}
+
+func (f fakeSnapshotStore) ListDecisions(context.Context, []string, int, int) ([]app.Decision, error) {
+	return f.decisions, nil
+}
+
+func (f fakeSnapshotStore) DecisionCounts(context.Context, []string) ([]app.DecisionCount, error) {
+	return f.counts, nil
+}
+
+// readAssemblyRows pulls the rows SnapshotService reads once from the real
+// store. The returned ids are the active and recent run ids in the same order,
+// so the reads phase and the assembly phase work on the same set.
+func readAssemblyRows(ctx context.Context, store app.SnapshotStore) (fakeSnapshotStore, []string, error) {
+	var out fakeSnapshotStore
+	var err error
+	if out.active, err = store.ListActive(ctx); err != nil {
+		return out, nil, err
+	}
+	if out.recent, err = store.ListRecent(ctx, app.DefaultRecentLimit); err != nil {
+		return out, nil, err
+	}
+	ids := make([]string, 0, len(out.active)+len(out.recent))
+	for _, run := range out.active {
+		ids = append(ids, string(run.ID))
+	}
+	for _, run := range out.recent {
+		ids = append(ids, string(run.ID))
+	}
+	if out.events, err = store.ListRunEvents(ctx, ids); err != nil {
+		return out, nil, err
+	}
+	if out.decisions, err = store.ListDecisions(ctx, ids, app.DefaultDecisionsLimit, app.DefaultOrphanDecisionsLimit); err != nil {
+		return out, nil, err
+	}
+	if out.counts, err = store.DecisionCounts(ctx, ids); err != nil {
+		return out, nil, err
+	}
+	return out, ids, nil
+}
+
+// snapshotAssembly is one full snapshot assembly result. Work counts the runs
+// and history entries put into the snapshot, body is the encoded JSON and errs
+// is one when assembly or encoding fails.
+type snapshotAssembly struct {
+	work int64
+	errs int64
+	body []byte
+}
+
+// assembleSnapshot runs the work the SQLite benchmark omits. It builds the
+// operator snapshot through SnapshotService.Snapshot and encodes it with
+// json.Marshal, the call printJSON uses for `beacon status --snapshot`
+// (cmd/beacon/main.go:504). A fake store holding pre-read rows keeps SQL reads
+// out of the timed phase.
+func assembleSnapshot(ctx context.Context, svc app.SnapshotService) snapshotAssembly {
+	snap, err := svc.Snapshot(ctx)
+	if err != nil {
+		return snapshotAssembly{errs: 1}
+	}
+	body, err := json.Marshal(snap)
+	if err != nil {
+		return snapshotAssembly{errs: 1}
+	}
+	return snapshotAssembly{work: snapshotWork(snap), body: body}
+}
+
+// snapshotWork counts the objects a snapshot assembles. A change that drops
+// history from the output cannot hide behind a flat timing number.
+func snapshotWork(snap *app.Snapshot) int64 {
+	work := int64(len(snap.Active) + len(snap.Recent) + len(snap.Queue))
+	for _, group := range [][]app.RunSnapshot{snap.Active, snap.Recent} {
+		for _, run := range group {
+			work += int64(len(run.Timeline) + len(run.Decisions) + len(run.Checks))
+		}
+	}
+	return work
+}
