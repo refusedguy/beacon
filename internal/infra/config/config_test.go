@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,14 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/policy"
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// stubCheckSource returns a fixed list of required-check names. It stands in
+// for the source the daemon wires into the policy in production.
+type stubCheckSource struct{ names []string }
+
+func (s stubCheckSource) Names(ctx context.Context) ([]string, error) {
+	return s.names, nil
+}
 
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
@@ -650,7 +659,7 @@ func TestWorkflowRequiredChecksFollowRenameOnReload(t *testing.T) {
 		t.Fatalf("reloaded required_checks = %v, want %v", reloaded.Merge.RequiredChecks, wantNew)
 	}
 
-	p := policy.New(policy.Config{RequiredChecks: reloaded.Merge.RequiredChecks})
+	p := policy.New(policy.Config{RequiredCheckSource: stubCheckSource{names: reloaded.Merge.RequiredChecks}})
 	obs := core.Observation{
 		PRState: "open",
 		Checks: []core.CheckResult{
@@ -708,7 +717,7 @@ func TestLoadWorkflowModeUsesDetectedNamesOverConfiguredFallback(t *testing.T) {
 		t.Fatalf("configured fallback was used despite workflow detection: %v", c.Merge.RequiredChecks)
 	}
 
-	p := policy.New(policy.Config{RequiredChecks: c.Merge.RequiredChecks})
+	p := policy.New(policy.Config{RequiredCheckSource: stubCheckSource{names: c.Merge.RequiredChecks}})
 	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
 		{Name: "build", State: core.CheckSuccess},
 		{Name: "vet", State: core.CheckSuccess},

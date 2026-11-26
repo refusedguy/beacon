@@ -323,11 +323,11 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 }
 
 func mergePolicy(cfg config.Config) core.MergePolicy {
-	// Required checks reach policy through the port. Config load already
-	// resolves workflow job names into RequiredChecks in workflow mode, so the
-	// explicit list is the override the source returns on both the initial
-	// load and every watcher reload. That keeps the wire shape and behaviour
-	// unchanged while SCM adapters can add their own source later.
+	// Required checks reach policy only through the source port. Config load
+	// resolves workflow job names into cfg.Merge.RequiredChecks in workflow
+	// mode, and the manual list is the override the source returns on both the
+	// initial load and every watcher reload. SCM adapters can add a fallback
+	// source later without a policy change.
 	source := checksource.Config{Explicit: cfg.Merge.RequiredChecks}
 	return policy.New(policy.Config{
 		RequiredCheckSource: source, RequiredApprovals: cfg.Merge.RequiredApprovals,

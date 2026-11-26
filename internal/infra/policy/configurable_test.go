@@ -22,10 +22,10 @@ func (f fakeCheckSource) Names(ctx context.Context) ([]string, error) {
 
 func TestEvaluateAllGreenReturnsMerge(t *testing.T) {
 	cfg := Config{
-		RequiredChecks:    []string{"ci", "lint"},
-		RequiredApprovals: 2,
-		Labels:            []string{"ready", "automerge"},
-		CommandGate:       "exit 0",
+		RequiredCheckSource: fakeCheckSource{names: []string{"ci", "lint"}},
+		RequiredApprovals:   2,
+		Labels:              []string{"ready", "automerge"},
+		CommandGate:         "exit 0",
 	}
 	obs := core.Observation{
 		PRState:   "open",
@@ -52,7 +52,7 @@ func TestEvaluateEmptyRequiredChecksGreenReturnsMerge(t *testing.T) {
 }
 
 func TestEvaluatePendingCheckReturnsWait(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"ci"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"ci"}}}
 	obs := core.Observation{
 		PRState: "open",
 		Checks:  []core.CheckResult{{Name: "ci", State: core.CheckPending}},
@@ -70,7 +70,7 @@ func TestEvaluatePendingCheckReturnsWait(t *testing.T) {
 }
 
 func TestEvaluateWorkflowSkippedDocsOnlyWithNoChecksMerges(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"build", "vet", "test", "lint"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build", "vet", "test", "lint"}}}
 	obs := core.Observation{PRState: "open", WorkflowSkipped: true}
 	got := New(cfg).Evaluate(obs)
 	if got.Verdict != core.VerdictMerge {
@@ -79,7 +79,7 @@ func TestEvaluateWorkflowSkippedDocsOnlyWithNoChecksMerges(t *testing.T) {
 }
 
 func TestEvaluateWorkflowSkippedWithFailureBlocks(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"build"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build"}}}
 	obs := core.Observation{
 		PRState:         "open",
 		WorkflowSkipped: true,
@@ -92,13 +92,13 @@ func TestEvaluateWorkflowSkippedWithFailureBlocks(t *testing.T) {
 	if got.Criterion != "invariant" {
 		t.Fatalf("criterion = %q, want invariant", got.Criterion)
 	}
-	if verdict, _ := (ChecksRule{Names: cfg.RequiredChecks}).Evaluate(obs); verdict == core.VerdictNoop {
-		t.Fatal("ChecksRule returned noop for a reported failure")
+	if verdict, _ := (SourceChecksRule{Source: cfg.RequiredCheckSource}).Evaluate(obs); verdict == core.VerdictNoop {
+		t.Fatal("SourceChecksRule returned noop for a reported failure")
 	}
 }
 
 func TestEvaluateMissingChecksWithoutSkipWaitsWithCriterion(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"build", "lint"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build", "lint"}}}
 	obs := core.Observation{PRState: "open"}
 	got := New(cfg).Evaluate(obs)
 	if got.Verdict != core.VerdictWait {
@@ -115,7 +115,7 @@ func TestEvaluateMissingChecksWithoutSkipWaitsWithCriterion(t *testing.T) {
 }
 
 func TestEvaluateWorkflowSkippedStillAppliesOtherCriteria(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"build"}, Labels: []string{"ready"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build"}}, Labels: []string{"ready"}}
 	obs := core.Observation{PRState: "open", WorkflowSkipped: true}
 	got := New(cfg).Evaluate(obs)
 	if got.Verdict != core.VerdictWait || got.Criterion != "labels" {
@@ -124,7 +124,7 @@ func TestEvaluateWorkflowSkippedStillAppliesOtherCriteria(t *testing.T) {
 }
 
 func TestEvaluateFailedCheckReturnsNeedsAgentFix(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"ci"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"ci"}}}
 	obs := core.Observation{
 		PRState: "open",
 		Checks:  []core.CheckResult{{Name: "ci", State: core.CheckFailure}},
@@ -139,7 +139,7 @@ func TestEvaluateFailedCheckReturnsNeedsAgentFix(t *testing.T) {
 }
 
 func TestEvaluateBehindReturnsNeedsRebase(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"ci"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"ci"}}}
 	obs := core.Observation{
 		PRState: "open",
 		Behind:  true,
@@ -152,7 +152,7 @@ func TestEvaluateBehindReturnsNeedsRebase(t *testing.T) {
 }
 
 func TestEvaluateConflictReturnsNeedsAgentFix(t *testing.T) {
-	cfg := Config{RequiredChecks: []string{"ci"}}
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"ci"}}}
 	obs := core.Observation{
 		PRState:  "open",
 		Conflict: true,
@@ -271,7 +271,7 @@ func TestRulePassReturnsNoopWithEmptyReason(t *testing.T) {
 		Labels:    []string{"ready"},
 	}
 	rules := []core.Criterion{
-		ChecksRule{Names: []string{"ci"}},
+		SourceChecksRule{Source: fakeCheckSource{names: []string{"ci"}}},
 		ApprovalsRule{Needed: 1},
 		LabelRule{Names: []string{"ready"}},
 		CommandRule{Command: "exit 0"},
@@ -290,7 +290,7 @@ func TestRulePassReturnsNoopWithEmptyReason(t *testing.T) {
 func TestRuleFailReturnsConcreteReason(t *testing.T) {
 	obs := core.Observation{PRState: "open"}
 	rules := []core.Criterion{
-		ChecksRule{Names: []string{"ci"}},
+		SourceChecksRule{Source: fakeCheckSource{names: []string{"ci"}}},
 		ApprovalsRule{Needed: 1},
 		LabelRule{Names: []string{"ready"}},
 		CommandRule{Command: "exit 1"},
@@ -310,10 +310,10 @@ func TestRuleFailReturnsConcreteReason(t *testing.T) {
 	}
 }
 
-// TestChecksRuleAcceptsResolvedWorkflowNames covers the names config load
-// feeds into RequiredChecks after a workflow rename: a verify job and a
-// matrix-backed test job, with none of the old build/vet/lint jobs present.
-func TestChecksRuleAcceptsResolvedWorkflowNames(t *testing.T) {
+// TestPolicyAcceptsResolvedWorkflowNames covers the names config load feeds
+// into the source after a workflow rename: a verify job and a matrix-backed
+// test job, with none of the old build/vet/lint jobs present.
+func TestPolicyAcceptsResolvedWorkflowNames(t *testing.T) {
 	obs := core.Observation{
 		PRState: "open",
 		Checks: []core.CheckResult{
@@ -321,11 +321,11 @@ func TestChecksRuleAcceptsResolvedWorkflowNames(t *testing.T) {
 			{Name: "test", State: core.CheckSuccess},
 		},
 	}
-	resolved := New(Config{RequiredChecks: []string{"test", "verify"}}).Evaluate(obs)
+	resolved := New(Config{RequiredCheckSource: fakeCheckSource{names: []string{"test", "verify"}}}).Evaluate(obs)
 	if resolved.Verdict != core.VerdictMerge {
 		t.Fatalf("verdict with resolved names = %+v, want merge", resolved)
 	}
-	stale := New(Config{RequiredChecks: []string{"build", "vet", "test", "lint"}}).Evaluate(obs)
+	stale := New(Config{RequiredCheckSource: fakeCheckSource{names: []string{"build", "vet", "test", "lint"}}}).Evaluate(obs)
 	if stale.Verdict != core.VerdictWait || stale.Criterion != "required_checks" {
 		t.Fatalf("verdict with stale names = %+v, want required_checks wait", stale)
 	}
@@ -348,20 +348,6 @@ func TestPolicyHonoursSwappedSources(t *testing.T) {
 	second := New(Config{RequiredCheckSource: fakeCheckSource{names: []string{"legacy"}}}).Evaluate(obs)
 	if second.Verdict != core.VerdictWait || second.Criterion != "required_checks" {
 		t.Fatalf("second source decision = %+v, want required_checks wait", second)
-	}
-}
-
-func TestPolicySourceTakesPrecedenceOverStaticNames(t *testing.T) {
-	obs := core.Observation{
-		PRState: "open",
-		Checks:  []core.CheckResult{{Name: "verify", State: core.CheckSuccess}},
-	}
-	p := New(Config{
-		RequiredChecks:      []string{"legacy"},
-		RequiredCheckSource: fakeCheckSource{names: []string{"verify"}},
-	})
-	if got := p.Evaluate(obs); got.Verdict != core.VerdictMerge {
-		t.Fatalf("decision = %+v, want source names to override the static list", got)
 	}
 }
 
