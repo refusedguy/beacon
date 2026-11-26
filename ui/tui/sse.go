@@ -86,7 +86,7 @@ func (c *Client) streamOnce(ctx context.Context, onEvent func(Event)) error {
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
+		applyAuth(req, c.Token)
 	}
 	resp, err := c.streamHTTPClient().Do(req)
 	if err != nil {
