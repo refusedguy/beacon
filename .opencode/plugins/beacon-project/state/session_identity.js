@@ -32,9 +32,15 @@ export const NO_ROLE = "none"
 
 const DEFAULT_WORKER_AGENTS = Object.freeze(["worker"])
 
+// Config objects come from plugin setup and stay stable for the session. Cache
+// the frozen list by object identity so repeated role checks do not rebuild it.
+const guardedAgentsCache = new WeakMap()
+
+const isCacheableConfig = (config) => config !== null && (typeof config === "object" || typeof config === "function")
+
 // Only a configured name is a worker. A name that merely contains "worker",
 // such as "networker", is not one. Project variants must be named explicitly.
-export function guardedAgents(config = {}) {
+function resolveGuardedAgents(config) {
   const value = config?.shellGuardAgents ?? config?.shellGuardAgent
   if (Array.isArray(value)) {
     const agents = value.filter((agent) => typeof agent === "string" && agent)
@@ -42,6 +48,16 @@ export function guardedAgents(config = {}) {
   }
   if (typeof value === "string" && value) return Object.freeze([value])
   return DEFAULT_WORKER_AGENTS
+}
+
+export function guardedAgents(config = {}) {
+  if (!isCacheableConfig(config)) return resolveGuardedAgents(config)
+  let agents = guardedAgentsCache.get(config)
+  if (!agents) {
+    agents = resolveGuardedAgents(config)
+    guardedAgentsCache.set(config, agents)
+  }
+  return agents
 }
 
 // One classification for rules, the shell guard and MCP. Callers ask the same
@@ -59,6 +75,10 @@ export function agentRole(agent, config = {}) {
   return null
 }
 
+// A session's identity is fixed for its lifetime. The model and agent come
+// from a session lookup, so reuse the first result for every later caller.
+const identityCache = new Map()
+
 // Plugin setup does not always receive a session ID directly. Fall back to the
 // newest session, the same way the agent resolver does. The model is optional:
 // never invent one when the session domain cannot provide it.
@@ -74,20 +94,23 @@ export async function sessionIdentity(ctx) {
     } catch { return {} }
   }
   if (typeof sessionID !== "string" || !sessionID) return {}
+  if (identityCache.has(sessionID)) return identityCache.get(sessionID)
   const identity = { sessionID }
   const direct = agentIdentity(ctx)
   if (direct) identity.agent = direct
-  if (typeof ctx.session?.get !== "function") return identity
-  try {
-    const info = await ctx.session.get({ sessionID })
-    const data = info?.data ?? info
-    const ref = data?.model
-    const model = ref?.id ?? ref?.modelID ?? ref?.modelId ?? data?.modelID ?? data?.modelId
-    if (typeof model === "string" && model) identity.model = model
-    if (!identity.agent) {
-      const agent = agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
-      if (agent) identity.agent = agent
-    }
-  } catch {}
+  if (typeof ctx.session?.get === "function") {
+    try {
+      const info = await ctx.session.get({ sessionID })
+      const data = info?.data ?? info
+      const ref = data?.model
+      const model = ref?.id ?? ref?.modelID ?? ref?.modelId ?? data?.modelID ?? data?.modelId
+      if (typeof model === "string" && model) identity.model = model
+      if (!identity.agent) {
+        const agent = agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
+        if (agent) identity.agent = agent
+      }
+    } catch {}
+  }
+  identityCache.set(sessionID, identity)
   return identity
 }
