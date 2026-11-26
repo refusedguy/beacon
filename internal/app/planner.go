@@ -1,6 +1,7 @@
 package app
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -54,6 +55,14 @@ func NewPlanner(checker core.OverlapChecker) ConflictPlanner {
 	return GreedyPlanner{Overlap: checker}
 }
 
+// Probe IDs keep an active-scope comparison path-only. They cannot collide with
+// a real card ID or appear in a real DependsOn list, so identity and dependency
+// rules in an injected checker cannot fire.
+const (
+	probeCandidateID core.TaskID = "\x00planner-candidate"
+	probeRunID       core.TaskID = "\x00planner-run"
+)
+
 // Select returns up to limit candidates that are available and free of scope
 // conflicts with active runs or earlier selections. It reports a reason for
 // each candidate it skips.
@@ -63,15 +72,7 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 	if limit <= 0 {
 		return selected, skipped, nil
 	}
-	busyIDs := make(map[core.TaskID]*core.Run)
-	var live []*core.Run
-	for _, r := range active {
-		if r == nil || r.State.Terminal() {
-			continue
-		}
-		busyIDs[r.TaskID] = r
-		live = append(live, r)
-	}
+	busyIDs, index := newActiveRunIndex(active)
 
 	for _, t := range candidates {
 		if len(selected) >= limit {
@@ -106,7 +107,7 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 			}
 			t.Scope = []core.ScopePath{core.ScopeAll()}
 		}
-		if blocker, paths := p.activeConflict(t, live); blocker != nil {
+		if blocker, paths := p.activeConflict(t, index); blocker != nil {
 			skipped = append(skipped, SkippedTask{
 				TaskID:       t.ID,
 				Code:         SkipActiveScopeOverlap,
@@ -140,13 +141,171 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 	return selected, skipped, nil
 }
 
-// activeConflict returns the first active run whose scope overlaps t and the
-// paths from t that intersect that run.
-func (p GreedyPlanner) activeConflict(t core.Task, active []*core.Run) (*core.Run, []core.ScopePath) {
+// newActiveRunIndex builds the per-cycle view of active runs: busy task IDs and
+// an index of live scope claims. Terminal and nil runs are ignored.
+func newActiveRunIndex(active []*core.Run) (map[core.TaskID]*core.Run, *activeScopeIndex) {
+	busyIDs := make(map[core.TaskID]*core.Run)
+	var live []*core.Run
 	for _, r := range active {
 		if r == nil || r.State.Terminal() {
 			continue
 		}
+		busyIDs[r.TaskID] = r
+		live = append(live, r)
+	}
+	return busyIDs, newActiveScopeIndex(live)
+}
+
+// activeScopeIndex maps scope claims of live runs to the runs that carry them.
+// It is built once per selection cycle and shared by every candidate, so a
+// candidate only checks the runs its own claims could overlap.
+type activeScopeIndex struct {
+	runs   []*core.Run
+	exact  map[core.ScopePath][]int
+	cover  map[core.ScopePath][]int
+	under  map[core.ScopePath][]int
+	globs  []int
+	unpath []int
+	broad  []int
+}
+
+func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
+	idx := &activeScopeIndex{
+		runs:  runs,
+		exact: make(map[core.ScopePath][]int),
+		cover: make(map[core.ScopePath][]int),
+		under: make(map[core.ScopePath][]int),
+	}
+	for i, r := range runs {
+		for _, claim := range r.Scope {
+			idx.exact[claim] = appendUnique(idx.exact[claim], i)
+			keys := claimDirKeys(claim)
+			for _, key := range keys {
+				idx.under[key] = appendUnique(idx.under[key], i)
+			}
+			if claim.Kind() == 'd' || claim.Kind() == 'g' {
+				for _, key := range keys {
+					idx.cover[key] = appendUnique(idx.cover[key], i)
+				}
+			}
+			if claim.Kind() == 'g' {
+				idx.globs = appendUnique(idx.globs, i)
+			}
+			if claim.Kind() == 'a' || (claim.Kind() == 'g' && leadingWildcard(claim.Value())) {
+				idx.broad = appendUnique(idx.broad, i)
+			}
+			if claim.Kind() != 'a' && !strings.Contains(claim.Value(), "/") {
+				idx.unpath = appendUnique(idx.unpath, i)
+			}
+		}
+	}
+	return idx
+}
+
+// matching returns the live runs whose claims could overlap t, in live order.
+// The result is a superset: every overlapping run is included, and the caller
+// confirms each one with the injected checker.
+func (idx *activeScopeIndex) matching(t core.Task) []int {
+	seen := make(map[int]bool)
+	var out []int
+	add := func(i int) {
+		if !seen[i] {
+			seen[i] = true
+			out = append(out, i)
+		}
+	}
+	allRuns := func() {
+		for i := range idx.runs {
+			add(i)
+		}
+	}
+	for _, claim := range t.Scope {
+		if claim.Kind() == 'a' || (claim.Kind() == 'g' && leadingWildcard(claim.Value())) {
+			// A broad claim can cover any active path, so no prefix key is
+			// selective enough. Fall back to a full scan for this candidate.
+			allRuns()
+			continue
+		}
+		for _, i := range idx.exact[claim] {
+			add(i)
+		}
+		keys := claimDirKeys(claim)
+		switch claim.Kind() {
+		case 'f':
+			for _, key := range keys {
+				for _, i := range idx.cover[key] {
+					add(i)
+				}
+			}
+		default:
+			for _, key := range keys {
+				for _, i := range idx.under[key] {
+					add(i)
+				}
+				for _, i := range idx.cover[key] {
+					add(i)
+				}
+			}
+			if claim.Kind() == 'g' {
+				for _, i := range idx.globs {
+					add(i)
+				}
+				for _, i := range idx.unpath {
+					add(i)
+				}
+			}
+		}
+	}
+	for _, i := range idx.broad {
+		add(i)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// claimDirKeys returns the directory keys under which a claim is indexed: the
+// claim's own value as a directory, then each literal ancestor directory. A
+// wildcard segment stops the walk because later segments are not fixed paths.
+func claimDirKeys(claim core.ScopePath) []core.ScopePath {
+	value := claim.Value()
+	parts := strings.Split(value, "/")
+	var out []core.ScopePath
+	var prefix strings.Builder
+	if !strings.ContainsAny(parts[0], "*?") {
+		out = append(out, core.ScopeDir(parts[0]))
+		prefix.WriteString(parts[0])
+	} else {
+		return out
+	}
+	for _, part := range parts[1:] {
+		if strings.ContainsAny(part, "*?") {
+			break
+		}
+		prefix.WriteString("/")
+		prefix.WriteString(part)
+		out = append(out, core.ScopeDir(prefix.String()))
+	}
+	return out
+}
+
+func leadingWildcard(value string) bool {
+	return strings.ContainsAny(strings.Split(value, "/")[0], "*?")
+}
+
+func appendUnique(indices []int, i int) []int {
+	for _, existing := range indices {
+		if existing == i {
+			return indices
+		}
+	}
+	return append(indices, i)
+}
+
+// activeConflict returns the first live run whose scope overlaps t and the
+// paths from t that intersect that run.
+func (p GreedyPlanner) activeConflict(t core.Task, index *activeScopeIndex) (*core.Run, []core.ScopePath) {
+	for _, i := range index.matching(t) {
+		r := index.runs[i]
 		if p.overlapsScope(t, r.Scope) {
 			return r, intersectScopes(t.Scope, r.Scope)
 		}
@@ -154,23 +313,28 @@ func (p GreedyPlanner) activeConflict(t core.Task, active []*core.Run) (*core.Ru
 	return nil, nil
 }
 
-// overlapsScope checks path overlap only. An active run carries scope but no
-// card identity, so passing a synthetic card to the injected checker would let
-// a real card with that ID match by identity instead of by scope.
-func (GreedyPlanner) overlapsScope(t core.Task, runScope []core.ScopePath) bool {
-	return core.OverlapByPaths(t, core.Task{Scope: runScope})
+// overlapsScope checks path overlap only. The probe IDs keep identity and
+// dependency rules out of the comparison while still counting it through the
+// injected checker. An active run carries scope but no card identity.
+func (p GreedyPlanner) overlapsScope(t core.Task, runScope []core.ScopePath) bool {
+	checker := p.Overlap
+	if checker == nil {
+		checker = core.PathsAndDependencies
+	}
+	return checker(
+		core.Task{ID: probeCandidateID, Scope: t.Scope},
+		core.Task{ID: probeRunID, Scope: runScope},
+	)
 }
 
 // intersectScopes returns the entries of a that cover or are covered by an
 // entry of b, in the order they appear in a.
 func intersectScopes(a, b []core.ScopePath) []core.ScopePath {
 	var out []core.ScopePath
-	seen := make(map[core.ScopePath]bool)
 	for _, x := range a {
 		for _, y := range b {
 			if x.Covers(y) || y.Covers(x) {
-				if !seen[x] {
-					seen[x] = true
+				if !containsPath(out, x) {
 					out = append(out, x)
 				}
 				break
@@ -178,6 +342,15 @@ func intersectScopes(a, b []core.ScopePath) []core.ScopePath {
 		}
 	}
 	return out
+}
+
+func containsPath(paths []core.ScopePath, path core.ScopePath) bool {
+	for _, p := range paths {
+		if p == path {
+			return true
+		}
+	}
+	return false
 }
 
 func overlapSuffix(paths []core.ScopePath) string {
