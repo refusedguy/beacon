@@ -276,15 +276,19 @@ func (m model) View() string {
 	}
 	var b strings.Builder
 	title := "Beacon runs"
+	header := title + "\n"
+	trailingNewline := false
 	if m.width > 0 {
 		if cache.padWidth != m.width {
 			cache.padWidth = m.width
 			cache.pad = strings.Repeat(" ", maxInt(0, m.width-len(title)))
 		}
-		b.WriteString(headerStyle.Render(title + cache.pad))
+		header = title + cache.pad
+		trailingNewline = true
+	}
+	b.WriteString(headerStyle.Render(header))
+	if trailingNewline {
 		b.WriteByte('\n')
-	} else {
-		b.WriteString(headerStyle.Render(title + "\n"))
 	}
 	if len(m.runs) == 0 {
 		b.WriteString("no runs\n")

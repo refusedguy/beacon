@@ -1,7 +1,7 @@
 ---
 id: T-ceedfdb8
 title: Collapse duplicated TUI header render
-status: available
+status: done
 scope:
     - ui/tui/model.go
 depends:
