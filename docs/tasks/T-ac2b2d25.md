@@ -1,7 +1,7 @@
 ---
 id: T-ac2b2d25
 title: Assert plugin defaults come from Plugin.define
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/index.js
     - .opencode/plugins/beacon-project/ui/ui.js

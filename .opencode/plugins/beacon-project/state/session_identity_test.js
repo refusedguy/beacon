@@ -1,7 +1,10 @@
 // Run: node --test .opencode/plugins/beacon-project/session_identity_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { cliEnv, sessionIdentity } from "./session_identity.js"
+import { agentRole, cliEnv, guardedAgents, sessionIdentity } from "./session_identity.js"
+import { roleFor } from "../rules/context.js"
+import { isWorkerAgent } from "../shell_guard.js"
+import { resolveMcpRegistration } from "../index.js"
 import { CliStatusSource, createStatusSource, errorMessage } from "../ui/ui.js"
 
 test("cliEnv carries the project root, session and model into the child env", () => {
@@ -53,6 +56,41 @@ test("sessionIdentity returns no values without a session and survives a failing
     session: { get: async () => { throw new Error("session unavailable") } },
   }
   assert.deepEqual(await sessionIdentity(failing), { sessionID: "ses_2" })
+})
+
+const AGENT_CLASSIFICATIONS = [
+  ["worker", "worker", true],
+  ["build", "orchestrator", false],
+  ["orchestrator", "orchestrator", false],
+  ["networker", null, false],
+  ["issue-scout", "none", false],
+]
+
+test("one classifier decides the role for rules, guard and MCP", async () => {
+  for (const [agent, expectedRole, expectedWorker] of AGENT_CLASSIFICATIONS) {
+    assert.equal(agentRole(agent), expectedRole, `agentRole(${agent})`)
+    assert.equal(roleFor(agent), expectedRole, `roleFor(${agent}) must match agentRole`)
+    assert.equal(isWorkerAgent(agent), expectedWorker, `isWorkerAgent(${agent}) must match role`)
+
+    const calls = []
+    const registrar = {
+      registerBeaconMcp: async () => { calls.push(agent); return { dispose() {} } },
+    }
+    const registration = await resolveMcpRegistration({}, "/p", { agent, registrar })
+    await registration.dispose()
+    assert.equal(registration.config === null, expectedWorker, `MCP worker decision for ${agent}`)
+    assert.equal(calls.length, expectedWorker ? 0 : 1, `MCP registration calls for ${agent}`)
+  }
+})
+
+test("worker names match exactly and a configured name overrides the default", () => {
+  assert.deepEqual(guardedAgents({}), ["worker"])
+  assert.deepEqual(guardedAgents({ shellGuardAgents: ["worker", "beacon-worker"] }), ["worker", "beacon-worker"])
+  assert.equal(agentRole("networker"), null, "a substring never makes a worker")
+  assert.equal(agentRole("networker", { shellGuardAgents: ["beacon-worker"] }), null)
+  assert.equal(agentRole("beacon-worker", { shellGuardAgents: ["beacon-worker"] }), "worker")
+  assert.equal(agentRole(" Worker "), "worker")
+  assert.equal(agentRole(null), null)
 })
 
 const source = (opts, execFile) => new CliStatusSource({

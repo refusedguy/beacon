@@ -1,4 +1,6 @@
-import { agentIdentity } from "./state/session_identity.js"
+import { agentIdentity, agentRole, guardedAgents } from "./state/session_identity.js"
+
+export { guardedAgents }
 
 // Advisory guard at the tool boundary. It catches the command shapes the
 // project documents for workers, and it can be relaxed with
@@ -54,7 +56,6 @@ export const SHELL_GUARD_RULES = Object.freeze([
 ])
 
 const GUARDED_TOOLS = new Set(["bash", "shell", "execute"])
-const DEFAULT_GUARDED_AGENTS = Object.freeze(["worker"])
 
 export function commandFromToolInput(input) {
   if (typeof input === "string") return input
@@ -173,21 +174,11 @@ export function findShellGuardHit(tool, input, rules = SHELL_GUARD_RULES) {
   return null
 }
 
-export function guardedAgents(config = {}) {
-  const value = config.shellGuardAgents ?? config.shellGuardAgent
-  if (Array.isArray(value)) {
-    const agents = value.filter((agent) => typeof agent === "string" && agent)
-    return agents.length ? Object.freeze(agents) : DEFAULT_GUARDED_AGENTS
-  }
-  if (typeof value === "string" && value) return Object.freeze([value])
-  return DEFAULT_GUARDED_AGENTS
-}
-
 export function guardAppliesToAgent(event, config = {}) {
   const agent = agentIdentity(null, event)
   // When the event carries no agent, keep the guard as a safety net.
   if (!agent) return true
-  return guardedAgents(config).includes(agent)
+  return agentRole(agent, config) === "worker"
 }
 
 export function guardMode(config = {}, env = process.env) {
@@ -196,14 +187,11 @@ export function guardMode(config = {}, env = process.env) {
   return config.shellGuard
 }
 
-// Workers inherit the pooled MCP daemon from the parent session. Only an agent
-// named exactly in the configured guard list is a worker. A name that merely
-// contains "worker", such as "networker", must not inherit that behavior. A
-// project variant has to be configured explicitly.
+// Workers inherit the pooled MCP daemon from the parent session. The shared
+// agentRole classifier answers this, so MCP, the shell guard and the rules
+// agree on who is a worker. Names such as "networker" never match by substring.
 export function isWorkerAgent(agent, config = {}) {
-  if (typeof agent !== "string" || !agent.trim()) return false
-  const name = agent.trim().toLowerCase()
-  return guardedAgents(config).some((configured) => configured.trim().toLowerCase() === name)
+  return agentRole(agent, config) === "worker"
 }
 
 export async function registerShellGuard(ctx, config = {}, env = process.env) {
