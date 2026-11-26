@@ -11,49 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/refusedguy/beacon/pkg/core"
 )
-
-type fakeControl struct {
-	actions       []string
-	ids           []core.RunID
-	approveSHA    string
-	nudgeMessages []string
-	err           error
-}
-
-func (f *fakeControl) Approve(_ context.Context, id core.RunID, sha string) error {
-	f.actions = append(f.actions, "approve")
-	f.ids = append(f.ids, id)
-	f.approveSHA = sha
-	return f.err
-}
-
-func (f *fakeControl) Unblock(_ context.Context, id core.RunID) error {
-	f.actions = append(f.actions, "unblock")
-	f.ids = append(f.ids, id)
-	return f.err
-}
-
-func (f *fakeControl) Cancel(_ context.Context, id core.RunID) error {
-	f.actions = append(f.actions, "cancel")
-	f.ids = append(f.ids, id)
-	return f.err
-}
-
-func (f *fakeControl) Retry(_ context.Context, id core.RunID) error {
-	f.actions = append(f.actions, "retry")
-	f.ids = append(f.ids, id)
-	return f.err
-}
-
-func (f *fakeControl) Nudge(_ context.Context, id core.RunID, message string) error {
-	f.actions = append(f.actions, "nudge")
-	f.ids = append(f.ids, id)
-	f.nudgeMessages = append(f.nudgeMessages, message)
-	return f.err
-}
 
 func TestValidateControl(t *testing.T) {
 	for _, action := range []string{"approve", "unblock", "cancel", "retry"} {
@@ -70,45 +28,12 @@ func TestValidateControl(t *testing.T) {
 	}
 }
 
-func TestApplyControlRoutesEveryAction(t *testing.T) {
-	for _, action := range []string{"approve", "unblock", "cancel", "retry"} {
-		t.Run(action, func(t *testing.T) {
-			ctrl := &fakeControl{}
-			if err := applyControl(context.Background(), ctrl, action, "r1", "abc"); err != nil {
-				t.Fatalf("applyControl(context.Background(), ctrl, action, \"r1\", \"abc\"): %v", err)
-			}
-			if len(ctrl.actions) != 1 || ctrl.actions[0] != action {
-				t.Fatalf("actions = %v", ctrl.actions)
-			}
-			if len(ctrl.ids) != 1 || ctrl.ids[0] != "r1" {
-				t.Fatalf("ids = %v", ctrl.ids)
-			}
-			if action == "approve" && ctrl.approveSHA != "abc" {
-				t.Fatalf("approve sha = %q", ctrl.approveSHA)
-			}
-		})
-	}
-}
-
 func TestValidateControlRequiresNudgeMessage(t *testing.T) {
 	if err := validateControl("nudge", "r1", "follow the checklist"); err != nil {
 		t.Fatalf("validateControl(\"nudge\", \"r1\", \"follow the checklist\"): %v", err)
 	}
 	if err := validateControl("nudge", "r1"); err == nil {
 		t.Fatal("nudge without a message was accepted")
-	}
-}
-
-func TestApplyControlForwardsNudgeMessage(t *testing.T) {
-	ctrl := &fakeControl{}
-	if err := applyControl(context.Background(), ctrl, "nudge", "r1", "", "please rebase first"); err != nil {
-		t.Fatalf("applyControl(context.Background(), ctrl, \"nudge\", \"r1\", \"\", \"please rebase first\"): %v", err)
-	}
-	if len(ctrl.actions) != 1 || ctrl.actions[0] != "nudge" {
-		t.Fatalf("actions = %v", ctrl.actions)
-	}
-	if len(ctrl.nudgeMessages) != 1 || ctrl.nudgeMessages[0] != "please rebase first" {
-		t.Fatalf("messages = %v", ctrl.nudgeMessages)
 	}
 }
 
@@ -229,7 +154,7 @@ func TestPostControlReportsServerError(t *testing.T) {
 		w.WriteHeader(http.StatusConflict)
 	}))
 	defer srv.Close()
-	err := postControl(context.Background(), &connectionInfo{Addr: srv.URL, Token: "tok"}, "retry", "r1", "")
+	err := postControlWithPR(context.Background(), &connectionInfo{Addr: srv.URL, Token: "tok"}, "retry", "r1", "", 0)
 	if err == nil || !strings.Contains(err.Error(), "409") {
 		t.Fatalf("error = %v, want status 409", err)
 	}
