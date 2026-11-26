@@ -1,7 +1,7 @@
 ---
 id: T-0aceb07f
 title: Share FNV body hash
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/index.js
     - .opencode/plugins/beacon-project/ui/ui_actions.js

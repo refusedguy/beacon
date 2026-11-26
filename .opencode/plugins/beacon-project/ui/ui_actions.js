@@ -5,20 +5,13 @@ import { CONTROL_ACTIONS, errorMessage, str } from "./ui_model.js"
 import { isDispatching, setDispatching } from "./ui_alerts.js"
 import { refreshDispatchingViews } from "./ui_sidebar.js"
 import { toastShow } from "./ui_test_helpers.js"
+import { dispatchRequestId } from "../protocol/body_hash.js"
+export { dispatchRequestId }
 
 // A mouse gesture on the Dispatch row reaches both onMouseDown and onMouseUp.
 // Equal bodies inside this window come from one gesture, so they share one
 // request and one POST. The hash makes the duplicate visible in the log.
 export const DISPATCH_DEDUPE_MS = 250
-export function dispatchRequestId(input) {
-  const text = JSON.stringify(input ?? null)
-  let hash = 0x811c9dc5
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i)
-    hash = Math.imul(hash, 0x01000193)
-  }
-  return `dispatch:${(hash >>> 0).toString(16).padStart(8, "0")}`
-}
 
 // Shared OSC52 copier. The toast reports the clipboard result, never a guess.
 export function clipboardCopier(ctx, toast) {
