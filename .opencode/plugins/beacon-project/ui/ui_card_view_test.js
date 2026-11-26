@@ -6,7 +6,7 @@ import assert from "node:assert/strict"
 import {
   CARD_PANEL_NAME, beaconStatusDefinition, cardHeader, cardModel,
   createButtonPlate, createCardMount, createDetailMount, createPanelChrome,
-  durationText, normalizeRun, normalizeSnapshot, runEventTimes, runTotalTime,
+  elapsed, normalizeRun, normalizeSnapshot, runEventTimes, runTotalTime,
 } from "./ui.js"
 import { hostModule, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -65,10 +65,10 @@ function findItem(node, predicate) {
 }
 
 test("duration uses the smallest readable unit, like the rest of the panel", () => {
-  assert.equal(durationText(500), "0s")
-  assert.equal(durationText(16 * 60 * 1000), "16m")
-  assert.equal(durationText(2 * 60 * 60 * 1000), "2h")
-  assert.equal(durationText(-1), "")
+  assert.equal(elapsed(500), "0s")
+  assert.equal(elapsed(16 * 60 * 1000), "16m")
+  assert.equal(elapsed(2 * 60 * 60 * 1000), "2h")
+  assert.equal(elapsed(-1), "")
 })
 
 test("total time spans the first and last event stamp, including decisions", () => {

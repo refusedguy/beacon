@@ -5,7 +5,6 @@ import { createBox, createLineMount, createText } from "./ui_nodes.js"
 import { taskTree } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
 import { propSetter } from "./ui_test_helpers.js"
-export { elapsed as durationText }
 // Timeline and decision events carry the `at` stamp. Their first and last
 // stamps bound the whole run, which is the number the card header shows.
 export function runEventTimes(run) {

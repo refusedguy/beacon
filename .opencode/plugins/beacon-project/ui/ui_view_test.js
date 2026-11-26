@@ -6,8 +6,8 @@ import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
   SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
-  detailLines, detailModel, durationText, elapsed, mergedReason, normalizeRun, phaseLabel, renderSnapshotLines,
-  runLineItems, sidebarModel, stateBarItem, truncate,
+  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel, renderSnapshotLines,
+  runLineItems, runTotalTime, sidebarModel, stateBarItem, truncate,
 } = ui
 
 test("elapsed formats seconds, minutes, hours and days", () => {
@@ -22,9 +22,8 @@ test("elapsed formats seconds, minutes, hours and days", () => {
 })
 
 test("the card and sidebar render durations with the same strings", () => {
-  for (const ms of [0, 500, 90_000, 16 * 60_000, 2 * 3_600_000, 26 * 3_600_000, -1, NaN]) {
-    assert.equal(durationText(ms), elapsed(ms), `duration for ${ms}`)
-  }
+  const card = runTotalTime({ timeline: [{ at: 1000 }, { at: 1000 + 90_000 }] })
+  assert.equal(card.text, elapsed(90_000))
 })
 
 test("state bar builds proportional colored segments and a human summary", () => {
