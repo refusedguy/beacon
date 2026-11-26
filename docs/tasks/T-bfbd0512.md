@@ -1,7 +1,7 @@
 ---
 id: T-bfbd0512
 title: Import build script constant and share cleanup wrapper
-status: in_progress
+status: done
 scope:
     - .opencode/plugins/beacon-project/mcp/mcp.js
     - .opencode/plugins/beacon-project/rules/context.js
