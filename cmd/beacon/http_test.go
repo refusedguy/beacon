@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -81,7 +82,7 @@ func TestPRChangeReachesReconcilerAndEveryMonitor(t *testing.T) {
 		}
 	}()
 
-	api := &apiServer{token: "secret", changes: subs}
+	api := &apiServer{token: "secret", changes: subs, frames: newEventFrames(nil, json.Marshal)}
 	srv := httptest.NewServer(api.handler())
 	defer srv.Close()
 
@@ -149,6 +150,197 @@ func TestChangeSubscribersDropsSlowClientWithoutBlockingOthers(t *testing.T) {
 			return
 		}
 	}
+}
+
+// TestHarnessEventEncodedOnceForAllMonitors proves that a burst of harness
+// events costs one JSON encode per event, not one per monitor. Eight subscribers
+// see byte-identical frames and the marshaller reports no errors. Lossy
+// channels may drop frames under the burst, but every delivered frame must
+// match the pre-encoded bytes.
+func TestHarnessEventEncodedOnceForAllMonitors(t *testing.T) {
+	const (
+		monitors = 8
+		total    = 5000
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := make(chan core.HarnessEvent)
+	var mu sync.Mutex
+	encodes, marshalErrors := 0, 0
+	marshal := func(v any) ([]byte, error) {
+		b, err := json.Marshal(v)
+		mu.Lock()
+		encodes++
+		if err != nil {
+			marshalErrors++
+		}
+		mu.Unlock()
+		return b, err
+	}
+
+	frames := newEventFrames(src, marshal)
+	runDone := make(chan struct{})
+	go func() {
+		frames.run(ctx)
+		close(runDone)
+	}()
+
+	subs := make([]<-chan []byte, monitors)
+	for i := range subs {
+		subs[i], _ = frames.subscribe()
+	}
+
+	// The lossy channels may drop frames under a tight burst, so readers drain
+	// until the source ends and then pick up anything still buffered.
+	stop := make(chan struct{})
+	got := make([][][]byte, monitors)
+	var wg sync.WaitGroup
+	for i := range subs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				select {
+				case frame := <-subs[i]:
+					got[i] = append(got[i], frame)
+				case <-stop:
+					for {
+						select {
+						case frame := <-subs[i]:
+							got[i] = append(got[i], frame)
+						default:
+							return
+						}
+					}
+				}
+			}
+		}(i)
+	}
+
+	ev := core.HarnessEvent{RunID: "r1", Kind: "progress"}
+	for j := 0; j < total; j++ {
+		src <- ev
+	}
+	close(src)
+	<-runDone
+	close(stop)
+	wg.Wait()
+
+	mu.Lock()
+	encodeCount, errorCount := encodes, marshalErrors
+	mu.Unlock()
+	if encodeCount != total {
+		t.Fatalf("marshaller encodes = %d, want %d (one per event)", encodeCount, total)
+	}
+	if errorCount != 0 {
+		t.Fatalf("marshaller errors = %d, want 0", errorCount)
+	}
+
+	recorder := httptest.NewRecorder()
+	writeSSE(recorder, "harness", core.NewWireEvent(ev))
+	want := recorder.Body.String()
+	delivered := 0
+	for i, received := range got {
+		if len(received) == 0 {
+			t.Fatalf("monitor %d received no frames", i)
+		}
+		for j, frame := range received {
+			if string(frame) != want {
+				t.Fatalf("monitor %d frame %d = %q, want %q", i, j, frame, want)
+			}
+			delivered++
+		}
+	}
+	t.Logf("%d events to %d monitors: %d encodes, %d errors, %d identical frames delivered (%d bytes each)",
+		total, monitors, encodeCount, errorCount, delivered, len(want))
+}
+
+// TestEventFramesDropsSlowSubscriber makes the lossy monitor policy explicit.
+// A monitor that never reads loses the overflow while a fast monitor sees
+// every frame.
+func TestEventFramesDropsSlowSubscriber(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := make(chan core.HarnessEvent)
+	frames := newEventFrames(src, json.Marshal)
+	go frames.run(ctx)
+
+	slow, unSlow := frames.subscribe()
+	defer unSlow()
+	fast, unFast := frames.subscribe()
+	defer unFast()
+
+	total := subscriberBuffer + 1
+	for j := 0; j < total; j++ {
+		src <- core.HarnessEvent{Kind: "tick"}
+		select {
+		case <-fast:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("fast monitor stalled at frame %d", j)
+		}
+	}
+
+	count := 0
+	for {
+		select {
+		case <-slow:
+			count++
+		default:
+			if count != subscriberBuffer {
+				t.Fatalf("slow monitor buffered %d frames, want %d", count, subscriberBuffer)
+			}
+			return
+		}
+	}
+}
+
+// TestHarnessFramesReachEveryMonitorOverHTTP proves the pre-encoded frames are
+// written to each monitor with the unchanged notification wire shape.
+func TestHarnessFramesReachEveryMonitorOverHTTP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := make(chan core.HarnessEvent)
+	frames := newEventFrames(src, json.Marshal)
+	go frames.run(ctx)
+
+	api := &apiServer{token: "secret", frames: frames, changes: newChangeSubscribers()}
+	srv := httptest.NewServer(api.handler())
+	defer srv.Close()
+
+	const monitors = 8
+	streams := make([]*bufio.Scanner, monitors)
+	closers := make([]func(), monitors)
+	for i := range streams {
+		streams[i], closers[i] = connectSSE(t, srv, "secret")
+	}
+	defer func() {
+		for _, close := range closers {
+			close()
+		}
+	}()
+
+	ev := core.HarnessEvent{RunID: "r1", Kind: "done"}
+	recorder := httptest.NewRecorder()
+	writeSSE(recorder, "harness", core.NewWireEvent(ev))
+	lines := strings.Split(recorder.Body.String(), "\n")
+	if len(lines) < 2 || lines[0] != "event: harness" {
+		t.Fatalf("unexpected wire frame %q", recorder.Body.String())
+	}
+	want := strings.TrimPrefix(lines[1], "data: ")
+
+	for rep := 0; rep < 2; rep++ {
+		src <- ev
+		for i, stream := range streams {
+			if got := sseData(t, stream, "harness"); got != want {
+				t.Fatalf("repetition %d monitor %d data = %q, want %q", rep, i, got, want)
+			}
+		}
+	}
+	t.Logf("harness frame over HTTP: %q", recorder.Body.String())
 }
 
 // recordingAPIServices records every call that reaches the service layer. A
@@ -309,6 +501,7 @@ func TestRunsSnapshotSharedAcrossMonitorsPerGeneration(t *testing.T) {
 	api := &apiServer{
 		services: apiServices{status: status},
 		token:    "secret",
+		frames:   newEventFrames(nil, json.Marshal),
 		changes:  subs,
 	}
 	srv := httptest.NewServer(api.handler())
