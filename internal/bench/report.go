@@ -90,17 +90,6 @@ func endToEnd(sums []summary) time.Duration {
 	return total
 }
 
-func withShares(sums []summary, total time.Duration) []summary {
-	out := make([]summary, len(sums))
-	copy(out, sums)
-	for i := range out {
-		if total > 0 {
-			out[i].Share = 100 * float64(out[i].Median) / float64(total)
-		}
-	}
-	return out
-}
-
 // printReport writes the human-readable part of the benchmark report. It goes
 // to stdout so `go test -bench=. -benchmem -count=5` emits it without -v.
 func printReport(w io.Writer, sums []summary, total time.Duration, iterations int) {
