@@ -1,7 +1,7 @@
 ---
 id: T-b71b84cc
 title: Unify agent and session id resolution
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/index.js
     - .opencode/plugins/beacon-project/rules/context.js

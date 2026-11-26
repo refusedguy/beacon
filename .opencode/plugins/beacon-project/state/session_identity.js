@@ -26,6 +26,13 @@ export function agentIdentity(ctx, event) {
   return null
 }
 
+// Setup contexts and hook events name the session under different keys. Read
+// the union once so every caller uses the same ID. Records from session.list
+// carry a bare `id`, which the caller that reads records handles directly.
+export function sessionIDOf(source) {
+  return source?.sessionID ?? source?.session?.id ?? source?.session?.sessionID
+}
+
 // One latest-session lookup for identity, rules and MCP. A known ID uses
 // session.get and falls back to the newest entry when that fails. Records come
 // bare from session.list and under `data` from session.get, so unwrap here.
@@ -49,6 +56,22 @@ export async function latestSession(ctx, sessionID = null) {
 // keys, so read the union in one place and let every caller agree on the id.
 export function agentFromSession(ctx, data) {
   return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
+}
+
+// One agent resolution for setup, hook events and identity. Direct identity on
+// the event or context wins. Otherwise look up the session named by the event,
+// then the context. Without a named session, latestSession falls back to the
+// newest one. A failed lookup returns null so callers keep their fallback.
+export async function resolveAgent(ctx, event = null, log = null) {
+  const direct = agentIdentity(ctx, event)
+  if (direct) return direct
+  const sessionID = sessionIDOf(event) ?? sessionIDOf(ctx)
+  try {
+    return agentFromSession(ctx, await latestSession(ctx, sessionID))
+  } catch (error) {
+    if (typeof log === "function") log(`beacon plugin: session lookup failed: ${error?.message ?? error}`)
+    return null
+  }
 }
 
 export const WORKER_ROLE = "worker"
@@ -95,7 +118,7 @@ export function agentRole(agent, config = {}) {
   if (guardedAgents(config).some((worker) => worker.trim().toLowerCase() === name)) {
     return WORKER_ROLE
   }
-  if (name === "build" || name === "orchestrator") return ORCHESTRATOR_ROLE
+  if (name === "build" || name === ORCHESTRATOR_ROLE) return ORCHESTRATOR_ROLE
   if (name === "issue-scout") return NO_ROLE
   return null
 }
@@ -109,11 +132,11 @@ const identityCache = new Map()
 // never invent one when the session domain cannot provide it.
 export async function sessionIdentity(ctx) {
   if (!ctx || typeof ctx !== "object") return {}
-  let sessionID = ctx.sessionID ?? ctx.session?.id ?? ctx.session?.sessionID
+  let sessionID = sessionIDOf(ctx)
   if (typeof sessionID !== "string" || !sessionID) {
     try {
       const latest = await latestSession(ctx)
-      sessionID = latest?.id ?? latest?.sessionID
+      sessionID = latest?.id ?? sessionIDOf(latest)
     } catch { return {} }
   }
   if (typeof sessionID !== "string" || !sessionID) return {}
