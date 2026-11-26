@@ -1,7 +1,7 @@
 ---
 id: T-5d46fd5b
 title: Cut SQLite snapshot query time
-status: available
+status: done
 scope:
     - internal/infra/sqlite/store.go
     - internal/infra/sqlite/store_test.go
