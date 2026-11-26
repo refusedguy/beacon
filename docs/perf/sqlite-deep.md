@@ -287,3 +287,80 @@ table and reopens the database to check that the backfill restores the counts.
 `TestListRecent` pins the recent-run order. The benchmark reports the same
 25,348 rows and zero errors before and after every change. No verdict value,
 wire field or result cap was changed.
+
+## Retention and reverse-edge indexes (T-3bd24007)
+
+The prune tick filters `deliveries` and `approvals` on `created_at`. The
+ready-task recursive step joins `task_deps` on `depends_on`. Neither column had
+an index. This note records the read benefit and the write cost of three new
+indexes created in `schema.go`:
+
+```sql
+CREATE INDEX deliveries_created_at_idx ON deliveries(created_at);
+CREATE INDEX approvals_created_at_idx ON approvals(created_at);
+CREATE INDEX task_deps_depends_on_task_idx ON task_deps(depends_on, task_id);
+```
+
+### Protocol
+
+One process opened two SQLite databases, one with the three `CREATE INDEX`
+statements and one without. It seeded identical fixtures into both, then ran
+the two variants in an alternating order, old then new, for five passes each.
+Each pass recorded elapsed time, rows touched and errors. The machine had eight
+logical CPUs and a load average near 2 to 3, so both variants saw roughly the
+same noise. The harness was temporary and is not part of the source tree.
+
+The prune fixture holds 20,000 rows in each of `deliveries` and `approvals`.
+Most rows have `created_at` at the current time. The last 2,000 rows are 31 days
+old, and the prune cutoff is 30 days. Each `PruneStale` pass removes 1,000 rows
+from each table. The harness replenishes those rows outside the timed region.
+
+### Results
+
+| Experiment | Old median | New median | Old range | New range | Work | Errors |
+| --- | --- | --- | --- | --- | --- | --- |
+| Prune filter only | 3.565 ms | 544 us | 3.226 to 6.284 ms | 416 to 695 us | 1,000 rows per pass | 0 |
+| Full `PruneStale` | 9.531 ms | 10.391 ms | 8.912 to 12.754 ms | 7.783 to 12.948 ms | 2,000 rows per pass | 0 |
+| Dependency walk | 525.971 ms | 446.666 ms | 433.066 to 565.751 ms | 430.066 to 491.188 ms | 1 ready task | 0 |
+| Write cost, 10,000 inserts | 22.297 ms | 31.030 ms | 21.090 to 27.401 ms | 25.805 to 36.313 ms | 10,000 rows per pass | 0 |
+
+Values are medians and ranges over five passes per side. The filter and the
+full prune read the same fixture. The filter isolates the two `created_at`
+subqueries, and the full prune includes the deletes.
+
+### Read effect
+
+The filter is faster on every pass. `EXPLAIN QUERY PLAN` shows the cause. The
+old database scans the table and skips the recent rows before it finds 1,000
+matches. The new database searches `deliveries_created_at_idx` and
+`approvals_created_at_idx` and reads the first 1,000 matching entries. The
+median falls from 3.565 ms to 544 us, about 6.5x, with no overlap between the
+two ranges.
+
+The full `PruneStale` call does not show a measurable gain. Its median moves
+from 9.531 ms to 10.391 ms, and the ranges overlap. Deleting 2,000 rows
+dominates the call, so the faster filter sits inside that cost. The limiter is
+the delete work, and the index does not change it.
+
+The dependency walk also shows no clear gain. `EXPLAIN QUERY PLAN` shows that
+the old database already builds an automatic covering index on `depends_on`
+for the recursive step. The new database uses the persistent index instead and
+skips that build. The recursive step and the union dedup dominate the walk, so
+the saved index build is small against them. The ranges overlap, so this result
+is inconclusive rather than a speedup.
+
+### Measured write cost
+
+Both `deliveries` and `approvals` take an insert on every reconcile tick, so the
+two `created_at` indexes add work to a write-hot path. The harness inserted
+10,000 rows per pass and alternated sides for five passes. The old database had
+a median of 22.297 ms. The new database had a median of 31.030 ms, about 39%
+slower. The new side was slower in all five alternating pairs. That cost is the
+price of maintaining the two indexes and is recorded here as the requirement
+for shipping them.
+
+### Correctness
+
+The indexes add no rows, columns or caps. `PruneStale`, `ListReadyTasks` and the
+snapshot reads keep their result shapes. Every recorded pass returned the
+expected row count with zero errors, so the work counts match across sides.

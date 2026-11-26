@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   key TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS deliveries_created_at_idx ON deliveries(created_at);
 
 CREATE TABLE IF NOT EXISTS approvals (
   run_id TEXT NOT NULL,
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS approvals (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (run_id, sha)
 );
+CREATE INDEX IF NOT EXISTS approvals_created_at_idx ON approvals(created_at);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -66,6 +68,7 @@ CREATE TABLE IF NOT EXISTS task_deps (
   depends_on TEXT NOT NULL,
   PRIMARY KEY (task_id, depends_on)
 );
+CREATE INDEX IF NOT EXISTS task_deps_depends_on_task_idx ON task_deps(depends_on, task_id);
 
 CREATE TABLE IF NOT EXISTS base_incidents (
   id TEXT PRIMARY KEY,
