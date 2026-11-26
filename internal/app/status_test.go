@@ -198,6 +198,96 @@ func TestRunSnapshotCarriesCIWallSeconds(t *testing.T) {
 	}
 }
 
+func TestRunSnapshotReportsStagedJobCriticalPath(t *testing.T) {
+	now := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+	at := func(second int) time.Time { return now.Add(time.Duration(second) * time.Second) }
+	run := core.NewRun("run-critical", "T-CRITICAL", now)
+	run.Checks = []core.CheckResult{
+		{Name: "build", State: core.CheckSuccess, StartedAt: at(0), CompletedAt: at(30)},
+		{Name: "rebase", State: core.CheckSuccess, StartedAt: at(35), CompletedAt: at(90)},
+		{Name: "fix", State: core.CheckSuccess, StartedAt: at(95), CompletedAt: at(420)},
+	}
+	got := makeRunSnapshot(run, nil, nil, now)
+	if got.CIWallSeconds != 420 {
+		t.Fatalf("ci wall seconds = %d, want 420", got.CIWallSeconds)
+	}
+	if got.CICriticalPath != 390 {
+		t.Fatalf("critical path = %d, want 390", got.CICriticalPath)
+	}
+	want := []int64{30, 55, 325}
+	for i, check := range got.Checks {
+		if check.DurationSeconds != want[i] {
+			t.Errorf("%s duration = %d, want %d", check.Name, check.DurationSeconds, want[i])
+		}
+	}
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf(`json.Marshal(got): %v`, err)
+	}
+	var decoded struct {
+		CriticalPath int64 `json:"ci_critical_path_seconds"`
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf(`json.Unmarshal(b, &decoded): %v`, err)
+	}
+	if decoded.CriticalPath != 390 {
+		t.Fatalf("json critical path = %d, want 390", decoded.CriticalPath)
+	}
+}
+
+func TestDeriveDurationsSplitsCIWaitByCycle(t *testing.T) {
+	now := time.Date(2026, 11, 26, 8, 10, 0, 0, time.UTC)
+	at := func(minute int) time.Time { return now.Add(time.Duration(minute-10) * time.Minute) }
+	run := core.NewRun("run-cycles", "T-CYCLES", at(0))
+	run.State = core.RunMerged
+	run.UpdatedAt = at(10)
+	events := []RunEvent{
+		{State: string(core.RunPending), At: at(0)},
+		{State: string(core.RunRunning), At: at(1)},
+		{State: string(core.RunWaitingCI), At: at(2)},
+		{State: string(core.RunNeedsRebase), At: at(3)},
+		{State: string(core.RunRunning), At: at(4)},
+		{State: string(core.RunWaitingCI), At: at(5)},
+		{State: string(core.RunNeedsAgentFix), At: at(6)},
+		{State: string(core.RunRunning), At: at(7)},
+		{State: string(core.RunWaitingCI), At: at(8)},
+		{State: string(core.RunMerged), At: at(9)},
+	}
+
+	got := deriveDurations(run, events, now)
+	if got.WaitingCI != 180 {
+		t.Fatalf("waiting CI = %d, want 180", got.WaitingCI)
+	}
+	if got.WaitingCIInitial != 60 || got.WaitingCIRebase != 60 || got.WaitingCIFix != 60 {
+		t.Fatalf("cycle split = %+v, want 60/60/60", got)
+	}
+	if got.WaitingCIInitial+got.WaitingCIRebase+got.WaitingCIFix != got.WaitingCI {
+		t.Fatalf("cycle split does not add up: %+v", got)
+	}
+}
+
+func TestSnapshotAggregatesCICycles(t *testing.T) {
+	now := time.Date(2026, 11, 26, 8, 2, 0, 0, time.UTC)
+	run := core.NewRun("run-metrics", "T-METRICS", now.Add(-2*time.Minute))
+	run.State = core.RunMerged
+	run.UpdatedAt = now
+	events := []RunEvent{
+		{State: string(core.RunWaitingCI), At: now.Add(-2 * time.Minute)},
+		{State: string(core.RunNeedsRebase), At: now.Add(-90 * time.Second)},
+		{State: string(core.RunWaitingCI), At: now.Add(-60 * time.Second)},
+		{State: string(core.RunMerged), At: now.Add(-30 * time.Second)},
+	}
+	snap := makeRunSnapshot(run, map[string][]RunEvent{string(run.ID): events}, nil, now)
+	m := makeMetrics([]RunSnapshot{snap}, nil, nil, nil, nil)
+	if m.CIWaitInitial != 30 || m.CIWaitRebase != 30 || m.CIWaitFix != 0 {
+		t.Fatalf("cycle metrics = %d/%d/%d, want 30/30/0", m.CIWaitInitial, m.CIWaitRebase, m.CIWaitFix)
+	}
+	if m.CIWaitInitial+m.CIWaitRebase+m.CIWaitFix != m.CIWaitSeconds {
+		t.Fatalf("cycle metrics do not sum to CI wait: %+v", m)
+	}
+}
+
 func TestRunSnapshotCarriesSessionIncidentAndPRURL(t *testing.T) {
 	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
 	run := core.NewRun("run-fields", "T-FIELDS", now)

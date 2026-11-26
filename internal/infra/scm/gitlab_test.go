@@ -158,6 +158,103 @@ func TestGitLabObserveFailedPipelineRedaction(t *testing.T) {
 	}
 }
 
+func TestGitLabObserveParsesStagedJobTiming(t *testing.T) {
+	base := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+	stamp := func(offset int) string {
+		return base.Add(time.Duration(offset) * time.Second).Format(time.RFC3339)
+	}
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/merge_requests/7"):
+			glWriteJSON(t, w, map[string]any{
+				"iid": 7, "state": "opened", "sha": "head1", "target_branch": "main",
+			})
+		case strings.HasSuffix(p, "/threads"), strings.HasSuffix(p, "/approvals"):
+			glWriteJSON(t, w, []any{})
+		case strings.HasSuffix(p, "/pipelines"):
+			glWriteJSON(t, w, []map[string]any{{"id": 11, "sha": "head1", "status": "success"}})
+		case strings.HasSuffix(p, "/pipelines/11/jobs"):
+			glWriteJSON(t, w, []map[string]any{
+				{"id": 110, "name": "build", "status": "success", "started_at": stamp(0), "finished_at": stamp(30)},
+				{"id": 111, "name": "rebase", "status": "success", "started_at": stamp(35), "finished_at": stamp(90)},
+				{"id": 112, "name": "fix", "status": "success", "started_at": stamp(95), "finished_at": stamp(420)},
+			})
+		case strings.HasSuffix(p, "/repository/compare"):
+			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, p)
+			http.NotFound(w, r)
+		}
+	}))
+
+	o, err := g.Observe(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Checks) != 3 {
+		t.Fatalf("checks = %+v", o.Checks)
+	}
+	want := []int64{30, 55, 325}
+	for i, check := range o.Checks {
+		if got := check.DurationSeconds(); got != want[i] {
+			t.Errorf("%s duration = %ds, want %ds", check.Name, got, want[i])
+		}
+		if check.StartedAt.IsZero() || check.CompletedAt.IsZero() {
+			t.Errorf("%s has no timing: %+v", check.Name, check)
+		}
+	}
+	if got := core.CIWallSeconds(o.Checks); got != 420 {
+		t.Fatalf("CI wall seconds = %d, want 420", got)
+	}
+}
+
+func TestGitLabObserveMissingAndBadTimestampsStayZero(t *testing.T) {
+	base := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/merge_requests/7"):
+			glWriteJSON(t, w, map[string]any{
+				"iid": 7, "state": "opened", "sha": "head1", "target_branch": "main",
+			})
+		case strings.HasSuffix(p, "/threads"):
+			glWriteJSON(t, w, []any{})
+		case strings.HasSuffix(p, "/approvals"):
+			glWriteJSON(t, w, map[string]any{})
+		case strings.HasSuffix(p, "/pipelines"):
+			glWriteJSON(t, w, []map[string]any{{"id": 11, "sha": "head1", "status": "success"}})
+		case strings.HasSuffix(p, "/pipelines/11/jobs"):
+			glWriteJSON(t, w, []map[string]any{
+				{"id": 110, "name": "pending", "status": "pending", "started_at": nil, "finished_at": nil},
+				{"id": 111, "name": "running", "status": "running", "started_at": base.Format(time.RFC3339), "finished_at": ""},
+				{"id": 112, "name": "bad", "status": "success", "started_at": "not-a-time", "finished_at": base.Add(time.Minute).Format(time.RFC3339)},
+			})
+		case strings.HasSuffix(p, "/repository/compare"):
+			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, p)
+			http.NotFound(w, r)
+		}
+	}))
+
+	o, err := g.Observe(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Incomplete {
+		t.Fatalf("incomplete = %t, reason = %q; bad timestamps must not fail the observation", o.Incomplete, o.IncompleteReason)
+	}
+	if len(o.Checks) != 3 {
+		t.Fatalf("checks = %+v", o.Checks)
+	}
+	for _, check := range o.Checks {
+		if got := check.DurationSeconds(); got != 0 {
+			t.Errorf("%s duration = %ds, want 0", check.Name, got)
+		}
+	}
+}
+
 func TestGitLabUpdateBranchRebase(t *testing.T) {
 	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut || !strings.HasSuffix(r.URL.Path, "/merge_requests/9/rebase") {

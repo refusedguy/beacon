@@ -2,10 +2,12 @@ package scm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -28,12 +30,41 @@ type glPipeline struct {
 	Status string `json:"status"`
 }
 
+// glTimestamp is a GitLab job timestamp. GitLab sends null or an empty string
+// for an endpoint the job has not reached yet, and a malformed value must not
+// turn a whole observation incomplete.
+type glTimestamp struct{ time.Time }
+
+func (t *glTimestamp) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" || string(data) == `""` {
+		t.Time = time.Time{}
+		return nil
+	}
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw == "" {
+		t.Time = time.Time{}
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Time = time.Time{}
+		return nil
+	}
+	t.Time = parsed
+	return nil
+}
+
 type glJob struct {
-	ID            int    `json:"id"`
-	Name          string `json:"name"`
-	Status        string `json:"status"`
-	AllowFailure  bool   `json:"allow_failure"`
-	FailureReason string `json:"failure_reason"`
+	ID            int         `json:"id"`
+	Name          string      `json:"name"`
+	Status        string      `json:"status"`
+	AllowFailure  bool        `json:"allow_failure"`
+	FailureReason string      `json:"failure_reason"`
+	StartedAt     glTimestamp `json:"started_at"`
+	FinishedAt    glTimestamp `json:"finished_at"`
 }
 
 // observationErrors collects failed provider calls so an observation can be
@@ -154,7 +185,10 @@ func (g *GitLab) checksFromJobs(ctx context.Context, jobs []glJob) ([]core.Check
 	excerpt := ""
 	for i, job := range jobs {
 		state := glCheckState(job.Status, job.AllowFailure)
-		checks[i] = core.CheckResult{Name: job.Name, State: state, Output: outputs[i]}
+		checks[i] = core.CheckResult{
+			Name: job.Name, State: state, Output: outputs[i],
+			StartedAt: job.StartedAt.Time, CompletedAt: job.FinishedAt.Time,
+		}
 		if state == core.CheckFailure && excerpt == "" {
 			excerpt = outputs[i]
 		}
