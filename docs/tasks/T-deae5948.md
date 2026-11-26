@@ -1,7 +1,7 @@
 ---
 id: T-deae5948
 title: Consolidate duration state categories
-status: available
+status: done
 scope:
     - internal/app/status.go
     - internal/app/status_test.go
