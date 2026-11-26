@@ -35,7 +35,7 @@ export const ORCHESTRATOR_RULES = [
 ].join("\n")
 
 // Plugin options can arrive under options or the full config object.
-export function contextOptions(config = {}) {
+function contextOptions(config = {}) {
   const opts = config && typeof config === "object" ? config : {}
   return {
     enabled: opts.survivalRulesEnabled !== false,
@@ -85,7 +85,7 @@ export async function sessionInstructions(ctx, event, config = {}, root = "", de
   }
 }
 
-export async function ensureRules(ctx, wanted, key) {
+async function ensureRules(ctx, wanted, key) {
   if (!wanted || typeof wanted.sessionID !== "string" || !wanted.sessionID) return false
   const entry = ctx?.session?.instructions?.entry
   if (typeof entry?.list !== "function" || typeof entry?.put !== "function") return false
@@ -105,7 +105,7 @@ export async function ensureSurvivalRules(ctx, sessionID, rules = SURVIVAL_RULES
   return ensureRules(ctx, { sessionID, value: rules }, SURVIVAL_KEY)
 }
 
-export async function registerProjectHooks(ctx, root, config = {}) {
+async function registerProjectHooks(ctx, root, config = {}) {
   const contextHook = await ctx.session.hook("context", async (event) => {
     try {
       const wanted = await sessionInstructions(ctx, event, config, root)
@@ -119,7 +119,7 @@ export async function registerProjectHooks(ctx, root, config = {}) {
   return { contextHook }
 }
 
-export async function registerCompactionHook(ctx, root, config = {}) {
+async function registerCompactionHook(ctx, root, config = {}) {
   try {
     return await ctx.session.hook("compaction", async (event) => {
       try {

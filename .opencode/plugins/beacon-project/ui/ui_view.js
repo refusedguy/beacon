@@ -40,10 +40,10 @@ const STATE_VIEW = Object.freeze({
   merged: { marker: "✔", color: MERGED_COLOR, label: "MERGED" },
   closed: { marker: "✖", color: "muted", label: "CLOSED" },
 })
-export const stateView = (state) => STATE_VIEW[str(state).toLowerCase()] ?? { marker: "·", color: "muted", label: "?" }
+const stateView = (state) => STATE_VIEW[str(state).toLowerCase()] ?? { marker: "·", color: "muted", label: "?" }
 
 // Recent rows use three calm verdicts instead of the full active state names.
-export function recentBadge(run) {
+function recentBadge(run) {
   const state = str(run?.state).toLowerCase()
   const reason = str(run?.reason)
   if (/already merged|duplicate/i.test(reason)) return "DUP"
@@ -60,8 +60,8 @@ export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "pr", "
 // the end with an explicit ellipsis. Detail text keeps its full width.
 export const SIDEBAR_TITLE_WIDTH = 29
 export const truncateSidebarTitle = (value) => truncate(value, SIDEBAR_TITLE_WIDTH)
-export const ageOf = (run, now) => { const t = Math.max(timeOf(run?.updatedAt), timeOf(run?.createdAt)); return t ? elapsed(now - t) : "" }
-export const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(run?.updatedAt); return a && b ? elapsed(b - a) : "" }
+const ageOf = (run, now) => { const t = Math.max(timeOf(run?.updatedAt), timeOf(run?.createdAt)); return t ? elapsed(now - t) : "" }
+const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(run?.updatedAt); return a && b ? elapsed(b - a) : "" }
 export function phaseLabel(run, now = Date.now()) {
   const d = run.durations ?? {}
   const state = str(run.state).toLowerCase()
@@ -77,7 +77,7 @@ const BADGE_LABEL = Object.freeze({
   pending: "PEND", running: "RUN", waiting_ci: "CI", needs_rebase: "REBASE",
   needs_agent_fix: "FIX", blocked: "BLOCKED", merged: "MERGED", closed: "CLOSED",
 })
-export function heroBadge(run, now = Date.now()) {
+function heroBadge(run, now = Date.now()) {
   const v = stateView(run.state)
   const label = BADGE_LABEL[str(run.state).toLowerCase()] || v.label
   const duration = phaseLabel(run, now)

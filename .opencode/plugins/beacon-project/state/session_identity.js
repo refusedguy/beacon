@@ -36,7 +36,7 @@ export function sessionIDOf(source) {
 // One latest-session lookup for identity, rules and MCP. A known ID uses
 // session.get and falls back to the newest entry when that fails. Records come
 // bare from session.list and under `data` from session.get, so unwrap here.
-export async function latestSession(ctx, sessionID = null) {
+async function latestSession(ctx, sessionID = null) {
   if (!ctx || typeof ctx !== "object") return null
   if (typeof sessionID === "string" && sessionID && typeof ctx.session?.get === "function") {
     try {
@@ -54,7 +54,7 @@ export async function latestSession(ctx, sessionID = null) {
 
 // One agent extraction from a session record. The agent travels under several
 // keys, so read the union in one place and let every caller agree on the id.
-export function agentFromSession(ctx, data) {
+function agentFromSession(ctx, data) {
   return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
 }
 
@@ -76,7 +76,7 @@ export async function resolveAgent(ctx, event = null, log = null) {
 
 export const WORKER_ROLE = "worker"
 export const ORCHESTRATOR_ROLE = "orchestrator"
-export const NO_ROLE = "none"
+const NO_ROLE = "none"
 
 const DEFAULT_WORKER_AGENTS = Object.freeze(["worker"])
 

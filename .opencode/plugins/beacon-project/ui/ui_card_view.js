@@ -34,7 +34,7 @@ export const cardRelativePath = (card) => card?.relativePath || `docs/tasks/${ca
 // Both mounts build the same panel chrome inside their render callback. The
 // builder owns the container, header, title, hint, gap and close nodes.
 // `padding` is the field-label column width: cards use 10, detail uses 8.
-export const panelFieldKey = (padding) => (text) => str(text).padEnd(padding, " ")
+const panelFieldKey = (padding) => (text) => str(text).padEnd(padding, " ")
 
 export function createPanelChrome(ui, deps, options = {}) {
   const { insert } = ui

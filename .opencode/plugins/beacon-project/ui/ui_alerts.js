@@ -394,7 +394,7 @@ export function compactReason(reason) {
   return text
 }
 
-export function clockDuration(seconds) {
+function clockDuration(seconds) {
   const s = Math.max(0, Math.floor(Number(seconds) || 0))
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)

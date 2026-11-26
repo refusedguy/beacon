@@ -6,7 +6,7 @@ import { REASON_WIDTH } from "./ui_model.js"
 import { isDispatching, truncate } from "./ui_alerts.js"
 import { truncateSidebarTitle } from "./ui_view.js"
 
-export const SIDEBAR_LINES = 34
+const SIDEBAR_LINES = 34
 
 // The real host supplies setProp; test doubles may only expose node.props.
 const propSetter = (source) => source?.setProp ?? ((node, key, value) => { node.props[key] = value })
