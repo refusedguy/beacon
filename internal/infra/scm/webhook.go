@@ -114,13 +114,27 @@ func (w *Webhook) Handler() http.Handler {
 			return
 		}
 		if n > 0 && w.Changes != nil {
-			select {
-			case w.Changes <- n:
-			case <-time.After(2 * time.Second):
-			}
+			w.deliver(n)
 		}
 		rw.WriteHeader(http.StatusAccepted)
 	})
+}
+
+// deliver hands n to the reconciler, waiting at most two seconds when the
+// channel is full. The non-blocking send first keeps the common case free of a
+// timer allocation; only a full channel pays for a stoppable timer.
+func (w *Webhook) deliver(n int) {
+	select {
+	case w.Changes <- n:
+		return
+	default:
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case w.Changes <- n:
+	case <-timer.C:
+	}
 }
 
 func (w *Webhook) valid(r *http.Request, body []byte) bool {
