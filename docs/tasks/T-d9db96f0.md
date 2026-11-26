@@ -1,7 +1,7 @@
 ---
 id: T-d9db96f0
 title: Stabilize plugin build hash memo key
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/mcp/mcp.js
     - .opencode/plugins/beacon-project/mcp/mcp_test.js

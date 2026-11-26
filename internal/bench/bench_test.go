@@ -74,13 +74,21 @@ func timed(name string, fn func() (int64, int64)) sample {
 
 // BenchmarkHotPaths is the single repeatable command for the whole dossier.
 // One pass runs all six hotspots, so the shares describe one end-to-end pass.
+//
+// CI runs a bounded smoke pass with BEACON_BENCH_SMOKE=1 and -benchtime=1x:
+//
+//	BEACON_BENCH_SMOKE=1 GOMAXPROCS=1 go test -run '^$' -bench '^BenchmarkHotPaths$' -benchtime=1x -count=1 ./internal/bench/
+//
+// Smoke mode skips the warm-up pass; the report and every count are unchanged.
 func BenchmarkHotPaths(b *testing.B) {
 	// One P removes scheduler contention from a shared machine. The timings
 	// then describe the hot paths instead of neighbouring builds.
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	e := newEnv(b)
-	warmup(e)
+	if !smokeMode() {
+		warmup(e)
+	}
 	b.ResetTimer()
 	samples := make([]sample, 0, b.N*len(hotspotOrder))
 	for i := 0; i < b.N; i++ {
