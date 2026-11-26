@@ -1,7 +1,7 @@
 ---
 id: T-3e9ee3c9
 title: Make orchestrator.md refer to AGENTS.md
-status: available
+status: done
 scope:
     - .opencode/agents/orchestrator.md
 priority: 62
