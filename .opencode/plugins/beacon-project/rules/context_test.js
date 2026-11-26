@@ -131,10 +131,11 @@ test("read-only and unknown agents get no commit or card rules", async () => {
   assert.equal(await sessionInstructions(ctx, { sessionID: SESSION }), null)
 })
 
-test("orchestrator rules warn against duplicate cards and dispatch loops", () => {
+test("orchestrator rules guard duplicate cards, dispatch loops and status checks", () => {
   for (const text of [
     "git log -n 10 --oneline", "beacon_recent", "narrow, disjoint Scope",
-    "Never dispatch blindly",
+    "Never dispatch blindly", "beacon_status", "beacon status --daemon",
+    "git status --short", "no ready tasks",
   ]) {
     assert.ok(ORCHESTRATOR_RULES.includes(text), `orchestrator rules missing ${text}`)
   }
@@ -185,12 +186,6 @@ test("installProjectContext passes the root to the compaction hook too", async (
   const event = { sessionID: SESSION, agent: "build", system: [] }
   await callbacks.compaction(event)
   assert.equal(ctx.puts[0], `${ORCHESTRATOR_RULES}\n${BUILD_REMINDER}`)
-})
-
-test("orchestrator rules ask for status checks before acting on a complaint", () => {
-  for (const text of ["beacon_status", "beacon status --daemon", "git status --short", "no ready tasks"]) {
-    assert.ok(ORCHESTRATOR_RULES.includes(text), `orchestrator rules missing ${text}`)
-  }
 })
 
 test("survivalRulesEnabled false disables role instruction injection", async () => {
