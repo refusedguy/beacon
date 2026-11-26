@@ -1,7 +1,7 @@
 ---
 id: T-4a2fa68a
 title: Unify automatic rebase cap constant
-status: available
+status: done
 scope:
     - internal/app/reconcile_observation.go
     - internal/infra/config/config.go
