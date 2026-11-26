@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -338,15 +337,10 @@ func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64,
 	return removed, nil
 }
 
-// ListActive returns every run that is not merged or closed.
+// ListActive returns every run that is not merged or closed. It is a read:
+// retention runs on the reconciler ticker, so status, dispatch and MCP reads
+// never issue DELETE statements.
 func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
-	// The reconciler calls ListActive on every tick. Reclaiming old rows here
-	// puts retention on that fixed schedule without a second goroutine or a
-	// second timer in the daemon. Cleanup is best effort: a failed prune must
-	// not stop the tick from reconciling active runs.
-	if _, err := s.PruneStale(ctx, deliveryRetention); err != nil {
-		slog.Warn("prune stale delivery rows", "error", err)
-	}
 	// Keep the state list literal: the partial index predicate must match it
 	// exactly, and bound parameters there would force a full scan and sort.
 	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN (`+activeStatesSQL+`) ORDER BY updated_at`)

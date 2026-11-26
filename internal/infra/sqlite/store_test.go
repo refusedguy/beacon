@@ -1137,7 +1137,7 @@ func TestPruneStaleRemovesOldDeliveryAndApprovalRows(t *testing.T) {
 	}
 }
 
-func TestListActivePrunesStaleRowsOnReconcileTick(t *testing.T) {
+func TestListActiveDoesNotPruneStaleRows(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
@@ -1145,20 +1145,22 @@ func TestListActivePrunesStaleRowsOnReconcileTick(t *testing.T) {
 	defer store.Close()
 	seedStaleDeliveryRows(t, store)
 
-	// The reconcile ticker calls ListActive on every pass, so this is the
-	// fixed schedule that keeps the idempotency tables bounded.
-	active, err := store.ListActive(context.Background())
-	if err != nil {
-		t.Fatalf("store.ListActive(context.Background()): %v", err)
+	// Status, dispatch and MCP reads all go through ListActive. A read must
+	// leave the idempotency tables untouched, even with stale rows present.
+	for i := 0; i < 2; i++ {
+		active, err := store.ListActive(context.Background())
+		if err != nil {
+			t.Fatalf("store.ListActive(context.Background()): %v", err)
+		}
+		if len(active) != 0 {
+			t.Fatalf("active = %+v, want none", active)
+		}
 	}
-	if len(active) != 0 {
-		t.Fatalf("active = %+v, want none", active)
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM deliveries`); got != 2 {
+		t.Fatalf("deliveries after reads = %d, want 2 (no DELETE)", got)
 	}
-	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM deliveries`); got != 1 {
-		t.Fatalf("deliveries after tick = %d, want 1", got)
-	}
-	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM approvals`); got != 1 {
-		t.Fatalf("approvals after tick = %d, want 1", got)
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM approvals`); got != 2 {
+		t.Fatalf("approvals after reads = %d, want 2 (no DELETE)", got)
 	}
 }
 
