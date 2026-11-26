@@ -88,7 +88,11 @@ func stateDir(cfg config.Config) string {
 // loopback address. It reports false when no daemon owns the state database.
 func liveDaemon(cfg config.Config) (*connectionInfo, bool) {
 	info, err := readConnection(stateDir(cfg))
-	if err != nil || !daemonAlive(info) {
+	if err != nil {
+		logDiscard("read daemon connection", err)
+		return nil, false
+	}
+	if !daemonAlive(info) {
 		return nil, false
 	}
 	return info, true

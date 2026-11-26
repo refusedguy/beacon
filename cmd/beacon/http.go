@@ -215,7 +215,9 @@ func runHTTP(ctx context.Context, errCh chan<- error, addr string, handler http.
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdown)
+		// Shutdown is data-loss handling: it gives in-flight requests a last
+		// chance to finish. Keep the call here and log its error.
+		logDiscard("http server shutdown", srv.Shutdown(shutdown))
 	}()
 	go func() { errCh <- srv.ListenAndServe() }()
 }
