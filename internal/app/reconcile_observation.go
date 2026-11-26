@@ -41,16 +41,16 @@ func (r *Reconciler) applyDecision(
 	obs core.Observation,
 	decision core.MergeDecision,
 ) (core.MergeDecision, error) {
-	switch decision.Verdict {
-	case core.VerdictNoop:
+	switch core.ActionForVerdict(decision.Verdict).Dispatch {
+	case core.DispatchNoop:
 		return decision, nil
-	case core.VerdictMerge:
+	case core.DispatchMerge:
 		return r.mergeIfReviewed(ctx, run, obs, decision)
-	case core.VerdictNeedsRebase:
+	case core.DispatchRebase:
 		return r.handleNeedsRebase(ctx, run, obs, decision)
-	case core.VerdictNeedsAgentFix:
+	case core.DispatchFix:
 		return r.handleNeedsAgentFix(ctx, run, obs, decision)
-	case core.VerdictBlocked:
+	case core.DispatchBlock:
 		return r.handleBlocked(ctx, run, decision)
 	default:
 		return r.handlePending(ctx, run, obs, decision)

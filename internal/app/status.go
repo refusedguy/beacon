@@ -704,22 +704,22 @@ func makeMetrics(
 
 func addCountMetrics(m *Metrics, counts []DecisionCount) {
 	for _, c := range counts {
-		switch c.Kind {
-		case "dispatch.candidates":
+		action := core.ActionForKind(c.Kind)
+		if action.Qualifier != "" && c.Action != action.Qualifier {
+			continue
+		}
+		switch action.Counter {
+		case core.CounterDispatchCycles:
 			m.DispatchCycles += c.Count
-		case "dispatch.skip":
+		case core.CounterSkip:
 			m.SkipCount += c.Count
 			m.Skips[c.Verdict] += c.Count
-		case "transition.spawn":
+		case core.CounterDispatch:
 			m.DispatchCount += c.Count
-		case "transition.rebase":
-			if c.Action == "rebased" {
-				m.RebaseCount += c.Count
-			}
-		case "transition.wake":
-			if c.Action == "woke" {
-				m.FixCount += c.Count
-			}
+		case core.CounterRebase:
+			m.RebaseCount += c.Count
+		case core.CounterFix:
+			m.FixCount += c.Count
 		}
 	}
 }

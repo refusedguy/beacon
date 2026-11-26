@@ -206,20 +206,7 @@ func (l *DecisionLogger) logDispatchSkip(ctx context.Context, s SkippedTask) {
 
 // reconcileAction names the concrete step the reconciler takes for a verdict.
 func reconcileAction(d core.MergeDecision) string {
-	switch d.Verdict {
-	case core.VerdictMerge:
-		return "merge"
-	case core.VerdictNeedsRebase:
-		return "rebase"
-	case core.VerdictNeedsAgentFix:
-		return "wake"
-	case core.VerdictBlocked:
-		return "block"
-	case core.VerdictNoop:
-		return "noop"
-	default:
-		return "wait"
-	}
+	return core.ActionForVerdict(d.Verdict).Label
 }
 
 func (l *DecisionLogger) logReconcileDecision(ctx context.Context, pr int, run *core.Run, obs core.Observation, decision core.MergeDecision, action string) {
