@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { projectRoot } from "./state/location.js"
 import { createMcpRegistrar, noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
 import { installProjectContext } from "./rules/context.js"
-import { agentIdentity, sessionIdentity } from "./state/session_identity.js"
+import { agentFromSession, agentIdentity, latestSession, sessionIdentity } from "./state/session_identity.js"
 import {
   pluginOptions, pollIntervalMs, snapshotLimits,
   statusPanelEnabled, watcherEnabled,
@@ -23,27 +23,12 @@ export async function currentSessionAgent(ctx) {
   if (direct) return direct
 
   const sessionID = ctx.sessionID ?? ctx.session?.id ?? ctx.session?.sessionID
-  if (typeof sessionID === "string" && sessionID && typeof ctx.session?.get === "function") {
-    try {
-      const info = await ctx.session.get({ sessionID })
-      const data = info?.data ?? info
-      return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
-    } catch (error) {
-      console.debug(`beacon plugin: session lookup failed: ${error?.message ?? error}`)
-    }
+  try {
+    return agentFromSession(ctx, await latestSession(ctx, sessionID))
+  } catch (error) {
+    console.debug(`beacon plugin: session lookup failed: ${error?.message ?? error}`)
+    return null
   }
-
-  if (typeof ctx.session?.list === "function") {
-    try {
-      const listed = await ctx.session.list({ order: "desc", limit: 1 })
-      const sessions = Array.isArray(listed) ? listed : listed?.data ?? []
-      const data = sessions[0]
-      if (data) return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
-    } catch (error) {
-      console.debug(`beacon plugin: session list failed: ${error?.message ?? error}`)
-    }
-  }
-  return null
 }
 
 // Resolve once. Workers get a no-op so no command resolution runs and no config
