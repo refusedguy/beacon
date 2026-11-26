@@ -451,16 +451,17 @@ on the benchmark machine separated two costs.
 
 | Stage | Measured cost |
 | --- | --- |
-| Cold `go test` compile of `./internal/bench/` | 71.63 s |
-| Warm smoke, whole script, five runs | 1.56, 1.57, 1.67, 2.25, 2.16 s |
+| Cold `go test` compile of `./internal/bench/` | 71.63 s, or 138 s under load |
+| Warm smoke, whole script, five runs | 4.03, 2.99, 3.77, 2.89, 3.59 s |
 | One measured pass of both benchmarks | about 0.2 s |
 
-The cold compile is the stage that crosses 30 s. The perf-smoke job restores the
-Go build cache with `cache-dependency-path: go.sum`, while build, vet, test and
-lint use `go.sum` plus `ui/tui/go.sum`. The two cache keys never match, so
-perf-smoke cannot reuse their objects and recompiles the dependency graph,
-including `modernc.org/sqlite`. That cache path is a workflow change and is not
-made here. It already landed on main in PR #2620.
+The cold compile is the stage that crosses 30 s. At the time of those PRs the
+perf-smoke job restored the Go build cache with `cache-dependency-path: go.sum`,
+while build, vet, test and lint used `go.sum` plus `ui/tui/go.sum`. The two keys
+did not match, so perf-smoke recompiled the dependency graph, including
+`modernc.org/sqlite`. That workflow change is not made here. It landed on main
+in PR #2620. A CI run after that fix still hit exit 124 because of the
+single-P compile described below.
 
 The script had a smaller defect of its own. T-c894c2fa added the
 `BEACON_BENCH_SMOKE` override so each benchmark skips its warm-up pass, and both
@@ -468,13 +469,18 @@ benchmarks document a smoke command that sets it. `scripts/bench-e2e.sh --smoke`
 never set the variable. `BenchmarkHotPaths` therefore ran all six hotspots a
 second time, and `BenchmarkE2EOperatorPaths` built two extra state databases and
 ran one reconcile tick and one dispatch call before the measured pair. The
-smoke branch now exports `BEACON_BENCH_SMOKE=1` and `GOMAXPROCS=1` before the
-`go test` call. That removes the redundant passes and keeps the P pin the
-harness already applies inside the timed loop.
+smoke branch now exports `BEACON_BENCH_SMOKE=1` and passes `-vet=off` before the
+`go test` call. That removes the redundant passes and the vet run that the CI
+vet job already performs. It does not set `GOMAXPROCS`. An earlier version
+of this change did, and the first CI run after it still hit exit 124. Setting
+`GOMAXPROCS=1` serializes the `go test` compile. In two fresh caches on the same
+machine, the default compile finished in 138 s while the single-P compile was
+still running after 160 s and was stopped. The benchmarks already pin P to one
+inside the timed loop, so the external setting only slows the build.
 
-Five runs after the change all finished inside the bound and reported identical
-counts: sqlite-snapshot 695/0, card-parse 300/0, wire-encode 7114/0, redaction
-296/0, mcp-journal 64/0, sse-fanout 192/64, reconcile-tick 20/0 and
-dispatch-prompt 4/0. The 64 on sse-fanout is the designed slow-view drop, not a
-failed call. Fixture sizes, the nightly gate and the 30 s step timeout are
-unchanged.
+Five runs after the final change finished in 4.03, 2.99, 3.77, 2.89 and 3.59 s
+and reported identical counts: sqlite-snapshot 695/0, card-parse 300/0,
+wire-encode 7114/0, redaction 296/0, mcp-journal 64/0, sse-fanout 192/64,
+reconcile-tick 20/0 and dispatch-prompt 4/0. The 64 on sse-fanout is the
+designed slow-view drop, not a failed call. Fixture sizes, the nightly gate and
+the 30 s step timeout are unchanged.

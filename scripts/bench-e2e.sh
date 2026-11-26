@@ -30,12 +30,12 @@ echo "Go toolchain: $(go version)" >&2
 
 if (( smoke )); then
   # The harness runs a full warm-up pass in each benchmark unless this env
-  # override is set. That pass is redundant in a smoke check and is what the
-  # 30 s CI bound measured. Pin P to the same value the harness uses inside
-  # the timed loop, so a busy runner cannot change which paths are sampled.
+  # override is set. That pass is redundant in a smoke check. Do not set
+  # GOMAXPROCS here: it serializes the go test compile, and the benchmarks
+  # already pin P to one inside the timed loop.
   export BEACON_BENCH_SMOKE=1
-  export GOMAXPROCS=1
-  run go test -run '^$' -bench 'BenchmarkHotPaths|BenchmarkE2EOperatorPaths' -benchtime=1x -count=1 ./internal/bench/
+  # -vet=off skips vet on this package. The CI vet job already covers it.
+  run go test -vet=off -run '^$' -bench 'BenchmarkHotPaths|BenchmarkE2EOperatorPaths' -benchtime=1x -count=1 ./internal/bench/
   exit 0
 fi
 
