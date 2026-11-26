@@ -364,3 +364,81 @@ for shipping them.
 The indexes add no rows, columns or caps. `PruneStale`, `ListReadyTasks` and the
 snapshot reads keep their result shapes. Every recorded pass returned the
 expected row count with zero errors, so the work counts match across sides.
+
+## Composite run read indexes (T-2c814a94)
+
+`FindByPR`, `FindActiveByTask`, `ListActive` and `ListByIncident` each filter on
+one column and sort by `updated_at`, but only single-column indexes served them.
+This note records the read gain from four composite indexes and the write cost
+of carrying them.
+
+```sql
+CREATE INDEX runs_pr_updated_idx ON runs(pr_number, updated_at DESC);
+CREATE INDEX runs_task_updated_idx ON runs(task_id, updated_at DESC);
+CREATE INDEX runs_active_updated_idx ON runs(updated_at)
+  WHERE state NOT IN ('merged','closed');
+CREATE INDEX runs_incident_state_idx ON runs(blocked_incident_id, state);
+```
+
+`runs_state_idx` was removed from the base schema and is dropped by an
+idempotent `DROP INDEX IF EXISTS` on open. It was a strict prefix of
+`runs_state_updated_idx`, which the snapshot indexes already supply, so it only
+added write cost. The drop runs after `openDB` and before the store is used, so
+an older state database loses the index on the next open.
+
+### Protocol
+
+A temporary harness opened two SQLite databases with the same 20,000 run rows.
+The old side kept the pre-task indexes (`runs_pr_idx`, `runs_task_idx`,
+`runs_state_updated_idx` and the now-dropped `runs_state_idx`). The new side
+added the four indexes above. Each pass ran the four store queries in the same
+order on both sides, old then new, five times. The harness recorded elapsed
+time and rows returned. It is not part of the source tree.
+
+`EXPLAIN QUERY PLAN` on the new side confirms each query takes its intended
+path. No `USE TEMP B-TREE FOR ORDER BY` step remains on any of the four:
+
+| Store read | Plan |
+| --- | --- |
+| `FindByPR` | `SEARCH runs USING INDEX runs_pr_updated_idx (pr_number=?)` |
+| `FindActiveByTask` | `SEARCH runs USING INDEX runs_task_updated_idx (task_id=?)` |
+| `ListActive` | `SCAN runs USING INDEX runs_active_updated_idx` |
+| `ListByIncident` | `SEARCH runs USING INDEX runs_incident_state_idx (blocked_incident_id=? AND state=?)` |
+
+The partial index matches `ListActive` because its predicate is exactly
+`state NOT IN ('merged','closed')`. A scan of that index yields rows in
+`updated_at` order, so the query no longer sorts the active set.
+
+### Results
+
+Values are medians and ranges over five alternating passes. The work column is
+rows returned per pass by the four queries combined. Every pass returned the
+same count with zero errors.
+
+| Experiment | Old median | New median | Old range | New range | Work | Errors |
+| --- | --- | --- | --- | --- | --- | --- |
+| Four filtered reads | 16.789 ms | 10.068 ms | 15.876 to 18.887 ms | 9.068 to 14.820 ms | 8,400 rows per pass | 0 |
+| Write cost, 10,000 inserts | 209.234 ms | 259.202 ms | 162.675 to 278.349 ms | 237.967 to 285.072 ms | 10,000 rows per pass | 0 |
+
+### Read effect
+
+The new side was faster on every one of the five alternating pairs. The gain
+comes from removing two kinds of work. `FindByPR` and `FindActiveByTask` seek
+the composite index and stop at the first matching row, instead of seeking the
+single-column index and sorting the matches by `updated_at`. `ListActive` scans
+the partial index in key order and skips the sort of the active rows.
+`ListByIncident` satisfies both predicates from one index entry.
+
+The write side shows the price. Each run insert now maintains four extra
+indexes and no longer maintains the dropped prefix, a net gain of three. The
+new side was slower in all five pairs, with a median about 24% above the old
+one. Run inserts are frequent on the orchestrator path, so this cost is
+recorded here as the condition for shipping the indexes.
+
+### Correctness
+
+The indexes add no rows, columns or caps. The four queries keep their result
+shapes and order. The migration test opens a database that still carries
+`runs_state_idx` and confirms the index is gone after `Open`. Every recorded
+pass returned the same row count with zero errors, so the work counts match
+across sides.

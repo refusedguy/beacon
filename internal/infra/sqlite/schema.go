@@ -32,9 +32,12 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS runs_state_idx ON runs(state);
 CREATE INDEX IF NOT EXISTS runs_pr_idx ON runs(pr_number);
 CREATE INDEX IF NOT EXISTS runs_task_idx ON runs(task_id);
+CREATE INDEX IF NOT EXISTS runs_pr_updated_idx ON runs(pr_number, updated_at DESC);
+CREATE INDEX IF NOT EXISTS runs_task_updated_idx ON runs(task_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS runs_active_updated_idx ON runs(updated_at) WHERE state NOT IN ('merged','closed');
+CREATE INDEX IF NOT EXISTS runs_incident_state_idx ON runs(blocked_incident_id, state);
 
 CREATE TABLE IF NOT EXISTS deliveries (
   key TEXT PRIMARY KEY,
