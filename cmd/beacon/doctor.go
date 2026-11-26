@@ -184,20 +184,22 @@ func doctorBaseBranch(root string, cfg config.Config) doctorCheck {
 	return doctorCheck{"base branch", checkWarn, cfg.BaseBranch + " not found locally or on origin"}
 }
 
-// doctorTokenCheck reports whether the SCM token is available.
+// doctorTokenCheck reports whether the SCM token is available. A missing token
+// stays advisory: doctor warns instead of failing startup.
 func doctorTokenCheck(cfg config.Config) doctorCheck {
-	if cfg.SCM.Token != "" || envString(cfg.SCM.TokenEnv, "") != "" {
+	if config.LiteralOrEnv(cfg.SCM.Token, cfg.SCM.TokenEnv) != "" {
 		return doctorCheck{"scm token", checkOK, "present via env or config"}
 	}
 	return doctorCheck{"scm token", checkWarn, "not set; export " + cfg.SCM.TokenEnv}
 }
 
-// doctorWebhookCheck verifies the webhook configuration.
+// doctorWebhookCheck verifies the webhook configuration. The rule comes from
+// config; doctor keeps its advisory wording and level.
 func doctorWebhookCheck(cfg config.Config) doctorCheck {
 	if !cfg.Webhook.Enabled {
 		return doctorCheck{"webhook", checkOK, "disabled"}
 	}
-	if cfg.Webhook.Secret == "" {
+	if err := config.ValidateWebhook(cfg.Webhook); err != nil {
 		return doctorCheck{"webhook", checkFail, "enabled without a secret; set webhook.secret or webhook.secret_env"}
 	}
 	return doctorCheck{"webhook", checkOK, "enabled with a secret"}
@@ -349,13 +351,13 @@ func doctorNetworkChecks(ctx context.Context, cfg config.Config, client *http.Cl
 		{
 			name:     "opencode endpoint",
 			endpoint: strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/project",
-			token:    firstNonEmpty(envString(cfg.Harness.TokenEnv, ""), cfg.Harness.Token),
+			token:    config.LiteralOrEnv(cfg.Harness.Token, cfg.Harness.TokenEnv),
 			auth:     shared.ApplyAuth,
 		},
 		{
 			name:     "scm base branch",
 			endpoint: scmBranchURL(cfg),
-			token:    firstNonEmpty(envString(cfg.SCM.TokenEnv, ""), cfg.SCM.Token),
+			token:    config.LiteralOrEnv(cfg.SCM.Token, cfg.SCM.TokenEnv),
 			auth:     bearerAuth,
 		},
 	}
