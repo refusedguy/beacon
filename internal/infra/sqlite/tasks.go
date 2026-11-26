@@ -121,32 +121,32 @@ func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []core.Task
-	for rows.Next() {
-		var t core.Task
-		var id, scopeJSON, source, kind, review, planJSON, workerAgent, workerPrompt string
-		var base, parent sql.NullString
-		if err := rows.Scan(&id, &t.Title, &t.Body, &t.Priority, &scopeJSON, &source,
-			&kind, &parent, &base, &review, &planJSON, &workerAgent, &workerPrompt); err != nil {
-			return nil, err
-		}
-		t.ID = core.TaskID(id)
-		t.Status = core.TaskAvailable
-		t.SourceRef = source
-		t.Kind = core.TaskKind(kind)
-		t.Parent = core.TaskID(parent.String)
-		t.BaseBranch = base.String
-		t.RequireReview = core.ReviewMode(review)
-		t.WorkerAgent = workerAgent
-		t.WorkerPrompt = workerPrompt
-		if err := json.Unmarshal([]byte(scopeJSON), &t.Scope); err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal([]byte(planJSON), &t.Plan); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
+	return collectRows(rows, scanTask)
+}
+
+// scanTask decodes one ready task row into a core.Task.
+func scanTask(row scanner) (core.Task, error) {
+	var t core.Task
+	var id, scopeJSON, source, kind, review, planJSON, workerAgent, workerPrompt string
+	var base, parent sql.NullString
+	if err := row.Scan(&id, &t.Title, &t.Body, &t.Priority, &scopeJSON, &source,
+		&kind, &parent, &base, &review, &planJSON, &workerAgent, &workerPrompt); err != nil {
+		return t, err
 	}
-	return out, rows.Err()
+	t.ID = core.TaskID(id)
+	t.Status = core.TaskAvailable
+	t.SourceRef = source
+	t.Kind = core.TaskKind(kind)
+	t.Parent = core.TaskID(parent.String)
+	t.BaseBranch = base.String
+	t.RequireReview = core.ReviewMode(review)
+	t.WorkerAgent = workerAgent
+	t.WorkerPrompt = workerPrompt
+	if err := decodeJSON(scopeJSON, &t.Scope); err != nil {
+		return t, err
+	}
+	if err := decodeJSON(planJSON, &t.Plan); err != nil {
+		return t, err
+	}
+	return t, nil
 }
