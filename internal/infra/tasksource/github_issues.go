@@ -88,7 +88,7 @@ func githubIssueRecord(issue *github.Issue) issueRecord {
 }
 
 func (g *GitHubIssues) Claim(ctx context.Context, id core.TaskID) error {
-	n, err := issueNumber(id)
+	n, err := issueNumber(id, "GH-")
 	if err != nil {
 		return err
 	}
@@ -97,7 +97,7 @@ func (g *GitHubIssues) Claim(ctx context.Context, id core.TaskID) error {
 }
 
 func (g *GitHubIssues) Complete(ctx context.Context, id core.TaskID) error {
-	n, err := issueNumber(id)
+	n, err := issueNumber(id, "GH-")
 	if err != nil {
 		return err
 	}
@@ -127,8 +127,10 @@ func (g *GitHubIssues) Create(ctx context.Context, task core.Task) (core.Task, e
 	return parseIssueRecord(githubIssueRecord(issue), "GH"), nil
 }
 
-func issueNumber(id core.TaskID) (int, error) {
-	s := strings.TrimPrefix(string(id), "GH-")
+// issueNumber strips prefix from id and parses the remaining decimal digits.
+// The prefix keeps GitHub and GitLab IDs distinct while sharing one parser.
+func issueNumber(id core.TaskID, prefix string) (int, error) {
+	s := strings.TrimPrefix(string(id), prefix)
 	n, err := strconv.Atoi(s)
 	if err != nil {
 		return 0, core.Errorf(core.CodeInvalidInput, "issue id %q", id)
