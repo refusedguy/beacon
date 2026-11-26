@@ -5,10 +5,10 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   CARD_PANEL_NAME, beaconStatusDefinition, cardHeader, cardModel,
-  createCardMount, durationText, normalizeRun, normalizeSnapshot,
-  runEventTimes, runTotalTime,
+  createButtonPlate, createCardMount, createDetailMount, createPanelChrome,
+  durationText, normalizeRun, normalizeSnapshot, runEventTimes, runTotalTime,
 } from "./ui.js"
-import { solidModule, themeStub } from "./ui_test_helpers.js"
+import { hostModule, solidModule, themeStub } from "./ui_test_helpers.js"
 
 const color = (key) => `theme.${key}`
 const cardDeps = (onClose = () => {}) => ({
@@ -196,4 +196,116 @@ test("the live panel renders the header from a snapshot run", async () => {
   assert.ok(texts(panel).some((line) => line.includes("T-0ea563d7") && line.includes("#2534")))
   assert.ok(texts(panel).includes("total 16m"))
   dispose()
+})
+
+test("panel chrome builder keeps header props and the 10 versus 8 field padding", () => {
+  const card = createPanelChrome(solidModule([]), cardDeps(), {
+    title: "Task card", titleColor: "action", padding: 10, wrapControls: true,
+  })
+  const detail = createPanelChrome(solidModule([]), cardDeps(), {
+    title: "Beacon", padding: 8,
+  })
+  assert.equal(card.fieldKey("ID"), "ID        ", "card keys stay padEnd(10)")
+  assert.equal(detail.fieldKey("Task"), "Task    ", "detail keys stay padEnd(8)")
+  for (const chrome of [card, detail]) {
+    assert.equal(chrome.container.props.flexDirection, "column")
+    assert.equal(chrome.container.props.minWidth, 0)
+    assert.equal(chrome.container.props.flexGrow, 1)
+    assert.equal(chrome.header.props.flexDirection, "row")
+    assert.equal(chrome.header.props.justifyContent, "space-between")
+    assert.equal(chrome.header.props.flexShrink, 0)
+    assert.equal(chrome.title.props.attributes, 1, "the title is bold")
+    assert.equal(chrome.hint.props.content, "ctrl+g")
+    assert.equal(chrome.hint.props.fg, "theme.action")
+    assert.equal(chrome.hint.props.paddingLeft, 1)
+    assert.equal(chrome.hint.props.paddingRight, 1)
+    assert.equal(chrome.gap.props.content, " ")
+    assert.equal(chrome.gap.props.fg, "theme.muted")
+    assert.equal(chrome.close.props.content, "✕")
+    assert.equal(chrome.close.props.fg, "theme.error")
+    assert.equal(chrome.close.props.paddingLeft, 1)
+    assert.equal(chrome.close.props.paddingRight, 1)
+  }
+  assert.equal(card.title.props.content, "Task card")
+  assert.equal(card.title.props.fg, "theme.action")
+  assert.equal(card.controls.props.flexWrap, "wrap")
+  assert.equal(card.controls.props.rowGap, 1)
+  assert.equal(detail.title.props.content, "Beacon")
+  assert.equal(detail.title.props.fg, "theme.base")
+  assert.equal(detail.controls.props.flexWrap, undefined)
+})
+
+test("button plate builder keeps raised padding, gap and hover colours", () => {
+  const ui = solidModule([])
+  const card = createButtonPlate(ui, cardDeps(), {
+    content: "⧉ Copy ID", fg: "base", name: "beacon-card-copy-id", marginRight: 1,
+    boxClick: true, onMouseUp: () => {},
+  })
+  const detail = createButtonPlate(ui, cardDeps(), {
+    content: "✖ Cancel", fg: "error", name: "beacon-action-cancel", marginRight: 1,
+    boxClick: true, visible: false, onMouseUp: () => {},
+  })
+  const confirm = createButtonPlate(ui, cardDeps(), {
+    content: "[ Keep ]", fg: "muted", hover: false, onMouseUp: () => {},
+  })
+  for (const plate of [card, detail, confirm]) {
+    assert.equal(plate.box.props.flexDirection, "row")
+    assert.equal(plate.box.props.flexShrink, 0)
+    assert.equal(plate.box.props.paddingLeft, 1)
+    assert.equal(plate.box.props.paddingRight, 1)
+    assert.equal(plate.box.props.backgroundColor, "theme.raised")
+    assert.notEqual(plate.text.props.fg, plate.box.props.backgroundColor)
+  }
+  assert.equal(card.text.props.name, "beacon-card-copy-id")
+  assert.equal(card.text.props.fg, "theme.base")
+  assert.equal(card.box.props.marginRight, 1)
+  assert.equal(detail.text.props.name, "beacon-action-cancel")
+  assert.equal(detail.text.props.fg, "theme.error")
+  assert.equal(detail.box.props.visible, false)
+  assert.equal(detail.text.props.visible, false)
+  assert.equal(confirm.text.props.name, undefined, "confirm plate adds no name")
+  assert.equal(confirm.box.props.marginRight, undefined, "keep plate has no margin prop")
+  assert.equal(confirm.box.props.onMouseOver, undefined, "confirm plate has no hover")
+  for (const plate of [card, detail]) {
+    assert.equal(typeof plate.box.props.onMouseOver, "function")
+    assert.equal(typeof plate.box.props.onMouseOut, "function")
+    assert.equal(typeof plate.box.props.onMouseUp, "function")
+    plate.box.props.onMouseOver()
+    assert.equal(plate.box.props.backgroundColor, "theme.panel")
+    plate.box.props.onMouseOut()
+    assert.equal(plate.box.props.backgroundColor, "theme.raised")
+  }
+})
+
+test("both mounts keep chrome and plate props on a host without box.children", () => {
+  const created = []
+  const ui = hostModule(created)
+  createCardMount(ui, cardDeps())
+  createDetailMount(ui, {
+    color, BOLD: 1, onAction: () => {}, onToggle: () => {}, onClose: () => {},
+    setProp: (node, key, value) => { node.props[key] = value },
+  })
+  const hints = created.filter((node) => node.props.content === "ctrl+g")
+  assert.equal(hints.length, 2, "card and detail each keep one hint")
+  for (const hint of hints) {
+    assert.equal(hint.props.fg, "theme.action")
+    assert.equal(hint.props.paddingLeft, 1)
+    assert.equal(hint.props.paddingRight, 1)
+  }
+  const closes = created.filter((node) => node.props.content === "✕")
+  assert.equal(closes.length, 2, "card and detail each keep one close control")
+  for (const close of closes) {
+    assert.equal(close.props.fg, "theme.error")
+    assert.equal(close.props.paddingLeft, 1)
+    assert.equal(close.props.paddingRight, 1)
+  }
+  const plates = created.filter((node) => node.props.backgroundColor === "theme.raised"
+    && node.props.flexDirection === "row")
+  assert.equal(plates.length, 11, "three card, six action and two confirm plates")
+  for (const plate of plates) {
+    assert.equal(plate.props.paddingLeft, 1)
+    assert.equal(plate.props.paddingRight, 1)
+    assert.equal(plate.props.flexShrink, 0)
+  }
+  assert.equal(created.filter((node) => node.props.content === " ").length >= 2, true)
 })
