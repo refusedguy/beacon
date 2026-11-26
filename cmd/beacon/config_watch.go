@@ -19,6 +19,11 @@ import (
 // weak machine.
 const configWatchInterval = 2 * time.Second
 
+// maxModelCacheEntries bounds model resolutions kept per config generation.
+// A dispatch can introduce a new parent session, so an unbounded cache grows
+// with every distinct parent until the next reload advances the generation.
+const maxModelCacheEntries = 64
+
 // liveState is an immutable snapshot. Reloads build a new one and swap the
 // pointer instead of editing maps or fields that a running worker may read.
 // generation identifies the config that produced this snapshot, so a cached
@@ -38,6 +43,7 @@ type eventRelay struct {
 	out     chan core.HarnessEvent
 	mu      sync.Mutex
 	changed chan struct{}
+	reloads uint64
 }
 
 // newEventRelay creates a relay with a fresh event channel and reload signal.
@@ -55,10 +61,19 @@ func (r *eventRelay) reloadSignal() <-chan struct{} {
 	return r.changed
 }
 
+// reloadState returns the reload count and the channel for the next one under
+// one lock, so a listener cannot miss a signal that lands between the two.
+func (r *eventRelay) reloadState() (uint64, <-chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reloads, r.changed
+}
+
 // signalReload wakes listeners and installs a fresh channel for the next reload.
 func (r *eventRelay) signalReload() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.reloads++
 	close(r.changed)
 	r.changed = make(chan struct{})
 }
@@ -81,6 +96,7 @@ type configWatcher struct {
 	// needed here.
 	modelMu         sync.Mutex
 	models          map[string]core.ModelRef
+	modelOrder      []string
 	modelGeneration uint64
 }
 
@@ -189,23 +205,45 @@ func (cw *configWatcher) build(cfg config.Config, root string) *liveState {
 	return newLiveState(cfg, h)
 }
 
+// resetModelCacheIfStale drops resolutions from an older config generation.
+// Callers hold modelMu.
+func (cw *configWatcher) resetModelCacheIfStale(state *liveState) {
+	if cw.models == nil || cw.modelGeneration != state.generation {
+		cw.models = make(map[string]core.ModelRef)
+		cw.modelOrder = nil
+		cw.modelGeneration = state.generation
+	}
+}
+
+// cacheModel stores a resolution under parent, evicting the oldest entry when
+// the cache is full. Callers hold modelMu.
+func (cw *configWatcher) cacheModel(parent string, ref core.ModelRef) {
+	if _, ok := cw.models[parent]; !ok {
+		if len(cw.models) >= maxModelCacheEntries {
+			oldest := cw.modelOrder[0]
+			delete(cw.models, oldest)
+			cw.modelOrder = cw.modelOrder[1:]
+		}
+		cw.modelOrder = append(cw.modelOrder, parent)
+	}
+	cw.models[parent] = ref
+}
+
 // modelResolver reads the current snapshot so a dispatch uses the model the
 // operator configured most recently. Resolution can be an HTTP session lookup,
-// so the result is cached per parent session and config generation.
+// so the result is cached per parent session and config generation. The cache
+// is bounded so many distinct parents cannot grow it without limit.
 func (cw *configWatcher) modelResolver(parent string) core.ModelRef {
 	state := cw.live.Load()
 	cw.modelMu.Lock()
 	defer cw.modelMu.Unlock()
-	if cw.models == nil || cw.modelGeneration != state.generation {
-		cw.models = make(map[string]core.ModelRef)
-		cw.modelGeneration = state.generation
-	}
+	cw.resetModelCacheIfStale(state)
 	if ref, ok := cw.models[parent]; ok {
 		return ref
 	}
 	_, _, token := loadTokens(state.cfg)
 	ref := resolveModel(state.cfg, token, parent)
-	cw.models[parent] = ref
+	cw.cacheModel(parent, ref)
 	return ref
 }
 
@@ -261,25 +299,38 @@ func configChange(old, next config.Config) (restart []string, modelOnly bool) {
 	return nil, reflect.DeepEqual(probe, next)
 }
 
+// eventForwarder copies events from one harness channel into the stable relay.
+// cancel stops it and done closes when it exits.
+type eventForwarder struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 // reloadableHarness delegates to the current harness. Every service holds one
 // stable wrapper, so a reload never mutates a harness a worker is using. The
-// wrapper owns one event channel and one idle watcher that follow the current
-// harness across reloads.
+// wrapper owns one event relay and one idle watcher that follow the current
+// harness across reloads. A reload replaces the single forwarder instead of
+// accumulating one per harness, so the goroutine count stays constant.
 type reloadableHarness struct {
 	live *atomic.Pointer[liveState]
 
 	// events is the source captured at setup. It seeds the relay; a reload
-	// adds the current harness's channel without dropping this one.
+	// replaces it with the current harness's channel.
 	events <-chan core.HarnessEvent
 
 	once  sync.Once
 	relay *eventRelay
+
+	mu     sync.Mutex
+	active *eventForwarder
 }
 
 // init starts the event pump once, seeding the relay from the current harness.
 func (h *reloadableHarness) init() {
 	h.once.Do(func() {
 		h.relay = (*h.live).Load().relay
+		h.setForwarder(h.events)
+		h.setForwarder(h.current().Events())
 		go h.pump()
 	})
 }
@@ -289,34 +340,60 @@ func (h *reloadableHarness) current() core.AgentHarness {
 	return (*h.live).Load().harness
 }
 
-// pump forwards events from every harness it sees into the stable output
-// channel. A reload builds a fresh harness with a fresh channel, so the pump
-// adds that channel on the reload signal. It keeps the older forwarders too,
-// because sessions started before the reload still publish on the old harness.
-func (h *reloadableHarness) pump() {
-	seen := make(map[<-chan core.HarnessEvent]struct{})
-	forward := func(src <-chan core.HarnessEvent) {
-		if src == nil {
-			return
-		}
-		if _, ok := seen[src]; ok {
-			return
-		}
-		seen[src] = struct{}{}
-		go func() {
-			for ev := range src {
+// setForwarder stops the active forwarder and starts one for src. A retired
+// harness loses its forwarder, so reloads do not accumulate goroutines.
+func (h *reloadableHarness) setForwarder(src <-chan core.HarnessEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.active != nil {
+		h.active.cancel()
+		<-h.active.done
+		h.active = nil
+	}
+	if src == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	h.active = &eventForwarder{cancel: cancel, done: done}
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case ev, ok := <-src:
+				if !ok {
+					return
+				}
 				select {
 				case h.relay.out <- ev:
 				default:
 				}
+			case <-ctx.Done():
+				return
 			}
-		}()
-	}
-	forward(h.events)
-	forward(h.current().Events())
+		}
+	}()
+}
+
+// activeForwarder returns the forwarder currently reading a harness channel.
+func (h *reloadableHarness) activeForwarder() *eventForwarder {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.active
+}
+
+// pump retargets the relay's single forwarder whenever a reload is broadcast.
+// It also picks up reloads that landed before the goroutine started.
+func (h *reloadableHarness) pump() {
+	var processed uint64
 	for {
-		<-h.relay.reloadSignal()
-		forward(h.current().Events())
+		count, changed := h.relay.reloadState()
+		if count > processed {
+			h.setForwarder(h.current().Events())
+			processed = count
+			continue
+		}
+		<-changed
 	}
 }
 
