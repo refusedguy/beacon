@@ -112,6 +112,70 @@ func (s *changeSubscribers) run(ctx context.Context, src <-chan int) {
 	}
 }
 
+// eventFrames encodes each harness event once and broadcasts the finished SSE
+// frame to one channel per monitor. Encoding at the source keeps one
+// json.Marshal per event no matter how many monitors are connected. Every
+// subscriber receives the same bytes.
+type eventFrames struct {
+	mu      sync.Mutex
+	subs    map[chan []byte]struct{}
+	src     <-chan core.HarnessEvent
+	marshal func(any) ([]byte, error)
+}
+
+// newEventFrames builds a broadcaster that reads harness events from src.
+// marshal encodes each event payload once, before any monitor sees the frame.
+func newEventFrames(src <-chan core.HarnessEvent, marshal func(any) ([]byte, error)) *eventFrames {
+	return &eventFrames{
+		subs:    make(map[chan []byte]struct{}),
+		src:     src,
+		marshal: marshal,
+	}
+}
+
+// subscribe returns a channel of complete SSE frames and an unsubscribe
+// function. The caller must call unsubscribe when the connection closes.
+func (f *eventFrames) subscribe() (<-chan []byte, func()) {
+	ch := make(chan []byte, subscriberBuffer)
+	f.mu.Lock()
+	f.subs[ch] = struct{}{}
+	f.mu.Unlock()
+	return ch, func() {
+		f.mu.Lock()
+		delete(f.subs, ch)
+		f.mu.Unlock()
+	}
+}
+
+// run reads each harness event, builds one frame, and hands the same bytes to
+// every subscriber. A full subscriber channel is skipped so a slow monitor
+// cannot stall the broadcast or the other monitors.
+func (f *eventFrames) run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-f.src:
+			if !ok {
+				return
+			}
+			b, err := f.marshal(core.NewWireEvent(ev))
+			if err != nil {
+				continue
+			}
+			frame := fmt.Appendf(nil, "event: harness\ndata: %s\n\n", b)
+			f.mu.Lock()
+			for ch := range f.subs {
+				select {
+				case ch <- frame:
+				default:
+				}
+			}
+			f.mu.Unlock()
+		}
+	}
+}
+
 // apiStatus and apiControl are the whole service surface the loopback API
 // needs. Keeping them as interfaces prevents handlers from reaching the
 // dispatcher, SCM, harness or task services behind the wiring root.
@@ -135,21 +199,23 @@ type apiServices struct {
 }
 
 type apiServer struct {
-	services    apiServices
-	token       string
-	eventStream <-chan core.HarnessEvent
-	changes     *changeSubscribers
+	services apiServices
+	token    string
+	frames   *eventFrames
+	changes  *changeSubscribers
 }
 
 // startAPIServer serves the loopback API until ctx ends and reports its exit
 // on errCh. It owns the server lifecycle so the serve command stays short.
 func startAPIServer(ctx context.Context, services apiServices, token string, events <-chan core.HarnessEvent, changes *changeSubscribers, addr string, errCh chan<- error) {
-	// One view feeds the SSE handlers and one ends the snapshot generation.
-	// A single consumer owns the invalidation view, so one harness event
-	// invalidates once no matter how many monitors are connected.
+	// One view feeds the frame broadcaster and one ends the snapshot
+	// generation. A single consumer owns the invalidation view, so one harness
+	// event invalidates once no matter how many monitors are connected.
 	views := fanout(ctx, events, 2)
 	go invalidateOnHarness(ctx, views[1], changes.snapshot)
-	api := &apiServer{services: services, token: token, eventStream: views[0], changes: changes}
+	frames := newEventFrames(views[0], json.Marshal)
+	go frames.run(ctx)
+	api := &apiServer{services: services, token: token, frames: frames, changes: changes}
 	srv := &http.Server{Addr: addr, Handler: api.handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -270,8 +336,10 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	changes, unsubscribe := a.changes.subscribe()
-	defer unsubscribe()
+	frames, unsubscribeFrames := a.frames.subscribe()
+	defer unsubscribeFrames()
+	changes, unsubscribeChanges := a.changes.subscribe()
+	defer unsubscribeChanges()
 	rw.Header().Set("Content-Type", "text/event-stream")
 	rw.Header().Set("Cache-Control", "no-cache")
 	// Send the headers now so the monitor's request returns before the first
@@ -280,13 +348,12 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	events := a.eventStream
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case ev := <-events:
-			writeSSE(rw, "harness", core.NewWireEvent(ev))
+		case frame := <-frames:
+			_, _ = rw.Write(frame)
 			flusher.Flush()
 		case pr := <-changes:
 			writeSSE(rw, "pr_changed", map[string]int{"pr": pr})
