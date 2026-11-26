@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
 	_ "modernc.org/sqlite" // register the "sqlite" driver for the store adapter
 
@@ -151,38 +152,91 @@ func wire(path, parentSession string) (*wiring, error) {
 }
 
 // wireInfra builds the adapters. It has no dependency on the service layer.
+// The constructors do not depend on each other, so they run concurrently and
+// time to first API is the slowest one rather than their sum.
 func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, error) {
 	scmToken, sourceToken, harnessToken := loadTokens(cfg)
-	store, err := sqlite.Open(cfg.StateDB)
-	if err != nil {
-		return nil, err
+	return buildInfra(infraConstructors{
+		store: func() (*sqlite.Store, error) {
+			return sqlite.Open(cfg.StateDB)
+		},
+		source: func() (core.TaskSource, error) {
+			return tasksource.New(tasksource.Config{
+				Provider: cfg.TaskSource.Provider, Dir: cfg.TaskSource.Dir,
+				Owner: cfg.SCM.Owner, Repo: cfg.SCM.Repo, GitlabURL: cfg.SCM.BaseURL,
+			}, sourceToken)
+		},
+		scm: func() (core.ScmGateway, error) {
+			return scm.New(scm.Config{
+				Provider: cfg.SCM.Provider, Owner: cfg.SCM.Owner, Repo: cfg.SCM.Repo,
+				BaseURL: cfg.SCM.BaseURL, BaseBranch: cfg.BaseBranch,
+			}, scmToken)
+		},
+		harness: func() (core.AgentHarness, error) {
+			return newHarness(cfg, harnessToken, parentSession, root)
+		},
+		workspace: func() (*workspace.GitWorktree, error) {
+			return workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
+		},
+	})
+}
+
+// infraConstructors holds the independent adapter constructors used at daemon
+// startup. Each closure captures the config it needs, so buildInfra can run
+// them concurrently without changing what the composition root wires.
+type infraConstructors struct {
+	store     func() (*sqlite.Store, error)
+	source    func() (core.TaskSource, error)
+	scm       func() (core.ScmGateway, error)
+	harness   func() (core.AgentHarness, error)
+	workspace func() (*workspace.GitWorktree, error)
+}
+
+// startupParallelLimit bounds the goroutines that build independent adapters.
+const startupParallelLimit = 5
+
+// buildInfra runs the adapter constructors under a bounded errgroup and
+// assembles the shared infrastructure. Each result lands in a fixed slot, so
+// the returned error is deterministic even when several constructors fail out
+// of order.
+func buildInfra(c infraConstructors) (*wiredInfra, error) {
+	var (
+		store        *sqlite.Store
+		source       core.TaskSource
+		scmGW        core.ScmGateway
+		h            core.AgentHarness
+		wt           *workspace.GitWorktree
+		errStore     error
+		errSource    error
+		errSCM       error
+		errHarness   error
+		errWorkspace error
+	)
+
+	var group errgroup.Group
+	group.SetLimit(startupParallelLimit)
+	group.Go(func() error { store, errStore = c.store(); return errStore })
+	group.Go(func() error { source, errSource = c.source(); return errSource })
+	group.Go(func() error { scmGW, errSCM = c.scm(); return errSCM })
+	group.Go(func() error { h, errHarness = c.harness(); return errHarness })
+	group.Go(func() error { wt, errWorkspace = c.workspace(); return errWorkspace })
+	// Wait's aggregate error is order-dependent. The slots below are inspected
+	// in a fixed order instead so failures stay reproducible.
+	_ = group.Wait()
+
+	for _, err := range []error{errStore, errSource, errSCM, errHarness, errWorkspace} {
+		if err != nil {
+			if store != nil {
+				_ = store.Close()
+			}
+			return nil, err
+		}
 	}
-	source, err := tasksource.New(tasksource.Config{
-		Provider: cfg.TaskSource.Provider, Dir: cfg.TaskSource.Dir,
-		Owner: cfg.SCM.Owner, Repo: cfg.SCM.Repo, GitlabURL: cfg.SCM.BaseURL,
-	}, sourceToken)
-	if err != nil {
-		return nil, err
-	}
-	scmGW, err := scm.New(scm.Config{
-		Provider: cfg.SCM.Provider, Owner: cfg.SCM.Owner, Repo: cfg.SCM.Repo,
-		BaseURL: cfg.SCM.BaseURL, BaseBranch: cfg.BaseBranch,
-	}, scmToken)
-	if err != nil {
-		return nil, err
-	}
-	h, err := newHarness(cfg, harnessToken, parentSession, root)
-	if err != nil {
-		return nil, err
-	}
-	wt, err := workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
-	if err != nil {
-		return nil, err
-	}
-	infra := &wiredInfra{store: store, source: source, harness: h,
-		workspace: wt, scm: scmGW, changes: make(chan int, 64),
-		decisions: app.DecisionLogger{Sink: store}}
-	return infra, nil
+
+	return &wiredInfra{
+		store: store, source: source, harness: h, workspace: wt, scm: scmGW,
+		changes: make(chan int, 64), decisions: app.DecisionLogger{Sink: store},
+	}, nil
 }
 
 // wireServices builds the application services on top of the adapters. The

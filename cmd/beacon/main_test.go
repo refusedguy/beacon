@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,12 +12,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
+	"github.com/refusedguy/beacon/internal/infra/workspace"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -339,5 +343,126 @@ func TestWireInjectsReloadableWrappersAtConstruction(t *testing.T) {
 	}
 	if got := w.dispatcher.ResolveModel(""); got.ID != "model-b" {
 		t.Fatalf("model after reload = %q, want model-b", got.ID)
+	}
+}
+
+// stubTaskSource and stubSCM are identity markers for the wiring test.
+type stubTaskSource struct{}
+
+func (stubTaskSource) ListAvailable(context.Context) ([]core.Task, error) { return nil, nil }
+func (stubTaskSource) Claim(context.Context, core.TaskID) error           { return nil }
+func (stubTaskSource) Complete(context.Context, core.TaskID) error        { return nil }
+func (stubTaskSource) MarkInWorkspace(context.Context, core.TaskID, string, string) error {
+	return nil
+}
+func (stubTaskSource) Create(context.Context, core.Task) (core.Task, error) {
+	return core.Task{}, nil
+}
+
+type stubSCM struct{}
+
+func (stubSCM) Observe(context.Context, int) (core.Observation, error) {
+	return core.Observation{}, nil
+}
+func (stubSCM) UpdateBranch(context.Context, int, string) (string, error) {
+	return "", nil
+}
+func (stubSCM) Merge(context.Context, int, string, string) error { return nil }
+func (stubSCM) BaseBranchStatus(context.Context, string) (core.BaseStatus, error) {
+	return core.BaseStatus{}, nil
+}
+func (stubSCM) FindOpenPRByBranch(context.Context, string) (int, error)     { return 0, nil }
+func (stubSCM) OpenPR(context.Context, string, string, string) (int, error) { return 0, nil }
+
+func TestBuildInfraRunsConstructorsConcurrently(t *testing.T) {
+	const stepDelay = 100 * time.Millisecond
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open(...): %v", err)
+	}
+	defer store.Close()
+
+	source := &stubTaskSource{}
+	scmGW := &stubSCM{}
+	h := bareHarness{}
+	wt := new(workspace.GitWorktree)
+
+	var active, peak int32
+	enter := func() {
+		now := atomic.AddInt32(&active, 1)
+		for {
+			seen := atomic.LoadInt32(&peak)
+			if now <= seen || atomic.CompareAndSwapInt32(&peak, seen, now) {
+				break
+			}
+		}
+		time.Sleep(stepDelay)
+		atomic.AddInt32(&active, -1)
+	}
+
+	start := time.Now()
+	infra, err := buildInfra(infraConstructors{
+		store:     func() (*sqlite.Store, error) { enter(); return store, nil },
+		source:    func() (core.TaskSource, error) { enter(); return source, nil },
+		scm:       func() (core.ScmGateway, error) { enter(); return scmGW, nil },
+		harness:   func() (core.AgentHarness, error) { enter(); return h, nil },
+		workspace: func() (*workspace.GitWorktree, error) { enter(); return wt, nil },
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("buildInfra(): %v", err)
+	}
+	if got := atomic.LoadInt32(&peak); got < 2 {
+		t.Errorf("peak concurrent constructors = %d, want more than one", got)
+	}
+	if elapsed >= 4*stepDelay {
+		t.Errorf("buildInfra took %v, want near %v, not serial %v", elapsed, stepDelay, 5*stepDelay)
+	}
+
+	if infra.store != store {
+		t.Error("store did not come from its constructor")
+	}
+	if infra.source != source {
+		t.Error("source did not come from its constructor")
+	}
+	if infra.scm != scmGW {
+		t.Error("scm did not come from its constructor")
+	}
+	if infra.harness != h {
+		t.Error("harness did not come from its constructor")
+	}
+	if infra.workspace != wt {
+		t.Error("workspace did not come from its constructor")
+	}
+	if infra.changes == nil || cap(infra.changes) != 64 {
+		t.Errorf("changes channel = %v, want buffered cap 64", infra.changes)
+	}
+	if infra.decisions.Sink != store {
+		t.Error("decision sink is not the store")
+	}
+}
+
+func TestBuildInfraReturnsErrorInFixedOrder(t *testing.T) {
+	storeErr := errors.New("store failed")
+	sourceErr := errors.New("source failed")
+
+	infra, err := buildInfra(infraConstructors{
+		store: func() (*sqlite.Store, error) {
+			time.Sleep(30 * time.Millisecond)
+			return nil, storeErr
+		},
+		source: func() (core.TaskSource, error) {
+			time.Sleep(20 * time.Millisecond)
+			return nil, sourceErr
+		},
+		scm:       func() (core.ScmGateway, error) { return nil, nil },
+		harness:   func() (core.AgentHarness, error) { return nil, nil },
+		workspace: func() (*workspace.GitWorktree, error) { return nil, errors.New("workspace failed") },
+	})
+	if infra != nil {
+		t.Fatalf("buildInfra() = %v, want nil on failure", infra)
+	}
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("buildInfra() error = %v, want store error first in fixed order", err)
 	}
 }
