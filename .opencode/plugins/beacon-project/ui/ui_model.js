@@ -20,6 +20,13 @@ export const REASON_WIDTH = 40
 export const RECENT_LIMIT = 5
 export const DECISION_LIMIT = 20
 export const EMPTY_SNAPSHOT = Object.freeze({ active: [], recent: [], queue: [] })
+// One map for both check rows and summary buckets. A null prototype keeps an
+// unknown state from resolving to an inherited Object key.
+export const CHECK_BUCKETS = Object.freeze(Object.assign(Object.create(null), {
+  failure: "failed", failed: "failed", error: "failed",
+  pending: "pending", in_progress: "pending", queued: "pending",
+  skipped: "skipped", neutral: "skipped",
+}))
 
 const bool = (v) => v === true || v === 1 || v === "true", raw = (v) => (v == null ? "" : v)
 export const failedCheckCount = (v) => {
@@ -33,6 +40,9 @@ export const failedCheckCount = (v) => {
 }
 
 export const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v))
+// One key builder for run signatures and event dedupe. Both join the same four
+// fields in the same order, so a run and its event share a key.
+export const joinKey = (id, sha, state, at) => [str(id), str(sha), str(state), str(at)].join("|")
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0 }, pick = (s, names) => { for (const n of names) { const v = s?.[n]; if (v != null) return v } }
 const list = (v, fn) => (Array.isArray(v) ? v : []).map(fn)
 const normalize = (value, spec) => {
@@ -139,7 +149,7 @@ export function parseSnapshot(text) {
   if (text == null || String(text).trim() === "") return {}
   try { const v = JSON.parse(String(text)); return v && typeof v === "object" && !Array.isArray(v) ? v : {} } catch { return {} }
 }
-export const runSignature = (run) => [str(run.id), str(run.sha), str(run.state), str(run.updatedAt)].join("|")
+export const runSignature = (run) => joinKey(run.id, run.sha, run.state, run.updatedAt)
 export const runChangedPayload = (run) => Object.freeze({
   id: str(run.id), sha: str(run.sha), state: str(run.state), at: str(run.updatedAt), key: runSignature(run),
 })
@@ -159,7 +169,7 @@ export function changedRuns(previous, next) {
   }
   return out
 }
-export const eventKey = (data) => str(data?.key) || [str(data?.id), str(data?.sha), str(data?.state), str(data?.at)].join("|")
+export const eventKey = (data) => str(data?.key) || joinKey(data?.id, data?.sha, data?.state, data?.at)
 export function eventMatchesLocation(eventLocation, ownLocation) {
   const event = locationInfo({ location: eventLocation })
   const own = locationInfo({ location: ownLocation })
