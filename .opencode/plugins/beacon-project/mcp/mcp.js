@@ -29,17 +29,37 @@ function pathBinary(name, deps) {
   return null
 }
 
+// Both a real registration and the worker no-op share one shape. The factory
+// owns the disposed flag and calls the optional hook once, so the plugin
+// cleanup path treats either registration the same way.
+function createRegistration(config, onDispose) {
+  let disposed = false
+  return Object.freeze({
+    server: BEACON_SERVER,
+    config,
+    get disposed() { return disposed },
+    async dispose() {
+      if (disposed) return
+      disposed = true
+      if (typeof onDispose === "function") await onDispose()
+    },
+  })
+}
+
+// Config building and registration both need a canonical project root. Keep
+// the check in one place so the two entry points reject the same input.
+function requireProjectRoot(root) {
+  if (typeof root !== "string" || root.trim() === "") {
+    throw new Error("beacon MCP: project root is required")
+  }
+  return root
+}
+
 // A worker session inherits the pooled daemon from its parent. This stands in
 // for a real registration so the plugin's cleanup path stays uniform without
 // resolving a command or touching a registrar's cache.
 export function noopMcpRegistration() {
-  let disposed = false
-  return Object.freeze({
-    server: BEACON_SERVER,
-    config: null,
-    get disposed() { return disposed },
-    async dispose() { disposed = true },
-  })
+  return createRegistration(null)
 }
 
 // Every returned registrar owns its registration and command caches. A caller
@@ -113,9 +133,7 @@ export function createMcpRegistrar(deps = defaultDeps) {
   }
 
   function beaconServerConfig(root, callDeps = baseDeps, sessionID = "") {
-    if (typeof root !== "string" || root.trim() === "") {
-      throw new Error("beacon MCP: project root is required")
-    }
+    requireProjectRoot(root)
     const effective = resolveDeps(callDeps)
     const resolveCommand = typeof effective.beaconCommand === "function" ? effective.beaconCommand : beaconCommand
     const environment = { [BEACON_PROJECT_ROOT_ENV]: root }
@@ -142,9 +160,7 @@ export function createMcpRegistrar(deps = defaultDeps) {
   // server manually. Registration here only records the config for that attach.
   // It never starts, reloads or restarts a daemon.
   async function registerBeaconMcp(ctx, root, callDeps = baseDeps) {
-    if (typeof root !== "string" || root.trim() === "") {
-      throw new Error("beacon MCP: project root is required")
-    }
+    requireProjectRoot(root)
     const effective = resolveDeps(callDeps)
     const existing = registrations.get(root)
     if (existing) return existing
@@ -154,12 +170,8 @@ export function createMcpRegistrar(deps = defaultDeps) {
     // that owns the pooled MCP daemon.
     const identity = await sessionIdentity(ctx)
     const config = beaconServerConfig(root, effective, identity.sessionID)
-    const registration = Object.freeze({
-      server: BEACON_SERVER,
-      config,
-      async dispose() {
-        if (registrations.get(root) === registration) registrations.delete(root)
-      },
+    const registration = createRegistration(config, () => {
+      if (registrations.get(root) === registration) registrations.delete(root)
     })
     registrations.set(root, registration)
     return registration
