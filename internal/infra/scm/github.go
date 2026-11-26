@@ -137,72 +137,81 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		Conflict: conflict,
 	}
 
-	// Checks, approvals and the base comparison need only the PR read. Fetch
-	// them together so one slow call does not hold up the others. Changed files
-	// depend on the check result and stay in a second round.
-	var (
-		checks       []core.CheckResult
-		approvals    int
-		cmp          *github.CommitsComparison
-		checksErr    error
-		approvalsErr error
-		compareErr   error
-	)
 	base := p.GetBase().GetRef()
 	if base == "" {
 		base = g.base
 	}
-	var group errgroup.Group
-	group.SetLimit(observeParallelLimit)
-	group.Go(func() error {
-		checks, checksErr = g.checks(ctx, sha)
-		return checksErr
-	})
-	group.Go(func() error {
-		approvals, approvalsErr = g.approvals(ctx, pr)
-		return approvalsErr
-	})
-	group.Go(func() error {
-		cmp, compareErr = guarded(g.br, func() (*github.CommitsComparison, error) {
-			c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
-			return c, err
-		})
-		return compareErr
-	})
-	_ = group.Wait()
+	signals := g.fetchSignals(ctx, pr, sha, base)
 
 	// Report failures in the original call order so callers see the same first
-	// error and the same partially filled observation.
-	if checksErr != nil {
-		return o, checksErr
+	// error and the same partially filled observation. Changed files depend on
+	// the check result and stay in a second round.
+	if signals.checksErr != nil {
+		return o, signals.checksErr
 	}
-	o.Checks = checks
-	for _, c := range checks {
+	o.Checks = signals.checks
+	for _, c := range signals.checks {
 		if c.State == core.CheckFailure {
 			o.FailureExcerpt = c.Output
 			break
 		}
 	}
-	if state == "open" && len(checks) == 0 {
+	if state == "open" && len(signals.checks) == 0 {
 		files, err := g.changedFiles(ctx, pr)
 		if err != nil {
 			return o, err
 		}
 		o.WorkflowSkipped = ignoredPathsOnly(files)
 	}
-	if approvalsErr != nil {
-		return o, approvalsErr
+	if signals.approvalsErr != nil {
+		return o, signals.approvalsErr
 	}
-	o.Approvals = approvals
+	o.Approvals = signals.approvals
 	for _, l := range p.Labels {
 		o.Labels = append(o.Labels, l.GetName())
 	}
-	if compareErr != nil {
-		return o, compareErr
+	if signals.compareErr != nil {
+		return o, signals.compareErr
 	}
-	o.Behind = cmp.GetBehindBy() > 0
-	o.BaseSHA = cmp.GetBaseCommit().GetSHA()
+	o.Behind = signals.cmp.GetBehindBy() > 0
+	o.BaseSHA = signals.cmp.GetBaseCommit().GetSHA()
 	return o, nil
+}
+
+// githubSignals carries the results of the first Observe round. Errors stay
+// separate so Observe can report them in the original call order.
+type githubSignals struct {
+	checks       []core.CheckResult
+	approvals    int
+	cmp          *github.CommitsComparison
+	checksErr    error
+	approvalsErr error
+	compareErr   error
+}
+
+// fetchSignals runs checks, approvals and the base comparison together. None of
+// them depends on another result, so one slow call cannot hold up the others.
+func (g *GitHub) fetchSignals(ctx context.Context, pr int, sha, base string) githubSignals {
+	var out githubSignals
+	var group errgroup.Group
+	group.SetLimit(observeParallelLimit)
+	group.Go(func() error {
+		out.checks, out.checksErr = g.checks(ctx, sha)
+		return out.checksErr
+	})
+	group.Go(func() error {
+		out.approvals, out.approvalsErr = g.approvals(ctx, pr)
+		return out.approvalsErr
+	})
+	group.Go(func() error {
+		out.cmp, out.compareErr = guarded(g.br, func() (*github.CommitsComparison, error) {
+			c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
+			return c, err
+		})
+		return out.compareErr
+	})
+	_ = group.Wait()
+	return out
 }
 
 // checks returns the check runs for commit sha.
