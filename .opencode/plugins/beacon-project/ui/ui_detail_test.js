@@ -102,17 +102,20 @@ test("sidebar and detail sections collapse with zero new createElement and persi
   dispose()
 })
 
-test("setup without injected deps keeps the TUI imports literal", async () => {
-  const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
+test("setup without injected deps resolves TUI peers from the static host runtime", async () => {
+  const runtimeSrc = readFileSync(new URL("./ui_runtime.js", import.meta.url), "utf8")
+  assert.equal((runtimeSrc.match(/import \* as /g) ?? []).length, 3, "all three peers use static namespace imports")
   for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {
-    assert.ok(src.includes(`import("${specifier}")`), `literal import("${specifier}") is present`)
+    assert.ok(runtimeSrc.includes(`"${specifier}"`), `static import for ${specifier} is present`)
   }
-  assert.match(src, /import\s*\{\s*Plugin\s*\}\s*from\s*"@opencode\/plugin\/tui"/, "the host Plugin import is static")
-  await assert.rejects(beaconStatusDefinition.setup({}), (error) => {
-    assert.equal(/unexpected import/.test(error.message), false)
-    assert.match(error.message, /Cannot find package|ERR_MODULE_NOT_FOUND|Cannot find module/)
-    return true
-  })
+  const uiSrc = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
+  assert.match(uiSrc, /import\s*\{\s*Plugin\s*\}\s*from\s*"@opencode\/plugin\/tui"/, "the host Plugin import is static")
+  assert.match(uiSrc, /from\s*"\.\/ui_runtime\.js"/, "ui.js imports the host runtime at top level")
+  const { runtimeImport } = await import("./ui_runtime.js")
+  for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {
+    assert.ok(runtimeImport(specifier), `${specifier} resolves from the host runtime`)
+  }
+  assert.throws(() => runtimeImport("other"), /unexpected import/)
 })
 
 test("plugin rendering uses theme tokens and native text styling only", async () => {
@@ -121,10 +124,9 @@ test("plugin rendering uses theme tokens and native text styling only", async ()
   assert.equal(/#[0-9a-fA-F]{3,8}\b/.test(src), false, "no hardcoded hex colors")
   assert.equal(/ascii_font/.test(src), false)
   assert.equal(/setProp\([^,]+,\s*"(font|size|width|height)"/.test(src), false)
-  // The view, model and bridge modules must load without the TUI peer. The
-  // ui.js import at the top succeeds while @opentui/core is unavailable, so
-  // these exported functions prove none of the three modules imports it.
-  await assert.rejects(import("@opentui/core"), /ERR_MODULE_NOT_FOUND|Cannot find package|Cannot find module/)
+  // The view, model and bridge modules must not import TUI peers themselves.
+  // The loader doubles let ui.js load its static runtime imports in plain Node,
+  // so these exported functions prove none of the three modules imports peers.
   for (const name of ["detailModel", "normalizeRun", "createRunChangeBridge"]) {
     assert.equal(typeof ui[name], "function", `${name} loads without @opentui/core`)
   }
