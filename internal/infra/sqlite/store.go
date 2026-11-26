@@ -80,82 +80,6 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// dropRedundantRunIndexes removes runs_state_idx. Its keys are a strict prefix
-// of runs_state_updated_idx, which the snapshot indexes supply on every open,
-// so keeping it only adds write cost. Databases created before the composite
-// index existed still carry it, hence the idempotent drop on open.
-func dropRedundantRunIndexes(db *sql.DB) error {
-	_, err := db.Exec(`DROP INDEX IF EXISTS runs_state_idx`)
-	return err
-}
-
-// ensureSnapshotIndexes adds the covering indexes the snapshot reads rely on.
-// They live on the read side, next to the queries they serve, so an older
-// state database gains them on the next open without a schema version bump.
-func ensureSnapshotIndexes(db *sql.DB) error {
-	for _, ddl := range []string{
-		`CREATE INDEX IF NOT EXISTS runs_state_updated_idx ON runs(state, updated_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS decisions_run_kind_verdict_action_idx ON decisions(run_id, kind, verdict, action)`,
-		`CREATE INDEX IF NOT EXISTS decisions_orphan_at_idx ON decisions(run_id, at DESC) WHERE run_id = ''`,
-	} {
-		if _, err := db.Exec(ddl); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// ensureDecisionSummary keeps a small aggregate of decision counts so a
-// snapshot never scans the decision table to build its metrics. A trigger
-// maintains the aggregate on every insert; the backfill makes an older state
-// database correct on the next open.
-func ensureDecisionSummary(db *sql.DB) error {
-	const table = `CREATE TABLE IF NOT EXISTS decision_summary (
-run_id TEXT NOT NULL, kind TEXT NOT NULL, verdict TEXT NOT NULL, action TEXT NOT NULL,
-n INTEGER NOT NULL, PRIMARY KEY (run_id, kind, verdict, action))`
-	if _, err := db.Exec(table); err != nil {
-		return err
-	}
-	const insertTrigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_insert
-AFTER INSERT ON decisions BEGIN
-INSERT INTO decision_summary (run_id, kind, verdict, action, n)
-VALUES (NEW.run_id, NEW.kind, NEW.verdict, NEW.action, 1)
-ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = n + 1;
-END`
-	if _, err := db.Exec(insertTrigger); err != nil {
-		return err
-	}
-	// Retention deletes old decisions. Without the matching decrement the
-	// summary would keep counting rows that no longer exist, so DecisionCounts
-	// would report totals larger than the bounded history it summarizes.
-	const deleteTrigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_delete
-AFTER DELETE ON decisions BEGIN
-UPDATE decision_summary SET n = n - 1
-WHERE run_id = OLD.run_id AND kind = OLD.kind
-  AND verdict = OLD.verdict AND action = OLD.action;
-DELETE FROM decision_summary WHERE run_id = OLD.run_id AND kind = OLD.kind
-  AND verdict = OLD.verdict AND action = OLD.action AND n <= 0;
-END`
-	if _, err := db.Exec(deleteTrigger); err != nil {
-		return err
-	}
-	// Backfill only when the aggregate is empty. A populated summary is kept
-	// current by the trigger, so a restart must not regroup a large decision
-	// table for no reason.
-	var rows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM decision_summary`).Scan(&rows); err != nil {
-		return err
-	}
-	if rows > 0 {
-		return nil
-	}
-	_, err := db.Exec(`INSERT INTO decision_summary (run_id, kind, verdict, action, n)
-SELECT run_id, kind, verdict, action, COUNT(*) FROM decisions
-GROUP BY run_id, kind, verdict, action
-ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = excluded.n`)
-	return err
-}
-
 // Close closes the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
@@ -164,9 +88,15 @@ const runColumns = `id, task_id, state, pr_number, head_sha, observed_sha, obser
  parent_session_id, workspace_path, branch, scope_json, blocked_incident_id, is_fixer,
  rebase_attempts, fix_attempts, max_attempts, reason, checks_json, created_at, updated_at`
 
-// Save inserts or updates r and records a timeline event when the state changes.
-func (s *Store) Save(ctx context.Context, r *core.Run) error {
-	now := time.Now().UTC()
+// saveRow holds the encoded JSON columns for one Save write. Timestamps are
+// defaulted on the run itself, so callers observe the values that were stored.
+type saveRow struct {
+	scope  []byte
+	checks []byte
+}
+
+// prepareSaveRow defaults r's timestamps and encodes its JSON columns.
+func prepareSaveRow(r *core.Run, now time.Time) (saveRow, error) {
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = now
 	}
@@ -175,26 +105,27 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 	}
 	scope, err := json.Marshal(r.Scope)
 	if err != nil {
-		return err
+		return saveRow{}, err
 	}
 	checks, err := json.Marshal(checksForSave(r.Checks))
 	if err != nil {
-		return err
+		return saveRow{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
+	return saveRow{scope: scope, checks: checks}, nil
+}
+
+// writeSaveRow upserts one prepared run and reports whether the row was new
+// and which state it held before the write.
+func writeSaveRow(ctx context.Context, tx *sql.Tx, r *core.Run, row saveRow) (bool, string, error) {
 	var previous string
 	newRun := false
-	err = tx.QueryRowContext(ctx, `SELECT state FROM runs WHERE id=?`, string(r.ID)).Scan(&previous)
+	err := tx.QueryRowContext(ctx, `SELECT state FROM runs WHERE id=?`, string(r.ID)).Scan(&previous)
 	switch {
 	case err == nil:
 	case err == sql.ErrNoRows:
 		newRun = true
 	default:
-		return err
+		return false, "", err
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO runs (`+runColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -210,22 +141,43 @@ ON CONFLICT(id) DO UPDATE SET
  checks_json=excluded.checks_json, updated_at=excluded.updated_at`,
 		string(r.ID), string(r.TaskID), string(r.State), r.PRNumber, r.HeadSHA,
 		r.ObservedSHA, r.ObservedBaseSHA, r.SessionID, r.ParentSessionID, r.WorkspacePath, r.Branch,
-		string(scope), r.BlockedIncidentID, boolInt(r.IsFixer), r.RebaseAttempts,
-		r.FixAttempts, r.MaxAttempts, r.Reason, string(checks), r.CreatedAt.UnixNano(), r.UpdatedAt.UnixNano())
+		string(row.scope), r.BlockedIncidentID, boolInt(r.IsFixer), r.RebaseAttempts,
+		r.FixAttempts, r.MaxAttempts, r.Reason, string(row.checks), r.CreatedAt.UnixNano(), r.UpdatedAt.UnixNano())
+	return newRun, previous, err
+}
+
+// recordSaveEvent inserts a timeline event when a run enters a new state.
+func recordSaveEvent(ctx context.Context, tx *sql.Tx, r *core.Run, newRun bool, previous string) error {
+	if !newRun && previous == string(r.State) {
+		return nil
+	}
+	kind, state, at := stateEventKind(r.State), r.State, r.UpdatedAt
+	if newRun {
+		at = r.CreatedAt
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO run_events (run_id, kind, state, at, head_sha, pr_number, reason) VALUES (?,?,?,?,?,?,?)`,
+		string(r.ID), kind, string(state), at.UnixNano(), r.HeadSHA, r.PRNumber, r.Reason)
+	return err
+}
+
+// Save prepares a row, writes it and records a state event in one transaction.
+func (s *Store) Save(ctx context.Context, r *core.Run) error {
+	row, err := prepareSaveRow(r, time.Now().UTC())
 	if err != nil {
 		return err
 	}
-	if newRun || previous != string(r.State) {
-		kind, state, at := stateEventKind(r.State), r.State, r.UpdatedAt
-		if newRun {
-			at = r.CreatedAt
-		}
-		_, err = tx.ExecContext(ctx, `
-INSERT INTO run_events (run_id, kind, state, at, head_sha, pr_number, reason) VALUES (?,?,?,?,?,?,?)`,
-			string(r.ID), kind, string(state), at.UnixNano(), r.HeadSHA, r.PRNumber, r.Reason)
-		if err != nil {
-			return err
-		}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	newRun, previous, err := writeSaveRow(ctx, tx, r, row)
+	if err != nil {
+		return err
+	}
+	if err := recordSaveEvent(ctx, tx, r, newRun, previous); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
