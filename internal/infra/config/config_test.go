@@ -450,6 +450,14 @@ func TestIntervalDefaultsWhenUnset(t *testing.T) {
 	}
 }
 
+func TestIntervalKeepsSilentDefaultForCodeBuiltConfig(t *testing.T) {
+	// Configs built in code skip Load validation and keep the silent default.
+	c := Config{PollInterval: "not-a-duration"}
+	if got := c.Interval(); got != 30*time.Second {
+		t.Fatalf("Interval() = %v, want 30s", got)
+	}
+}
+
 func TestLoadDoesNotExpandSecrets(t *testing.T) {
 	const envName = "BEACON_TEST_SECRET_EXPANSION"
 	t.Setenv(envName, "expanded-value")

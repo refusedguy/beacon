@@ -23,6 +23,10 @@ const (
 // merge.max_auto_rebases is unset. It preserves the old hardcoded value.
 const defaultMaxAutoRebases = 2
 
+// defaultPollInterval is the silent fallback for code-built configs that
+// never passed through Load.
+const defaultPollInterval = 30 * time.Second
+
 // DefaultWorkerInstructions is prepended to worker spawn prompts when the
 // operator does not configure harness.worker_instructions. It keeps heavy
 // verification off the operator's machine.
@@ -43,6 +47,11 @@ type Config struct {
 	OnBaseRed    OnBaseRed   `yaml:"on_base_red"`
 	Webhook      Webhook     `yaml:"webhook"`
 	Notify       Notify      `yaml:"notify"`
+
+	// interval is the parsed PollInterval. Load sets it once so readers of a
+	// loaded config never parse the same value again. Code-built configs leave
+	// it zero and Interval falls back to the silent default.
+	interval time.Duration
 }
 
 // Concurrency bounds the daemon's concurrent work.
@@ -143,7 +152,7 @@ func (c Config) Complete() bool {
 // daemon never runs with a silently substituted interval.
 func parseInterval(value string) (time.Duration, error) {
 	if value == "" {
-		return 30 * time.Second, nil
+		return defaultPollInterval, nil
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
@@ -152,12 +161,16 @@ func parseInterval(value string) (time.Duration, error) {
 	return d, nil
 }
 
-// Interval returns the configured poll interval. Load validates PollInterval,
-// so the fallback only applies to configs built directly in code.
+// Interval returns the configured poll interval. Load parses PollInterval once
+// and stores the result, so a loaded config does not parse it again. The
+// fallback applies only to configs built directly in code.
 func (c Config) Interval() time.Duration {
+	if c.interval != 0 {
+		return c.interval
+	}
 	d, err := parseInterval(c.PollInterval)
 	if err != nil {
-		return 30 * time.Second
+		return defaultPollInterval
 	}
 	return d
 }
@@ -179,9 +192,10 @@ func ValidateWebhook(w Webhook) error {
 
 // validate rejects a config that cannot drive the daemon. An absent SCM
 // section is left to Complete to reject on reload; a partial one fails here
-// with a clear message. A malformed poll interval surfaces the ParseDuration
-// error instead of silently falling back.
-func (c Config) validate() error {
+// with a clear message. Load parses PollInterval once and passes the result
+// here, so a malformed value surfaces the ParseDuration error instead of
+// silently falling back, and the accepted duration is kept for Interval.
+func (c *Config) validate(interval time.Duration, intervalErr error) error {
 	set := 0
 	for _, field := range []string{c.SCM.Provider, c.SCM.Owner, c.SCM.Repo} {
 		if field != "" {
@@ -191,14 +205,15 @@ func (c Config) validate() error {
 	if set > 0 && set < 3 {
 		return fmt.Errorf("scm requires provider, owner and repo together")
 	}
-	if _, err := parseInterval(c.PollInterval); err != nil {
-		return fmt.Errorf("invalid poll_interval %q: %w", c.PollInterval, err)
+	if intervalErr != nil {
+		return fmt.Errorf("invalid poll_interval %q: %w", c.PollInterval, intervalErr)
 	}
 	switch c.Merge.RequiredChecksMode {
 	case "", RequiredChecksManual, RequiredChecksWorkflow:
 	default:
 		return fmt.Errorf("invalid merge.required_checks_mode %q", c.Merge.RequiredChecksMode)
 	}
+	c.interval = interval
 	return nil
 }
 
@@ -228,7 +243,8 @@ func Load(path string) (Config, error) {
 	}
 	c.Notify.TelegramToken = LiteralOrEnv(c.Notify.TelegramToken, c.Notify.TelegramTokenEnv)
 	c.SCM.Token = LiteralOrEnv(c.SCM.Token, c.SCM.TokenEnv)
-	if err := c.validate(); err != nil {
+	interval, intervalErr := parseInterval(c.PollInterval)
+	if err := c.validate(interval, intervalErr); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
 	applyDefaults(&c)
@@ -412,6 +428,7 @@ func defaults() Config {
 		WorkspaceDir: ".beacon/worktrees",
 		BaseBranch:   "main",
 		PollInterval: "30s",
+		interval:     defaultPollInterval,
 		Concurrency:  Concurrency{MaxInFlight: 20, MaxActiveAgents: 4},
 		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
 		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
