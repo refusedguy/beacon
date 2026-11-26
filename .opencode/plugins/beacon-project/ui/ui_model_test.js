@@ -102,6 +102,28 @@ test("readTitle uses frontmatter and falls back to the task ID", () => {
   assert.equal(ui.readTitle("/p", "T-3", deps), "T-3")
 })
 
+test("readCard keeps body titles and scopes stable across repeated reads", () => {
+  const files = {
+    "/p/docs/tasks/T-1.md": "---\nid: T-1\ntitle: Frontmatter title\nstatus: ready\n---\nScope: pkg/a.go\ndepends_on: T-0\nEpic: T-EPIC\nGoal: work.\n",
+    "/p/docs/tasks/T-2.md": "---\nid: T-2\nstatus: ready\nscope:\n  - pkg/b.go\ndepends:\n  - T-1\n---\nGoal: work.\n",
+    "/p/docs/tasks/T-3.md": "---\nid: T-3\nstatus: ready\n---\nbase_branch: beacon/T-BRANCH\nGoal: work.\n",
+  }
+  const deps = { existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p] }
+  const first = ui.readCard("/p", "T-1", deps)
+  assert.equal(first.title, "Frontmatter title")
+  assert.equal(first.scope, "pkg/a.go")
+  assert.equal(first.depends, "T-0")
+  assert.equal(first.parent, "T-EPIC")
+  assert.equal(ui.readCard("/p", "T-2", deps).scope, "pkg/b.go")
+  assert.equal(ui.readCard("/p", "T-2", deps).depends, "T-1")
+  assert.equal(ui.readCard("/p", "T-3", deps).parent, "T-BRANCH")
+  for (let i = 0; i < 20; i++) {
+    assert.equal(ui.readCard("/p", "T-1", deps).scope, first.scope)
+    assert.equal(ui.readCard("/p", "T-2", deps).scope, "pkg/b.go")
+    assert.equal(ui.readTitle("/p", "T-1", deps), first.title)
+  }
+})
+
 test("parseSnapshot tolerates null, empty and malformed output", () => {
   assert.deepEqual(parseSnapshot("null"), {})
   assert.deepEqual(parseSnapshot(""), {})
