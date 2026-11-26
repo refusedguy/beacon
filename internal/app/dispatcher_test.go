@@ -1273,3 +1273,122 @@ func TestSelectDispatchCandidatesPropagatesPlannerError(t *testing.T) {
 		t.Fatalf("planner calls = %d, want 1", planner.calls)
 	}
 }
+
+// countingActiveStore records the active-run reads a dispatch makes. It keeps
+// FindActiveByTask so a regression that restores per-task lookups shows up in
+// the count.
+type countingActiveStore struct {
+	*fakeStore
+	listActive int
+	findActive int
+}
+
+func (s *countingActiveStore) ListActive(ctx context.Context) ([]*core.Run, error) {
+	s.listActive++
+	return s.fakeStore.ListActive(ctx)
+}
+
+func (s *countingActiveStore) FindActiveByTask(ctx context.Context, id core.TaskID) (*core.Run, error) {
+	s.findActive++
+	return s.fakeStore.FindActiveByTask(ctx, id)
+}
+
+func TestDispatchReadsActiveListOnce(t *testing.T) {
+	store := &countingActiveStore{fakeStore: newFakeStore()}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: twentyTasks()[:5]}, Planner: NewPlanner(nil),
+		Workspace: &fakeWorkspace{}, Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 5, MaxActiveAgents: 5},
+	}
+	res, err := d.Dispatch(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if len(res.Runs) != 5 {
+		t.Fatalf("runs = %d, want 5", len(res.Runs))
+	}
+	if store.listActive != 1 {
+		t.Fatalf("ListActive calls = %d, want 1", store.listActive)
+	}
+	if store.findActive != 0 {
+		t.Fatalf("FindActiveByTask calls = %d, want 0", store.findActive)
+	}
+}
+
+func TestDispatchGuardUsesTheOneActiveList(t *testing.T) {
+	ctx := context.Background()
+	tasks := twentyTasks()[:5]
+	store := &countingActiveStore{fakeStore: newFakeStore()}
+	active := core.NewRun("r-existing", tasks[0].ID, time.Now().UTC())
+	active.State = core.RunRunning
+	if err := store.Save(ctx, active); err != nil {
+		t.Fatalf("store.Save: %v", err)
+	}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: tasks}, Planner: NewPlanner(nil),
+		Workspace: &fakeWorkspace{}, Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 10},
+	}
+	res, err := d.Dispatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	var skip *SkippedTask
+	for i := range res.Skipped {
+		if res.Skipped[i].TaskID == tasks[0].ID {
+			skip = &res.Skipped[i]
+		}
+	}
+	if skip == nil {
+		t.Fatalf("active task not skipped: %+v", res.Skipped)
+	}
+	if skip.Code != SkipActiveRun || skip.BlockedByRun != "r-existing" {
+		t.Fatalf("skip = %+v, want %q blocked by r-existing", skip, SkipActiveRun)
+	}
+	if len(res.Runs) != 4 {
+		t.Fatalf("runs = %d, want 4", len(res.Runs))
+	}
+	if store.listActive != 1 {
+		t.Fatalf("ListActive calls = %d, want 1", store.listActive)
+	}
+	if store.findActive != 0 {
+		t.Fatalf("FindActiveByTask calls = %d, want 0", store.findActive)
+	}
+}
+
+type failFirstHarness struct {
+	*fakeHarness
+	calls int
+}
+
+func (h *failFirstHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.calls++
+	if h.calls == 1 {
+		return core.Session{}, errors.New("spawn exploded")
+	}
+	return h.fakeHarness.Spawn(ctx, req)
+}
+
+func TestDispatchReReadsActiveOnlyAfterSpawnFailure(t *testing.T) {
+	ctx := context.Background()
+	store := &countingActiveStore{fakeStore: newFakeStore()}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: twentyTasks()[:2]}, Planner: NewPlanner(nil),
+		Workspace: &fakeWorkspace{}, Harness: &failFirstHarness{fakeHarness: &fakeHarness{}},
+		Store:       store,
+		Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
+	}
+	res, err := d.Dispatch(ctx, 2)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if len(res.Failures) != 1 || len(res.Runs) != 1 {
+		t.Fatalf("failures = %d, runs = %d, want 1 and 1", len(res.Failures), len(res.Runs))
+	}
+	if store.listActive != 2 {
+		t.Fatalf("ListActive calls = %d, want 2 (first read and one after the failure)", store.listActive)
+	}
+	if store.findActive != 0 {
+		t.Fatalf("FindActiveByTask calls = %d, want 0", store.findActive)
+	}
+}
