@@ -157,6 +157,73 @@ const (
 	VerdictNoop Verdict = "noop"
 )
 
+// ActionDispatch selects the reconcile handler a verdict runs.
+type ActionDispatch string
+
+const (
+	DispatchNoop    ActionDispatch = "noop"
+	DispatchMerge   ActionDispatch = "merge"
+	DispatchRebase  ActionDispatch = "rebase"
+	DispatchFix     ActionDispatch = "fix"
+	DispatchBlock   ActionDispatch = "block"
+	DispatchPending ActionDispatch = "pending"
+)
+
+// ActionCounter names the metric a decision category increments.
+type ActionCounter string
+
+const (
+	CounterDispatchCycles ActionCounter = "dispatch_cycles"
+	CounterSkip           ActionCounter = "skip"
+	CounterDispatch       ActionCounter = "dispatch"
+	CounterRebase         ActionCounter = "rebase"
+	CounterFix            ActionCounter = "fix"
+)
+
+// DecisionAction is one row of the verdict and decision-kind category table.
+// Label is the action written to decision records, Dispatch selects the
+// reconcile handler, and Counter names the metric a decision increments.
+// Qualifier gates a counter on a transition result such as "rebased".
+type DecisionAction struct {
+	Label     string
+	Dispatch  ActionDispatch
+	Counter   ActionCounter
+	Qualifier string
+}
+
+// decisionActions is the single table for verdicts and decision kinds. Keys
+// are verdict strings and decision-kind strings. One row carries every output
+// the taxonomy drives, so a new verdict or kind needs one edit here.
+var decisionActions = map[string]DecisionAction{
+	string(VerdictMerge):         {Label: "merge", Dispatch: DispatchMerge},
+	string(VerdictNeedsRebase):   {Label: "rebase", Dispatch: DispatchRebase},
+	string(VerdictNeedsAgentFix): {Label: "wake", Dispatch: DispatchFix},
+	string(VerdictBlocked):       {Label: "block", Dispatch: DispatchBlock},
+	string(VerdictNoop):          {Label: "noop", Dispatch: DispatchNoop},
+	string(VerdictWait):          {Label: "wait", Dispatch: DispatchPending},
+
+	"dispatch.candidates": {Counter: CounterDispatchCycles},
+	"dispatch.skip":       {Counter: CounterSkip},
+	"transition.spawn":    {Counter: CounterDispatch},
+	"transition.rebase":   {Counter: CounterRebase, Qualifier: "rebased"},
+	"transition.wake":     {Counter: CounterFix, Qualifier: "woke"},
+}
+
+// ActionForVerdict returns the table row for v. A verdict outside the known
+// taxonomy takes the wait row, which keeps the reconciler's default branch.
+func ActionForVerdict(v Verdict) DecisionAction {
+	if action, ok := decisionActions[string(v)]; ok {
+		return action
+	}
+	return decisionActions[string(VerdictWait)]
+}
+
+// ActionForKind returns the table row for a decision kind. An unknown kind
+// returns the zero row, which increments no counter.
+func ActionForKind(kind string) DecisionAction {
+	return decisionActions[kind]
+}
+
 // Criterion returns VerdictNoop when it passed. Any other verdict stops the chain.
 type Criterion interface {
 	Name() string

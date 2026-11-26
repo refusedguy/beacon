@@ -709,3 +709,37 @@ func BenchmarkSnapshotDurationPass(b *testing.B) {
 	b.ReportMetric(float64(runCount), "runs/op")
 	b.ReportMetric(float64(len(events)), "events/op")
 }
+
+func TestAddCountMetricsKeepsEveryCounter(t *testing.T) {
+	counts := []DecisionCount{
+		{Kind: "dispatch.candidates", Count: 2},
+		{Kind: "dispatch.skip", Verdict: "overlap", Count: 3},
+		{Kind: "dispatch.skip", Verdict: "blocked_by", Count: 4},
+		{Kind: "transition.spawn", Count: 5},
+		{Kind: "transition.rebase", Action: "rebased", Count: 6},
+		{Kind: "transition.rebase", Action: "stale", Count: 7},
+		{Kind: "transition.wake", Action: "woke", Count: 8},
+		{Kind: "transition.wake", Action: "failed", Count: 9},
+		{Kind: "unknown.kind", Count: 10},
+	}
+	m := Metrics{Skips: map[string]int{}}
+	addCountMetrics(&m, counts)
+	if m.DispatchCycles != 2 {
+		t.Fatalf("dispatch cycles = %d, want 2", m.DispatchCycles)
+	}
+	if m.SkipCount != 7 {
+		t.Fatalf("skip count = %d, want 7", m.SkipCount)
+	}
+	if want := map[string]int{"overlap": 3, "blocked_by": 4}; !reflect.DeepEqual(m.Skips, want) {
+		t.Fatalf("skips = %+v, want %+v", m.Skips, want)
+	}
+	if m.DispatchCount != 5 {
+		t.Fatalf("dispatch count = %d, want 5", m.DispatchCount)
+	}
+	if m.RebaseCount != 6 {
+		t.Fatalf("rebase count = %d, want 6", m.RebaseCount)
+	}
+	if m.FixCount != 8 {
+		t.Fatalf("fix count = %d, want 8", m.FixCount)
+	}
+}
