@@ -1,7 +1,7 @@
 ---
 id: T-fbf30c1d
 title: Inline closed PR verdict check
-status: available
+status: done
 scope:
     - internal/app/reconciler.go
     - internal/app/reconcile_observation.go
