@@ -1,7 +1,7 @@
 ---
 id: T-b8d8c6f8
 title: Add strict TUI wire contract fixtures
-status: available
+status: done
 scope:
     - ui/tui/wire_contract_test.go
     - cmd/beacon/http.go
