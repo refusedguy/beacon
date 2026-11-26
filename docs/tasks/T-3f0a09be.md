@@ -1,7 +1,7 @@
 ---
 id: T-3f0a09be
 title: Add SSE reconnect resume and force a read
-status: in_progress
+status: done
 scope:
     - ui/tui/sse.go
     - cmd/beacon/http.go
