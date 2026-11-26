@@ -1,7 +1,7 @@
 ---
 id: T-e9a1a8f4
 title: Cover remaining task source parsing costs
-status: available
+status: done
 scope:
     - internal/infra/tasksource/github_issues.go
     - internal/infra/tasksource/parse.go

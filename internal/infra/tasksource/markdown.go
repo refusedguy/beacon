@@ -263,9 +263,15 @@ func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	return out, nil
 }
 
-// splitFrontmatter separates a card's YAML header from its body.
-func splitFrontmatter(s string) (yamlText, body string, ok bool) {
-	lines := strings.Split(strings.ReplaceAll(s, "\r", ""), "\n")
+// cardLines normalizes line endings and splits card text once. Every parser
+// below works from these lines so one card is never split twice.
+func cardLines(s string) []string {
+	return strings.Split(strings.ReplaceAll(s, "\r", ""), "\n")
+}
+
+// splitFrontmatterLines separates a card's YAML header from its body using
+// lines that were already split from the card text.
+func splitFrontmatterLines(lines []string) (yamlText, body string, ok bool) {
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
 		return "", "", false
 	}
@@ -275,6 +281,11 @@ func splitFrontmatter(s string) (yamlText, body string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+// splitFrontmatter separates a card's YAML header from its body.
+func splitFrontmatter(s string) (yamlText, body string, ok bool) {
+	return splitFrontmatterLines(cardLines(s))
 }
 
 // parseCard parses one card's content and records its path.
@@ -288,7 +299,8 @@ func parseCard(content, path string) (core.Task, bool) {
 // splitting the same text a second time.
 func parseCardFields(content, path string) (core.Task, bool, bool) {
 	dir := filepath.Dir(path)
-	fmText, body, hasFM := splitFrontmatter(content)
+	lines := cardLines(content)
+	fmText, body, hasFM := splitFrontmatterLines(lines)
 	var t core.Task
 	if hasFM {
 		var fm cardSchema
@@ -321,18 +333,18 @@ func parseCardFields(content, path string) (core.Task, bool, bool) {
 		}
 		t.Body = strings.TrimSpace(body)
 		if t.ID == "" {
-			t.ID, t.Title = headingID(content)
+			t.ID, t.Title = headingIDLines(lines)
 		}
 	} else {
-		t = parseLegacy(content, dir)
+		t = parseLegacyLines(lines, dir)
 	}
 	t.SourceRef = path
 	return t, t.ID != "", hasFM
 }
 
-// headingID extracts an identifier and title from a card heading.
-func headingID(s string) (core.TaskID, string) {
-	for _, line := range strings.Split(strings.ReplaceAll(s, "\r", ""), "\n") {
+// headingIDLines extracts an identifier and title from pre-split card lines.
+func headingIDLines(lines []string) (core.TaskID, string) {
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "# ") {
 			continue
@@ -345,12 +357,17 @@ func headingID(s string) (core.TaskID, string) {
 	return "", ""
 }
 
-// parseLegacy parses a card that has no YAML frontmatter.
-func parseLegacy(content, dir string) core.Task {
+// headingID extracts an identifier and title from a card heading.
+func headingID(s string) (core.TaskID, string) {
+	return headingIDLines(cardLines(s))
+}
+
+// parseLegacyLines parses a card without frontmatter from pre-split lines.
+func parseLegacyLines(lines []string, dir string) core.Task {
 	t := core.Task{}
-	t.ID, t.Title = headingID(content)
+	t.ID, t.Title = headingIDLines(lines)
 	var extra []string
-	for _, line := range strings.Split(strings.ReplaceAll(content, "\r", ""), "\n") {
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(line, "Статус:"):
@@ -369,6 +386,11 @@ func parseLegacy(content, dir string) core.Task {
 	}
 	t.Body = strings.Join(extra, "\n")
 	return t
+}
+
+// parseLegacy parses a card that has no YAML frontmatter.
+func parseLegacy(content, dir string) core.Task {
+	return parseLegacyLines(cardLines(content), dir)
 }
 
 // Children returns the child tasks declared in an epic card's plan. A card
