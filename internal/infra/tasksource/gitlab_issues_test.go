@@ -68,6 +68,24 @@ func glIssueServer(t *testing.T) *GitLabIssues {
 	return NewGitLabIssues(srv.URL+"/api/v4/", "tok", "o", "r")
 }
 
+func TestGitLabIssuesPrefersBodyID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		glIssueWriteJSON(t, w, []map[string]any{
+			{"iid": 9, "title": "Body id", "description": sharedIssueBody, "web_url": "https://gitlab.example/o/r/-/issues/9"},
+		})
+	}))
+	defer srv.Close()
+	s := NewGitLabIssues(srv.URL+"/api/v4/", "tok", "o", "r")
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %+v", tasks)
+	}
+	assertSharedIssueFields(t, tasks[0], "GL-7")
+}
+
 func TestGitLabIssuesLifecycle(t *testing.T) {
 	s := glIssueServer(t)
 	tasks, err := s.ListAvailable(context.Background())

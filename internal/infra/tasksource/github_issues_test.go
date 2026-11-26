@@ -9,7 +9,46 @@ import (
 	"testing"
 
 	"github.com/google/go-github/v93/github"
+
+	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// sharedIssueBody is parsed through both issue sources so the field results
+// can be compared directly.
+const sharedIssueBody = "```yaml\nid: T-42\nscope:\n  - internal/shared/\ndepends:\n  - 7\npriority: 3\n```\n"
+
+func assertSharedIssueFields(t *testing.T, task core.Task, dependency core.TaskID) {
+	t.Helper()
+	if task.ID != "T-42" || task.Priority != 3 {
+		t.Fatalf("task = %+v", task)
+	}
+	if len(task.Scope) != 1 || !task.Scope[0].CoversPath("internal/shared/x.go") {
+		t.Fatalf("scope = %v", task.Scope)
+	}
+	if len(task.DependsOn) != 1 || task.DependsOn[0] != dependency {
+		t.Fatalf("depends = %v", task.DependsOn)
+	}
+}
+
+func TestGitHubIssuesPrefersBodyID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `[{"number":11,"title":"Body id","html_url":"https://github.com/o/r/issues/11","body":%q}]`, sharedIssueBody)
+	}))
+	defer srv.Close()
+	client, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithEnterpriseURLs(srv.URL+"/", srv.URL+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := NewGitHubIssues(client, "o", "r").ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %+v", tasks)
+	}
+	assertSharedIssueFields(t, tasks[0], "GH-7")
+}
 
 func TestGitHubIssuesParsesYAMLAndScopes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
