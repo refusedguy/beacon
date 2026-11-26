@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,7 +24,7 @@ func newMCPCommand(configPath *string) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
-			parent := os.Getenv("BEACON_PARENT_SESSION")
+			parent := parentSessionFromEnv()
 			w, err := wire(*configPath, parent)
 			if err != nil {
 				return err

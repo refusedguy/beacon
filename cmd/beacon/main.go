@@ -83,7 +83,7 @@ var (
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
 // started with a cwd, but a caller can pin the root without changing that cwd.
 func projectRoot() (string, error) {
-	if fromEnv := os.Getenv("BEACON_PROJECT_ROOT"); fromEnv != "" {
+	if fromEnv := envString("BEACON_PROJECT_ROOT", ""); fromEnv != "" {
 		return filepath.Abs(fromEnv)
 	}
 	return filepath.Abs(".")
@@ -322,12 +322,12 @@ func newReconciler(
 }
 
 func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) {
-	scmToken = firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token)
-	sourceToken = os.Getenv(cfg.TaskSource.TokenEnv)
+	scmToken = firstNonEmpty(envString(cfg.SCM.TokenEnv, ""), cfg.SCM.Token)
+	sourceToken = envString(cfg.TaskSource.TokenEnv, "")
 	if sourceToken == "" {
 		sourceToken = scmToken
 	}
-	harnessToken = firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token)
+	harnessToken = firstNonEmpty(envString(cfg.Harness.TokenEnv, ""), cfg.Harness.Token)
 	return
 }
 
@@ -363,7 +363,7 @@ func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarnes
 // resolveModel uses the configured model, then BEACON_MODEL, then the model
 // of the orchestrator session so workers run with the user's current choice.
 func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
-	if v := os.Getenv("BEACON_MODEL"); v != "" {
+	if v := envString("BEACON_MODEL", ""); v != "" {
 		return core.ModelRef{ProviderID: "opencode", ID: v}
 	}
 	if cfg.Harness.Model != "" {
@@ -424,7 +424,7 @@ func firstNonEmpty(values ...string) string {
 func (w *wiring) close() { _ = w.store.Close() }
 
 func main() {
-	slog.SetDefault(shared.NewLogger(os.Getenv("BEACON_LOG_LEVEL")))
+	slog.SetDefault(shared.NewLogger(envString("BEACON_LOG_LEVEL", "")))
 	root := &cobra.Command{Use: "beacon", Short: "Parallel AI agent controller"}
 	configPath := root.PersistentFlags().String("config", "", "path to config.yaml")
 
