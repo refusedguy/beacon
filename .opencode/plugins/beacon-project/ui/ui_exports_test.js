@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs"
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { Plugin } from "@opencode/plugin"
 
 const modulePaths = [
   "./ui_model.js",
@@ -47,5 +48,25 @@ test("entry modules take Plugin from the host without an identity fallback", () 
     const src = readFileSync(new URL(file, import.meta.url), "utf8")
     assert.match(src, /import\s*\{\s*Plugin\s*\}\s*from\s*"@opencode\/plugin/)
     assert.equal(src.includes("catch(() => (definition) => definition)"), false, file)
+  }
+})
+
+test("both default exports are the host define result, not the definition", async () => {
+  // The loader maps both host specifiers to this one Plugin double, so swapping
+  // define reaches both entry modules. A null marker makes an identity fallback
+  // or a || / ?? replacement return the definition and fail these assertions.
+  const hostResult = null
+  const originalDefine = Plugin.define
+  Plugin.define = () => hostResult
+  try {
+    const fresh = "?host-define-sentinel"
+    const [index, ui] = await Promise.all([
+      import(`../index.js${fresh}`),
+      import(`./ui.js${fresh}`),
+    ])
+    assert.equal(index.default, hostResult)
+    assert.equal(ui.default, hostResult)
+  } finally {
+    Plugin.define = originalDefine
   }
 })
