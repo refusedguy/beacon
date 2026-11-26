@@ -1,3 +1,4 @@
+import { Plugin } from "@opencode/plugin"
 import { projectRoot } from "./state/location.js"
 import { createMcpRegistrar, noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
 import { installProjectContext } from "./rules/context.js"
@@ -127,15 +128,10 @@ export const beaconProjectDefinition = {
   },
 }
 
-// The caller supplies define so the plugin can be built with any double. The
-// entry module passes the OpenCode define with an identity fallback for plain
-// Node, without keeping the resolved Plugin module in a module-level value.
+// The caller supplies define so tests can build the plugin with a double. The
+// host supplies Plugin here, so its own OpenTUI and Solid instances are used.
 export function defineBeaconProject(define) { return define(beaconProjectDefinition) }
-export const beaconProject = defineBeaconProject(
-  await import("@opencode/plugin")
-    .then(({ Plugin }) => Plugin.define)
-    .catch(() => (definition) => definition),
-)
+export const beaconProject = Plugin.define(beaconProjectDefinition)
 
 export { agentIdentity } from "./state/session_identity.js"
 export {

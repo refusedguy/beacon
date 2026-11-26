@@ -107,7 +107,7 @@ test("setup without injected deps keeps the TUI imports literal", async () => {
   for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {
     assert.ok(src.includes(`import("${specifier}")`), `literal import("${specifier}") is present`)
   }
-  assert.ok(src.includes('import("@opencode/plugin/tui")'), "the TUI plugin import stays literal")
+  assert.match(src, /import\s*\{\s*Plugin\s*\}\s*from\s*"@opencode\/plugin\/tui"/, "the host Plugin import is static")
   await assert.rejects(beaconStatusDefinition.setup({}), (error) => {
     assert.equal(/unexpected import/.test(error.message), false)
     assert.match(error.message, /Cannot find package|ERR_MODULE_NOT_FOUND|Cannot find module/)

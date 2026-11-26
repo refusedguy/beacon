@@ -1,5 +1,7 @@
 // Beacon status panel and run detail for the OpenCode TUI. The view model,
 // node pools and action handlers live in sibling files so each stays small.
+import { Plugin } from "@opencode/plugin/tui"
+
 export * from "./ui_model.js"
 export * from "./ui_view.js"
 export * from "./ui_bridge.js"
@@ -354,13 +356,8 @@ async function setup(ctx, deps = {}) {
 
 export const beaconStatusDefinition = { id: "beacon-project-status", setup }
 
-// The caller supplies define so the plugin can be built with any double. The
-// entry module keeps the literal import for the OpenCode rewriter and falls
-// back to the identity define when plain Node cannot resolve the TUI package.
+// The caller supplies define so tests can build the plugin with a double. The
+// host supplies Plugin here, so its own OpenTUI and Solid instances are used.
 export function defineBeaconStatus(define) { return define(beaconStatusDefinition) }
 export function defineBeaconStatusPlugin(Plugin) { return defineBeaconStatus(Plugin.define) }
-export default defineBeaconStatus(
-  await import("@opencode/plugin/tui")
-    .then(({ Plugin }) => Plugin.define)
-    .catch(() => (definition) => definition),
-)
+export default Plugin.define(beaconStatusDefinition)
