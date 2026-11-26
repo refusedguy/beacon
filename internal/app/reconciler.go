@@ -125,20 +125,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	return r.applyDecision(ctx, run, obs, decision)
 }
 
-// applyAndSave applies e and persists the run. A non-zero obs records both the
+// applyAndSave applies e and persists the run. A non-zero obs notes both the
 // head and base SHA; the zero value leaves the recorded observation untouched.
 func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Event, obs core.Observation) error {
 	if err := run.Apply(e); err != nil {
 		return err
 	}
 	if obs.HeadSHA != "" || obs.BaseSHA != "" {
-		recordObservation(run, obs.HeadSHA, obs.BaseSHA)
+		run.NoteObservation(obs.HeadSHA, obs.BaseSHA)
 	}
 	return r.Store.Save(ctx, run)
 }
 
 func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
-	recordObservation(run, obs.HeadSHA, obs.BaseSHA)
+	run.NoteObservation(obs.HeadSHA, obs.BaseSHA)
 	_, isEpic := r.epicTask(ctx, run.TaskID)
 	if !run.IsFixer && !isEpic && run.WorkspacePath != "" {
 		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {

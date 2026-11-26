@@ -394,8 +394,21 @@ func (r *Run) Apply(e Event) error {
 	return nil
 }
 
+// NoteObservation records the PR head and base SHA last seen for the run and
+// reports whether either value changed. It is the single place that stamps an
+// observation, so head, base and timestamp always move together.
+func (r *Run) NoteObservation(headSHA, baseSHA string) bool {
+	if headSHA == r.ObservedSHA && baseSHA == r.ObservedBaseSHA {
+		return false
+	}
+	r.ObservedSHA = headSHA
+	r.ObservedBaseSHA = baseSHA
+	r.UpdatedAt = time.Now().UTC()
+	return true
+}
+
 // ObserveSHA records the PR head and, when supplied, the base SHA last seen for
-// the run. It reports whether either value changed.
+// the run. It reports whether either value changed. An empty head is ignored.
 func (r *Run) ObserveSHA(sha string, base ...string) bool {
 	if sha == "" {
 		return false
@@ -404,11 +417,5 @@ func (r *Run) ObserveSHA(sha string, base ...string) bool {
 	if len(base) > 0 {
 		baseSHA = base[0]
 	}
-	if sha == r.ObservedSHA && baseSHA == r.ObservedBaseSHA {
-		return false
-	}
-	r.ObservedSHA = sha
-	r.ObservedBaseSHA = baseSHA
-	r.UpdatedAt = time.Now().UTC()
-	return true
+	return r.NoteObservation(sha, baseSHA)
 }
