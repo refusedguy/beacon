@@ -194,7 +194,6 @@ func (cw *configWatcher) build(cfg config.Config, root string) *liveState {
 // so the result is cached per parent session and config generation.
 func (cw *configWatcher) modelResolver(parent string) core.ModelRef {
 	state := cw.live.Load()
-	parent = firstNonEmpty(parent, state.cfg.Harness.ParentSessionID)
 	cw.modelMu.Lock()
 	defer cw.modelMu.Unlock()
 	if cw.models == nil || cw.modelGeneration != state.generation {
