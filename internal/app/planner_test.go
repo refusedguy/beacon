@@ -276,6 +276,90 @@ func TestActiveConflictDoesNotMatchSyntheticIDAsDependency(t *testing.T) {
 	}
 }
 
+func TestPlannerInjectedCheckerDecidesActiveScopeConflicts(t *testing.T) {
+	// Both live runs claim paths under src, so each path-overlaps the candidate
+	// and reaches the injected checker through the index. The caller's verdict,
+	// not the path comparison, must decide which run blocks the candidate.
+	candidate := core.Task{
+		ID: "T", Status: core.TaskAvailable,
+		Scope: []core.ScopePath{core.ScopeDir("src")},
+	}
+	active := []*core.Run{
+		{ID: "r-allow", TaskID: "A-allow", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("src/allow.go")}},
+		{ID: "r-block", TaskID: "A-block", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("src/block.go")}},
+	}
+	hasScopeValue := func(scope []core.ScopePath, want string) bool {
+		for _, p := range scope {
+			if p.Value() == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tc := range []struct {
+		name             string
+		blocks           func(core.Task) bool
+		wantBlockedBy    core.TaskID
+		wantBlockedByRun core.RunID
+	}{
+		{
+			name:             "checker blocks the later run",
+			blocks:           func(run core.Task) bool { return hasScopeValue(run.Scope, "src/block.go") },
+			wantBlockedBy:    "A-block",
+			wantBlockedByRun: "r-block",
+		},
+		{
+			name:   "checker allows both overlapping runs",
+			blocks: func(core.Task) bool { return false },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var probes int
+			checker := func(a, b core.Task) bool {
+				if a.ID == probeCandidateID && b.ID == probeRunID {
+					probes++
+					return tc.blocks(b)
+				}
+				t.Fatalf("unexpected overlap check with a=%+v b=%+v", a, b)
+				return false
+			}
+			chosen, skipped, err := NewPlanner(checker).Select([]core.Task{candidate}, active, 1, false)
+			if err != nil {
+				t.Fatalf(`Select(candidate, active, 1, false): %v`, err)
+			}
+			if probes != len(active) {
+				t.Errorf("active overlap checks = %d, want %d", probes, len(active))
+			}
+			if tc.wantBlockedByRun == "" {
+				if ids := taskIDs(chosen); len(ids) != 1 || ids[0] != "T" {
+					t.Fatalf("chosen = %v, want [T]", ids)
+				}
+				if len(skipped) != 0 {
+					t.Fatalf("skipped = %+v, want none", skipped)
+				}
+				return
+			}
+			if len(chosen) != 0 {
+				t.Fatalf("chosen = %+v, want none", chosen)
+			}
+			if len(skipped) != 1 {
+				t.Fatalf("skipped = %+v, want one active conflict", skipped)
+			}
+			got := skipped[0]
+			if got.TaskID != "T" || got.Code != SkipActiveScopeOverlap {
+				t.Errorf("skip = %+v, want active scope overlap for T", got)
+			}
+			if got.BlockedBy != tc.wantBlockedBy {
+				t.Errorf("blocked_by = %q, want %q", got.BlockedBy, tc.wantBlockedBy)
+			}
+			if got.BlockedByRun != tc.wantBlockedByRun {
+				t.Errorf("blocked_by_run = %q, want %q", got.BlockedByRun, tc.wantBlockedByRun)
+			}
+		})
+	}
+}
+
 func taskIDs(tasks []core.Task) []core.TaskID {
 	ids := make([]core.TaskID, 0, len(tasks))
 	for _, task := range tasks {
