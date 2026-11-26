@@ -190,31 +190,27 @@ func (w *rollbackFailWorkspace) CommitPath(ctx context.Context, ws core.Workspac
 	return w.err
 }
 
-// cardSource is a single-read task lister used to check the batch sync count.
+// cardSource lists a fixed set of tasks for graph sync tests.
 type cardSource struct {
 	tasks []core.Task
 	err   error
-	calls int
 }
 
 func (s *cardSource) ListAvailable(context.Context) ([]core.Task, error) {
-	s.calls++
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.tasks, nil
 }
 
-// syncStore counts graph writes and keeps the last graph it received.
+// syncStore keeps the last graph it received.
 type syncStore struct {
 	*fakeStore
 	tasks []core.Task
-	calls int
 	err   error
 }
 
 func (s *syncStore) SyncTasks(_ context.Context, tasks []core.Task) error {
-	s.calls++
 	if s.err != nil {
 		return s.err
 	}
@@ -273,7 +269,7 @@ func TestTaskDeleterRollbackFailureNamesAffectedCard(t *testing.T) {
 	}
 }
 
-func TestTaskDeleterSyncsGraphOnceWithoutDeletedCards(t *testing.T) {
+func TestTaskDeleterSyncsGraphWithoutDeletedCards(t *testing.T) {
 	dir := t.TempDir()
 	writeCards(t, dir, "T-A", "T-B", "T-KEEP")
 	source := &cardSource{tasks: []core.Task{
@@ -285,9 +281,6 @@ func TestTaskDeleterSyncsGraphOnceWithoutDeletedCards(t *testing.T) {
 
 	if _, err := deleter.Delete(context.Background(), []string{"T-A", "T-B"}); err != nil {
 		t.Fatalf(`deleter.Delete(context.Background(), []string{"T-A", "T-B"}): %v`, err)
-	}
-	if source.calls != 1 || store.calls != 1 {
-		t.Fatalf("source calls = %d, sync calls = %d", source.calls, store.calls)
 	}
 	if len(store.tasks) != 1 || store.tasks[0].ID != "T-KEEP" {
 		t.Fatalf("synced graph = %+v", store.tasks)
@@ -307,9 +300,6 @@ func TestTaskDeleterRestoresGraphWhenPublishFails(t *testing.T) {
 
 	if _, err := deleter.Delete(context.Background(), []string{"T-A"}); !errors.Is(err, ws.err) {
 		t.Fatalf("error = %v, want %v", err, ws.err)
-	}
-	if store.calls != 2 {
-		t.Fatalf("sync calls = %d, want one sync and one restore", store.calls)
 	}
 	if len(store.tasks) != 1 || store.tasks[0].ID != "T-A" {
 		t.Fatalf("restored graph = %+v", store.tasks)

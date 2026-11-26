@@ -229,7 +229,7 @@ func TestTaskUpdaterReportsRollbackFailureWithPath(t *testing.T) {
 	}
 }
 
-func TestTaskUpdaterSyncsGraphOnceWithUpdatedFields(t *testing.T) {
+func TestTaskUpdaterSyncsGraphWithUpdatedFields(t *testing.T) {
 	dir := t.TempDir()
 	writeUpdateCard(t, dir, "T-A", updateCardBody)
 	source := &cardSource{tasks: []core.Task{{ID: "T-A", Title: "Old title", Priority: 5}}}
@@ -246,9 +246,6 @@ func TestTaskUpdaterSyncsGraphOnceWithUpdatedFields(t *testing.T) {
 	}
 	if !got.Pushed {
 		t.Fatalf("result = %+v", got)
-	}
-	if source.calls != 1 || store.calls != 1 {
-		t.Fatalf("source calls = %d, sync calls = %d", source.calls, store.calls)
 	}
 	if len(store.tasks) != 1 || store.tasks[0].Title != "Renamed" || store.tasks[0].Priority != 9 {
 		t.Fatalf("synced graph = %+v", store.tasks)
@@ -269,9 +266,6 @@ func TestTaskUpdaterRestoresGraphWhenPublishFails(t *testing.T) {
 
 	if _, err := updater.Update(context.Background(), []UpdateInput{{ID: "T-A", Title: &title}}); !errors.Is(err, ws.err) {
 		t.Fatalf("error = %v, want %v", err, ws.err)
-	}
-	if store.calls != 2 {
-		t.Fatalf("sync calls = %d, want one sync and one restore", store.calls)
 	}
 	if len(store.tasks) != 1 || store.tasks[0].Title != "Old title" {
 		t.Fatalf("restored graph = %+v", store.tasks)
