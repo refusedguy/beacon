@@ -134,11 +134,11 @@ func (g *GitLabIssues) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	}
 	var out []core.Task
 	for _, issue := range issues {
-		if glHasLabel(issue.Labels, "beacon/claimed") {
+		rec := glIssueRecord(issue)
+		if !issueAvailable(rec) {
 			continue
 		}
-		task := glParseIssue(issue)
-		out = append(out, task)
+		out = append(out, parseIssueRecord(rec, "GL"))
 	}
 	core.SortTasks(out)
 	return out, nil
@@ -187,9 +187,7 @@ func (g *GitLabIssues) Create(ctx context.Context, task core.Task) (core.Task, e
 	if err := json.Unmarshal(data, &issue); err != nil {
 		return core.Task{}, err
 	}
-	created := glParseIssue(issue)
-	created.Status = core.TaskAvailable
-	return created, nil
+	return parseIssueRecord(glIssueRecord(issue), "GL"), nil
 }
 
 func glIssueNumber(id core.TaskID) (int, error) {
@@ -201,25 +199,13 @@ func glIssueNumber(id core.TaskID) (int, error) {
 	return n, nil
 }
 
-func glHasLabel(labels glLabels, want string) bool {
-	for _, label := range labels {
-		if strings.EqualFold(label, want) {
-			return true
-		}
-	}
-	return false
-}
-
-func glParseIssue(issue glIssue) core.Task {
-	fields := ParseTaskFields(issue.Description, "", "GL")
-	return core.Task{
-		ID:        core.TaskID(firstNonEmpty("GL-"+strconv.Itoa(issue.IID), fields.ID)),
+// glIssueRecord adapts a GitLab issue to the shared parser input.
+func glIssueRecord(issue glIssue) issueRecord {
+	return issueRecord{
+		Number:    issue.IID,
 		Title:     issue.Title,
 		Body:      issue.Description,
-		Status:    core.TaskAvailable,
-		Priority:  fields.Priority,
-		Scope:     fields.Scopes(""),
-		DependsOn: fields.Dependencies(),
+		Labels:    []string(issue.Labels),
 		SourceRef: issue.WebURL,
 	}
 }

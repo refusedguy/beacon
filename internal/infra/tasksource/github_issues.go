@@ -54,38 +54,30 @@ func (g *GitHubIssues) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	}
 	var out []core.Task
 	for _, issue := range issues {
-		if issue.GetPullRequestLinks() != nil || hasLabel(issue.Labels, "beacon/claimed") {
+		rec := githubIssueRecord(issue)
+		if !issueAvailable(rec) {
 			continue
 		}
-		t := parseIssue(issue)
-		t.Status = core.TaskAvailable
-		out = append(out, t)
+		out = append(out, parseIssueRecord(rec, "GH"))
 	}
 	core.SortTasks(out)
 	return out, nil
 }
 
-func parseIssue(issue *github.Issue) core.Task {
-	fields := ParseTaskFields(issue.GetBody(), "", "GH")
-	return core.Task{
-		ID:        core.TaskID(firstNonEmpty(fields.ID, "GH-"+strconv.Itoa(issue.GetNumber()))),
-		Title:     issue.GetTitle(),
-		Body:      issue.GetBody(),
-		Status:    core.TaskAvailable,
-		Priority:  fields.Priority,
-		Scope:     fields.Scopes(""),
-		DependsOn: fields.Dependencies(),
-		SourceRef: issue.GetHTMLURL(),
+// githubIssueRecord adapts a GitHub issue to the shared parser input.
+func githubIssueRecord(issue *github.Issue) issueRecord {
+	labels := make([]string, 0, len(issue.Labels))
+	for _, label := range issue.Labels {
+		labels = append(labels, label.GetName())
 	}
-}
-
-func hasLabel(labels []*github.Label, want string) bool {
-	for _, l := range labels {
-		if strings.EqualFold(l.GetName(), want) {
-			return true
-		}
+	return issueRecord{
+		Number:      issue.GetNumber(),
+		Title:       issue.GetTitle(),
+		Body:        issue.GetBody(),
+		Labels:      labels,
+		SourceRef:   issue.GetHTMLURL(),
+		PullRequest: issue.GetPullRequestLinks() != nil,
 	}
-	return false
 }
 
 func (g *GitHubIssues) Claim(ctx context.Context, id core.TaskID) error {
@@ -125,9 +117,7 @@ func (g *GitHubIssues) Create(ctx context.Context, task core.Task) (core.Task, e
 	if err != nil {
 		return core.Task{}, err
 	}
-	created := parseIssue(issue)
-	created.Status = core.TaskAvailable
-	return created, nil
+	return parseIssueRecord(githubIssueRecord(issue), "GH"), nil
 }
 
 func issueNumber(id core.TaskID) (int, error) {
