@@ -170,6 +170,36 @@ func TestDecisionLogTransitionFields(t *testing.T) {
 	}
 }
 
+func TestDecisionLogTransitionDecisionFields(t *testing.T) {
+	sink := &memoryDecisionSink{}
+	logger := DecisionLogger{Sink: sink}
+	ctx := WithCycleID(context.Background(), "run-9")
+
+	logger.logTransitionWatchPR(ctx, "run-9", 77)
+	logger.logTransitionWake(ctx, "run-9", 77, "woke")
+	logger.logTransitionMerge(ctx, "run-9", 77, "attempt")
+	logger.logTransitionParentNotify(ctx, "run-9", 77, "notified")
+
+	want := []Decision{
+		{CycleID: "run-9", Kind: "transition.watch_pr", RunID: "run-9", PRNumber: 77},
+		{CycleID: "run-9", Kind: "transition.wake", RunID: "run-9", PRNumber: 77, Action: "woke"},
+		{CycleID: "run-9", Kind: "transition.merge", RunID: "run-9", PRNumber: 77, Action: "attempt"},
+		{CycleID: "run-9", Kind: "transition.parent_notify", RunID: "run-9", PRNumber: 77, Action: "notified"},
+	}
+	if len(sink.decisions) != len(want) {
+		t.Fatalf("recorded %d decisions, want %d", len(sink.decisions), len(want))
+	}
+	for i, d := range sink.decisions {
+		w := want[i]
+		if d.CycleID != w.CycleID || d.Kind != w.Kind || d.RunID != w.RunID || d.PRNumber != w.PRNumber || d.Action != w.Action {
+			t.Errorf("decision %d = %+v, want %+v", i, d, w)
+		}
+		if len(d.Fields) != 0 {
+			t.Errorf("decision %d fields = %+v, want none", i, d.Fields)
+		}
+	}
+}
+
 func TestCycleIDContext(t *testing.T) {
 	if got := cycleID(context.Background()); got != "" {
 		t.Fatalf("empty context cycle id = %q", got)
