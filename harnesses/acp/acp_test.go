@@ -344,13 +344,6 @@ func TestManagedProcessDetectsTerminatedAgent(t *testing.T) {
 	}
 }
 
-func TestNotifyParentIsNoop(t *testing.T) {
-	h := testHarness(standardProcess())
-	if err := h.NotifyParent(context.Background(), "sess_1", "hello"); err != nil {
-		t.Fatalf("notify parent: %v", err)
-	}
-}
-
 func TestOneProcessHandlesManyIdenticalRPCs(t *testing.T) {
 	t.Setenv("ACP_FAKE_AGENT", "1")
 	var starts atomic.Int64

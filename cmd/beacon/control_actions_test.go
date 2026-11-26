@@ -58,6 +58,9 @@ func TestValidateControlUsesOneVocabulary(t *testing.T) {
 			t.Errorf("action %q was accepted", verb)
 		}
 	}
+	if err := validateControl("approve", ""); err == nil {
+		t.Error("empty run ID was accepted")
+	}
 }
 
 func TestApplyControlWithPRRoutesWatch(t *testing.T) {

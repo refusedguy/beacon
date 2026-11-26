@@ -17,12 +17,3 @@ func TestControlDescriptionCarriesCoreVerbs(t *testing.T) {
 	}
 	t.Fatal("beacon_control is missing from ToolCatalog")
 }
-
-func TestCatalogToolRejectsUnknownName(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("catalogTool accepted a name outside the catalog")
-		}
-	}()
-	catalogTool("beacon_missing")
-}

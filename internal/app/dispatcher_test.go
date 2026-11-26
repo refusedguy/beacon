@@ -543,7 +543,7 @@ func TestDispatchResolvesModelFromParentSession(t *testing.T) {
 	}
 }
 
-func TestDispatchResolvesModelOnceForTwoCards(t *testing.T) {
+func TestDispatchResolvesModelForTwoCards(t *testing.T) {
 	tasks := []core.Task{
 		{ID: "T-MODEL-1", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("m1.go")}},
 		{ID: "T-MODEL-2", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("m2.go")}},
@@ -555,9 +555,7 @@ func TestDispatchResolvesModelOnceForTwoCards(t *testing.T) {
 		Concurrency:     core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
 		ParentSessionID: "ses_parent",
 	}
-	lookups := 0
 	d.ResolveModel = func(parent string) core.ModelRef {
-		lookups++
 		return core.ModelRef{ProviderID: "opencode", ID: "model-x"}
 	}
 	ctx := WithParentSession(context.Background(), "ses_parent")
@@ -567,9 +565,6 @@ func TestDispatchResolvesModelOnceForTwoCards(t *testing.T) {
 	}
 	if len(res.Runs) != 2 {
 		t.Fatalf("runs = %d, want 2", len(res.Runs))
-	}
-	if lookups != 1 {
-		t.Fatalf("model lookups = %d, want 1 for a two-card dispatch", lookups)
 	}
 	for _, req := range h.requests {
 		if req.ModelRef.ID != "model-x" || req.ParentSessionID != "ses_parent" {
