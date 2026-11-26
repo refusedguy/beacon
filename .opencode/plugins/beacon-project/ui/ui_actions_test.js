@@ -3,7 +3,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 import {
-  beaconStatusDefinition, createActionRunner, createSidebarMount, dispatchItem,
+  beaconStatusDefinition, bodyHash, createActionRunner, createSidebarMount, dispatchItem,
   dispatchRequestId, normalizeRun, setDispatching, sidebarModel,
 } from "./ui.js"
 
@@ -165,6 +165,12 @@ test("Dispatch starts one task, toasts the result and refreshes", async () => {
   assert.deepEqual(h.dispatches, [{ n: 1 }])
   assert.equal(h.toasts[0].message, "Dispatched 1 task")
   assert.equal(h.refreshes, 1)
+})
+
+test("the TUI dispatch id uses the same FNV hash as the RPC request id", () => {
+  for (const input of [{ n: 1 }, { n: 2, note: "keep me" }, { n: 0 }, null]) {
+    assert.equal(dispatchRequestId(input), `dispatch:${bodyHash(input)}`)
+  }
 })
 
 test("one dispatch gesture makes one call even when both mouse handlers fire", async () => {

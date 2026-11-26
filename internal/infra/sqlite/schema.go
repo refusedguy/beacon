@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS run_events (
   reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS run_events_run_at_idx ON run_events(run_id, at);
+CREATE INDEX IF NOT EXISTS run_events_at_idx ON run_events(at);
 
 CREATE TABLE IF NOT EXISTS decisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +115,7 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS decisions_run_at_idx ON decisions(run_id, at);
 CREATE INDEX IF NOT EXISTS decisions_kind_at_idx ON decisions(kind, at);
+CREATE INDEX IF NOT EXISTS decisions_at_idx ON decisions(at);
 `
 
 // dsn builds a SQLite file URI. The path is escaped as a URL path so a name

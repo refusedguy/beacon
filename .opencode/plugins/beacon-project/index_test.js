@@ -464,6 +464,20 @@ test("dispatch handlers normalize n and log the body hash", async () => {
   assert.ok(logs.some((line) => /dispatch ok/.test(line)))
 })
 
+test("the RPC dispatch handler normalizes n without dropping caller fields", async () => {
+  const calls = []
+  const handlers = createStatusRpcHandlers({
+    snapshot: async () => ({ active: [], recent: [] }),
+    control: async () => ({}),
+    dispatch: async (input) => { calls.push(input); return { started: 1 } },
+  }, { log: () => {} })
+
+  await handlers.dispatch({ n: 2.9, note: "keep me" })
+  await handlers.dispatch({ n: -1 })
+
+  assert.deepEqual(calls, [{ n: 2, note: "keep me" }, { n: 1 }])
+})
+
 test("a failed RPC method logs the rejection body and rethrows", async () => {
   const logs = []
   const rejection = { type: "rpc.unavailable", status: 400, message: "RPC is unavailable", data: { hint: "retry" } }

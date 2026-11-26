@@ -489,6 +489,21 @@ func waitWatchCall(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
+// waitForwarderChange waits for the pump to replace the active forwarder after
+// a reload and returns the new one.
+func waitForwarderChange(t *testing.T, proxy *reloadableHarness, previous *eventForwarder) *eventForwarder {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := proxy.activeForwarder(); got != nil && got != previous {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("active event forwarder did not change after reload")
+	return nil
+}
+
 func TestHarnessEventsUseStableChannelAfterReload(t *testing.T) {
 	oldEvents := make(chan core.HarnessEvent, 4)
 	newEvents := make(chan core.HarnessEvent, 4)
@@ -503,15 +518,63 @@ func TestHarnessEventsUseStableChannelAfterReload(t *testing.T) {
 	waitHarnessEvent(t, stable, "after")
 }
 
-func TestHarnessEventsFromPreviousHarnessSurviveReload(t *testing.T) {
+// TestHarnessEventsFromRetiredHarnessAreDropped confirms a reload stops the
+// retired harness's forwarder. Events are notifications only, so dropping ones
+// published by a retired harness does not lose state: consumers re-read state.
+func TestHarnessEventsFromRetiredHarnessAreDropped(t *testing.T) {
 	oldEvents := make(chan core.HarnessEvent, 4)
 	newEvents := make(chan core.HarnessEvent, 4)
 	cw, proxy := newRelayWatcher(t, &relayHarness{events: oldEvents})
 	stable := proxy.Events()
+	retired := proxy.activeForwarder()
+	if retired == nil {
+		t.Fatal("no initial forwarder")
+	}
 
 	swapRelayState(cw, &relayHarness{events: newEvents})
-	oldEvents <- core.HarnessEvent{RunID: "in-flight", Kind: "idle"}
-	waitHarnessEvent(t, stable, "in-flight")
+	waitForwarderChange(t, proxy, retired)
+
+	oldEvents <- core.HarnessEvent{RunID: "retired", Kind: "idle"}
+	select {
+	case ev := <-stable:
+		t.Fatalf("event from retired harness reached the relay: %q", ev.RunID)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	newEvents <- core.HarnessEvent{RunID: "current", Kind: "idle"}
+	waitHarnessEvent(t, stable, "current")
+}
+
+// TestReloadRetiresOldForwarders drives repeated reloads and confirms each
+// retired forwarder exits and exactly one stays active. The forwarder count
+// stays constant instead of growing with the number of reloads.
+func TestReloadRetiresOldForwarders(t *testing.T) {
+	events := make(chan core.HarnessEvent, 4)
+	cw, proxy := newRelayWatcher(t, &relayHarness{events: events})
+	proxy.Events()
+	active := proxy.activeForwarder()
+	if active == nil {
+		t.Fatal("no initial forwarder")
+	}
+
+	const reloads = 30
+	retired := make([]*eventForwarder, 0, reloads)
+	for i := 0; i < reloads; i++ {
+		next := make(chan core.HarnessEvent, 1)
+		swapRelayState(cw, &relayHarness{events: next})
+		retired = append(retired, active)
+		active = waitForwarderChange(t, proxy, active)
+	}
+	if got := proxy.activeForwarder(); got != active {
+		t.Fatal("more than one forwarder is active")
+	}
+	for i, f := range retired {
+		select {
+		case <-f.done:
+		default:
+			t.Fatalf("forwarder from reload %d is still running", i)
+		}
+	}
 }
 
 func TestWatchIdleFollowsReloadedHarness(t *testing.T) {
@@ -536,5 +599,61 @@ func TestWatchIdleFollowsReloadedHarness(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("WatchIdle did not stop after context cancel")
+	}
+}
+
+// TestModelResolverCapsCache confirms many distinct parents cannot grow the
+// per-generation cache past its bound. The oldest parents are evicted first.
+func TestModelResolverCapsCache(t *testing.T) {
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
+	cw, _ := newTestWatcher(t, path)
+	total := maxModelCacheEntries + 20
+	for i := 0; i < total; i++ {
+		cw.modelResolver(fmt.Sprintf("ses_%d", i))
+	}
+
+	cw.modelMu.Lock()
+	defer cw.modelMu.Unlock()
+	if len(cw.models) != maxModelCacheEntries {
+		t.Fatalf("model cache size = %d, want %d", len(cw.models), maxModelCacheEntries)
+	}
+	if len(cw.modelOrder) != maxModelCacheEntries {
+		t.Fatalf("model cache order size = %d, want %d", len(cw.modelOrder), maxModelCacheEntries)
+	}
+	if _, ok := cw.models["ses_0"]; ok {
+		t.Fatal("oldest parent was not evicted")
+	}
+	if _, ok := cw.models[fmt.Sprintf("ses_%d", total-1)]; !ok {
+		t.Fatal("newest parent is missing from the cache")
+	}
+}
+
+// TestModelResolverCacheResetsOnGeneration confirms a model reload drops old
+// resolutions so dispatch sees the newly configured model.
+func TestModelResolverCacheResetsOnGeneration(t *testing.T) {
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
+	cw, _ := newTestWatcher(t, path)
+	ref := cw.modelResolver("ses_1")
+	if ref.ID != "model-a" {
+		t.Fatalf("initial model = %q, want model-a", ref.ID)
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWatchFile(t, path, strings.Replace(string(body), "model: model-a", "model: model-b", 1))
+	if !cw.reload() {
+		t.Fatal("reload did not apply the changed config")
+	}
+
+	if got := cw.modelResolver("ses_1"); got.ID != "model-b" {
+		t.Fatalf("model after reload = %q, want model-b", got.ID)
+	}
+	cw.modelMu.Lock()
+	cached := len(cw.models)
+	cw.modelMu.Unlock()
+	if cached != 1 {
+		t.Fatalf("cache after generation change = %d, want 1", cached)
 	}
 }

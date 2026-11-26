@@ -484,3 +484,56 @@ wire-encode 7114/0, redaction 296/0, mcp-journal 64/0, sse-fanout 192/64,
 reconcile-tick 20/0 and dispatch-prompt 4/0. The 64 on sse-fanout is the
 designed slow-view drop, not a failed call. Fixture sizes, the nightly gate and
 the 30 s step timeout are unchanged.
+
+## Audit table retention (T-a5ae7a69)
+
+`decisions` and `run_events` had no prune while deliveries and approvals were capped at 30 days. This change adds both tables to the `PruneStale` tick and indexes their `at` column so the filter searches the oldest rows. The window stays at 30 days because the status snapshot reads recent history from both tables. No result cap or wire field changes.
+
+```sql
+CREATE INDEX IF NOT EXISTS run_events_at_idx ON run_events(at);
+CREATE INDEX IF NOT EXISTS decisions_at_idx ON decisions(at);
+CREATE TRIGGER IF NOT EXISTS decision_summary_delete
+AFTER DELETE ON decisions BEGIN
+  UPDATE decision_summary SET n = n - 1
+  WHERE run_id = OLD.run_id AND kind = OLD.kind
+    AND verdict = OLD.verdict AND action = OLD.action;
+  DELETE FROM decision_summary WHERE run_id = OLD.run_id AND kind = OLD.kind
+    AND verdict = OLD.verdict AND action = OLD.action AND n <= 0;
+END
+```
+
+The trigger keeps `decision_summary` equal to the rows still stored. Without it, `DecisionCounts` would keep counting decisions that retention removed. `PruneStale` gains two bounded deletes:
+
+```sql
+DELETE FROM decisions WHERE id IN (SELECT id FROM decisions WHERE at < ? LIMIT ?);
+DELETE FROM run_events WHERE id IN (SELECT id FROM run_events WHERE at < ? LIMIT ?);
+```
+
+Each table loses at most `retentionBatchSize` rows per tick, as the delivery and approval deletes already do.
+
+### Protocol
+
+One process opened two SQLite databases through `Open`. The old side dropped the two `at` indexes after open, which reproduces the pre-change write path. Both sides kept the summary insert and delete triggers, so the measured difference is the two indexes. The machine had eight logical CPUs and a load average near 1.8.
+
+For the write harness, each pass inserted 5,000 decisions and 5,000 run events in one transaction. The timed region covered the inserts and the commit. The two sides ran in alternating order, old then new, for five passes each. The harness counted inserted rows and errors.
+
+For the prune harness, each database held 20,000 decisions and 20,000 run events with `at` 31 days old. Each prune removed up to 1,000 rows per table, and the harness replenished 1,000 rows of each kind outside the timed region. The two sides alternated for five passes each. The harness counted removed rows and errors.
+
+### Results
+
+Values are medians and ranges over five passes per side. Every pass returned the counted rows with zero errors.
+
+| Experiment | Old median | New median | Old range | New range | Work | Errors |
+| --- | --- | --- | --- | --- | --- | --- |
+| Write cost, 5,000 decisions + 5,000 events | 346.9 ms | 403.3 ms | 309.1 to 381.0 ms | 353.2 to 421.8 ms | 10,000 rows per pass | 0 |
+| Full `PruneStale` | 11.63 ms | 13.34 ms | 10.57 to 13.16 ms | 12.82 to 18.53 ms | 2,000 rows per pass | 0 |
+
+### Write cost
+
+The two indexes cost writes. The new side was slower in four of the five alternating insert pairs. The medians are 346.9 ms and 403.3 ms, about 16% apart. The ranges overlap between 353.2 ms and 381.0 ms, so the size of the gap is approximate and the direction is the reliable result. Each insert maintains one extra B-tree entry in each table, and that work is the limiter.
+
+The prune call was slower on the new side in all five pairs, with medians 11.63 ms and 13.34 ms, about 15% apart. `EXPLAIN QUERY PLAN` shows the new side searching `decisions_at_idx` and `run_events_at_idx` for the filter. The old side scans both tables. Deleting 2,000 rows and their index entries dominates the filter saving, the same result the delivery and approval prune showed in the earlier section.
+
+### Correctness
+
+A temporary test seeded five old and three recent decisions and run events. One prune removed the ten old rows and left the three recent ones. `ListDecisions`, `LastDecision` and `DecisionCounts` all returned the recent decisions, and `decision_summary` fell from 8 to 3 to match the remaining rows. A second prune removed nothing. The prune bounds row counts and lets SQLite reuse freed pages. It does not compact the file. `PRAGMA page_count` stayed at 164 while `PRAGMA freelist_count` rose from 0 to 57. No verdict, cap or wire field changed.
