@@ -53,6 +53,44 @@ func TestRunRejectsInvalidAndExhausted(t *testing.T) {
 	}
 }
 
+func TestRunStateCanTakeQueriesStayEventSpecific(t *testing.T) {
+	states := []RunState{
+		RunPending, RunRunning, RunWaitingCI, RunNeedsRebase,
+		RunNeedsAgentFix, RunBlocked, RunMerged, RunClosed,
+	}
+	queries := []struct {
+		name     string
+		event    EventKind
+		can      func(RunState) bool
+		eligible map[RunState]bool
+	}{
+		{"behind", EvBehind, RunState.CanTakeBehind, map[RunState]bool{RunRunning: true, RunWaitingCI: true}},
+		{"check failed", EvChecksFailed, RunState.CanTakeCheckFailed, map[RunState]bool{RunRunning: true, RunWaitingCI: true}},
+		{"check pending", EvChecksPending, RunState.CanTakeCheckPending, map[RunState]bool{RunRunning: true, RunWaitingCI: true}},
+	}
+	for _, q := range queries {
+		t.Run(q.name, func(t *testing.T) {
+			for _, state := range states {
+				want := q.eligible[state]
+				if got := q.can(state); got != want {
+					t.Errorf("%s query = %v, want %v", state, got, want)
+				}
+				r := &Run{ID: "r1", State: state, MaxAttempts: 3}
+				err := r.Apply(Event{Kind: q.event})
+				if want {
+					if err != nil {
+						t.Errorf("Apply(%s) from %s: %v", q.event, state, err)
+					}
+					continue
+				}
+				if CodeOf(err) != CodeInvalidTransition {
+					t.Errorf("Apply(%s) from %s error = %v, want invalid transition", q.event, state, err)
+				}
+			}
+		})
+	}
+}
+
 func TestRebaseBudgetExhaustedHonorsCap(t *testing.T) {
 	r := &Run{ID: "r1", MaxAttempts: 3, RebaseAttempts: 2}
 	if !r.RebaseBudgetExhausted(2) {
