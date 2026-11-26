@@ -3,7 +3,6 @@ module github.com/refusedguy/beacon
 go 1.26.0
 
 require (
-	github.com/bmatcuk/doublestar/v4 v4.10.4
 	github.com/google/go-github/v93 v93.0.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/refusedguy/beacon/harnesses/opencode v0.0.0
