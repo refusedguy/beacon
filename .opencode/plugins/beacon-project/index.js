@@ -9,9 +9,10 @@ import {
 } from "./state/options.js"
 import {
   BeaconStatusRpc, RUN_CHANGED_EVENT,
-  bodyHash, createCliStatusSource, elapsedMs, normalizeSnapshot,
-  requestId, timingFromContext,
+  createCliStatusSource, elapsedMs, normalizeSnapshot,
+  timingFromContext,
 } from "./ui/status_rpc.js"
+import { bodyHash, requestId } from "./protocol/body_hash.js"
 export { bodyHash, requestId }
 import { createRunChangeWatcher } from "./run_watcher.js"
 import { isWorkerAgent, registerShellGuard } from "./shell_guard.js"
