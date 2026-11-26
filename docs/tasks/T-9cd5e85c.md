@@ -1,7 +1,7 @@
 ---
 id: T-9cd5e85c
 title: Share SSE frame parser across modules
-status: available
+status: done
 scope:
     - harnesses/opencode/sse.go
     - ui/tui/sse.go
