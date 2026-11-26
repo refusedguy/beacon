@@ -1,7 +1,7 @@
 ---
 id: T-bbc24ab4
 title: Benchmark full snapshot assembly
-status: available
+status: done
 scope:
     - internal/bench/hotspots.go
     - internal/bench/report.go
