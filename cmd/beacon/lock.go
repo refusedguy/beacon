@@ -14,12 +14,80 @@ import (
 	"time"
 )
 
+// errInvalidState marks a state file that exists but does not decode, so a
+// caller can tell a malformed record from a read failure.
+var errInvalidState = errors.New("invalid state file")
+
+// stateAccessor is a typed JSON state file bound to a directory and file name.
+type stateAccessor[T any] struct {
+	dir  string
+	name string
+}
+
+// stateFile binds a typed state record to dir and name, leaving both visible at
+// the call site.
+func stateFile[T any](dir, name string) stateAccessor[T] {
+	return stateAccessor[T]{dir: dir, name: name}
+}
+
+func (s stateAccessor[T]) path() string {
+	return filepath.Join(s.dir, s.name)
+}
+
+// load reads and decodes the state file.
+func (s stateAccessor[T]) load() (*T, error) {
+	data, err := os.ReadFile(s.path())
+	if err != nil {
+		return nil, err
+	}
+	var v T
+	if err := json.Unmarshal(data, &v); err != nil {
+		return nil, errors.Join(errInvalidState, err)
+	}
+	return &v, nil
+}
+
+// save encodes v to a temp file and renames it into place with mode 0600.
+func (s stateAccessor[T]) save(v T) error {
+	path := s.path()
+	f, err := os.CreateTemp(filepath.Dir(path), ".beacon-state-*")
+	if err != nil {
+		return err
+	}
+	defer removeIfExists(f.Name(), true)
+	if err := json.NewEncoder(f).Encode(v); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
+}
+
+// clear removes the state file, treating a missing file as success.
+func (s stateAccessor[T]) clear() {
+	removeIfExists(s.path(), true)
+}
+
+// removeIfExists removes path and logs advisory errors when log is true. A
+// missing file is always a successful no-op.
+func removeIfExists(path string, log bool) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && log {
+		slog.Error("remove state file", "path", path, "error", err)
+	}
+}
+
 // connectionInfo is the daemon's loopback address, auth token and process id.
 type connectionInfo struct {
 	Addr  string `json:"addr"`
 	Token string `json:"token"`
 	PID   int    `json:"pid"`
 }
+
+const connectionFile = "connection.json"
 
 // acquireLock takes an exclusive file lock in dir, failing when another daemon holds it.
 func acquireLock(dir string) (*os.File, error) {
@@ -45,12 +113,7 @@ func writeConnection(dir, addr string) (string, error) {
 	}
 	token := hex.EncodeToString(b[:])
 	info := connectionInfo{Addr: addr, Token: token, PID: os.Getpid()}
-	data, err := json.Marshal(info)
-	if err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, "connection.json")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := stateFile[connectionInfo](dir, connectionFile).save(info); err != nil {
 		return "", err
 	}
 	return token, nil
@@ -58,25 +121,14 @@ func writeConnection(dir, addr string) (string, error) {
 
 // readConnection loads the daemon's loopback connection record from dir.
 func readConnection(dir string) (*connectionInfo, error) {
-	b, err := os.ReadFile(filepath.Join(dir, "connection.json"))
-	if err != nil {
-		return nil, err
-	}
-	var info connectionInfo
-	if err := json.Unmarshal(b, &info); err != nil {
-		return nil, err
-	}
-	return &info, nil
+	return stateFile[connectionInfo](dir, connectionFile).load()
 }
 
 // removeConnection deletes the connection record on shutdown.
 func removeConnection(dir string) {
-	path := filepath.Join(dir, "connection.json")
 	// Shutdown cleanup is best effort: the lock is already released and the
 	// next start overwrites a stale record.
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Error("remove connection record", "path", path, "error", err)
-	}
+	stateFile[connectionInfo](dir, connectionFile).clear()
 }
 
 // daemonStateFile and daemonErrorFile name the daemon status records; heartbeatEvery and staleAfter set heartbeat cadence and freshness.
@@ -139,9 +191,7 @@ func startDaemonState(dir string) (*daemonTracker, error) {
 		return nil, err
 	}
 	// A stale error record is cleared best effort; the first new error replaces it.
-	if err := os.Remove(filepath.Join(dir, daemonErrorFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Error("clear daemon error record", "dir", dir, "error", err)
-	}
+	stateFile[daemonError](dir, daemonErrorFile).clear()
 	go t.loop()
 	return t, nil
 }
@@ -169,7 +219,7 @@ func (t *daemonTracker) refresh() error {
 	t.state.Heartbeat = time.Now().UTC()
 	state := t.state
 	t.mu.Unlock()
-	return writeJSONAtomic(filepath.Join(t.dir, daemonStateFile), state)
+	return stateFile[daemonState](t.dir, daemonStateFile).save(state)
 }
 
 // write persists the current daemon state atomically.
@@ -177,25 +227,22 @@ func (t *daemonTracker) write() error {
 	t.mu.Lock()
 	state := t.state
 	t.mu.Unlock()
-	return writeJSONAtomic(filepath.Join(t.dir, daemonStateFile), state)
+	return stateFile[daemonState](t.dir, daemonStateFile).save(state)
 }
 
 // Close stops the heartbeat loop and removes the state file.
 func (t *daemonTracker) Close() {
 	close(t.stop)
 	<-t.done
-	path := filepath.Join(t.dir, daemonStateFile)
 	// Best effort shutdown cleanup: a leftover state file is replaced on the
 	// next start and the heartbeat loop has already stopped.
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Error("remove daemon state", "path", path, "error", err)
-	}
+	stateFile[daemonState](t.dir, daemonStateFile).clear()
 }
 
 // writeDaemonError persists a fatal error record for the doctor command to read.
 func writeDaemonError(dir, kind string, err error) {
 	record := daemonError{At: time.Now().UTC(), Kind: kind, Message: err.Error()}
-	if writeErr := writeJSONAtomic(filepath.Join(dir, daemonErrorFile), record); writeErr != nil {
+	if writeErr := stateFile[daemonError](dir, daemonErrorFile).save(record); writeErr != nil {
 		slog.Error("write daemon error record", "error", writeErr)
 	}
 }
@@ -203,38 +250,33 @@ func writeDaemonError(dir, kind string, err error) {
 // readDaemonStatus reconstructs daemon liveness from the state and error files.
 func readDaemonStatus(dir string) daemonStatus {
 	status := daemonStatus{State: "absent"}
-	data, err := os.ReadFile(filepath.Join(dir, daemonStateFile))
-	if err == nil {
-		var state daemonState
-		if json.Unmarshal(data, &state) != nil || state.PID <= 0 {
-			status.State = "invalid"
-		} else {
-			status.PID = state.PID
-			status.StartedAt = &state.StartedAt
-			status.Root = state.Root
-			status.Heartbeat = &state.Heartbeat
-			age := time.Since(state.Heartbeat)
-			if age < 0 {
-				age = 0
-			}
-			status.HeartbeatAgeSecond = age.Round(time.Millisecond).Seconds()
-			switch {
-			case !pidAlive(state.PID):
-				status.State = "dead"
-			case age > staleAfter:
-				status.State = "stale"
-			default:
-				status.State = "alive"
-			}
+	state, err := stateFile[daemonState](dir, daemonStateFile).load()
+	switch {
+	case err == nil && state.PID > 0:
+		status.PID = state.PID
+		status.StartedAt = &state.StartedAt
+		status.Root = state.Root
+		status.Heartbeat = &state.Heartbeat
+		age := time.Since(state.Heartbeat)
+		if age < 0 {
+			age = 0
 		}
-	} else if !os.IsNotExist(err) {
+		status.HeartbeatAgeSecond = age.Round(time.Millisecond).Seconds()
+		switch {
+		case !pidAlive(state.PID):
+			status.State = "dead"
+		case age > staleAfter:
+			status.State = "stale"
+		default:
+			status.State = "alive"
+		}
+	case err == nil || errors.Is(err, errInvalidState):
+		status.State = "invalid"
+	case !os.IsNotExist(err):
 		status.State = "unreadable"
 	}
-	if data, err := os.ReadFile(filepath.Join(dir, daemonErrorFile)); err == nil {
-		var record daemonError
-		if json.Unmarshal(data, &record) == nil {
-			status.Error = &record
-		}
+	if record, err := stateFile[daemonError](dir, daemonErrorFile).load(); err == nil {
+		status.Error = record
 	}
 	return status
 }
@@ -246,29 +288,4 @@ func pidAlive(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
-}
-
-// writeJSONAtomic encodes v to a temp file and renames it into place.
-func writeJSONAtomic(path string, v any) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".beacon-state-*")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		// The rename consumes the temp file. A leftover on an earlier failure is
-		// never read and uses a fresh name next time, so removal stays best effort.
-		if err := os.Remove(f.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.Error("remove temp state", "path", f.Name(), "error", err)
-		}
-	}()
-	if err := json.NewEncoder(f).Encode(v); err != nil {
-		return errors.Join(err, f.Close())
-	}
-	if err := f.Chmod(0o600); err != nil {
-		return errors.Join(err, f.Close())
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), path)
 }
