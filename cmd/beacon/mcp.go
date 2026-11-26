@@ -34,7 +34,7 @@ func newMCPCommand(configPath *string) *cobra.Command {
 			services := mcpServices(w)
 			dir := stateDir(w.cfg)
 			if info, ok := liveDaemon(w.cfg); ok {
-				client := &remoteClient{info: info, http: &http.Client{Timeout: 5 * time.Second}}
+				client := &remoteClient{info: info, http: bearerClient(5 * time.Second)}
 				services.Remote = client.call
 			} else if lock, err := acquireLock(dir); err != nil {
 				slog.Error("acquire daemon lock", "error", err)

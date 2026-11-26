@@ -360,7 +360,7 @@ func postControlWithPR(ctx context.Context, info *connectionInfo, action, runID,
 	if err != nil {
 		return err
 	}
-	return postControlJSON(ctx, info, payload, &http.Client{Timeout: 5 * time.Second})
+	return postControlJSON(ctx, info, payload, bearerClient(5*time.Second))
 }
 
 // postControlJSON sends a marshaled control body to the daemon's loopback
@@ -373,7 +373,7 @@ func postControlJSON(ctx context.Context, info *connectionInfo, body []byte, cli
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+info.Token)
+	bearerAuth(req, info.Token)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
