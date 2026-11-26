@@ -637,17 +637,8 @@ ORDER BY d.task_id, d.depends_on`)
 
 // CurrentIncident returns the newest open base-branch incident, if any.
 func (s *Store) CurrentIncident(ctx context.Context) (*core.BaseIncident, error) {
-	incidents, err := s.ListOpenIncidents(ctx)
-	if err != nil || len(incidents) == 0 {
-		return nil, err
-	}
-	current := incidents[0]
-	for _, in := range incidents[1:] {
-		if in.CreatedAt > current.CreatedAt || (in.CreatedAt == current.CreatedAt && in.ID > current.ID) {
-			current = in
-		}
-	}
-	return current, nil
+	return s.scanIncident(s.db.QueryRowContext(ctx,
+		`SELECT `+incidentColumns+` FROM base_incidents WHERE status='open' ORDER BY created_at DESC, id DESC LIMIT 1`))
 }
 
 // inQuery expands the placeholder in template into one slot per id.
