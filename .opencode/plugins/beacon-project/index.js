@@ -9,7 +9,7 @@ import {
 } from "./state/options.js"
 import {
   BeaconStatusRpc, RUN_CHANGED_EVENT,
-  createCliStatusSource, elapsedMs, normalizeSnapshot,
+  createCliStatusSource, elapsedMs,
   timingFromContext,
 } from "./ui/status_rpc.js"
 import { bodyHash, requestId } from "./protocol/body_hash.js"
@@ -67,7 +67,7 @@ export function createStatusRpcHandlers(source, { limits = {}, log = console.deb
     }
   }
   return {
-    snapshot: (input, context) => call("snapshot", input, async () => normalizeSnapshot(await source.snapshot(input ?? limits)), context),
+    snapshot: (input, context) => call("snapshot", input, () => source.snapshot(input ?? limits), context),
     control: (input, context) => call("control", input, async () => source.control(input ?? {}), context),
     dispatch: (input, context) => call("dispatch", input, async (timing) => source.dispatch(dispatchInput(input), timing), context),
   }

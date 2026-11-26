@@ -261,17 +261,13 @@ export const cardIsPending = (root, id, deps = {}) => {
   return Boolean(card) && !["done", "dropped"].includes(str(card.status).toLowerCase())
 }
 export function enrichRuns(root, runs, deps = {}) {
-  return list(runs, (run) => {
-    const r = normalizeRun(run)
-    if (!r.title) r.title = readTitle(root, r.taskID, deps)
-    return r
-  })
+  return list(runs, (run) => (run.title ? run : { ...run, title: readTitle(root, run.taskID, deps) }))
 }
 
 export class CliStatusSource {
   constructor({ root, deps = {}, limits = {}, sessionID, model, log = console.debug }) {
     Object.assign(this, { root, limits, sessionID, model, log })
-    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, now: () => Date.now(), ...deps }
+    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, now: () => Date.now(), normalizeSnapshot, ...deps }
   }
   #exec(base, args, { label = "cli", timing = null } = {}) {
     const [program, ...rest] = base
@@ -307,7 +303,7 @@ export class CliStatusSource {
     return typeof this.deps.command === "function" ? this.deps.command() : this.#base()
   }
   async snapshot(limits = this.limits) {
-    const snap = normalizeSnapshot(parseSnapshot((await this.#exec(this.#command(), this.#statusArgs(limits), { label: "snapshot" })).stdout))
+    const snap = this.deps.normalizeSnapshot(parseSnapshot((await this.#exec(this.#command(), this.#statusArgs(limits), { label: "snapshot" })).stdout))
     return { ...snap, active: enrichRuns(this.root, snap.active, this.deps), recent: enrichRuns(this.root, snap.recent, this.deps) }
   }
   async control({ action, runID, sha, message } = {}) {
@@ -436,9 +432,8 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
   }
   const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits, log, now }) : null
   const snapshotView = (value, project) => {
-    const view = normalizeSnapshot(value)
-    if (!project) return view
-    return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
+    if (!project) return value
+    return { ...value, queue: value.queue.filter((item) => cardIsPending(project, item.id, deps)) }
   }
   // The CLI already loaded the task cards when it dispatched. Take the titles
   // from the queue in the last snapshot instead of reading the cards again, and
