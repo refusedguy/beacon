@@ -199,9 +199,6 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 		}
 		run.Scope = task.Scope
 		run.ParentSessionID = core.FirstNonEmpty(parentSession(ctx), d.ParentSessionID)
-		if err := d.Store.Save(ctx, run); err != nil {
-			return out, err
-		}
 		if budget > 0 {
 			if err := d.startOne(ctx, run, task); err != nil {
 				out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
@@ -213,6 +210,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 				continue
 			}
 			budget--
+		} else {
+			// A run that cannot start yet still needs a row so PromotePending
+			// can find it. A started run is saved once in startOne, where the
+			// session ID and the final status land in the same write.
+			if err := d.Store.Save(ctx, run); err != nil {
+				return out, err
+			}
 		}
 		out.Runs = append(out.Runs, run)
 	}

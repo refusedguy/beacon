@@ -1,7 +1,7 @@
 ---
 id: T-5bc61abe
 title: Remove redundant post-spawn store writes
-status: available
+status: done
 scope:
     - internal/app/dispatcher.go
     - internal/app/dispatcher_test.go

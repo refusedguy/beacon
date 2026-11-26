@@ -1037,11 +1037,40 @@ func TestDispatchSpansCoverEveryStep(t *testing.T) {
 			t.Fatalf("%s recorded %d times, want %d", want[i], n, len(tasks))
 		}
 	}
-	if deps.store.saves != 2*len(tasks) {
-		t.Fatalf("saves = %d, want %d", deps.store.saves, 2*len(tasks))
+	if deps.store.saves != len(tasks) {
+		t.Fatalf("saves = %d, want %d", deps.store.saves, len(tasks))
 	}
 	if deps.store.statuses != len(tasks) || len(deps.src.fakeSource.marked) != len(tasks) {
 		t.Fatalf("status writes = %d, marks = %v", deps.store.statuses, deps.src.fakeSource.marked)
+	}
+}
+
+func TestDispatchPersistsPendingRunsOnce(t *testing.T) {
+	store := newFakeStore()
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: twentyTasks()}, Planner: NewPlanner(nil),
+		Workspace: &fakeWorkspace{}, Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 1},
+	}
+	res, err := d.Dispatch(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(active) != len(res.Runs) {
+		t.Fatalf("persisted runs = %d, dispatched = %d", len(active), len(res.Runs))
+	}
+	pending := 0
+	for _, r := range active {
+		if r.State == core.RunPending {
+			pending++
+		}
+	}
+	if pending != len(res.Runs)-1 {
+		t.Fatalf("pending runs = %d, want %d", pending, len(res.Runs)-1)
 	}
 }
 
