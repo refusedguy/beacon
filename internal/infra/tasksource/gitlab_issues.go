@@ -174,16 +174,6 @@ func (g *GitLabIssues) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	return out, nil
 }
 
-func (g *GitLabIssues) Claim(ctx context.Context, id core.TaskID) error {
-	iid, err := issueNumber(id, "GL-")
-	if err != nil {
-		return err
-	}
-	path := fmt.Sprintf("/projects/%s/issues/%d/labels", g.project(), iid)
-	_, err = g.request(ctx, http.MethodPost, path, nil, map[string]string{"labels": "beacon/claimed"})
-	return err
-}
-
 func (g *GitLabIssues) Complete(ctx context.Context, id core.TaskID) error {
 	iid, err := issueNumber(id, "GL-")
 	if err != nil {
@@ -199,8 +189,8 @@ func (g *GitLabIssues) MarkInWorkspace(context.Context, core.TaskID, string, str
 	return nil
 }
 
-// Create opens a GitLab issue. The issue IID becomes the task ID so the Claim
-// and Complete calls can address it.
+// Create opens a GitLab issue. The issue IID becomes the task ID so a Complete
+// call can address it.
 func (g *GitLabIssues) Create(ctx context.Context, task core.Task) (core.Task, error) {
 	body, err := issueBody(task)
 	if err != nil {

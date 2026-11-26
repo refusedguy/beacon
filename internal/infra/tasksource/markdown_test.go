@@ -125,29 +125,22 @@ func TestMarkdownLegacyLifecycle(t *testing.T) {
 	if got.SourceRef != path {
 		t.Fatalf("SourceRef = %q, want %q", got.SourceRef, path)
 	}
-	if err := s.Claim(context.Background(), "T-1"); err != nil {
-		t.Fatalf("s.Claim(context.Background(), \"T-1\"): %v", err)
+	if err := s.Complete(context.Background(), "T-1"); err != nil {
+		t.Fatalf("s.Complete(context.Background(), \"T-1\"): %v", err)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("os.ReadFile(path): %v", err)
 	}
-	if !strings.Contains(string(b), "Статус: in_progress") {
-		t.Fatalf("claim did not write in_progress: %s", b)
+	if !strings.Contains(string(b), "Статус: done") {
+		t.Fatalf("complete did not write done: %s", b)
 	}
 	tasks, err = s.ListAvailable(context.Background())
 	if err != nil {
 		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
 	}
 	if len(tasks) != 0 {
-		t.Fatalf("claimed task still available: %+v", tasks)
-	}
-	if err := s.Complete(context.Background(), "T-1"); err != nil {
-		t.Fatalf("s.Complete(context.Background(), \"T-1\"): %v", err)
-	}
-	b, _ = os.ReadFile(path)
-	if !strings.Contains(string(b), "Статус: done") {
-		t.Fatalf("complete did not write done: %s", b)
+		t.Fatalf("completed task still available: %+v", tasks)
 	}
 }
 
@@ -190,16 +183,16 @@ func TestMarkdownFrontmatter(t *testing.T) {
 	if got.SourceRef != path {
 		t.Fatalf("SourceRef = %q, want %q", got.SourceRef, path)
 	}
-	if err := s.Claim(context.Background(), "T-2"); err != nil {
-		t.Fatalf("s.Claim(context.Background(), \"T-2\"): %v", err)
+	if err := s.Complete(context.Background(), "T-2"); err != nil {
+		t.Fatalf("s.Complete(context.Background(), \"T-2\"): %v", err)
 	}
 	b, _ := os.ReadFile(path)
-	if !strings.Contains(string(b), "status: in_progress") {
-		t.Fatalf("claim did not write in_progress: %s", b)
+	if !strings.Contains(string(b), "status: done") {
+		t.Fatalf("complete did not write done: %s", b)
 	}
 	tasks, _ = s.ListAvailable(context.Background())
 	if len(tasks) != 0 {
-		t.Fatalf("claimed frontmatter task still available: %+v", tasks)
+		t.Fatalf("completed frontmatter task still available: %+v", tasks)
 	}
 }
 
@@ -225,9 +218,6 @@ func TestMarkdownFrontmatterAliases(t *testing.T) {
 	}
 	if len(got.Scope) != 1 || got.Scope[0] != "f:internal/app/a.go" {
 		t.Fatalf("scope = %v", got.Scope)
-	}
-	if err := s.Claim(context.Background(), "T-ALIAS"); err != nil {
-		t.Fatalf("s.Claim(context.Background(), \"T-ALIAS\"): %v", err)
 	}
 }
 
@@ -704,16 +694,13 @@ func TestCardIndexDetectsExternalEdit(t *testing.T) {
 	}
 }
 
-func TestCardIndexStateChangesThroughMarkdown(t *testing.T) {
+func TestCardIndexStateChangeThroughMarkdown(t *testing.T) {
 	dir := t.TempDir()
 	writeIndexCard(t, dir, "T-MD", "available")
 	s := NewMarkdown(dir)
 	resetCardIndex(dir)
 	cardScanCount.Store(0)
 
-	if err := s.Claim(context.Background(), "T-MD"); err != nil {
-		t.Fatalf("Claim: %v", err)
-	}
 	if err := s.Complete(context.Background(), "T-MD"); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -725,7 +712,7 @@ func TestCardIndexStateChangesThroughMarkdown(t *testing.T) {
 		t.Fatalf("Complete did not write done: %s", b)
 	}
 	if got := cardScanCount.Load(); got != 1 {
-		t.Fatalf("scans after Claim and Complete = %d, want 1", got)
+		t.Fatalf("scans after Complete = %d, want 1", got)
 	}
 
 	tasks, err := s.ListAvailable(context.Background())

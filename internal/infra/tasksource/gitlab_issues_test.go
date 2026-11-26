@@ -125,9 +125,6 @@ func TestGitLabIssuesLifecycle(t *testing.T) {
 	if len(tasks[1].DependsOn) != 1 || tasks[1].DependsOn[0] != "GL-9" {
 		t.Fatalf("yaml depends = %v", tasks[1].DependsOn)
 	}
-	if err := s.Claim(context.Background(), "GL-9"); err != nil {
-		t.Fatal(err)
-	}
 	if err := s.Complete(context.Background(), "GL-9"); err != nil {
 		t.Fatal(err)
 	}
@@ -135,8 +132,8 @@ func TestGitLabIssuesLifecycle(t *testing.T) {
 
 func TestGitLabIssuesInvalidID(t *testing.T) {
 	s := glIssueServer(t)
-	if err := s.Claim(context.Background(), "bad"); core.CodeOf(err) != core.CodeInvalidInput {
-		t.Fatalf("claim error = %v", err)
+	if err := s.Complete(context.Background(), "bad"); core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("complete error = %v", err)
 	}
 	if err := s.Complete(context.Background(), "GH-9"); core.CodeOf(err) != core.CodeInvalidInput {
 		t.Fatalf("complete error = %v", err)
