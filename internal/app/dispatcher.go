@@ -477,8 +477,9 @@ func (d *Dispatcher) modelRef(parent string) core.ModelRef {
 
 // prePRCheck is appended to the stock worker prompt before the task card's
 // override. It makes a known formatting or test failure stop the worker before
-// it opens a PR, so CI does not spend a fix round on it. The full suite stays
-// advisory on weak machines and runs in CI instead.
+// it opens a PR, so CI does not spend a fix round on it. The Go check commands
+// are concrete; the verification rule they serve comes from pkg/core so the
+// spawn prompt cannot contradict the config default or the init instructions.
 const prePRCheck = `Before opening a pull request, run the local format and test check.
 
 Run: gofmt -l <changed Go files>
@@ -489,7 +490,8 @@ The command must pass. If a test fails, fix it and run the command again.
 
 If gofmt -l still prints a file or a targeted test still fails, stop. Do not open a pull request. Report the exact command you ran and its full output, then stop.
 
-On a weak machine, the full test suite, the full build and repository linters are advisory. Leave them to CI. The gofmt -l and targeted go test checks are required on every machine.
+` + core.WeakMachineVerificationRule + `
+The gofmt -l and targeted go test checks are required on every machine.
 `
 
 func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {

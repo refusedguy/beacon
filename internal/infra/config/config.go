@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/shared"
+	"github.com/refusedguy/beacon/pkg/core"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,9 +29,10 @@ const defaultMaxAutoRebases = 2
 const defaultPollInterval = 30 * time.Second
 
 // DefaultWorkerInstructions is prepended to worker spawn prompts when the
-// operator does not configure harness.worker_instructions. It keeps heavy
-// verification off the operator's machine.
-const DefaultWorkerInstructions = "Worker environment: weak PC. Run targeted tests only for the files or packages you changed; leave full test suites, full builds and full repo linters to CI. Use the beacon_* MCP tools only. Never locate, build or execute the beacon binary or cmd/beacon source from a shell."
+// operator does not configure harness.worker_instructions. It combines the
+// shared weak-machine verification rule with the MCP-only tool rule, and stays
+// language agnostic so no stack is told to run another stack's test command.
+const DefaultWorkerInstructions = core.WeakMachineVerificationRule + " Use the beacon_* MCP tools only. Never locate, build or execute the beacon binary or cmd/beacon source from a shell."
 
 // Config holds every setting loaded from .beacon/config.yaml.
 type Config struct {

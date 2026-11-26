@@ -519,6 +519,20 @@ func TestSpawnPromptRequiresPrePRFormatAndTestCheck(t *testing.T) {
 	}
 }
 
+func TestSpawnPromptSharesWeakMachineRule(t *testing.T) {
+	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	d := newInstructionDispatcher(h, "")
+	if _, err := d.Dispatch(context.Background(), 1); err != nil {
+		t.Fatalf(`d.Dispatch(context.Background(), 1): %v`, err)
+	}
+	if len(h.requests) != 1 {
+		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
+	}
+	if !strings.Contains(h.requests[0].Prompt, core.WeakMachineVerificationRule) {
+		t.Fatalf("spawn prompt does not state the shared rule: %q", h.requests[0].Prompt)
+	}
+}
+
 func TestDispatchResolvesModelFromParentSession(t *testing.T) {
 	ref := core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode"}
 	var parents []string

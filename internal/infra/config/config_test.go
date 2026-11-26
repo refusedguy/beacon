@@ -215,6 +215,12 @@ func TestLoadDefaultWorkerInstructions(t *testing.T) {
 	}
 }
 
+func TestDefaultWorkerInstructionsShareWeakMachineRule(t *testing.T) {
+	if !strings.Contains(DefaultWorkerInstructions, core.WeakMachineVerificationRule) {
+		t.Fatalf("default worker instructions do not state the shared rule: %q", DefaultWorkerInstructions)
+	}
+}
+
 func TestDefaultWorkerInstructionsForbidCLIFallback(t *testing.T) {
 	want := "Use the beacon_* MCP tools only. Never locate, build or execute the beacon binary or cmd/beacon source from a shell."
 	if !strings.Contains(DefaultWorkerInstructions, want) {
