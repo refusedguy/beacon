@@ -543,6 +543,60 @@ func TestDoctorNetworkChecksShareCallerContext(t *testing.T) {
 	}
 }
 
+func TestDoctorNetworkChecksShareOneTimeoutWindow(t *testing.T) {
+	reached := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		reached <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	// No client timeout: the shared context in doctorNetworkChecks is the only
+	// thing that can end these two hung requests.
+	client := &http.Client{}
+	type result struct {
+		checks  []doctorCheck
+		elapsed time.Duration
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		checks := doctorNetworkChecks(context.Background(), doctorNetworkTestConfig(srv.URL, srv.URL), client)
+		done <- result{checks, time.Since(start)}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(doctorHTTPTimeout + 3*time.Second):
+		t.Fatal("hung network probes did not finish within one timeout window")
+	}
+
+	// Both probes must actually reach a hung endpoint, or the bound is vacuous.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-reached:
+		default:
+			t.Fatal("both probes did not reach a hung endpoint")
+		}
+	}
+
+	if len(got.checks) != 2 {
+		t.Fatalf("checks = %d, want 2", len(got.checks))
+	}
+	for _, c := range got.checks {
+		if c.level != checkWarn || c.detail != "unreachable" {
+			t.Errorf("%s check = %v %q, want WARN unreachable", c.name, c.level, c.detail)
+		}
+	}
+
+	// Two hung probes cost one timeout window, not two. Allow scheduling slack
+	// but reject anything approaching 2*doctorHTTPTimeout.
+	if got.elapsed > doctorHTTPTimeout+3*time.Second {
+		t.Fatalf("two hung probes took %s, want within roughly one %s window", got.elapsed, doctorHTTPTimeout)
+	}
+}
+
 func TestDoctorSCMCheckToleratesSlowServer(t *testing.T) {
 	received := make(chan struct{})
 	release := make(chan struct{})
