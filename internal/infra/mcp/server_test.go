@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1320,4 +1321,85 @@ func TestMutationAndControlToolsRejectNilServices(t *testing.T) {
 			}
 		})
 	}
+}
+
+// benchmarkWireRuns builds the fixed 200-value payload used by the JSON result
+// benchmark, so the encoded bytes are reproducible across runs.
+func benchmarkWireRuns(n int) []core.WireRun {
+	runs := make([]core.WireRun, n)
+	for i := range runs {
+		runs[i] = core.WireRun{
+			ID:        fmt.Sprintf("run-%04d", i),
+			TaskID:    fmt.Sprintf("T-%04d", i),
+			State:     "open",
+			PR:        i + 1,
+			HeadSHA:   fmt.Sprintf("%040x", i),
+			Branch:    fmt.Sprintf("beacon/T-%04d", i),
+			Reason:    "waiting for checks",
+			UpdatedAt: "2026-01-02T03:04:05Z",
+		}
+	}
+	return runs
+}
+
+func resultWireBytes(t testing.TB, res *msdk.CallToolResult) []byte {
+	t.Helper()
+	if res.IsError || len(res.Content) != 1 {
+		t.Fatalf("unexpected tool result: %+v", res)
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatalf("content[0] = %T, want *msdk.TextContent", res.Content[0])
+	}
+	return []byte(text.Text)
+}
+
+func TestJSONResultKeepsWireBytes(t *testing.T) {
+	runs := benchmarkWireRuns(200)
+	want, err := json.Marshal(runs)
+	if err != nil {
+		t.Fatalf("json.Marshal(runs): %v", err)
+	}
+	got := resultWireBytes(t, jsonResult(runs))
+	if !bytes.Equal(got, want) {
+		t.Fatalf("jsonResult changed the wire bytes\ngot  %s\nwant %s", got, want)
+	}
+}
+
+// jsonResultWithCopy is the pre-optimization writer. It stays in the test so
+// the benchmark can report the allocations the string view removes.
+func jsonResultWithCopy(v any) *msdk.CallToolResult {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return textResult(fmt.Sprintf("{\"error\":%q}", err.Error()))
+	}
+	return textResult(string(b))
+}
+
+var benchResult *msdk.CallToolResult
+
+func BenchmarkJSONResult(b *testing.B) {
+	runs := benchmarkWireRuns(200)
+	want, err := json.Marshal(runs)
+	if err != nil {
+		b.Fatalf("json.Marshal(runs): %v", err)
+	}
+	if got := resultWireBytes(b, jsonResult(runs)); !bytes.Equal(got, want) {
+		b.Fatalf("jsonResult changed the wire bytes\ngot  %s\nwant %s", got, want)
+	}
+	if got := resultWireBytes(b, jsonResultWithCopy(runs)); !bytes.Equal(got, want) {
+		b.Fatalf("baseline changed the wire bytes\ngot  %s\nwant %s", got, want)
+	}
+	b.Run("stringCopy", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchResult = jsonResultWithCopy(runs)
+		}
+	})
+	b.Run("stringView", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchResult = jsonResult(runs)
+		}
+	})
 }
