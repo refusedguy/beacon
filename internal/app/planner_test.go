@@ -283,3 +283,271 @@ func taskIDs(tasks []core.Task) []core.TaskID {
 	}
 	return ids
 }
+
+func largeDispatchFixtures() ([]core.Task, []*core.Run) {
+	const (
+		candidateCount = 1000
+		activeCount    = 500
+		pathCount      = 3
+	)
+	tasks := make([]core.Task, candidateCount)
+	for i := range tasks {
+		scope := make([]core.ScopePath, pathCount)
+		for j := range scope {
+			scope[j] = core.ScopeFile(fmt.Sprintf("internal/task%04d/file%d.go", i, j))
+		}
+		if i < activeCount {
+			scope[0] = core.ScopeFile(fmt.Sprintf("internal/active%04d/file0.go", i))
+		}
+		tasks[i] = core.Task{
+			ID:     core.TaskID(fmt.Sprintf("T-%04d", i)),
+			Status: core.TaskAvailable,
+			Scope:  scope,
+		}
+	}
+	active := make([]*core.Run, activeCount)
+	for i := range active {
+		scope := make([]core.ScopePath, pathCount)
+		for j := range scope {
+			scope[j] = core.ScopeFile(fmt.Sprintf("internal/active%04d/file%d.go", i, j))
+		}
+		active[i] = &core.Run{
+			ID:     core.RunID(fmt.Sprintf("run-%04d", i)),
+			TaskID: core.TaskID(fmt.Sprintf("A-%04d", i)),
+			State:  core.RunRunning,
+			Scope:  scope,
+		}
+	}
+	return tasks, active
+}
+
+// referenceSelect repeats the straightforward scan the index replaces. It is
+// the oracle for the large dispatch case, not a production path.
+func referenceSelect(candidates []core.Task, active []*core.Run, limit int) []core.Task {
+	var selected []core.Task
+	for _, t := range candidates {
+		if len(selected) >= limit {
+			break
+		}
+		if len(t.Scope) == 0 {
+			t.Scope = []core.ScopePath{core.ScopeAll()}
+		}
+		conflict := false
+		for _, r := range active {
+			if r == nil || r.State.Terminal() {
+				continue
+			}
+			if core.OverlapByPaths(t, core.Task{Scope: r.Scope}) {
+				conflict = true
+				break
+			}
+		}
+		if conflict {
+			continue
+		}
+		for _, s := range selected {
+			if core.PathsAndDependencies(t, s) {
+				conflict = true
+				break
+			}
+		}
+		if conflict {
+			continue
+		}
+		selected = append(selected, t)
+	}
+	return selected
+}
+
+// referencePlan mirrors the full-scan planner. It is the oracle for behavior
+// preservation, independent of the active-scope index.
+func referencePlan(candidates []core.Task, active []*core.Run, limit int, strict bool) ([]core.Task, []SkippedTask) {
+	var selected []core.Task
+	var skipped []SkippedTask
+	if limit <= 0 {
+		return selected, skipped
+	}
+	busy := make(map[core.TaskID]*core.Run)
+	var live []*core.Run
+	for _, r := range active {
+		if r == nil || r.State.Terminal() {
+			continue
+		}
+		busy[r.TaskID] = r
+		live = append(live, r)
+	}
+	for _, t := range candidates {
+		if len(selected) >= limit {
+			break
+		}
+		if t.Status != core.TaskAvailable && t.Status != "" {
+			skipped = append(skipped, SkippedTask{TaskID: t.ID, Code: SkipBadStatus, Reason: "task status is " + string(t.Status)})
+			continue
+		}
+		if r, ok := busy[t.ID]; ok {
+			skipped = append(skipped, SkippedTask{
+				TaskID: t.ID, Code: SkipActiveRun, BlockedBy: t.ID, BlockedByRun: r.ID,
+				Reason: "task already has an active run",
+			})
+			continue
+		}
+		if len(t.Scope) == 0 {
+			if strict {
+				skipped = append(skipped, SkippedTask{
+					TaskID: t.ID, Code: SkipNoScope, Reason: "task has no scope and strict_scope is enabled",
+				})
+				continue
+			}
+			t.Scope = []core.ScopePath{core.ScopeAll()}
+		}
+		blocked := false
+		for _, r := range live {
+			if !core.OverlapByPaths(t, core.Task{Scope: r.Scope}) {
+				continue
+			}
+			paths := intersectScopes(t.Scope, r.Scope)
+			skipped = append(skipped, SkippedTask{
+				TaskID: t.ID, Code: SkipActiveScopeOverlap, BlockedBy: r.TaskID, BlockedByRun: r.ID,
+				Overlap: paths, Reason: "scope overlaps " + string(r.TaskID) + overlapSuffix(paths),
+			})
+			blocked = true
+			break
+		}
+		if blocked {
+			continue
+		}
+		for _, s := range selected {
+			if !core.PathsAndDependencies(t, s) {
+				continue
+			}
+			paths := intersectScopes(t.Scope, s.Scope)
+			skipped = append(skipped, SkippedTask{
+				TaskID: t.ID, Code: SkipSelectedScopeOverlap, BlockedBy: s.ID,
+				Overlap: paths, Reason: "scope overlaps " + string(s.ID) + overlapSuffix(paths),
+			})
+			blocked = true
+			break
+		}
+		if blocked {
+			continue
+		}
+		selected = append(selected, t)
+	}
+	return selected, skipped
+}
+
+func TestPlannerIndexPreservesFullScanBehavior(t *testing.T) {
+	candidates := []core.Task{
+		{ID: "file", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("src/a.go")}},
+		{ID: "dir", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeDir("src")}},
+		{ID: "glob", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopePattern("src/**/*.go")}},
+		{ID: "top-glob", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopePattern("*.go")}},
+		{ID: "leading-glob", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopePattern("*/*.go")}},
+		{ID: "deep-glob", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopePattern("a/**/z.go")}},
+		{ID: "question-glob", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopePattern("src/f?.go")}},
+		{ID: "all", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeAll()}},
+		{ID: "unscoped", Status: core.TaskAvailable},
+		{ID: "depend", Status: core.TaskAvailable, DependsOn: []core.TaskID{"file"}, Scope: []core.ScopePath{core.ScopeFile("other.go")}},
+		{ID: "done", Status: core.TaskDone, Scope: []core.ScopePath{core.ScopeFile("done.go")}},
+	}
+	active := []*core.Run{
+		{ID: "r-file", TaskID: "A-file", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("src/a.go")}},
+		{ID: "r-dir", TaskID: "A-dir", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeDir("lib")}},
+		{ID: "r-glob", TaskID: "A-glob", State: core.RunRunning, Scope: []core.ScopePath{core.ScopePattern("**/*.md")}},
+		{ID: "r-top-glob", TaskID: "A-top-glob", State: core.RunRunning, Scope: []core.ScopePath{core.ScopePattern("*.go")}},
+		{ID: "r-top-file", TaskID: "A-top-file", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("top.go")}},
+		{ID: "r-deep", TaskID: "A-deep", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("a/b/c/z.go")}},
+		{ID: "r-done", TaskID: "A-done", State: core.RunMerged, Scope: []core.ScopePath{core.ScopeFile("done.go")}},
+		nil,
+	}
+	for _, strict := range []bool{false, true} {
+		for _, limit := range []int{0, 1, 3, 100} {
+			got, skipped, err := NewPlanner(nil).Select(candidates, active, limit, strict)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantTasks, wantSkipped := referencePlan(candidates, active, limit, strict)
+			if gotIDs, wantIDs := taskIDs(got), taskIDs(wantTasks); len(gotIDs) != len(wantIDs) {
+				t.Fatalf("strict=%v limit=%d selected %v, want %v", strict, limit, gotIDs, wantIDs)
+			} else {
+				for i := range gotIDs {
+					if gotIDs[i] != wantIDs[i] {
+						t.Fatalf("strict=%v limit=%d selected %v, want %v", strict, limit, gotIDs, wantIDs)
+					}
+				}
+			}
+			gotJSON, err := json.Marshal(skipped)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantJSON, err := json.Marshal(wantSkipped)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(gotJSON) != string(wantJSON) {
+				t.Fatalf("strict=%v limit=%d skipped = %s, want %s", strict, limit, gotJSON, wantJSON)
+			}
+		}
+	}
+}
+
+func TestPlannerIndexBoundsActiveChecks(t *testing.T) {
+	tasks, active := largeDispatchFixtures()
+	const limit = 20
+	var activeChecks, selectedChecks int
+	checker := func(a, b core.Task) bool {
+		if a.ID == probeCandidateID && b.ID == probeRunID {
+			activeChecks++
+		} else {
+			selectedChecks++
+		}
+		return core.PathsAndDependencies(a, b)
+	}
+	chosen, _, err := NewPlanner(checker).Select(tasks, active, limit, false)
+	if err != nil {
+		t.Fatalf(`Select(tasks, active, %d, false): %v`, limit, err)
+	}
+	want := referenceSelect(tasks, active, limit)
+	if gotIDs, wantIDs := taskIDs(chosen), taskIDs(want); len(gotIDs) != len(wantIDs) {
+		t.Fatalf("selected %v, want %v", gotIDs, wantIDs)
+	} else {
+		for i := range gotIDs {
+			if gotIDs[i] != wantIDs[i] {
+				t.Fatalf("selected %v, want %v", gotIDs, wantIDs)
+			}
+		}
+	}
+	// Only 500 candidates claim an active path, so at most 500 of the active
+	// runs can be confirmed. A full scan would perform up to 1000*500 checks.
+	if activeChecks > len(tasks)/2 {
+		t.Fatalf("active overlap checks = %d, want at most %d", activeChecks, len(tasks)/2)
+	}
+	// The remaining checks are the candidate-to-selected comparisons, which
+	// are bounded by the dispatch limit.
+	if selectedChecks > limit*len(tasks) {
+		t.Fatalf("selected overlap checks = %d, want at most %d", selectedChecks, limit*len(tasks))
+	}
+}
+
+func BenchmarkPlannerSelectLargeDispatch(b *testing.B) {
+	tasks, active := largeDispatchFixtures()
+	const limit = 20
+	var checks int
+	checker := func(a, bb core.Task) bool {
+		checks++
+		return core.PathsAndDependencies(a, bb)
+	}
+	p := NewPlanner(checker)
+	chosen, _, err := p.Select(tasks, active, limit, false)
+	if err != nil || len(chosen) != limit || checks > 2*limit*len(tasks) {
+		b.Fatalf("chosen=%d checks=%d err=%v", len(chosen), checks, err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, err := p.Select(tasks, active, limit, false)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(checks)/float64(b.N), "overlap-checks/op")
+}

@@ -40,9 +40,14 @@ type Harness struct {
 
 	initOnce  sync.Once
 	watchOnce sync.Once
+	modelOnce sync.Once
 	events    chan core.HarnessEvent
 	mu        sync.RWMutex
 	runs      map[string]core.RunID
+
+	// modelDefault is the harness-level model resolved once on first use. A
+	// model carried by a SpawnRequest still takes precedence per dispatch.
+	modelDefault core.ModelRef
 }
 
 // OpenCode is an alias kept for callers that use the older name.
@@ -121,20 +126,23 @@ func firstNonEmpty(a, b string) string {
 }
 
 // modelRef returns the model to use as a Model.Ref object. A model resolved at
-// dispatch from the parent session wins over the startup fallback. OpenCode
-// child sessions do not inherit the parent model, so the ref is sent both when
-// the session is created and when it is configured. A bare id is not a ref.
+// dispatch from the parent session wins over the startup fallback. The fallback
+// is resolved once per harness because its inputs are fixed for the harness
+// lifetime. OpenCode child sessions do not inherit the parent model, so the ref
+// is sent both when the session is created and when it is configured. A bare id
+// is not a ref.
 func (h *Harness) modelRef(req core.SpawnRequest) core.ModelRef {
 	if !req.ModelRef.IsZero() {
 		return req.ModelRef
 	}
-	if !h.ModelRef.IsZero() {
-		return h.ModelRef
-	}
-	if h.Model != "" {
-		return core.ModelRef{ProviderID: "opencode", ID: h.Model}
-	}
-	return core.ModelRef{}
+	h.modelOnce.Do(func() {
+		if !h.ModelRef.IsZero() {
+			h.modelDefault = h.ModelRef
+		} else if h.Model != "" {
+			h.modelDefault = core.ModelRef{ProviderID: "opencode", ID: h.Model}
+		}
+	})
+	return h.modelDefault
 }
 
 // messageID builds a unique prompt id with a prefix and random suffix.
@@ -287,7 +295,8 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	if agent := firstNonEmpty(strings.TrimSpace(req.Task.WorkerAgent), h.Agent); agent != "" {
 		body["agent"] = agent
 	}
-	if ref := h.modelRef(req); !ref.IsZero() {
+	ref := h.modelRef(req)
+	if !ref.IsZero() {
 		body["model"] = ref
 	}
 	data, _, err := h.do(ctx, http.MethodPost, "/api/session", body)
@@ -299,7 +308,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 		return core.Session{}, fmt.Errorf("opencode: missing session id in %s", redact.Redact(string(data)))
 	}
 	h.bind(id, req.RunID)
-	if err := h.configureSession(ctx, id, req); err != nil {
+	if err := h.configureSession(ctx, id, req, ref); err != nil {
 		return core.Session{}, err
 	}
 	if err := h.prompt(ctx, id, req.Prompt, messageID("spawn")); err != nil {
