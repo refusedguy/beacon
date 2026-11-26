@@ -442,7 +442,7 @@ func (h *reloadableHarness) WatchIdle(ctx context.Context) {
 	h.init()
 	for {
 		changed := h.relay.reloadSignal()
-		watcher, ok := h.current().(idleWatcher)
+		watcher, ok := h.current().(core.IdleWatcher)
 		if !ok {
 			select {
 			case <-ctx.Done():

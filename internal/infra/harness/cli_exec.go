@@ -27,12 +27,13 @@ func NewCLIExec(command, tmpl string) *CLIExec {
 	return &CLIExec{Command: command, Template: tmpl, Timeout: 30 * time.Minute, events: make(chan core.HarnessEvent, 16)}
 }
 
-// render applies tmpl to prompt, or returns prompt when tmpl is empty.
-func (c *CLIExec) render(tmpl, prompt string) (string, error) {
-	if strings.TrimSpace(tmpl) == "" {
+// render applies the configured template to prompt, or returns prompt when
+// the template is empty.
+func (c *CLIExec) render(prompt string) (string, error) {
+	if strings.TrimSpace(c.Template) == "" {
 		return prompt, nil
 	}
-	t, err := template.New("prompt").Parse(tmpl)
+	t, err := template.New("prompt").Parse(c.Template)
 	if err != nil {
 		return "", err
 	}
@@ -45,7 +46,7 @@ func (c *CLIExec) render(tmpl, prompt string) (string, error) {
 
 // run executes the configured command with prompt on stdin.
 func (c *CLIExec) run(ctx context.Context, prompt string, req core.SpawnRequest) (string, error) {
-	text, err := c.render(c.Template, prompt)
+	text, err := c.render(prompt)
 	if err != nil {
 		return "", err
 	}

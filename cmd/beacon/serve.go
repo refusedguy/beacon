@@ -11,9 +11,6 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// idleWatcher is an alias kept for config_watch.go. New code uses the port.
-type idleWatcher = core.IdleWatcher
-
 func newServeCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
