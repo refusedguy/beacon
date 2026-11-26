@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -726,6 +730,88 @@ func BenchmarkSnapshotDurationPass(b *testing.B) {
 	}
 	b.ReportMetric(float64(runCount), "runs/op")
 	b.ReportMetric(float64(len(events)), "events/op")
+}
+
+// sourceVerbs reads a control vocabulary from a Go source file. Both core and
+// the TUI declare their verb list as a literal array of named string constants,
+// so a source comparison catches drift even though ui/tui is a separate module.
+func sourceVerbs(t *testing.T, path, arrayName string) []string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(%q): %v", path, err)
+	}
+	constants := map[string]string{}
+	var verbs []string
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			values, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			switch gen.Tok {
+			case token.CONST:
+				for i, name := range values.Names {
+					if i >= len(values.Values) {
+						continue
+					}
+					lit, ok := values.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					value, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("%s: unquote %s: %v", path, lit.Value, err)
+					}
+					constants[name.Name] = value
+				}
+			case token.VAR:
+				if len(values.Names) != 1 || values.Names[0].Name != arrayName {
+					continue
+				}
+				if len(values.Values) != 1 {
+					t.Fatalf("%s: %s has %d values", path, arrayName, len(values.Values))
+				}
+				array, ok := values.Values[0].(*ast.CompositeLit)
+				if !ok {
+					t.Fatalf("%s: %s is not a literal array", path, arrayName)
+				}
+				for _, element := range array.Elts {
+					id, ok := element.(*ast.Ident)
+					if !ok {
+						t.Fatalf("%s: %s has a non-constant element", path, arrayName)
+					}
+					verb, ok := constants[id.Name]
+					if !ok {
+						t.Fatalf("%s: verb %s has no constant value", path, id.Name)
+					}
+					verbs = append(verbs, verb)
+				}
+			}
+		}
+	}
+	if len(verbs) == 0 {
+		t.Fatalf("%s: %s is empty", path, arrayName)
+	}
+	return verbs
+}
+
+func TestControlVocabularySharedBetweenCoreAndTUI(t *testing.T) {
+	// The TUI cannot import pkg/core, so it mirrors the vocabulary in
+	// ui/tui/api.go. Compare the two sources and the runtime accessor. A new
+	// core action without a TUI action must fail this test.
+	coreVerbs := sourceVerbs(t, "../../pkg/core/control.go", "ControlActions")
+	tuiVerbs := sourceVerbs(t, "../../ui/tui/api.go", "actions")
+	if !reflect.DeepEqual(tuiVerbs, coreVerbs) {
+		t.Fatalf("TUI actions = %v, core.ControlActions = %v", tuiVerbs, coreVerbs)
+	}
+	if !reflect.DeepEqual(coreVerbs, core.ControlActionNames()) {
+		t.Fatalf("source verbs = %v, core.ControlActionNames = %v", coreVerbs, core.ControlActionNames())
+	}
 }
 
 func TestAddCountMetricsKeepsEveryCounter(t *testing.T) {

@@ -235,6 +235,30 @@ test("panel chrome builder keeps header props and the 10 versus 8 field padding"
   assert.equal(detail.controls.props.flexWrap, undefined)
 })
 
+test("panel chrome hint and close wire their mouse-up handlers", () => {
+  let hints = 0, closes = 0
+  const ui = solidModule([])
+  const chrome = createPanelChrome(ui, cardDeps(), {
+    title: "Task card", onHint: () => { hints++ }, onClose: () => { closes++ },
+  })
+  assert.equal(typeof chrome.hint.props.onMouseUp, "function")
+  assert.equal(typeof chrome.close.props.onMouseUp, "function")
+  chrome.hint.props.onMouseUp()
+  assert.equal(hints, 1, "the hint calls onHint")
+  assert.equal(closes, 0, "the hint does not close the panel")
+  chrome.close.props.onMouseUp()
+  assert.equal(closes, 1, "the close control closes the panel")
+
+  let fallback = 0
+  const plain = createPanelChrome(ui, cardDeps(), {
+    title: "Beacon", onClose: () => { fallback++ },
+  })
+  plain.hint.props.onMouseUp()
+  assert.equal(fallback, 1, "without onHint the hint falls back to onClose")
+  plain.close.props.onMouseUp()
+  assert.equal(fallback, 2, "the close control closes without onHint")
+})
+
 test("button plate builder keeps raised padding, gap and hover colours", () => {
   const ui = solidModule([])
   const card = createButtonPlate(ui, cardDeps(), {

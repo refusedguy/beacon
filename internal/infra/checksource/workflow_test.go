@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/infra/config"
 )
 
 func TestWorkflowNamesParsesJobNames(t *testing.T) {
@@ -43,5 +45,36 @@ func TestWorkflowNamesUsesInjectedDetect(t *testing.T) {
 	}
 	if want := []string{"alpha", "beta"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Names = %v, want %v", got, want)
+	}
+}
+
+func TestWorkflowNamesAgreeWithConfigDetector(t *testing.T) {
+	// config and checksource keep two copies of the workflow parser. Both
+	// adapters must return the same names for one fixture, fail-fast matrix
+	// jobs included, or the daemon and the operator would gate on different
+	// check sets.
+	root := t.TempDir()
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(dir): %v", err)
+	}
+	content := "name: CI\njobs:\n" +
+		"  verify:\n    runs-on: ubuntu-latest\n" +
+		"  test-modules:\n    runs-on: ubuntu-latest\n" +
+		"    strategy:\n      fail-fast: false\n      matrix:\n        module: [cmd, pkg]\n" +
+		"  build:\n    runs-on: ubuntu-latest\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(content), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(ci.yml): %v", err)
+	}
+	got, err := (Workflow{Root: root}).Names(context.Background())
+	if err != nil {
+		t.Fatalf("Names: %v", err)
+	}
+	want := config.DetectRequiredChecks(root)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("checksource names = %v, config detection = %v", got, want)
+	}
+	if want := []string{"build", "verify"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("names = %v, want %v", got, want)
 	}
 }

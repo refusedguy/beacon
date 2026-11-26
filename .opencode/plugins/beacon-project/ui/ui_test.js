@@ -255,6 +255,71 @@ test("dispatch overlaps the snapshot read and only the watcher's final snapshot 
   dispose()
 })
 
+test("three rapid refresh requests coalesce into one follow-up read", async () => {
+  const renderers = Object.create(null)
+  let resolvePending
+  const pendingRead = new Promise((resolve) => { resolvePending = resolve })
+  const queue = [{ id: "T-2", title: "Queued task", status: "ready", priority: 1 }]
+  const baseline = { active: [], recent: [], queue }
+  const stale = { active: [makeRun({ ID: "run-stale", State: "running" })], recent: [], queue }
+  const fresh = { active: [makeRun({ ID: "run-fresh", State: "running" })], recent: [], queue }
+  let snapshotCalls = 0
+  let watcher = null
+  const rpc = {
+    snapshot: async () => {
+      const index = Math.min(snapshotCalls++, 3)
+      if (index === 1) return pendingRead
+      return index === 0 ? baseline : fresh
+    },
+    control: async () => ({}),
+    dispatch: async () => ({ started: 1 }),
+    events: { on: (_name, callback) => { watcher = callback; return () => { watcher = null } } },
+  }
+  const location = {
+    project: { canonical: "/work/project", id: "project-1" },
+    workspaceID: "ws-1", directory: "/work/project",
+  }
+  const ctx = {
+    theme: themeStub(), location, client: { rpc: () => rpc },
+    storage: { store: () => [{ id: "" }, async () => {}] },
+    ui: {
+      toast: { show: () => {} },
+      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
+      panel: { open: () => {}, close: () => {} },
+    },
+    keymap: { layer: () => () => {} },
+  }
+  const modules = {
+    "@opentui/solid": solidModule(),
+    "solid-js": signals(),
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    options: { statusPollMs: 0, watcherEnabled: true },
+    import: (specifier) => modules[specifier],
+    cardDeps: { existsSync: () => false, readFileSync: () => "" },
+  })
+  await flush()
+  assert.equal(snapshotCalls, 1, "setup takes one baseline snapshot")
+
+  const sidebar = renderers["sidebar.content"]()
+  for (const key of ["change-1", "change-2", "change-3"]) {
+    watcher({ location, data: { key } })
+  }
+  assert.equal(snapshotCalls, 2, "the first event starts a read; the next two queue behind it")
+
+  resolvePending(stale)
+  await flush()
+  await flush()
+  assert.equal(snapshotCalls, 3, "three events coalesce into one follow-up read")
+
+  const ids = sidebar.children.map((box) => box.item?.runID).filter(Boolean)
+  assert.ok(ids.includes("run-fresh"), "the final snapshot renders")
+  assert.equal(ids.includes("run-stale"), false, "the superseded snapshot never renders")
+  dispose()
+})
+
 test("dispatch without a watcher reads the snapshot again after settling", async () => {
   const renderers = Object.create(null)
   const queue = [{ id: "T-2", title: "Queued task", status: "ready", priority: 1 }]
