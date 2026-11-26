@@ -406,9 +406,22 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 		return err
 	}
 	if ws.Branch != "" {
-		if _, err := g.run(ctx, "branch", "-d", ws.Branch); err != nil {
-			return fmt.Errorf("delete branch %s: %w", ws.Branch, err)
+		if err := g.deleteBranch(ctx, ws.Branch, false); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// deleteBranch deletes the local branch with -d for a safe delete or -D for a
+// forced one. Both paths wrap a failure with the same message.
+func (g *GitWorktree) deleteBranch(ctx context.Context, branch string, force bool) error {
+	flag := "-d"
+	if force {
+		flag = "-D"
+	}
+	if _, err := g.run(ctx, "branch", flag, branch); err != nil {
+		return fmt.Errorf("delete branch %s: %w", branch, err)
 	}
 	return nil
 }
@@ -425,9 +438,7 @@ func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error 
 func (g *GitWorktree) removeForce(ctx context.Context, ws core.Workspace) error {
 	_, err := g.run(ctx, "worktree", "remove", "--force", ws.Path)
 	if err == nil && ws.Branch != "" {
-		if _, err := g.run(ctx, "branch", "-D", ws.Branch); err != nil {
-			return fmt.Errorf("delete branch %s: %w", ws.Branch, err)
-		}
+		err = g.deleteBranch(ctx, ws.Branch, true)
 	}
 	return err
 }
