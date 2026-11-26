@@ -1,7 +1,7 @@
 ---
 id: T-fbfa62a8
 title: Extract PRAGMA column scanner
-status: available
+status: in_progress
 scope:
     - internal/infra/sqlite/schema.go
     - internal/infra/sqlite/tasks.go

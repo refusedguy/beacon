@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -177,10 +178,12 @@ var runMigrationColumns = []struct{ name, ddl string }{
 	{"checks_json", "checks_json TEXT NOT NULL DEFAULT '[]'"},
 }
 
-func ensureRunColumns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(runs)`)
+// presentColumns reads the column names of table from PRAGMA table_info. It
+// closes the rows on a scan error so a failed scan does not hold a connection.
+func presentColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	present := make(map[string]bool)
 	for rows.Next() {
@@ -189,14 +192,22 @@ func ensureRunColumns(db *sql.DB) error {
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		present[name] = true
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return present, nil
+}
+
+func ensureRunColumns(db *sql.DB) error {
+	present, err := presentColumns(context.Background(), db, "runs")
+	if err != nil {
 		return err
 	}
 	for _, col := range runMigrationColumns {
