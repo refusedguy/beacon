@@ -4,9 +4,13 @@
 import { CONTROL_ACTIONS, errorMessage, str } from "./ui_model.js"
 import { isDispatching, setDispatching } from "./ui_alerts.js"
 import { refreshDispatchingViews } from "./ui_sidebar.js"
-import { toastShow } from "./ui_test_helpers.js"
 import { dispatchRequestId } from "../protocol/body_hash.js"
 export { dispatchRequestId }
+
+// Host adapters are optional in test doubles. This fallback keeps the toast
+// path identical for every action runner without importing the test helper.
+const toastShow = (ctx, toast) =>
+  toast ?? ((message, variant = "info") => ctx.ui?.toast?.show?.({ message, variant }))
 
 // A mouse gesture on the Dispatch row reaches both onMouseDown and onMouseUp.
 // Equal bodies inside this window come from one gesture, so they share one

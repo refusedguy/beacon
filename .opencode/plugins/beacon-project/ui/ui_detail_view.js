@@ -3,10 +3,12 @@
 // a collapse, a refresh or a new selection never allocates a node.
 import { ACTION_NAMES, DETAIL_OPEN } from "./ui_view.js"
 import { createBox, createLineMount, createText } from "./ui_nodes.js"
-import { propSetter } from "./ui_test_helpers.js"
 import { createButtonPlate, createPanelChrome } from "./ui_card_view.js"
 
 export const DETAIL_LINES = 80
+
+// The real host supplies setProp; test doubles may only expose node.props.
+const propSetter = (source) => source?.setProp ?? ((node, key, value) => { node.props[key] = value })
 const ACTION_LABEL = Object.freeze({
   retry: "↻ Retry", approve: "✔ Approve", cancel: "✖ Cancel",
   pr: "⧉ PR URL", help: "💬 Help", copy: "⧉ Copy ID",

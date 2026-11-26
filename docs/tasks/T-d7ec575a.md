@@ -1,7 +1,7 @@
 ---
 id: T-d7ec575a
 title: Remove test-only re-export from ui_test_helpers
-status: available
+status: in_progress
 scope:
     - .opencode/plugins/beacon-project/ui/ui_test_helpers.js
     - .opencode/plugins/beacon-project/index.js
