@@ -40,6 +40,47 @@ export const failedCheckCount = (v) => {
 }
 
 export const str = (v) => (typeof v === "string" ? v : v == null ? "" : String(v))
+
+// One id for a click across the TUI, the RPC handler and the CLI child. FNV-1a
+// over the input body gives the same value on both sides of the wire. The body
+// is never logged, so prompts and tokens stay out of the log.
+const fnv1a = (input) => {
+  const text = JSON.stringify(input ?? null)
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0")
+}
+export const bodyHash = (input) => fnv1a(input)
+export const requestId = (method, input) => `${method}:${bodyHash(input)}`
+export const elapsedMs = (now, startedAt) => {
+  const delta = Number(now) - Number(startedAt)
+  return Number.isFinite(delta) && delta >= 0 ? Math.round(delta) : 0
+}
+
+// Timing travels as request headers. The RPC input body stays unchanged.
+export const REQUEST_ID_HEADER = "x-beacon-request-id"
+export const STARTED_AT_HEADER = "x-beacon-started-at"
+export const timingMeta = (timing) => {
+  const meta = {}
+  if (!timing) return meta
+  if (str(timing.id)) meta[REQUEST_ID_HEADER] = str(timing.id)
+  if (Number.isFinite(timing.startedAt)) meta[STARTED_AT_HEADER] = String(timing.startedAt)
+  return meta
+}
+export const timingFromContext = (context) => {
+  const source = context?.headers ?? context?.meta ?? context ?? {}
+  const get = (key) => source?.[key] ?? source?.[key.toUpperCase()]
+  const id = get(REQUEST_ID_HEADER)
+  const startedAt = Number(get(STARTED_AT_HEADER))
+  return {
+    id: typeof id === "string" && id ? id : null,
+    startedAt: Number.isFinite(startedAt) ? startedAt : null,
+  }
+}
+
 // One key builder for run signatures and event dedupe. Both join the same four
 // fields in the same order, so a run and its event share a key.
 export const joinKey = (id, sha, state, at) => [str(id), str(sha), str(state), str(at)].join("|")
@@ -228,16 +269,33 @@ export function enrichRuns(root, runs, deps = {}) {
 }
 
 export class CliStatusSource {
-  constructor({ root, deps = {}, limits = {}, sessionID, model }) {
-    Object.assign(this, { root, limits, sessionID, model })
-    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, ...deps }
+  constructor({ root, deps = {}, limits = {}, sessionID, model, log = console.debug }) {
+    Object.assign(this, { root, limits, sessionID, model, log })
+    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, now: () => Date.now(), ...deps }
   }
-  #exec(base, args) {
+  #exec(base, args, { label = "cli", timing = null } = {}) {
     const [program, ...rest] = base
-    return this.deps.execFile(program, [...rest, ...args], {
-      cwd: this.root, encoding: "utf8", maxBuffer: 16 * 1024 * 1024,
-      env: cliEnv(this.root, this), timeout: RPC_TIMEOUT_MS,
-    })
+    const startedAt = this.deps.now()
+    const finished = (outcome) => {
+      const id = str(timing?.id) || requestId(label, args)
+      const durationMs = elapsedMs(this.deps.now(), startedAt)
+      const chain = timing?.startedAt == null ? "" : ` elapsedMs=${elapsedMs(this.deps.now(), timing.startedAt)}`
+      this.log(`beacon CLI ${label} id=${id} ${outcome} durationMs=${durationMs}${chain}`)
+    }
+    let promise
+    try {
+      promise = Promise.resolve(this.deps.execFile(program, [...rest, ...args], {
+        cwd: this.root, encoding: "utf8", maxBuffer: 16 * 1024 * 1024,
+        env: cliEnv(this.root, this), timeout: RPC_TIMEOUT_MS,
+      }))
+    } catch (error) {
+      finished("failed")
+      return Promise.reject(error)
+    }
+    return promise.then(
+      (value) => { finished("ok"); return value },
+      (error) => { finished("failed"); throw error },
+    )
   }
   #statusArgs(limits) {
     const args = ["status", "--snapshot"]
@@ -249,18 +307,18 @@ export class CliStatusSource {
     return typeof this.deps.command === "function" ? this.deps.command() : this.#base()
   }
   async snapshot(limits = this.limits) {
-    const snap = normalizeSnapshot(parseSnapshot((await this.#exec(this.#command(), this.#statusArgs(limits))).stdout))
+    const snap = normalizeSnapshot(parseSnapshot((await this.#exec(this.#command(), this.#statusArgs(limits), { label: "snapshot" })).stdout))
     return { ...snap, active: enrichRuns(this.root, snap.active, this.deps), recent: enrichRuns(this.root, snap.recent, this.deps) }
   }
   async control({ action, runID, sha, message } = {}) {
     const args = ["control", "--action", str(action), "--run-id", str(runID), "--json"]
     if (sha) args.push("--sha", str(sha))
     if (message) args.push("--message", str(message))
-    return parseSnapshot((await this.#exec(this.#command(), args)).stdout)
+    return parseSnapshot((await this.#exec(this.#command(), args, { label: "control" })).stdout)
   }
-  async dispatch({ n = 1 } = {}) {
+  async dispatch({ n = 1 } = {}, timing = null) {
     const count = num(n) > 0 ? Math.floor(num(n)) : 1
-    return parseSnapshot((await this.#exec(this.#command(), ["dispatch", String(count)])).stdout)
+    return parseSnapshot((await this.#exec(this.#command(), ["dispatch", String(count)], { label: "dispatch", timing })).stdout)
   }
   #base() {
     const parts = beaconCommand(this.root)
@@ -317,8 +375,8 @@ export const BeaconStatusRpc = Object.freeze({
   }),
 })
 export class RpcStatusSource {
-  constructor(ctx, { timeout = RPC_TIMEOUT_MS, limits = {} } = {}) {
-    this.ctx = ctx; this.timeout = timeout; this.limits = limits
+  constructor(ctx, { timeout = RPC_TIMEOUT_MS, limits = {}, log = console.debug, now = () => Date.now() } = {}) {
+    this.ctx = ctx; this.timeout = timeout; this.limits = limits; this.log = log; this.now = now
   }
   #rpc() { return this.ctx.client.rpc(BeaconStatusRpc) }
   async snapshot(limits = this.limits) {
@@ -329,20 +387,37 @@ export class RpcStatusSource {
   async control(input) {
     return this.#rpc().control(input, { signal: AbortSignal.timeout(this.timeout) })
   }
-  async dispatch(input) {
-    return this.#rpc().dispatch(input, { signal: AbortSignal.timeout(this.timeout) })
+  async dispatch(input, timing = null) {
+    const meta = {
+      id: str(timing?.id) || requestId("dispatch", input),
+      startedAt: Number.isFinite(timing?.startedAt) ? timing.startedAt : this.now(),
+    }
+    const startedAt = this.now()
+    try {
+      const result = await this.#rpc().dispatch(input, {
+        signal: AbortSignal.timeout(this.timeout), headers: timingMeta(meta),
+      })
+      this.log(`beacon dispatch rpc ok id=${meta.id} durationMs=${elapsedMs(this.now(), startedAt)}`)
+      return result
+    } catch (error) {
+      this.log(`beacon dispatch rpc failed id=${meta.id} durationMs=${elapsedMs(this.now(), startedAt)}`)
+      throw error
+    }
   }
 }
-export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionID, model } = {}) {
+export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionID, model, log = console.debug, now = () => Date.now() } = {}) {
   // cwd is a transient fallback, never a verified root; re-resolve per call so
   // a late location replaces it without a reload and can filter the queue.
   const explicit = root ?? deps.root ?? null
   const exists = deps.existsSync ?? fsExistsSync
-  let current = null, cli = null, verified = false, filterRoot = null
+  let current = null, cli = null, verified = false, filterRoot = null, lastDispatch = null
   const rootOf = () => {
     const located = explicit ?? projectRoot(ctx)
     const next = located ?? process.cwd()
-    if (next !== current || !cli) { current = next; cli = new CliStatusSource({ root: next, deps, limits, sessionID, model }) }
+    if (next !== current || !cli) {
+      current = next
+      cli = new CliStatusSource({ root: next, deps: { now, ...deps }, limits, sessionID, model, log })
+    }
     // Only a canonical root that can see docs/tasks may judge the queue. A
     // worktree directory loads the plugin but holds none of the main project's
     // cards, so filtering against it would drop every ready card. Without a
@@ -355,13 +430,13 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
     verified = Boolean(filterRoot)
     return next
   }
-  const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits }) : null
+  const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits, log, now }) : null
   const snapshotView = (value, project) => {
     const view = normalizeSnapshot(value)
     if (!project) return view
     return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
   }
-  const fallback = async (name, input) => {
+  const fallback = async (name, input, timing = null) => {
     rootOf()
     const project = filterRoot, isVerified = verified
     // A verified root lets the CLI read this project's store on this call. An
@@ -370,18 +445,38 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
     // cwd guess stays behind RPC. RPC remains the accelerator for control and
     // dispatch.
     if (name === "snapshot" && isVerified) {
-      try { return snapshotView(await cli.snapshot(input), project) } catch {}
+      try { return snapshotView(await cli.snapshot(input, timing), project) } catch {}
     }
     let value, usedRPC = false
-    if (rpc) { try { value = await rpc[name](input); usedRPC = true } catch {} }
-    if (!usedRPC) value = await cli[name](input)
+    if (rpc) { try { value = await rpc[name](input, timing); usedRPC = true } catch {} }
+    if (!usedRPC) value = await cli[name](input, timing)
     if (name !== "snapshot") return value
     return snapshotView(value, project)
   }
   return {
-    snapshot: (input = limits) => fallback("snapshot", input),
+    snapshot: async (input = limits) => {
+      const parent = lastDispatch
+      lastDispatch = null
+      const startedAt = now()
+      const id = requestId("snapshot", input ?? limits)
+      const chain = parent ? ` parent=${parent.id} clickElapsedMs=${elapsedMs(now(), parent.startedAt)}` : ""
+      try {
+        const value = await fallback("snapshot", input)
+        log(`beacon status refresh ok id=${id}${chain} durationMs=${elapsedMs(now(), startedAt)}`)
+        return value
+      } catch (error) {
+        log(`beacon status refresh failed id=${id}${chain} durationMs=${elapsedMs(now(), startedAt)}`)
+        throw error
+      }
+    },
     control: (input) => fallback("control", input),
-    dispatch: (input) => fallback("dispatch", input), root: rootOf, verified: () => verified,
+    dispatch: (input) => {
+      const timing = { id: requestId("dispatch", input), startedAt: now() }
+      lastDispatch = timing
+      log(`beacon dispatch click id=${timing.id}`)
+      return fallback("dispatch", input, timing)
+    },
+    root: rootOf, verified: () => verified,
   }
 }
 export const errorMessage = (error) => (error && typeof error.message === "string" ? error.message : String(error))

@@ -3,7 +3,8 @@
 // ui/ui.js re-exports these names so TUI callers keep their existing imports.
 export {
   BeaconStatusRpc, RUN_CHANGED_EVENT,
-  createCliStatusSource, normalizeSnapshot,
+  bodyHash, createCliStatusSource, elapsedMs, normalizeSnapshot,
+  requestId, REQUEST_ID_HEADER, STARTED_AT_HEADER, timingFromContext, timingMeta,
 } from "./ui_model.js"
 
 // The watcher core lives in run_watcher.js. Re-export it so server callers keep
