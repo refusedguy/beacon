@@ -15,6 +15,10 @@ An inner package never imports an outer one. The 350-line production-file limit 
 
 Two modules sit outside the root module in `go.work`: `harnesses/opencode` is the agent harness adapter, and `ui/tui` is the operator monitor. `ui/tui` imports no Beacon package. It reaches the daemon through loopback HTTP and SSE only.
 
+## Vocabulary
+
+`GLOSSARY.md` defines the names used in cards, code and reports. Use those exact names in prose. A `Criterion` is one merge check, not a "merge rule". A `DecisionKind` names a decision record; a `Verdict` names a merge outcome. A `DecisionAction` ties a verdict or kind to its `ActionDispatch` and `ActionCounter`. `Run.NoteObservation` is the one place that stamps a run's head, base and update time from an observation.
+
 ## Loopback API
 
 The monitor uses three routes:

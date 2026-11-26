@@ -7,8 +7,9 @@ import (
 )
 
 // sameObservation reports whether the run already recorded the exact head and
-// base SHA pair from obs. Reconcile uses it to skip duplicate rebase and wake
-// work when the PR has not actually changed.
+// base SHA pair from obs. It only reads the pair written by NoteObservation, so
+// a duplicate observation skips rebase and wake work without stamping the run
+// a second time.
 func sameObservation(run *core.Run, obs core.Observation) bool {
 	return run.ObservedSHA == obs.HeadSHA && run.ObservedBaseSHA == obs.BaseSHA
 }
@@ -31,13 +32,6 @@ func (r *Reconciler) autoRebaseCap() int {
 		return r.MaxAutoRebases
 	}
 	return DefaultMaxAutoRebases
-}
-
-// recordObservation stores the head and base SHA pair the reconciler has just
-// acted on, so the next poll can skip an identical observation.
-func recordObservation(run *core.Run, headSHA, baseSHA string) {
-	run.ObservedSHA = headSHA
-	run.ObservedBaseSHA = baseSHA
 }
 
 // closedPRVerdict returns the decision for a PR the provider no longer keeps

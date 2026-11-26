@@ -18,6 +18,26 @@ One execution of a task. A work run owns a worktree, a branch, a harness session
 
 The outcome of the merge decision chain for a work run: `wait`, `merge`, `needs_rebase`, `needs_agent_fix`, `blocked` or `noop`. A verdict describes what happens next, not what has already happened.
 
+## Criterion
+
+One criterion in the merge decision chain. A criterion has a `Name()` and an `Evaluate(Observation)` method. `Evaluate` returns `VerdictNoop` when the criterion passes and a stopping verdict when it fails. `Decide` applies the invariants first, then the criteria in order, and returns a merge verdict only when every criterion passes. `MergeDecision.Criterion` names the criterion that stopped the chain.
+
+## ActionDispatch
+
+The reconcile handler a verdict selects: `noop`, `merge`, `rebase`, `fix`, `block` or `pending`. `DecisionAction.Dispatch` carries this value and `applyDecision` switches on it.
+
+## ActionCounter
+
+The metric a decision category increments: `dispatch_cycles`, `skip`, `dispatch`, `rebase` or `fix`. `DecisionAction.Counter` carries this value.
+
+## DecisionAction
+
+One row of the verdict and decision-kind table in `pkg/core/verdict.go`. It carries the `Label` written to decision records, the `ActionDispatch`, the `ActionCounter` and a `Qualifier` that gates a counter on a result such as `rebased`. `ActionForVerdict` and `ActionForKind` return the row for a verdict or a decision kind.
+
+## DecisionKind
+
+The string key of a decision category in the verdict and decision-kind table. Verdict strings and kind strings share the table. Kind names include `dispatch.candidates`, `dispatch.skip`, `transition.spawn`, `transition.rebase` and `transition.wake`. A decision kind names a decision record; it is not a verdict. `ActionForKind` maps a kind to its `DecisionAction`.
+
 ## BaseIncident
 
 A recorded failure of checks on the base branch. An incident holds a signature of the failed checks, the runs it blocks, a fix attempt counter and a status of open or resolved. While an incident is open, merges stay blocked.
@@ -33,10 +53,6 @@ The adapter that supplies tasks. A task source lists available cards, reports th
 ## ScmGateway
 
 The adapter for source control operations. A gateway reads pull requests and checks, posts comments, rebases branches and merges pull requests. GitHub and GitLab gateways implement the same port.
-
-## MergeRule
-
-One criterion in the merge decision chain. A rule returns `noop` when it passes and a stopping verdict when it fails. The controller evaluates rules in order and returns a merge verdict only when every rule passes.
 
 ## FixerRun
 
@@ -56,7 +72,11 @@ The declarative list of MCP tools in `internal/infra/mcp/registry.go`. It names 
 
 ## QueueTask
 
-A local task card shown in the queue section of the status snapshot. It carries the card ID, title, priority, and unresolved dependencies. `Waiting` marks a card whose dependencies are not finished.
+A local task card with its unresolved dependencies, returned by `QueueStore.ListQueueTasks`. It carries the card ID, title, priority and dependencies. `Waiting` marks a card whose dependencies are not finished. `makeQueue` maps a queue task into a `QueueItemSnapshot`.
+
+## QueueItemSnapshot
+
+The queue section of the status snapshot. It carries the card ID, title, priority, status and dependencies. `makeQueue` derives `status` from `QueueTask.Waiting`: `waiting_deps` when dependencies are unresolved, `ready` otherwise.
 
 ## FixPrompt
 
