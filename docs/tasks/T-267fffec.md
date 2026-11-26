@@ -1,7 +1,7 @@
 ---
 id: T-267fffec
 title: Flatten failed-run matching in dispatch summary
-status: available
+status: done
 scope:
     - internal/infra/mcp/tool_dispatch.go
     - internal/infra/mcp/tool_dispatch_test.go
