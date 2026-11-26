@@ -96,6 +96,18 @@ func (o Observation) Failure() (CheckResult, bool) {
 	return CheckResult{}, false
 }
 
+// HasPending reports whether any check is still running. A behind pull request
+// with a pending check can still turn red, so it must wait for a verdict before
+// the reconciler updates its branch.
+func (o Observation) HasPending() bool {
+	for _, c := range o.Checks {
+		if c.State == CheckPending {
+			return true
+		}
+	}
+	return false
+}
+
 // AllRequiredPass reports whether every named check passed or was skipped.
 func (o Observation) AllRequiredPass(names []string) bool {
 	if len(o.Checks) == 0 {
@@ -182,7 +194,7 @@ func Decide(o Observation, criteria []Criterion) MergeDecision {
 			Criterion: "invariant",
 		}
 	}
-	if c, ok := o.Failure(); ok && !o.Behind {
+	if c, ok := o.Failure(); ok {
 		reason := "required check failed: " + c.Name
 		if o.FailureExcerpt != "" {
 			reason += ": " + o.FailureExcerpt
