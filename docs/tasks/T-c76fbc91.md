@@ -1,7 +1,7 @@
 ---
 id: T-c76fbc91
 title: Cheap prefilter before log redaction
-status: available
+status: done
 scope:
     - pkg/core/redact/redact.go
     - internal/infra/shared/logger.go
