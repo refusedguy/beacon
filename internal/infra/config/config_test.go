@@ -30,6 +30,9 @@ func TestLoadDefaultsToTwelveMergeAttempts(t *testing.T) {
 	if c.Merge.MaxAttempts != 12 {
 		t.Fatalf("MaxAttempts = %d, want 12", c.Merge.MaxAttempts)
 	}
+	if c.Merge.MaxAutoRebases != 2 {
+		t.Fatalf("MaxAutoRebases = %d, want 2", c.Merge.MaxAutoRebases)
+	}
 }
 
 func TestLoadEmptyFileMatchesMissingFile(t *testing.T) {
@@ -77,6 +80,32 @@ func TestLoadUnsetMaxAttemptsFallsBackToTwelve(t *testing.T) {
 	}
 	if c.Merge.MaxAttempts != 12 {
 		t.Fatalf("MaxAttempts = %d, want 12", c.Merge.MaxAttempts)
+	}
+}
+
+func TestLoadMergeMaxAutoRebasesOverride(t *testing.T) {
+	c, err := Load(writeConfig(t, "merge:\n  max_auto_rebases: 5\n"))
+	if err != nil {
+		t.Fatalf("Load(writeConfig(t, \"merge:\\n  max_auto_rebases: 5\\n\")): %v", err)
+	}
+	if c.Merge.MaxAutoRebases != 5 {
+		t.Fatalf("MaxAutoRebases = %d, want 5", c.Merge.MaxAutoRebases)
+	}
+	if c.Merge.MaxAttempts != 12 {
+		t.Fatalf("MaxAttempts = %d, want 12; the rebase cap must not change it", c.Merge.MaxAttempts)
+	}
+}
+
+func TestLoadUnsetMaxAutoRebasesFallsBackToTwo(t *testing.T) {
+	c, err := Load(writeConfig(t, "merge:\n  max_attempts: 7\n"))
+	if err != nil {
+		t.Fatalf("Load(writeConfig(t, \"merge:\\n  max_attempts: 7\\n\")): %v", err)
+	}
+	if c.Merge.MaxAutoRebases != 2 {
+		t.Fatalf("MaxAutoRebases = %d, want 2", c.Merge.MaxAutoRebases)
+	}
+	if c.Merge.MaxAttempts != 7 {
+		t.Fatalf("MaxAttempts = %d, want 7", c.Merge.MaxAttempts)
 	}
 }
 

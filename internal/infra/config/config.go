@@ -19,6 +19,10 @@ const (
 	RequiredChecksWorkflow = "workflow"
 )
 
+// defaultMaxAutoRebases is the automatic rebase cap used when
+// merge.max_auto_rebases is unset. It preserves the old hardcoded value.
+const defaultMaxAutoRebases = 2
+
 // DefaultWorkerInstructions is prepended to worker spawn prompts when the
 // operator does not configure harness.worker_instructions. It keeps heavy
 // verification off the operator's machine.
@@ -83,7 +87,8 @@ type Harness struct {
 }
 
 // Merge holds the automerge settings. RequiredChecksMode selects where the
-// required check names come from. An empty mode means manual.
+// required check names come from. An empty mode means manual. MaxAutoRebases
+// caps automatic branch updates separately from MaxAttempts.
 type Merge struct {
 	RequiredChecksMode string   `yaml:"required_checks_mode"`
 	RequiredChecks     []string `yaml:"required_checks"`
@@ -92,6 +97,7 @@ type Merge struct {
 	CommandGate        string   `yaml:"command_gate"`
 	AutoRebase         bool     `yaml:"auto_rebase"`
 	MaxAttempts        int      `yaml:"max_attempts"`
+	MaxAutoRebases     int      `yaml:"max_auto_rebases"`
 }
 
 // OnBaseRed configures the response to a failing base branch.
@@ -215,6 +221,15 @@ func Load(path string) (Config, error) {
 	if err := c.validate(); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
+	applyDefaults(&c)
+	resolveRequiredChecks(&c, path)
+	return c, nil
+}
+
+// applyDefaults fills unset scalar settings after validation. Load calls it
+// so every caller gets the same values, including the rebase cap that used to
+// live in the reconciler.
+func applyDefaults(c *Config) {
 	if c.StateDB == "" {
 		c.StateDB = ".beacon/state.db"
 	}
@@ -226,6 +241,9 @@ func Load(path string) (Config, error) {
 	}
 	if c.Merge.MaxAttempts <= 0 {
 		c.Merge.MaxAttempts = 12
+	}
+	if c.Merge.MaxAutoRebases <= 0 {
+		c.Merge.MaxAutoRebases = defaultMaxAutoRebases
 	}
 	if c.Concurrency.MaxInFlight <= 0 {
 		c.Concurrency.MaxInFlight = 20
@@ -242,8 +260,6 @@ func Load(path string) (Config, error) {
 	if c.Harness.WorkerInstructions == "" {
 		c.Harness.WorkerInstructions = DefaultWorkerInstructions
 	}
-	resolveRequiredChecks(&c, path)
-	return c, nil
 }
 
 // resolveRequiredChecks replaces the configured names with the job names in
@@ -388,7 +404,7 @@ func defaults() Config {
 		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
 		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
 		Harness:      Harness{WorkerInstructions: DefaultWorkerInstructions},
-		Merge:        Merge{MaxAttempts: 12, AutoRebase: true},
+		Merge:        Merge{MaxAttempts: 12, MaxAutoRebases: defaultMaxAutoRebases, AutoRebase: true},
 		OnBaseRed:    OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
 }
