@@ -26,6 +26,39 @@ export function agentIdentity(ctx, event) {
   return null
 }
 
+export const WORKER_ROLE = "worker"
+export const ORCHESTRATOR_ROLE = "orchestrator"
+export const NO_ROLE = "none"
+
+const DEFAULT_WORKER_AGENTS = Object.freeze(["worker"])
+
+// Only a configured name is a worker. A name that merely contains "worker",
+// such as "networker", is not one. Project variants must be named explicitly.
+export function guardedAgents(config = {}) {
+  const value = config?.shellGuardAgents ?? config?.shellGuardAgent
+  if (Array.isArray(value)) {
+    const agents = value.filter((agent) => typeof agent === "string" && agent)
+    return agents.length ? Object.freeze(agents) : DEFAULT_WORKER_AGENTS
+  }
+  if (typeof value === "string" && value) return Object.freeze([value])
+  return DEFAULT_WORKER_AGENTS
+}
+
+// One classification for rules, the shell guard and MCP. Callers ask the same
+// question: is this agent a worker, the operator's orchestrator, or neither?
+// Worker names come from config and match exactly, as do the two orchestrator
+// names. A configured worker name wins so a project can rename a worker.
+export function agentRole(agent, config = {}) {
+  if (typeof agent !== "string" || !agent.trim()) return null
+  const name = agent.trim().toLowerCase()
+  if (guardedAgents(config).some((worker) => worker.trim().toLowerCase() === name)) {
+    return WORKER_ROLE
+  }
+  if (name === "build" || name === "orchestrator") return ORCHESTRATOR_ROLE
+  if (name === "issue-scout") return NO_ROLE
+  return null
+}
+
 // Plugin setup does not always receive a session ID directly. Fall back to the
 // newest session, the same way the agent resolver does. The model is optional:
 // never invent one when the session domain cannot provide it.

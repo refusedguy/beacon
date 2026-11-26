@@ -122,9 +122,11 @@ test("build is the operator's orchestration agent, not a worker", async () => {
 test("read-only and unknown agents get no commit or card rules", async () => {
   assert.equal(roleFor("issue-scout"), "none")
   assert.equal(roleFor("explore"), null)
+  assert.equal(roleFor("networker"), null, "a substring match never makes a worker")
   assert.equal(roleFor(null), null)
   const ctx = fakeCtx()
   assert.equal(await sessionInstructions(ctx, { sessionID: SESSION, agent: "issue-scout" }), null)
+  assert.equal(await sessionInstructions(ctx, { sessionID: SESSION, agent: "networker" }), null)
   assert.equal(await sessionInstructions(ctx, { sessionID: SESSION, agent: "unknown" }), null)
   assert.equal(await sessionInstructions(ctx, { sessionID: SESSION }), null)
 })
