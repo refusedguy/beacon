@@ -94,7 +94,14 @@ func (r *Reconciler) epicTask(ctx context.Context, id core.TaskID) (core.Task, b
 // baseBranchFor returns the branch a run's pull request targets. Children of
 // an epic target the epic branch; other runs target the configured base.
 func (r *Reconciler) baseBranchFor(ctx context.Context, run *core.Run) string {
-	tree := r.taskTree(ctx)
+	return r.baseBranchForTree(r.taskTree(ctx), run)
+}
+
+// baseBranchForTree answers the same question from a tree the caller built
+// once. Callers that inspect many runs use it to read the card source once
+// instead of once per run. Duplicate IDs and missing cards resolve the same
+// way as baseBranchFor because both use the same indexed snapshot.
+func (r *Reconciler) baseBranchForTree(tree core.TaskTree, run *core.Run) string {
 	task, ok := tree.Task(run.TaskID)
 	if !ok {
 		return r.BaseBranch
