@@ -57,25 +57,6 @@ func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	return out, nil
 }
 
-// frontmatter is the YAML header of a markdown card.
-type frontmatter struct {
-	ID            string     `yaml:"id"`
-	Title         string     `yaml:"title"`
-	Status        string     `yaml:"status"`
-	Scope         stringList `yaml:"scope"`
-	Depends       stringList `yaml:"depends"`
-	DependsOn     stringList `yaml:"depends_on"`
-	Priority      int        `yaml:"priority"`
-	SourceRef     string     `yaml:"source_ref"`
-	Phase         string     `yaml:"phase"`
-	Kind          string     `yaml:"kind"`
-	BaseBranch    string     `yaml:"base_branch"`
-	RequireReview string     `yaml:"require_review"`
-	WorkerAgent   string     `yaml:"worker_agent"`
-	WorkerPrompt  string     `yaml:"worker_prompt"`
-	Plan          []planSpec `yaml:"plan"`
-}
-
 // splitFrontmatter separates a card's YAML header from its body.
 func splitFrontmatter(s string) (yamlText, body string, ok bool) {
 	lines := strings.Split(strings.ReplaceAll(s, "\r", ""), "\n")
@@ -104,14 +85,15 @@ func parseCardFields(content, path string) (core.Task, bool, bool) {
 	fmText, body, hasFM := splitFrontmatter(content)
 	var t core.Task
 	if hasFM {
-		var fm frontmatter
+		var fm cardSchema
 		if err := yaml.Unmarshal([]byte(fmText), &fm); err != nil {
 			slog.Warn("tasksource: malformed card frontmatter", "path", path, "error", err)
 			return t, false, hasFM
 		}
-		t.ID = core.TaskID(strings.TrimSpace(fm.ID))
+		t.ID = core.TaskID(firstNonEmpty(fm.TaskID, fm.ID))
 		t.Title = strings.TrimSpace(fm.Title)
 		t.Status = normalizeStatus(fm.Status)
+		t.Parent = core.TaskID(strings.TrimSpace(fm.Parent))
 		t.Priority = fm.Priority
 		t.Kind = normalizeKind(fm.Kind)
 		t.BaseBranch = strings.TrimSpace(fm.BaseBranch)
@@ -119,9 +101,7 @@ func parseCardFields(content, path string) (core.Task, bool, bool) {
 		t.WorkerAgent = strings.TrimSpace(fm.WorkerAgent)
 		t.WorkerPrompt = strings.TrimSpace(fm.WorkerPrompt)
 		t.Plan = childSpecs(fm.Plan, dir)
-		for _, p := range fm.Scope {
-			t.Scope = append(t.Scope, scopeForPath(p, dir))
-		}
+		t.Scope = scopePaths(fm.combinedScope(), dir)
 		for _, d := range append(fm.Depends, fm.DependsOn...) {
 			if d = strings.TrimSpace(d); d != "" {
 				t.DependsOn = append(t.DependsOn, core.TaskID(d))

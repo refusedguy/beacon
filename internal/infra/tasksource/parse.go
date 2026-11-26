@@ -119,10 +119,14 @@ func (l *stringList) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// yamlFields is the wire shape of a legacy YAML field block.
-type yamlFields struct {
+// cardSchema is the wire shape shared by markdown frontmatter and the fenced
+// YAML block in issue bodies. Both decoders accept every alias, so task_id and
+// owner_files read the same in either format.
+type cardSchema struct {
 	ID            string     `yaml:"id"`
 	TaskID        string     `yaml:"task_id"`
+	Title         string     `yaml:"title"`
+	Status        string     `yaml:"status"`
 	Parent        string     `yaml:"parent"`
 	Scope         stringList `yaml:"scope"`
 	OwnerFiles    stringList `yaml:"owner_files"`
@@ -132,7 +136,29 @@ type yamlFields struct {
 	Kind          string     `yaml:"kind"`
 	BaseBranch    string     `yaml:"base_branch"`
 	RequireReview string     `yaml:"require_review"`
+	SourceRef     string     `yaml:"source_ref"`
+	Phase         string     `yaml:"phase"`
+	WorkerAgent   string     `yaml:"worker_agent"`
+	WorkerPrompt  string     `yaml:"worker_prompt"`
 	Plan          []planSpec `yaml:"plan"`
+}
+
+// combinedScope returns the scope field followed by its owner_files alias.
+func (s cardSchema) combinedScope() []string {
+	out := make([]string, 0, len(s.Scope)+len(s.OwnerFiles))
+	out = append(out, s.Scope...)
+	out = append(out, s.OwnerFiles...)
+	return out
+}
+
+// scopePaths resolves raw scope values against dir. Frontmatter and fenced
+// YAML both reach scope conversion through here.
+func scopePaths(values []string, dir string) []core.ScopePath {
+	var out []core.ScopePath
+	for _, p := range values {
+		out = append(out, scopeForPath(p, dir))
+	}
+	return out
 }
 
 // planSpec is the wire shape of one child in an epic's plan array.
@@ -307,7 +333,7 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 // and scope conversion in one place so cached and fresh parses stay identical.
 func parseTaskFields(body, dir, depPrefix string) taskFields {
 	var out taskFields
-	var yf yamlFields
+	var yf cardSchema
 	lines, block, hasBlock := splitFieldLines(body)
 	if hasBlock {
 		if err := yaml.Unmarshal([]byte(block), &yf); err != nil {
@@ -315,8 +341,7 @@ func parseTaskFields(body, dir, depPrefix string) taskFields {
 		} else {
 			out.ID = firstNonEmpty(yf.TaskID, yf.ID)
 			out.Parent = strings.TrimSpace(yf.Parent)
-			out.Scope = append(out.Scope, yf.Scope...)
-			out.Scope = append(out.Scope, yf.OwnerFiles...)
+			out.Scope = append(out.Scope, yf.combinedScope()...)
 			out.Depends = append(out.Depends, yf.Depends...)
 			out.Depends = append(out.Depends, yf.DependsOn...)
 			out.Priority = yf.Priority
@@ -361,11 +386,7 @@ func parseTaskFields(body, dir, depPrefix string) taskFields {
 
 // Scopes resolves the parsed scope strings against dir.
 func (t taskFields) Scopes(dir string) []core.ScopePath {
-	var out []core.ScopePath
-	for _, p := range t.Scope {
-		out = append(out, scopeForPath(p, dir))
-	}
-	return out
+	return scopePaths(t.Scope, dir)
 }
 
 // ParentID returns the parsed parent as a task ID. It is empty when the source

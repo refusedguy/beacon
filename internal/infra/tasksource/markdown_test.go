@@ -200,6 +200,34 @@ func TestMarkdownFrontmatter(t *testing.T) {
 	}
 }
 
+func TestMarkdownFrontmatterAliases(t *testing.T) {
+	dir := t.TempDir()
+	card := "---\ntask_id: T-ALIAS\ntitle: Alias card\nstatus: available\nowner_files: [internal/app/a.go]\n---\n# T-ALIAS. Wrong title\nBody.\n"
+	path := filepath.Join(dir, "odd-name.md")
+	if err := os.WriteFile(path, []byte(card), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(path, []byte(card), 0o644): %v", err)
+	}
+	s := NewMarkdown(dir)
+
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatalf("s.ListAvailable(context.Background()): %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %+v", tasks)
+	}
+	got := tasks[0]
+	if got.ID != "T-ALIAS" || got.Title != "Alias card" {
+		t.Fatalf("identity = %+v", got)
+	}
+	if len(got.Scope) != 1 || got.Scope[0] != "f:internal/app/a.go" {
+		t.Fatalf("scope = %v", got.Scope)
+	}
+	if err := s.Claim(context.Background(), "T-ALIAS"); err != nil {
+		t.Fatalf("s.Claim(context.Background(), \"T-ALIAS\"): %v", err)
+	}
+}
+
 func TestMarkdownMarkInWorkspace(t *testing.T) {
 	root := t.TempDir()
 	cardDir := filepath.Join(root, "docs", "tasks")
