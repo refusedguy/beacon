@@ -823,3 +823,61 @@ func TestResolveRequiredChecksUsesExplicitProjectRoot(t *testing.T) {
 		t.Fatalf("standalone required_checks = %v, want %v", sc.Merge.RequiredChecks, want)
 	}
 }
+
+func TestApplyDefaultsFillsUnsetValues(t *testing.T) {
+	var c Config
+	ApplyDefaults(&c)
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"state db", c.StateDB, ".beacon/state.db"},
+		{"workspace dir", c.WorkspaceDir, ".beacon/worktrees"},
+		{"base branch", c.BaseBranch, "main"},
+		{"max attempts", c.Merge.MaxAttempts, 12},
+		{"max auto rebases", c.Merge.MaxAutoRebases, DefaultMaxAutoRebases},
+		{"max in flight", c.Concurrency.MaxInFlight, 20},
+		{"on base red mode", c.OnBaseRed.Mode, "spawn_fixer"},
+		{"max fix attempts", c.OnBaseRed.MaxFixAttempts, 2},
+		{"worker instructions", c.Harness.WorkerInstructions, DefaultWorkerInstructions},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+func TestApplyDefaultsKeepsExplicitValues(t *testing.T) {
+	c := Config{
+		StateDB:      "custom/state.db",
+		WorkspaceDir: "custom/worktrees",
+		BaseBranch:   "develop",
+		PollInterval: "45s",
+		Harness:      Harness{WorkerInstructions: "custom instructions"},
+		Merge:        Merge{MaxAttempts: 7, MaxAutoRebases: 5},
+		OnBaseRed:    OnBaseRed{Mode: "report_only", MaxFixAttempts: 4},
+	}
+	ApplyDefaults(&c)
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"state db", c.StateDB, "custom/state.db"},
+		{"workspace dir", c.WorkspaceDir, "custom/worktrees"},
+		{"base branch", c.BaseBranch, "develop"},
+		{"poll interval", c.PollInterval, "45s"},
+		{"worker instructions", c.Harness.WorkerInstructions, "custom instructions"},
+		{"max attempts", c.Merge.MaxAttempts, 7},
+		{"max auto rebases", c.Merge.MaxAutoRebases, 5},
+		{"on base red mode", c.OnBaseRed.Mode, "report_only"},
+		{"max fix attempts", c.OnBaseRed.MaxFixAttempts, 4},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
