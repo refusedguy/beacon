@@ -176,11 +176,8 @@ func seedParentModel(cw *configWatcher, parent string, ref core.ModelRef) {
 	state := cw.live.Load()
 	cw.modelMu.Lock()
 	defer cw.modelMu.Unlock()
-	if cw.models == nil {
-		cw.models = make(map[string]core.ModelRef)
-	}
-	cw.models[parent] = ref
-	cw.modelGeneration = state.generation
+	cw.resetModelCacheIfStale(state)
+	cw.cacheModel(parent, ref)
 }
 
 // wireInfra builds the adapters. It has no dependency on the service layer.
