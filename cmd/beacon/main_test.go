@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -343,6 +344,88 @@ func TestWireInjectsReloadableWrappersAtConstruction(t *testing.T) {
 	}
 	if got := w.dispatcher.ResolveModel(""); got.ID != "model-b" {
 		t.Fatalf("model after reload = %q, want model-b", got.ID)
+	}
+}
+
+// parentModelServer counts session lookups and returns a model that can only
+// come from the HTTP lookup, so a cached resolution is observable.
+func parentModelServer(gets *atomic.Int32) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/session/") {
+			gets.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":{"model":{"id":"parent-model","providerID":"opencode","variant":"default"}}}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
+// wireParentModelConfig writes a config with no model, so resolveModel must
+// look up the fixed parent over HTTP.
+func wireParentModelConfig(t *testing.T, endpoint, parent string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	body := fmt.Sprintf("state_db: %s\nworkspace_dir: %s\nbase_branch: main\n"+
+		"task_source:\n  provider: markdown\n  dir: %s\n"+
+		"scm:\n  provider: github\n  owner: owner\n  repo: repo\n"+
+		"harness:\n  provider: opencode\n  endpoint: %s\n  token: %q\n  parent_session_id: %s\n",
+		filepath.Join(dir, "state.db"), filepath.Join(dir, "worktrees"), dir, endpoint, "worker-token", parent)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestWireDoesNotResolveParentModelOnFirstDispatch(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	var gets atomic.Int32
+	srv := parentModelServer(&gets)
+	defer srv.Close()
+
+	path := wireParentModelConfig(t, srv.URL, "ses_parent")
+	w, err := wire(path, "")
+	if err != nil {
+		t.Fatalf("wire(): %v", err)
+	}
+	defer w.close()
+
+	startup := gets.Load()
+	if startup != 1 {
+		t.Fatalf("parent session GETs at startup = %d, want 1", startup)
+	}
+
+	want := core.ModelRef{ProviderID: "opencode", ID: "parent-model", Variant: "default"}
+	for i := 0; i < 5; i++ {
+		if got := w.dispatcher.ResolveModel("ses_parent"); got != want {
+			t.Fatalf("dispatch %d model = %+v, want %+v", i, got, want)
+		}
+	}
+	if got := gets.Load(); got != startup {
+		t.Fatalf("parent session GETs after five dispatches = %d, want %d", got, startup)
+	}
+}
+
+func TestWireStillResolvesPerDispatchParentOverride(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	var gets atomic.Int32
+	srv := parentModelServer(&gets)
+	defer srv.Close()
+
+	path := wireParentModelConfig(t, srv.URL, "ses_parent")
+	w, err := wire(path, "")
+	if err != nil {
+		t.Fatalf("wire(): %v", err)
+	}
+	defer w.close()
+
+	want := core.ModelRef{ProviderID: "opencode", ID: "parent-model", Variant: "default"}
+	if got := w.dispatcher.ResolveModel("ses_override"); got != want {
+		t.Fatalf("override model = %+v, want %+v", got, want)
+	}
+	if got := gets.Load(); got != 2 {
+		t.Fatalf("parent session GETs = %d, want 2 (startup plus override)", got)
 	}
 }
 
