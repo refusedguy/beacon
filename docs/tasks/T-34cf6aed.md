@@ -1,7 +1,7 @@
 ---
 id: T-34cf6aed
 title: Add event-specific eligible-state queries
-status: available
+status: done
 scope:
     - pkg/core/run.go
     - internal/app/reconcile_observation.go

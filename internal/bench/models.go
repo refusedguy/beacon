@@ -125,16 +125,6 @@ type fanoutBench struct {
 	cancel context.CancelFunc
 }
 
-func newFanoutBench(n int) *fanoutBench {
-	ctx, cancel := context.WithCancel(context.Background())
-	src := make(chan int, 64)
-	views := fanout(ctx, src, n)
-	for i := 0; i < fanoutBuffer; i++ {
-		views[2] <- -1
-	}
-	return &fanoutBench{src: src, views: views, cancel: cancel}
-}
-
 func (f *fanoutBench) close() {
 	f.cancel()
 }

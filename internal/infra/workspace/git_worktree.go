@@ -164,7 +164,7 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 			return core.Workspace{}, err
 		}
 		if dirty && !onlyCards {
-			return core.Workspace{}, core.Errorf(core.CodeConflict, "refusing to remove dirty worktree %s", path)
+			return core.Workspace{}, core.WorkspaceConflict(path)
 		}
 		if err := g.removeForce(ctx, core.Workspace{Path: path}); err != nil {
 			return core.Workspace{}, err
@@ -400,7 +400,7 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 		return err
 	}
 	if !clean {
-		return fmt.Errorf("refusing to remove dirty worktree %s", ws.Path)
+		return core.WorkspaceConflict(ws.Path)
 	}
 	if _, err := g.run(ctx, "worktree", "remove", ws.Path); err != nil {
 		return err

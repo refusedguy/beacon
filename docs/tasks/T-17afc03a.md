@@ -1,7 +1,7 @@
 ---
 id: T-17afc03a
 title: Unify workspace conflict marker
-status: available
+status: done
 scope:
     - internal/infra/workspace/git_worktree.go
     - pkg/core/errors.go

@@ -269,13 +269,17 @@ func assertFailureJSON(t *testing.T, failures []DispatchFailure, want string) {
 
 func TestDispatchFailureJSONIncludesWorkspaceConflict(t *testing.T) {
 	want := "workspace: conflict: refusing to remove dirty worktree /ws/T-CONFLICT"
+	conflict := core.WorkspaceConflict("/ws/T-CONFLICT")
+	if got := core.CodeOf(conflict); got != core.CodeConflict {
+		t.Fatalf("core.CodeOf(WorkspaceConflict(...)) = %q, want %q", got, core.CodeConflict)
+	}
 	store := newFakeStore()
 	d := &Dispatcher{
 		Source:  &fakeSource{tasks: []core.Task{{ID: "T-CONFLICT", Status: core.TaskAvailable}}},
 		Planner: NewPlanner(nil),
 		Workspace: failingWorkspace{
 			fakeWorkspace: &fakeWorkspace{},
-			err:           errors.New("conflict: refusing to remove dirty worktree /ws/T-CONFLICT"),
+			err:           conflict,
 		},
 		Harness:     &fakeHarness{},
 		Store:       store,

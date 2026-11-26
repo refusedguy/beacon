@@ -422,3 +422,114 @@ func TestFailedRunsKeepsNewestRunForTask(t *testing.T) {
 		t.Fatalf("resolved run = %v, want the newest %v", got["T-DUP"], newer)
 	}
 }
+
+type parentCapturingHarness struct {
+	stubDispatchHarness
+	parents []string
+}
+
+func (h *parentCapturingHarness) Spawn(_ context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.parents = append(h.parents, req.ParentSessionID)
+	return core.Session{ID: "ses-" + string(req.RunID)}, nil
+}
+
+// dispatchWithMeta calls beacon_dispatch over the in-memory transport and
+// returns the harness that captured each spawn's parent session together with
+// the store that persisted the run.
+func dispatchWithMeta(t *testing.T, meta msdk.Meta) (*parentCapturingHarness, *sqlite.Store) {
+	t.Helper()
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	h := &parentCapturingHarness{}
+	d := &app.Dispatcher{
+		Source: &dispatchSource{tasks: []core.Task{{ID: "T-PARENT", Status: core.TaskAvailable,
+			Scope: []core.ScopePath{core.ScopeFile("parent.go")}}}},
+		Planner: planner.New(planner.Options{}), Workspace: dispatchWorkspace{},
+		Harness: h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	server := NewServer(Services{Dispatcher: d})
+	clientTransport, serverTransport := msdk.NewInMemoryTransports()
+	ss, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ss.Close() })
+	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
+	cs, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_dispatch", Arguments: DispatchArgs{N: 1}, Meta: meta,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Content) == 0 {
+		t.Fatal("empty dispatch result")
+	}
+	return h, store
+}
+
+func TestDispatchToolFallsBackToEnvParentWithoutMeta(t *testing.T) {
+	t.Setenv("BEACON_PARENT_SESSION", "ses_operator")
+	h, store := dispatchWithMeta(t, nil)
+	if !reflect.DeepEqual(h.parents, []string{"ses_operator"}) {
+		t.Fatalf("spawn parents = %v, want [ses_operator]", h.parents)
+	}
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ParentSessionID != "ses_operator" {
+		t.Fatalf("persisted runs = %+v, want one with parent ses_operator", active)
+	}
+}
+
+func TestDispatchToolMetaOverridesEnvParent(t *testing.T) {
+	t.Setenv("BEACON_PARENT_SESSION", "ses_env")
+	h, store := dispatchWithMeta(t, msdk.Meta{"ai.opencode/sessionID": "ses_meta"})
+	if !reflect.DeepEqual(h.parents, []string{"ses_meta"}) {
+		t.Fatalf("spawn parents = %v, want [ses_meta]", h.parents)
+	}
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ParentSessionID != "ses_meta" {
+		t.Fatalf("persisted runs = %+v, want one with parent ses_meta", active)
+	}
+}
+
+func TestParentSessionAcceptsAdditionalMetaKeys(t *testing.T) {
+	keys := []string{
+		"ai.opencode/sessionId", "beacon/sessionId", "opencode/sessionID",
+		"sessionID", "sessionId",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv("BEACON_PARENT_SESSION", "ses_env")
+			req := &msdk.CallToolRequest{}
+			req.Params = &msdk.CallToolParamsRaw{Meta: msdk.Meta{key: "ses_meta"}}
+			if got := parentSession(req); got != "ses_meta" {
+				t.Fatalf("parentSession(%q) = %q, want ses_meta", key, got)
+			}
+		})
+	}
+}
+
+func TestParentSessionUsesEnvWithoutMeta(t *testing.T) {
+	t.Setenv("BEACON_PARENT_SESSION", "ses_operator")
+	if got := parentSession(nil); got != "ses_operator" {
+		t.Fatalf("parentSession(nil) = %q, want ses_operator", got)
+	}
+	t.Setenv("BEACON_PARENT_SESSION", "")
+	if got := parentSession(nil); got != "" {
+		t.Fatalf("parentSession(nil) = %q, want empty", got)
+	}
+}
