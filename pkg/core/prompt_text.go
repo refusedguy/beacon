@@ -18,6 +18,12 @@ var prPattern = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
 // instead of restating the rule, so one prompt cannot carry opposing advice.
 const WeakMachineVerificationRule = "On a weak machine, the full test suite, the full build and repository linters are advisory. Leave them to CI. A weak PC runs the local format and targeted tests instead; those checks are required on every machine. On a full machine, run the full test suite, the full build and the repository linters before reporting done."
 
+// OpenPRAndWatchInstruction is the single statement telling an agent to open
+// a pull request and bind the run with beacon_watch_pr. The spawn prompt, both
+// correction prompts and the idle nudge all use it, so the instruction has one
+// wording. It starts lowercase so a caller can place it after its own lead-in.
+const OpenPRAndWatchInstruction = "open a pull request, then call beacon_watch_pr with the run ID and PR number."
+
 // PRFromText returns the pull request number an agent printed. Both the URL
 // shape (pull/17) and the JSON shape ("pr": 17) are accepted. It returns zero
 // when the text contains no number.
@@ -35,8 +41,8 @@ func PRFromText(s string) int {
 
 // WakeText renders the correction prompt used by the ACP and CLI harnesses.
 func WakeText(w WakeContext) string {
-	return fmt.Sprintf("Beacon correction for run %s, PR #%d, head %s.\nReason: %s\n%s\nFix the issue, push and open a PR.\n",
-		w.RunID, w.PRNumber, w.HeadSHA, w.Reason, w.Excerpt)
+	return fmt.Sprintf("Beacon correction for run %s, PR #%d, head %s.\nReason: %s\n%s\nFix the issue, push and %s\n",
+		w.RunID, w.PRNumber, w.HeadSHA, w.Reason, w.Excerpt, OpenPRAndWatchInstruction)
 }
 
 // WakeTextLimited renders a correction prompt that carries retry counters and
@@ -49,7 +55,7 @@ func WakeTextLimited(w WakeContext, limit int) string {
 	if w.Excerpt != "" {
 		fmt.Fprintf(&b, "excerpt: %s\n", truncate(w.Excerpt, limit))
 	}
-	b.WriteString("fix the issue, push, then call beacon_watch_pr again")
+	b.WriteString("fix the issue, push, " + OpenPRAndWatchInstruction)
 	return b.String()
 }
 
