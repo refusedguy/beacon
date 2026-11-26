@@ -1,7 +1,7 @@
 ---
 id: T-e0c81eb0
 title: Surface the control result reason
-status: available
+status: done
 scope:
     - ui/tui/model.go
     - ui/tui/model_test.go
