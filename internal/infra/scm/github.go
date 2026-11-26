@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/go-github/v93/github"
 	"github.com/sony/gobreaker/v2"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -77,6 +78,11 @@ func (g *GitHub) guarded(fn func() (any, error)) (any, error) {
 // daemon fetching pages forever. With PerPage=100 it covers 10,000 entries.
 const maxGitHubPages = 100
 
+// observeParallelLimit bounds the goroutines that fetch independent PR signals.
+// A single Observe stays within the circuit breaker's burst allowance instead
+// of opening an unbounded number of requests at once.
+const observeParallelLimit = 4
+
 // githubPage carries one page through the breaker, which stores any.
 type githubPage[T any] struct {
 	items []T
@@ -131,48 +137,81 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		Conflict: conflict,
 	}
 
-	checks, err := g.checks(ctx, sha)
-	if err != nil {
-		return o, err
+	base := p.GetBase().GetRef()
+	if base == "" {
+		base = g.base
 	}
-	o.Checks = checks
-	for _, c := range checks {
+	signals := g.fetchSignals(ctx, pr, sha, base)
+
+	// Report failures in the original call order so callers see the same first
+	// error and the same partially filled observation. Changed files depend on
+	// the check result and stay in a second round.
+	if signals.checksErr != nil {
+		return o, signals.checksErr
+	}
+	o.Checks = signals.checks
+	for _, c := range signals.checks {
 		if c.State == core.CheckFailure {
 			o.FailureExcerpt = c.Output
 			break
 		}
 	}
-	if state == "open" && len(checks) == 0 {
+	if state == "open" && len(signals.checks) == 0 {
 		files, err := g.changedFiles(ctx, pr)
 		if err != nil {
 			return o, err
 		}
 		o.WorkflowSkipped = ignoredPathsOnly(files)
 	}
-
-	approvals, err := g.approvals(ctx, pr)
-	if err != nil {
-		return o, err
+	if signals.approvalsErr != nil {
+		return o, signals.approvalsErr
 	}
-	o.Approvals = approvals
+	o.Approvals = signals.approvals
 	for _, l := range p.Labels {
 		o.Labels = append(o.Labels, l.GetName())
 	}
-
-	base := p.GetBase().GetRef()
-	if base == "" {
-		base = g.base
+	if signals.compareErr != nil {
+		return o, signals.compareErr
 	}
-	cmp, err := guarded(g.br, func() (*github.CommitsComparison, error) {
-		c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
-		return c, err
-	})
-	if err != nil {
-		return o, err
-	}
-	o.Behind = cmp.GetBehindBy() > 0
-	o.BaseSHA = cmp.GetBaseCommit().GetSHA()
+	o.Behind = signals.cmp.GetBehindBy() > 0
+	o.BaseSHA = signals.cmp.GetBaseCommit().GetSHA()
 	return o, nil
+}
+
+// githubSignals carries the results of the first Observe round. Errors stay
+// separate so Observe can report them in the original call order.
+type githubSignals struct {
+	checks       []core.CheckResult
+	approvals    int
+	cmp          *github.CommitsComparison
+	checksErr    error
+	approvalsErr error
+	compareErr   error
+}
+
+// fetchSignals runs checks, approvals and the base comparison together. None of
+// them depends on another result, so one slow call cannot hold up the others.
+func (g *GitHub) fetchSignals(ctx context.Context, pr int, sha, base string) githubSignals {
+	var out githubSignals
+	var group errgroup.Group
+	group.SetLimit(observeParallelLimit)
+	group.Go(func() error {
+		out.checks, out.checksErr = g.checks(ctx, sha)
+		return out.checksErr
+	})
+	group.Go(func() error {
+		out.approvals, out.approvalsErr = g.approvals(ctx, pr)
+		return out.approvalsErr
+	})
+	group.Go(func() error {
+		out.cmp, out.compareErr = guarded(g.br, func() (*github.CommitsComparison, error) {
+			c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
+			return c, err
+		})
+		return out.compareErr
+	})
+	_ = group.Wait()
+	return out
 }
 
 // checks returns the check runs for commit sha.

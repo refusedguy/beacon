@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -87,19 +89,20 @@ func (g *GitLab) latestPipeline(ctx context.Context, query url.Values) (glPipeli
 	return pipelines[0], nil
 }
 
-// observeChecks fills the check fields from the latest pipeline for sha.
-// Provider failures are reported through failed and leave the checks empty.
-func (g *GitLab) observeChecks(ctx context.Context, o *core.Observation, sha string, failed *observationErrors) {
-	pipeline, err := g.latestPipeline(ctx, url.Values{"sha": {sha}})
-	failed.add("pipelines", err)
-	if err != nil || pipeline.ID == 0 {
-		return
-	}
+// observeChecks fills the check fields from a pipeline the caller fetched in
+// the first round. Provider failures are reported through failed and leave the
+// checks empty.
+func (g *GitLab) observeChecks(ctx context.Context, o *core.Observation, pipeline glPipeline, failed *observationErrors) {
 	checks, excerpt, err := g.pipelineChecks(ctx, pipeline.ID)
 	failed.add("jobs", err)
 	if err != nil {
 		return
 	}
+	applyChecks(o, checks, excerpt, pipeline)
+}
+
+// applyChecks writes checks and the excerpt in the original field order.
+func applyChecks(o *core.Observation, checks []core.CheckResult, excerpt string, pipeline glPipeline) {
 	o.Checks = checks
 	if len(checks) == 0 {
 		o.Checks = []core.CheckResult{{Name: "pipeline", State: glCheckState(pipeline.Status, false)}}
@@ -113,25 +116,50 @@ func (g *GitLab) observeChecks(ctx context.Context, o *core.Observation, sha str
 }
 
 func (g *GitLab) pipelineChecks(ctx context.Context, pipelineID int) ([]core.CheckResult, string, error) {
+	jobs, err := g.pipelineJobs(ctx, pipelineID)
+	if err != nil {
+		return nil, "", err
+	}
+	checks, excerpt := g.checksFromJobs(ctx, jobs)
+	return checks, excerpt, nil
+}
+
+func (g *GitLab) pipelineJobs(ctx context.Context, pipelineID int) ([]glJob, error) {
 	path := fmt.Sprintf("/projects/%s/pipelines/%d/jobs", g.project(), pipelineID)
 	var jobs []glJob
 	if err := g.getJSON(ctx, path, url.Values{"per_page": {"100"}}, &jobs); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	checks := make([]core.CheckResult, 0, len(jobs))
-	excerpt := ""
-	for _, job := range jobs {
-		state := glCheckState(job.Status, job.AllowFailure)
-		out := ""
-		if state == core.CheckFailure {
-			out = g.jobFailureOutput(ctx, job)
-			if excerpt == "" {
-				excerpt = out
-			}
+	return jobs, nil
+}
+
+// checksFromJobs fetches failure traces concurrently but fills checks and the
+// excerpt in job order, so callers see the same first failure as before.
+func (g *GitLab) checksFromJobs(ctx context.Context, jobs []glJob) ([]core.CheckResult, string) {
+	checks := make([]core.CheckResult, len(jobs))
+	outputs := make([]string, len(jobs))
+	var group errgroup.Group
+	group.SetLimit(observeParallelLimit)
+	for i, job := range jobs {
+		i, job := i, job
+		if glCheckState(job.Status, job.AllowFailure) != core.CheckFailure {
+			continue
 		}
-		checks = append(checks, core.CheckResult{Name: job.Name, State: state, Output: out})
+		group.Go(func() error {
+			outputs[i] = g.jobFailureOutput(ctx, job)
+			return nil
+		})
 	}
-	return checks, excerpt, nil
+	_ = group.Wait()
+	excerpt := ""
+	for i, job := range jobs {
+		state := glCheckState(job.Status, job.AllowFailure)
+		checks[i] = core.CheckResult{Name: job.Name, State: state, Output: outputs[i]}
+		if state == core.CheckFailure && excerpt == "" {
+			excerpt = outputs[i]
+		}
+	}
+	return checks, excerpt
 }
 
 func (g *GitLab) jobFailureOutput(ctx context.Context, job glJob) string {
