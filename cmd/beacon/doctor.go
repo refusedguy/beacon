@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -341,14 +342,47 @@ func doctorDaemonCheck(cfg config.Config) doctorCheck {
 	}
 }
 
-// doctorNetworkChecks probes the OpenCode endpoint and the SCM base branch.
+// doctorProbe describes one doctor network probe.
+type doctorProbe struct {
+	name     string
+	endpoint string
+	token    string
+	auth     func(*http.Request, string)
+}
+
+// doctorNetworkChecks probes the OpenCode endpoint and the SCM base branch concurrently.
+// Both probes share one deadline, so two hung endpoints cost one timeout rather than two.
+// Results are returned in probe order regardless of which finishes first.
 func doctorNetworkChecks(ctx context.Context, cfg config.Config, client *http.Client) []doctorCheck {
-	return []doctorCheck{
-		doctorHTTPCheck(ctx, "opencode endpoint", strings.TrimRight(cfg.Harness.Endpoint, "/")+"/api/project",
-			firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token), shared.ApplyAuth, client),
-		doctorHTTPCheck(ctx, "scm base branch", scmBranchURL(cfg),
-			firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token), bearerAuth, client),
+	probes := []doctorProbe{
+		{
+			name:     "opencode endpoint",
+			endpoint: strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/project",
+			token:    firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token),
+			auth:     shared.ApplyAuth,
+		},
+		{
+			name:     "scm base branch",
+			endpoint: scmBranchURL(cfg),
+			token:    firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token),
+			auth:     bearerAuth,
+		},
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, doctorHTTPTimeout)
+	defer cancel()
+
+	checks := make([]doctorCheck, len(probes))
+	var wg sync.WaitGroup
+	for i, probe := range probes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			checks[i] = doctorHTTPCheck(ctx, probe.name, probe.endpoint, probe.token, probe.auth, client)
+		}()
+	}
+	wg.Wait()
+	return checks
 }
 
 // bearerAuth sets a Bearer Authorization header on req.

@@ -45,6 +45,7 @@ func TestDoctorCommandReturnsExitError(t *testing.T) {
 	t.Chdir(dir)
 
 	cmd := newDoctorCommand(new(string))
+	cmd.SetContext(context.Background())
 	cmd.SetOut(io.Discard)
 	err := cmd.RunE(cmd, nil)
 	var coder exitCoder
@@ -66,6 +67,7 @@ func TestDoctorCommandSucceedsWithoutExitError(t *testing.T) {
 	}
 
 	cmd := newDoctorCommand(new(string))
+	cmd.SetContext(context.Background())
 	cmd.SetOut(io.Discard)
 	// RunE builds its own HTTP client; the probes only warn when unreachable.
 	if err := cmd.RunE(cmd, nil); err != nil {
@@ -439,6 +441,105 @@ func TestDoctorHTTPCheckAuth(t *testing.T) {
 				t.Fatalf("Authorization = %q, want Bearer %q", gotAuth, tc.wantBearer)
 			}
 		})
+	}
+}
+
+func doctorNetworkTestConfig(endpoint, baseURL string) config.Config {
+	return config.Config{
+		BaseBranch: "main",
+		SCM: config.SCM{
+			Provider: "gitlab",
+			BaseURL:  baseURL,
+			Owner:    "acme",
+			Repo:     "demo",
+			TokenEnv: "BEACON_DOCTOR_NETWORK_TOKEN",
+		},
+		Harness: config.Harness{
+			Endpoint: endpoint,
+			Command:  "worker",
+			TokenEnv: "BEACON_DOCTOR_NETWORK_HARNESS_TOKEN",
+		},
+	}
+}
+
+func TestDoctorNetworkChecksRunConcurrently(t *testing.T) {
+	received := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		received <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	defer unblock()
+
+	done := make(chan []doctorCheck, 1)
+	go func() {
+		done <- doctorNetworkChecks(context.Background(), doctorNetworkTestConfig(srv.URL, srv.URL), doctorHTTPClient())
+	}()
+
+	// Sequential probes would block on the first request, so the second would
+	// never reach the server before this deadline.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-received:
+		case <-time.After(2 * time.Second):
+			t.Fatal("network probes did not run concurrently")
+		}
+	}
+	unblock()
+
+	checks := <-done
+	wantNames := []string{"opencode endpoint", "scm base branch"}
+	if len(checks) != len(wantNames) {
+		t.Fatalf("checks = %d, want %d", len(checks), len(wantNames))
+	}
+	for i, c := range checks {
+		if c.name != wantNames[i] {
+			t.Errorf("check %d name = %q, want %q", i, c.name, wantNames[i])
+		}
+		if c.level != checkOK || c.detail != "HTTP 200" {
+			t.Errorf("%s check = %v %q, want OK HTTP 200", c.name, c.level, c.detail)
+		}
+	}
+}
+
+func TestDoctorNetworkChecksShareCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reached := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		reached <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	done := make(chan []doctorCheck, 1)
+	go func() {
+		done <- doctorNetworkChecks(ctx, doctorNetworkTestConfig(srv.URL, srv.URL), doctorHTTPClient())
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-reached:
+		case <-time.After(2 * time.Second):
+			t.Fatal("network probe did not reach the server")
+		}
+	}
+	cancel()
+
+	checks := <-done
+	if len(checks) != 2 {
+		t.Fatalf("checks = %d, want 2", len(checks))
+	}
+	for _, c := range checks {
+		if c.level != checkWarn || c.detail != "unreachable" {
+			t.Errorf("%s check = %v %q, want WARN unreachable", c.name, c.level, c.detail)
+		}
 	}
 }
 
