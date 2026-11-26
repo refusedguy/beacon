@@ -224,34 +224,46 @@ export function eventMatchesLocation(eventLocation, ownLocation) {
 export const tuiLocation = (ctx) => ctx?.location ?? ctx?.data?.location?.default?.() ?? null
 export const CARD_BODY_LINES = 80
 const unquote = (v) => v.trim().replace(/^(["'])(.*)\1$/, "$2").trim()
+const CARD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+const CARD_FRONTMATTER_RE = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n?/
+const CARD_META_ITEM_RE = /^\s+-\s+(.+?)\s*$/
+const CARD_META_FIELD_RE = /^([A-Za-z_][\w-]*):\s*(.*?)\s*$/
+// One regex reads every body field, so repeated card reads compile nothing.
+const CARD_BODY_FIELD_RE = /^([A-Za-z_][\w-]*):\s*(.+?)\s*$/gim
+const BEACON_BRANCH_RE = /^beacon\/(.+)$/
 
 // Read a card from docs/tasks. A missing or unreadable file returns null so
 // the caller fails closed instead of showing a stale SQLite queue row.
 export function readCard(root, id, deps = {}) {
   const cardID = str(id)
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(cardID)) return null
+  if (!CARD_ID_RE.test(cardID)) return null
   const path = join(root, "docs", "tasks", `${cardID}.md`)
   let body
   try {
     if (!(deps.existsSync ?? fsExistsSync)(path)) return null
     body = String((deps.readFileSync ?? fsReadFileSync)(path, "utf8"))
   } catch { return null }
-  const match = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n?/.exec(body)
+  const match = CARD_FRONTMATTER_RE.exec(body)
   const meta = Object.create(null)
   let key = ""
   for (const line of (match?.[1] ?? "").split(/\r?\n/)) {
-    const item = /^\s+-\s+(.+?)\s*$/.exec(line)
+    const item = CARD_META_ITEM_RE.exec(line)
     if (item && key) { (Array.isArray(meta[key]) ? meta[key] : (meta[key] = [])).push(unquote(item[1])); continue }
-    const field = /^([A-Za-z_][\w-]*):\s*(.*?)\s*$/.exec(line)
+    const field = CARD_META_FIELD_RE.exec(line)
     if (field) { key = field[1].toLowerCase(); meta[key] = field[2] ? unquote(field[2]) : [] }
   }
   const text = (name) => { const v = meta[name]; return Array.isArray(v) ? v.join(", ") : str(v) }
   const rest = match ? body.slice(match[0].length) : body
-  const field = (name) => text(name) || new RegExp(`^${name}:\\s*(.+?)\\s*$`, "im").exec(rest)?.[1] || ""
+  const bodyFields = Object.create(null)
+  for (const found of rest.matchAll(CARD_BODY_FIELD_RE)) {
+    const name = found[1].toLowerCase()
+    if (bodyFields[name] === undefined) bodyFields[name] = found[2]
+  }
+  const field = (name) => text(name) || bodyFields[name.toLowerCase()] || ""
   return {
     id: cardID, title: text("title") || cardID, priority: text("priority"), status: text("status"),
     kind: text("kind") || "task", scope: field("scope"), depends: field("depends") || field("depends_on"), meta,
-    parent: (field("epic") || (/^beacon\/(.+)$/.exec(field("base_branch"))?.[1] ?? "")).trim(),
+    parent: (field("epic") || (BEACON_BRANCH_RE.exec(field("base_branch"))?.[1] ?? "")).trim(),
     path, relativePath: relative(root, path), body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
   }
 }
