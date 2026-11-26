@@ -1,7 +1,7 @@
 // Sidebar slot: a dedicated Beacon header row, a wide state bar, a muted
 // legend and the pooled Active/Recent line list. The header and Dispatch are
 // real boxes so they align and hover like the native Context/MCP sections.
-import { createBox, createLineMount, createSegmentBar, createText } from "./ui_nodes.js"
+import { createBox, createSegmentBar, createText, mountLines } from "./ui_nodes.js"
 import { REASON_WIDTH } from "./ui_model.js"
 import { isDispatching, truncate } from "./ui_alerts.js"
 import { truncateSidebarTitle } from "./ui_view.js"
@@ -90,11 +90,9 @@ export function createSidebarMount(ui, deps) {
   set(legend, "flexShrink", 0)
   insert(container, legend)
 
-  const meta = createLineMount(ui, { ...deps, maxLines: 1 })
-  meta.node.forEach((node) => insert(container, node))
+  const meta = mountLines(ui, container, deps, { maxLines: 1 })
 
-  const list = createLineMount(ui, { ...deps, onItem: handle, maxLines: SIDEBAR_LINES })
-  list.node.forEach((node) => insert(container, node))
+  const list = mountLines(ui, container, deps, { onItem: handle, maxLines: SIDEBAR_LINES })
 
   const raised = color("raised")
   // The Dispatch line becomes a padded, themed button. Pooled rows reset every
