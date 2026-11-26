@@ -1,7 +1,7 @@
 ---
 id: T-c03ccdeb
 title: Remove synchronous binary rebuild from click path
-status: in_progress
+status: done
 scope:
     - .opencode/plugins/beacon-project/mcp/mcp.js
     - .opencode/plugins/beacon-project/mcp/mcp_test.js
