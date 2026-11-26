@@ -321,10 +321,20 @@ func DetectRequiredChecks(root string) []string {
 
 // parseJobNames extracts job names from a workflow document. Only the two-space
 // indented keys directly under jobs: are names; nested matrix and step keys sit
-// deeper and are ignored.
+// deeper and are ignored. A job with strategy.matrix is omitted because GitHub
+// reports only the expanded cell names, so the bare job name can never be
+// satisfied as a required check.
 func parseJobNames(content string) []string {
 	var names []string
 	inJobs := false
+	var current string
+	var body []string
+	flush := func() {
+		if current == "" || hasMatrix(body) {
+			return
+		}
+		names = append(names, current)
+	}
 	for _, line := range strings.Split(content, "\n") {
 		if strings.HasPrefix(line, "jobs:") {
 			inJobs = true
@@ -336,15 +346,43 @@ func parseJobNames(content string) []string {
 		if line != "" && !strings.HasPrefix(line, " ") {
 			break
 		}
-		if !strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "    ") {
-			continue
+		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") {
+			name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+			if ok && name != "" && !strings.HasPrefix(name, "#") {
+				flush()
+				current = name
+				body = nil
+				continue
+			}
 		}
-		name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if ok && name != "" && !strings.HasPrefix(name, "#") {
-			names = append(names, name)
+		if current != "" {
+			body = append(body, line)
 		}
 	}
+	flush()
 	return names
+}
+
+// hasMatrix reports whether a job body declares strategy.matrix.
+func hasMatrix(lines []string) bool {
+	inStrategy := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "strategy:" {
+			inStrategy = true
+			continue
+		}
+		if inStrategy && trimmed == "matrix:" {
+			return true
+		}
+		if line != "" && !strings.HasPrefix(line, " ") {
+			break
+		}
+		if inStrategy && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && trimmed != "" {
+			inStrategy = false
+		}
+	}
+	return false
 }
 
 // literalOrEnv returns the environment value when set, else literal.
