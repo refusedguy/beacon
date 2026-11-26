@@ -24,6 +24,10 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := dropRedundantRunIndexes(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := ensureSnapshotIndexes(db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -33,6 +37,15 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+// dropRedundantRunIndexes removes runs_state_idx. Its keys are a strict prefix
+// of runs_state_updated_idx, which the snapshot indexes supply on every open,
+// so keeping it only adds write cost. Databases created before the composite
+// index existed still carry it, hence the idempotent drop on open.
+func dropRedundantRunIndexes(db *sql.DB) error {
+	_, err := db.Exec(`DROP INDEX IF EXISTS runs_state_idx`)
+	return err
 }
 
 // ensureSnapshotIndexes adds the covering indexes the snapshot reads rely on.
