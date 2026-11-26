@@ -36,6 +36,7 @@ func (bareHarness) Stop(context.Context, string) error                   { retur
 func (bareHarness) IsAlive(context.Context, string) (bool, error)        { return false, nil }
 func (bareHarness) NotifyParent(context.Context, string, string) error   { return nil }
 func (bareHarness) Events() <-chan core.HarnessEvent                     { return nil }
+func (bareHarness) RefreshWorktrees(context.Context) error               { return nil }
 
 func TestProjectRootPrefersEnvironment(t *testing.T) {
 	want := t.TempDir()

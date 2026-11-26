@@ -60,10 +60,10 @@ func compact(s string) string {
 	return s[:i] + "\n...[truncated]"
 }
 
-// reviewGate is the part of a merge policy that decides whether an epic PR
+// ReviewGate is the part of a merge policy that decides whether an epic PR
 // still needs review approval. The policy lives in an outer package, so the
 // reconciler reaches it through this port instead of a concrete rule.
-type reviewGate interface {
+type ReviewGate interface {
 	ReviewRequired(core.ReviewMode, core.Observation) bool
 }
 
@@ -231,14 +231,7 @@ func (r *Reconciler) guardEpicReview(ctx context.Context, run *core.Run, obs cor
 	if mode == core.ReviewModeLLM {
 		r.maybeSpawnReviewer(ctx, run, obs)
 	}
-	gate, ok := r.Policy.(reviewGate)
-	if !ok {
-		// A policy without a review gate cannot approve an epic review, so
-		// hold the merge rather than dropping the task card's requirement.
-		slog.Warn("merge policy has no epic review gate", "run", run.ID)
-		return false, nil
-	}
-	return !gate.ReviewRequired(mode, obs), nil
+	return !r.Policy.ReviewRequired(mode, obs), nil
 }
 
 // maybeSpawnReviewer starts one LLM review session for an epic commit. The

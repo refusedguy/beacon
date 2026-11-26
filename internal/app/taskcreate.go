@@ -82,11 +82,19 @@ type CreateTaskInput struct {
 	Plan          []core.ChildSpec `json:"plan,omitempty"`
 }
 
+// TaskWorkspace is the workspace surface TaskCreator uses. It composes the
+// commit capability with branch creation, so an epic can publish its base
+// branch without discovering the capability by assertion at use.
+type TaskWorkspace interface {
+	PathCommitter
+	BranchEnsurer
+}
+
 // TaskCreator writes cards through the source, then commits and pushes them.
 // An epic with a plan expands into deterministic child cards before the epic.
 type TaskCreator struct {
 	Source    core.TaskSource
-	Workspace PathCommitter
+	Workspace TaskWorkspace
 	Root      core.Workspace
 	Store     TaskGraphStore
 	// Date overrides the date used by generated random IDs. Derived epic and
@@ -150,7 +158,7 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		}
 		// Children fetch this branch before the epic opens a PR, so publish it
 		// before any card is written. A failure leaves no half-created epic.
-		if err := ensureBranch(ctx, c.Workspace, epicBranch(id), publishBase(c.Root)); err != nil {
+		if err := ensureEpicBranch(ctx, c.Workspace, epicBranch(id), publishBase(c.Root)); err != nil {
 			return out, fmt.Errorf("create epic branch: %w", err)
 		}
 	}
@@ -194,6 +202,16 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		c.Cache.RememberCreated(key, created)
 	}
 	return c.result(created), nil
+}
+
+// ensureEpicBranch publishes an epic base branch through the composed workspace
+// injected into TaskCreator. Tasks on the configured base need no branch work.
+func ensureEpicBranch(ctx context.Context, ws TaskWorkspace, branch, base string) error {
+	branch = strings.TrimSpace(branch)
+	if !strings.HasPrefix(branch, epicBranchPrefix) {
+		return nil
+	}
+	return ws.EnsureBranch(ctx, branch, base)
 }
 
 // epicChildren gives an epic's plan the branch that its children branch from.

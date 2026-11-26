@@ -40,12 +40,35 @@ type stalePruner interface {
 	PruneStale(ctx context.Context, retention time.Duration) (int64, error)
 }
 
+// ReconcilerPolicy is the policy surface the reconciler uses. It composes the
+// merge decision with the epic review gate, so the gate is part of the injected
+// dependency rather than a capability discovered by assertion at use.
+type ReconcilerPolicy interface {
+	core.MergePolicy
+	ReviewGate
+}
+
+// ReconcilerConfig holds the settings the reconciler reads at construction.
+// The composition root copies them from config.Config, so the service never
+// receives unrelated configuration.
+type ReconcilerConfig struct {
+	Notifier       core.Notifier
+	Repo           string
+	BaseBranch     string
+	ParentSession  string
+	BaseRedMode    string
+	MaxFixTries    int
+	Interval       time.Duration
+	AutoRebase     bool
+	MaxAutoRebases int
+}
+
 // Reconciler observes pull requests, applies merge policy to their runs and
 // drains the harness and timer events that drive the daemon loop.
 type Reconciler struct {
 	Store           ReconcilerStore
 	SCM             core.ScmGateway
-	Policy          core.MergePolicy
+	Policy          ReconcilerPolicy
 	Harness         core.AgentHarness
 	Source          core.TaskSource
 	Workspace       core.WorkspaceManager

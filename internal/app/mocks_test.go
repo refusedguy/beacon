@@ -266,6 +266,8 @@ func (f *fakeWorkspace) ForceRemove(_ context.Context, _ core.Workspace) error {
 func (f *fakeWorkspace) HasChanges(context.Context, core.Workspace, string) (bool, error) {
 	return false, nil
 }
+func (f *fakeWorkspace) EnsureBranch(context.Context, string, string) error { return nil }
+
 func (f *fakeWorkspace) CommitPath(_ context.Context, _ core.Workspace, pathspec, message string) error {
 	f.commits = append(f.commits, commitCall{pathspec: pathspec, message: message})
 	f.log.add("commit:" + pathspec)
