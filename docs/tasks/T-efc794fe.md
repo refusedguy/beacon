@@ -1,7 +1,7 @@
 ---
 id: T-efc794fe
 title: Split markdown card index cache
-status: available
+status: done
 scope:
     - internal/infra/tasksource/markdown.go
     - internal/infra/tasksource/cardindex.go
