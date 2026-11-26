@@ -23,8 +23,8 @@ func registerWatchPR(s *msdk.Server, sv Services) {
 			}
 			return textResult("watching PR " + fmt.Sprint(a.PR)), nil, nil
 		}
-		if sv.Control == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "control service is not configured")
+		if err := requireService("control service", sv.Control); err != nil {
+			return nil, nil, err
 		}
 		if err := sv.Control.WatchPR(ctx, core.RunID(a.RunID), a.PR); err != nil {
 			return nil, nil, err

@@ -32,8 +32,8 @@ func registerTaskCreate(s *msdk.Server, sv Services) {
 	// writing the same cards twice. The create wrapper also accepts epic fields.
 	journal := newOpJournal()
 	msdk.AddTool(s, catalogTool("beacon_task_create"), func(ctx context.Context, _ *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
-		if sv.TaskCreator == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "task creator is not configured")
+		if err := requireService("task creator", sv.TaskCreator); err != nil {
+			return nil, nil, err
 		}
 		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
 			return createTasks(ctx, sv.TaskCreator, a)
@@ -67,8 +67,8 @@ func createTasks(ctx context.Context, creator *app.TaskCreator, a epicCreateArgs
 func registerTaskUpdate(s *msdk.Server, sv Services) {
 	journal := newOpJournal()
 	msdk.AddTool(s, catalogTool("beacon_task_update"), func(ctx context.Context, _ *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
-		if sv.TaskUpdater == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "task updater is not configured")
+		if err := requireService("task updater", sv.TaskUpdater); err != nil {
+			return nil, nil, err
 		}
 		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
 			return updateTasks(ctx, sv.TaskUpdater, a)
@@ -87,8 +87,8 @@ func updateTasks(ctx context.Context, updater *app.TaskUpdater, a updateTaskArgs
 func registerTaskDelete(s *msdk.Server, sv Services) {
 	journal := newOpJournal()
 	msdk.AddTool(s, catalogTool("beacon_task_delete"), func(ctx context.Context, _ *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
-		if sv.TaskDeleter == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "task deleter is not configured")
+		if err := requireService("task deleter", sv.TaskDeleter); err != nil {
+			return nil, nil, err
 		}
 		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
 			return deleteTasks(ctx, sv.TaskDeleter, a)
@@ -369,8 +369,8 @@ type reconcileArgs struct {
 
 func registerReconcile(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, catalogTool("beacon_reconcile"), func(ctx context.Context, _ *msdk.CallToolRequest, a reconcileArgs) (*msdk.CallToolResult, any, error) {
-		if sv.Reconcile == nil {
-			return nil, nil, core.Errorf(core.CodeUnavailable, "reconcile service is not configured")
+		if err := requireService("reconcile service", sv.Reconcile); err != nil {
+			return nil, nil, err
 		}
 		result := sv.Reconcile.Tick(ctx, a.PR)
 		if result.Error != "" {
