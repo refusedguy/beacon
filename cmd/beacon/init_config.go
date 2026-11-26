@@ -12,7 +12,9 @@ import (
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
-// buildInitConfig constructs the Beacon config from resolved options and the remote.
+// buildInitConfig constructs the Beacon config from resolved options and the
+// remote. It writes only detected values and lets config.ApplyDefaults fill
+// the rest, so generated and loaded configs share one default path.
 func buildInitConfig(root string, o initOptions, r remote, base string) config.Config {
 	provider := firstNonEmpty(o.scm, r.provider)
 	tokenEnv := "GITHUB_TOKEN"
@@ -22,9 +24,7 @@ func buildInitConfig(root string, o initOptions, r remote, base string) config.C
 		baseURL = gitlabAPI(r.host)
 	}
 	stack := detectStack(root)
-	return config.Config{
-		StateDB:      ".beacon/state.db",
-		WorkspaceDir: ".beacon/worktrees",
+	cfg := config.Config{
 		BaseBranch:   base,
 		PollInterval: "30s",
 		Concurrency: config.Concurrency{
@@ -43,10 +43,11 @@ func buildInitConfig(root string, o initOptions, r remote, base string) config.C
 		Merge: config.Merge{
 			RequiredChecksMode: config.RequiredChecksWorkflow,
 			RequiredChecks:     detectRequiredChecks(root),
-			MaxAttempts:        12, AutoRebase: true, Labels: []string{},
+			AutoRebase:         true, Labels: []string{},
 		},
-		OnBaseRed: config.OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
+	config.ApplyDefaults(&cfg)
+	return cfg
 }
 
 // gitlabAPI returns the GitLab API base URL for host.

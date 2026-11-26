@@ -251,15 +251,15 @@ func Load(path string) (Config, error) {
 	if err := c.validate(interval, intervalErr); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
-	applyDefaults(&c)
+	ApplyDefaults(&c)
 	resolveRequiredChecks(&c, path)
 	return c, nil
 }
 
-// applyDefaults fills unset scalar settings after validation. Load calls it
-// so every caller gets the same values, including the rebase cap that used to
-// live in the reconciler.
-func applyDefaults(c *Config) {
+// ApplyDefaults fills unset scalar settings. Load and beacon init both call
+// it, so a generated config and a loaded config share the same values. It
+// never overwrites a value the operator or init supplied explicitly.
+func ApplyDefaults(c *Config) {
 	if c.StateDB == "" {
 		c.StateDB = ".beacon/state.db"
 	}

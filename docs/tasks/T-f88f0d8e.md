@@ -1,7 +1,7 @@
 ---
 id: T-f88f0d8e
 title: Single config default path
-status: available
+status: done
 scope:
     - internal/infra/config/config.go
     - cmd/beacon/init.go
