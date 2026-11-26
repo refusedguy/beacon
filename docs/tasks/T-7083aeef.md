@@ -1,7 +1,7 @@
 ---
 id: T-7083aeef
 title: Add CI perf smoke and nightly regression gate
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
     - scripts/check-bench-regression.sh

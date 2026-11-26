@@ -89,6 +89,7 @@ func (r *Reconciler) blockRunsOnRedBase(ctx context.Context, in *core.BaseIncide
 	if err != nil {
 		return err
 	}
+	tree := r.taskTree(ctx)
 	baseFailed := failedNames(failed)
 	for _, other := range active {
 		if other.IsFixer || other.PRNumber == 0 {
@@ -97,7 +98,7 @@ func (r *Reconciler) blockRunsOnRedBase(ctx context.Context, in *core.BaseIncide
 		if other.State != core.RunWaitingCI && other.State != core.RunNeedsAgentFix {
 			continue
 		}
-		if r.baseBranchFor(ctx, other) != baseBranch {
+		if r.baseBranchForTree(tree, other) != baseBranch {
 			continue
 		}
 		otherObs, err := r.SCM.Observe(ctx, other.PRNumber)

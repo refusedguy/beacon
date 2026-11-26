@@ -316,6 +316,31 @@ test("server config carries the project root and enables the server", () => {
   assert.throws(() => beaconServerConfig("", deps), /project root is required/)
 })
 
+test("500 config requests over a 2000-file source tree walk it once and spawn no build", () => {
+  const { local } = localPaths()
+  const cmd = join(ROOT, "cmd")
+  const files = { [local]: "binary" }
+  const mtimes = { [local]: BINARY_MTIME }
+  const names = []
+  for (let i = 0; i < 2000; i += 1) {
+    const name = `source${i}.go`
+    files[join(cmd, name)] = "package main"
+    mtimes[join(cmd, name)] = BINARY_MTIME - 1
+    names.push(name)
+  }
+  const deps = fakeDeps({ files, mtimes, dirs: { [cmd]: names } })
+
+  for (let i = 0; i < 500; i += 1) {
+    assert.deepEqual(beaconServerConfig(ROOT, deps).command, [local, "mcp"])
+  }
+
+  // One walk of the five source dirs, one binary stat per request, and two
+  // source stats from that single walk. No later request rewalks or rebuilds.
+  assert.equal(deps.readdirCalls.length, 5)
+  assert.equal(deps.statCalls.length, 500 + 2 * 2000)
+  assert.equal(deps.execCalls.length, 0)
+})
+
 test("a deps override for beaconCommand is used instead of probing the filesystem", () => {
   const calls = []
   const override = (root) => { calls.push(root); return ["/bin/beacon", "mcp"] }
