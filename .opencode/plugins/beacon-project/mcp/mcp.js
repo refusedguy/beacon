@@ -1,22 +1,17 @@
-import { existsSync as fsExistsSync, statSync as fsStatSync, readdirSync as fsReaddirSync } from "node:fs"
-import { execFileSync as defaultExecFileSync } from "node:child_process"
+import { existsSync as fsExistsSync } from "node:fs"
 import { delimiter, join } from "node:path"
 import { sessionIdentity } from "../state/session_identity.js"
 
 export const BEACON_SERVER = "beacon"
 export const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 export const BEACON_PARENT_SESSION_ENV = "BEACON_PARENT_SESSION"
+// Kept as the single path used by the operator reminder in rules/context.js.
+// Builds happen at development time, never during MCP command resolution.
 export const BEACON_BUILD_SCRIPT = "scripts/build-beacon.sh"
-
-const SOURCE_DIRS = ["cmd", "internal", "pkg", "harnesses", "ui/tui"]
-const MODULE_FILES = ["go.mod", "go.sum", "go.work"]
 
 const defaultDeps = {
   env: process.env,
   existsSync: fsExistsSync,
-  statSync: fsStatSync,
-  readdirSync: fsReaddirSync,
-  execFileSync: defaultExecFileSync,
 }
 
 // Partial dependency objects are useful at call sites that only override one
@@ -34,58 +29,6 @@ function pathBinary(name, deps) {
   return null
 }
 
-// Yield every build input tracked by scripts/build-beacon.sh. Directories are
-// walked with readdirSync and statSync so the common path never spawns bash.
-function* sourcePaths(root, deps) {
-  for (const name of MODULE_FILES) {
-    const path = join(root, name)
-    if (deps.existsSync(path)) yield path
-  }
-  const stack = SOURCE_DIRS.map((dir) => join(root, dir))
-  while (stack.length) {
-    const dir = stack.pop()
-    let entries
-    try {
-      entries = deps.readdirSync(dir)
-    } catch {
-      continue
-    }
-    for (const name of entries) {
-      const path = join(dir, name)
-      let stat
-      try {
-        stat = deps.statSync(path)
-      } catch {
-        continue
-      }
-      if (stat.isDirectory()) stack.push(path)
-      else if (name.endsWith(".go")) yield path
-    }
-  }
-}
-
-// A binary is fresh when every build input is older than the binary itself.
-// Any stat failure means we could not prove freshness, so we rebuild.
-function sourceNewerThanBinary(root, deps, binaryMtime) {
-  for (const source of sourcePaths(root, deps)) {
-    try {
-      if (deps.statSync(source).mtimeMs > binaryMtime) return true
-    } catch {
-      return true
-    }
-  }
-  return false
-}
-
-function runBuild(root, deps) {
-  const script = join(root, ...BEACON_BUILD_SCRIPT.split("/"))
-  try {
-    deps.execFileSync("bash", [script], { cwd: root, stdio: "inherit" })
-  } catch (error) {
-    console.warn(`beacon MCP: failed to rebuild local binary: ${error.message}`)
-  }
-}
-
 // A worker session inherits the pooled daemon from its parent. This stands in
 // for a real registration so the plugin's cleanup path stays uniform without
 // resolving a command or touching a registrar's cache.
@@ -99,55 +42,28 @@ export function noopMcpRegistration() {
   })
 }
 
-// Every returned registrar owns its registration and rebuild maps. A caller
-// that passes different deps to two registrars gets two independent caches.
+// Every returned registrar owns its registration map. A caller that passes
+// different deps to two registrars gets two independent caches.
 export function createMcpRegistrar(deps = defaultDeps) {
   const baseDeps = normalizeDeps(deps)
   const registrations = new Map()
-  const rebuilds = new WeakMap()
 
-  // Resolve each caller's deps once. beaconServerConfig hands the resolved
-  // object to beaconCommand, which uses it as its memo key. A fresh object on
-  // every config request would miss the memo and rewalk the source tree.
-  const resolvedDeps = new WeakMap()
-
-  // Call-level deps override the deps this registrar was created with. The
-  // result belongs to this registrar and stays stable for the same deps object.
+  // Call-level deps override the deps this registrar was created with.
   function resolveDeps(callDeps) {
-    const source = callDeps && typeof callDeps === "object" ? callDeps : baseDeps
-    let effective = resolvedDeps.get(source)
-    if (!effective) {
-      effective = { ...baseDeps, ...source }
-      resolvedDeps.set(source, effective)
-    }
-    return effective
+    return callDeps && typeof callDeps === "object" ? { ...baseDeps, ...callDeps } : baseDeps
   }
 
-  // One rebuild attempt per root and binary mtime. A successful build changes
-  // the binary mtime, so a later resolution checks the new build. Until then,
-  // repeated resolutions reuse the decision instead of racing with the script.
-  function rebuildLocalIfStale(root, local, effective, memoKey) {
-    let mtime
-    try { mtime = effective.statSync(local).mtimeMs } catch { mtime = null }
-    let checked = rebuilds.get(memoKey)
-    if (!checked) { checked = new Set(); rebuilds.set(memoKey, checked) }
-    const key = `${root}\u0000${mtime}`
-    if (checked.has(key)) return
-    checked.add(key)
-    if (mtime === null || sourceNewerThanBinary(root, effective, mtime)) runBuild(root, effective)
-  }
-
+  // Resolve the binary location only. A stale local binary is reported by the
+  // operator reminder and rebuilt with the explicit script at development time.
+  // Nothing here reads source files or starts a subprocess, so a dispatch call
+  // never waits on a build.
   function beaconCommand(root, callDeps = baseDeps) {
-    const memoKey = callDeps && typeof callDeps === "object" ? callDeps : baseDeps
     const effective = resolveDeps(callDeps)
     const explicit = effective.env.BEACON_BIN
     if (explicit && effective.existsSync(explicit)) return [explicit, "mcp"]
 
     const local = join(root, ".opencode", "bin", "beacon")
-    if (effective.existsSync(local)) {
-      rebuildLocalIfStale(root, local, effective, memoKey)
-      return [local, "mcp"]
-    }
+    if (effective.existsSync(local)) return [local, "mcp"]
 
     const repoBin = join(root, "bin", "beacon")
     if (effective.existsSync(repoBin)) return [repoBin, "mcp"]
