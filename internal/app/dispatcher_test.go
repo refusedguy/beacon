@@ -1171,3 +1171,105 @@ func BenchmarkDispatchSteps(b *testing.B) {
 		})
 	}
 }
+
+// failingPlanner records whether a caller asks it to select. The pure helper
+// must skip planning when the slot budget is already exhausted.
+type failingPlanner struct {
+	calls int
+}
+
+func (p *failingPlanner) Select([]core.Task, []*core.Run, int, bool) ([]core.Task, []SkippedTask, error) {
+	p.calls++
+	return nil, nil, errors.New("planner should not be called")
+}
+
+func busyRun(id core.RunID, task core.TaskID) *core.Run {
+	r := core.NewRun(id, task, time.Now().UTC())
+	r.State = core.RunRunning
+	return r
+}
+
+func TestSelectDispatchCandidatesBudget(t *testing.T) {
+	ready := []core.Task{
+		{ID: "T-1", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("one.go")}},
+		{ID: "T-2", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("two.go")}},
+	}
+	active := []*core.Run{busyRun("r-1", "R-1"), busyRun("r-2", "R-2")}
+	for _, tc := range []struct {
+		name       string
+		n          int
+		inFlight   int
+		wantLimit  int
+		wantChosen int
+	}{
+		{"request below free slots", 1, 5, 1, 1},
+		{"free slots below request", 4, 3, 1, 1},
+		{"no free slots", 4, 2, 0, 0},
+		{"negative free slots", 4, 1, -1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sel, err := selectDispatchCandidates(NewPlanner(nil), ready, active, tc.n, tc.inFlight, false)
+			if err != nil {
+				t.Fatalf("selectDispatchCandidates: %v", err)
+			}
+			if sel.Limit != tc.wantLimit {
+				t.Errorf("limit = %d, want %d", sel.Limit, tc.wantLimit)
+			}
+			if len(sel.Chosen) != tc.wantChosen {
+				t.Errorf("chosen = %d, want %d", len(sel.Chosen), tc.wantChosen)
+			}
+		})
+	}
+}
+
+func TestSelectDispatchCandidatesSkipsPlannerWithoutBudget(t *testing.T) {
+	ready := []core.Task{{ID: "T-1", Status: core.TaskAvailable}}
+	active := []*core.Run{busyRun("r-1", "R-1")}
+	planner := &failingPlanner{}
+	sel, err := selectDispatchCandidates(planner, ready, active, 5, 1, false)
+	if err != nil {
+		t.Fatalf("selectDispatchCandidates: %v", err)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner called %d times with no budget", planner.calls)
+	}
+	if sel.Limit != 0 || len(sel.Chosen) != 0 || len(sel.Skipped) != 0 {
+		t.Fatalf("selection = %+v, want empty", sel)
+	}
+}
+
+func TestSelectDispatchCandidatesSelection(t *testing.T) {
+	ready := []core.Task{
+		{ID: "A", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("shared.go")}},
+		{ID: "B", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("shared.go")}},
+		{ID: "C", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("other.go")}},
+	}
+	sel, err := selectDispatchCandidates(NewPlanner(nil), ready, nil, 10, 10, false)
+	if err != nil {
+		t.Fatalf("selectDispatchCandidates: %v", err)
+	}
+	if sel.Limit != 10 {
+		t.Fatalf("limit = %d, want 10", sel.Limit)
+	}
+	if len(sel.Chosen) != 2 || sel.Chosen[0].ID != "A" || sel.Chosen[1].ID != "C" {
+		t.Fatalf("chosen = %v, want [A C]", sel.Chosen)
+	}
+	if len(sel.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want one conflict", sel.Skipped)
+	}
+	skip := sel.Skipped[0]
+	if skip.TaskID != "B" || skip.Code != SkipSelectedScopeOverlap || skip.BlockedBy != "A" {
+		t.Fatalf("skip = %+v, want B blocked by A", skip)
+	}
+}
+
+func TestSelectDispatchCandidatesPropagatesPlannerError(t *testing.T) {
+	planner := &failingPlanner{}
+	_, err := selectDispatchCandidates(planner, []core.Task{{ID: "T-1"}}, nil, 1, 1, false)
+	if err == nil || err.Error() != "planner should not be called" {
+		t.Fatalf("err = %v, want the planner error", err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls = %d, want 1", planner.calls)
+	}
+}
