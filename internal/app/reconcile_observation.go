@@ -91,7 +91,7 @@ func (r *Reconciler) handleNeedsRebase(
 		return decision, nil
 	}
 	if run.RebaseBudgetExhausted(r.autoRebaseCap()) {
-		if run.State != core.RunBlocked {
+		if !run.State.Blocked() {
 			return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase budget exhausted"}, obs)
 		}
 		return decision, nil
@@ -154,7 +154,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 	if err != nil {
 		return decision, err
 	}
-	if fresh != nil && fresh.State == core.RunBlocked {
+	if fresh != nil && fresh.State.Blocked() {
 		return decision, nil
 	}
 	if fresh != nil {
@@ -164,7 +164,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 }
 
 func (r *Reconciler) handleBlocked(ctx context.Context, run *core.Run, decision core.MergeDecision) (core.MergeDecision, error) {
-	if run.State != core.RunBlocked {
+	if !run.State.Blocked() {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}

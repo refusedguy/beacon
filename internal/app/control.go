@@ -236,12 +236,12 @@ func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 		if err != nil {
 			return err
 		}
-		switch run.State {
-		case core.RunBlocked:
+		switch {
+		case run.State.Blocked():
 			if err := run.RetryBlocked("retried by operator"); err != nil {
 				return err
 			}
-		case core.RunClosed:
+		case run.State == core.RunClosed:
 			if err := c.retryClosed(ctx, run); err != nil {
 				return err
 			}
