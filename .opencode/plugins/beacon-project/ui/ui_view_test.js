@@ -6,7 +6,7 @@ import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
   SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
-  detailLines, detailModel, elapsed, mergedReason, normalizeRun, phaseLabel, renderSnapshotLines,
+  detailLines, detailModel, elapsed, mergedReason, metricsLine, normalizeRun, phaseLabel, renderSnapshotLines,
   runLineItems, runTotalTime, sidebarModel, stateBarItem, truncate,
 } = ui
 
@@ -186,6 +186,14 @@ test("a sanitized stale line keeps the prefix and never shows help text", () => 
   assert.equal(stale.name, "[stale] beacon status temporarily unavailable")
   assert.equal(stale.name.includes("--help"), false)
   assert.ok(stale.name.length <= 9 + REASON_WIDTH)
+})
+
+test("view helpers with an omitted snapshot use the empty snapshot", () => {
+  assert.deepEqual(stateBarItem().counts, stateBarItem(EMPTY_SNAPSHOT).counts)
+  assert.deepEqual(sidebarModel().items.map((i) => i.name), sidebarModel(EMPTY_SNAPSHOT).items.map((i) => i.name))
+  assert.deepEqual(metricsLine(), {
+    marker: "", name: "Beacon 0 active", status: "P0 R0 C0 E0 F0 B0 M0 X0", color: "muted",
+  })
 })
 
 test("empty snapshot shows one queue line and counted headers", () => {
