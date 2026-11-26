@@ -167,6 +167,16 @@ func (c Config) RepoSlug() string {
 	return c.SCM.Owner + "/" + c.SCM.Repo
 }
 
+// ValidateWebhook checks the shared webhook secret rule. An enabled webhook
+// needs a literal secret or a secret_env name that resolves to one. Config
+// load, serve and doctor call this instead of restating the rule.
+func ValidateWebhook(w Webhook) error {
+	if w.Enabled && w.Secret == "" {
+		return fmt.Errorf("webhook.enabled requires webhook.secret or webhook.secret_env")
+	}
+	return nil
+}
+
 // validate rejects a config that cannot drive the daemon. An absent SCM
 // section is left to Complete to reject on reload; a partial one fails here
 // with a clear message. A malformed poll interval surfaces the ParseDuration
@@ -212,12 +222,12 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
 	expandNonSecrets(&c)
-	c.Webhook.Secret = literalOrEnv(c.Webhook.Secret, c.Webhook.SecretEnv)
-	if c.Webhook.Enabled && c.Webhook.Secret == "" {
-		return c, fmt.Errorf("config %s: webhook.enabled requires webhook.secret or webhook.secret_env", path)
+	c.Webhook.Secret = LiteralOrEnv(c.Webhook.Secret, c.Webhook.SecretEnv)
+	if err := ValidateWebhook(c.Webhook); err != nil {
+		return c, fmt.Errorf("config %s: %w", path, err)
 	}
-	c.Notify.TelegramToken = literalOrEnv(c.Notify.TelegramToken, c.Notify.TelegramTokenEnv)
-	c.SCM.Token = literalOrEnv(c.SCM.Token, c.SCM.TokenEnv)
+	c.Notify.TelegramToken = LiteralOrEnv(c.Notify.TelegramToken, c.Notify.TelegramTokenEnv)
+	c.SCM.Token = LiteralOrEnv(c.SCM.Token, c.SCM.TokenEnv)
 	if err := c.validate(); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
@@ -385,8 +395,10 @@ func hasMatrix(lines []string) bool {
 	return false
 }
 
-// literalOrEnv returns the environment value when set, else literal.
-func literalOrEnv(literal, envName string) string {
+// LiteralOrEnv returns the environment value named by envName when it is set,
+// else literal. Callers that read a secret or token share this resolver so the
+// precedence is the same in config, serve and doctor.
+func LiteralOrEnv(literal, envName string) string {
 	if v := os.Getenv(envName); v != "" {
 		return v
 	}
