@@ -116,13 +116,27 @@ n INTEGER NOT NULL, PRIMARY KEY (run_id, kind, verdict, action))`
 	if _, err := db.Exec(table); err != nil {
 		return err
 	}
-	const trigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_insert
+	const insertTrigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_insert
 AFTER INSERT ON decisions BEGIN
 INSERT INTO decision_summary (run_id, kind, verdict, action, n)
 VALUES (NEW.run_id, NEW.kind, NEW.verdict, NEW.action, 1)
 ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = n + 1;
 END`
-	if _, err := db.Exec(trigger); err != nil {
+	if _, err := db.Exec(insertTrigger); err != nil {
+		return err
+	}
+	// Retention deletes old decisions. Without the matching decrement the
+	// summary would keep counting rows that no longer exist, so DecisionCounts
+	// would report totals larger than the bounded history it summarizes.
+	const deleteTrigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_delete
+AFTER DELETE ON decisions BEGIN
+UPDATE decision_summary SET n = n - 1
+WHERE run_id = OLD.run_id AND kind = OLD.kind
+  AND verdict = OLD.verdict AND action = OLD.action;
+DELETE FROM decision_summary WHERE run_id = OLD.run_id AND kind = OLD.kind
+  AND verdict = OLD.verdict AND action = OLD.action AND n <= 0;
+END`
+	if _, err := db.Exec(deleteTrigger); err != nil {
 		return err
 	}
 	// Backfill only when the aggregate is empty. A populated summary is kept
@@ -300,9 +314,10 @@ AND state NOT IN (%s)`, taskIDs, terminalStates)
 	return out, rows.Err()
 }
 
-// deliveryRetention bounds how long delivery keys and approvals stay in the
-// state database. Both are idempotency markers for a specific SHA, so a row
-// older than this window can never affect a new decision.
+// deliveryRetention is the default window for every pruned table. Delivery
+// keys and approvals are idempotency markers for a SHA, while decisions and run
+// events are audit history. The status snapshot shows only recent history, so
+// a row older than this window can no longer change a snapshot or a decision.
 const deliveryRetention = 30 * 24 * time.Hour
 
 // retentionBatchSize caps how many rows one prune pass removes from a table.
@@ -310,9 +325,10 @@ const deliveryRetention = 30 * 24 * time.Hour
 // rows; a later tick removes the next batch.
 const retentionBatchSize = 1000
 
-// PruneStale deletes delivery and approval rows older than retention. It
-// returns the number of rows removed. A non-positive retention uses the
-// default 30-day window.
+// PruneStale deletes delivery, approval, decision and run event rows older than
+// retention. It returns the number of rows removed. A non-positive retention
+// uses the default 30-day window. Decisions are deleted through the summary
+// delete trigger so DecisionCounts keeps matching the rows still stored.
 func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64, error) {
 	if retention <= 0 {
 		retention = deliveryRetention
@@ -321,6 +337,8 @@ func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64,
 	queries := []string{
 		`DELETE FROM deliveries WHERE key IN (SELECT key FROM deliveries WHERE created_at < ? LIMIT ?)`,
 		`DELETE FROM approvals WHERE rowid IN (SELECT rowid FROM approvals WHERE created_at < ? LIMIT ?)`,
+		`DELETE FROM decisions WHERE id IN (SELECT id FROM decisions WHERE at < ? LIMIT ?)`,
+		`DELETE FROM run_events WHERE id IN (SELECT id FROM run_events WHERE at < ? LIMIT ?)`,
 	}
 	var removed int64
 	for _, query := range queries {
