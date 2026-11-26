@@ -267,6 +267,26 @@ test("status source reads snapshot from CLI and keeps RPC for control and dispat
   ])
 })
 
+test("a failed RPC snapshot falls back to one CLI status read", async () => {
+  let rpcSnapshots = 0
+  const cliCalls = []
+  const rpc = { snapshot: async () => { rpcSnapshots++; throw new Error("rpc down") } }
+  const deps = {
+    command: () => ["/bin/beacon"],
+    execFile: async (_program, args) => {
+      cliCalls.push(args[0])
+      return { stdout: JSON.stringify({ active: [makeRun({ TaskID: "T-42", title: "From CLI fallback" })], recent: [] }) }
+    },
+  }
+  const source = createStatusSource({ client: { rpc: () => rpc } }, { deps })
+  const snap = await source.snapshot()
+
+  assert.equal(source.verified(), false, "without a root the CLI stays behind RPC")
+  assert.equal(rpcSnapshots, 1, "RPC is tried first")
+  assert.deepEqual(cliCalls, ["status"], "one CLI read replaces the failed RPC snapshot")
+  assert.equal(snap.active[0].title, "From CLI fallback")
+})
+
 test("an unverified root keeps every queue card instead of filtering them all", async () => {
   const deps = {
     command: () => ["/bin/beacon"],

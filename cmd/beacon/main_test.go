@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/harnesses/acp"
+	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
@@ -295,6 +296,47 @@ func TestWireServicesReconcilerPrefersEnvironmentParent(t *testing.T) {
 	w := wireServices(cfg, t.TempDir(), "ses_from_env", infra, bareHarness{}, mergePolicy(cfg), nil)
 	if w.recon.ParentSessionID != "ses_from_env" {
 		t.Fatalf("reconciler parent = %q, want ses_from_env", w.recon.ParentSessionID)
+	}
+}
+
+func TestWireServicesUsesConfiguredRebaseCap(t *testing.T) {
+	cfg := config.Config{BaseBranch: "main", Merge: config.Merge{MaxAutoRebases: 7}}
+	infra := &wiredInfra{changes: make(chan int, 1)}
+	w := wireServices(cfg, t.TempDir(), "", infra, bareHarness{}, mergePolicy(cfg), nil)
+	if w.recon.MaxAutoRebases != 7 {
+		t.Fatalf("reconciler max auto rebases = %d, want 7", w.recon.MaxAutoRebases)
+	}
+}
+
+func TestWirePassesConfiguredParentToHarnessAndServices(t *testing.T) {
+	t.Setenv("BEACON_MODEL", "")
+	var gets atomic.Int32
+	srv := parentModelServer(&gets)
+	defer srv.Close()
+
+	path := wireParentModelConfig(t, srv.URL, "ses_from_config")
+	w, err := wire(path, "")
+	if err != nil {
+		t.Fatalf("wire(path, \"\"): %v", err)
+	}
+	defer w.close()
+
+	if w.dispatcher.ParentSessionID != "ses_from_config" {
+		t.Errorf("dispatcher parent = %q, want ses_from_config", w.dispatcher.ParentSessionID)
+	}
+	if w.recon.ParentSessionID != "ses_from_config" {
+		t.Errorf("reconciler parent = %q, want ses_from_config", w.recon.ParentSessionID)
+	}
+	reloadable, ok := w.harness.(*reloadableHarness)
+	if !ok {
+		t.Fatalf("wired harness = %T, want *reloadableHarness", w.harness)
+	}
+	oh, ok := reloadable.current().(*opencode.Harness)
+	if !ok {
+		t.Fatalf("harness behind wrapper = %T, want *opencode.Harness", reloadable.current())
+	}
+	if oh.ParentSessionID != "ses_from_config" {
+		t.Errorf("harness parent = %q, want ses_from_config", oh.ParentSessionID)
 	}
 }
 

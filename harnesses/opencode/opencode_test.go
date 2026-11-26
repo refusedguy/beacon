@@ -812,6 +812,67 @@ func TestSpawnReturnsBeforeDeferredSetup(t *testing.T) {
 	}
 }
 
+func TestDeferredSetupOutlivesCallerCancellation(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var moves []map[string]any
+	var moveCtxErr error
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			_, _ = io.WriteString(w, `{"id":"ses_cancel"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/move"):
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			select {
+			case <-r.Context().Done():
+			case <-time.After(100 * time.Millisecond):
+			}
+			mu.Lock()
+			moveCtxErr = r.Context().Err()
+			moves = append(moves, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(Config{Endpoint: srv.URL})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := h.Spawn(ctx, testSpawnRequest()); err != nil {
+		close(release)
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("deferred move did not reach the server")
+	}
+	cancel()
+	close(release)
+	h.waitForSetup()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if moveCtxErr != nil {
+		t.Fatalf("deferred move was cancelled with the caller: %v", moveCtxErr)
+	}
+	if len(moves) != 1 || moves[0]["directory"] != "/tmp/worktrees/widget" {
+		t.Fatalf("deferred moves = %v, want one with the worktree directory", moves)
+	}
+}
+
 func TestNewUsesConfiguredClientAndTrimsEndpoint(t *testing.T) {
 	var gotURL string
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
