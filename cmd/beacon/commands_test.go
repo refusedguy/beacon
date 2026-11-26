@@ -188,6 +188,49 @@ func TestPostControlReportsServerError(t *testing.T) {
 	}
 }
 
+func TestStatusCommandKeepsFlagNamesAndDefaults(t *testing.T) {
+	cmd := newStatusCommand(new(string))
+	want := map[string]string{
+		"recent":          "false",
+		"snapshot":        "false",
+		"recent-limit":    "0",
+		"decisions-limit": "0",
+		"daemon":          "false",
+	}
+	for name, def := range want {
+		flag := cmd.Flags().Lookup(name)
+		if flag == nil {
+			t.Errorf("status flag %q is not registered", name)
+			continue
+		}
+		if flag.DefValue != def {
+			t.Errorf("status flag %q default = %q, want %q", name, flag.DefValue, def)
+		}
+	}
+}
+
+func TestControlCommandKeepsFlagNamesAndDefaults(t *testing.T) {
+	cmd := newControlCommand(new(string), wire)
+	want := map[string]string{
+		"action":  "",
+		"run-id":  "",
+		"sha":     "",
+		"pr":      "0",
+		"message": "",
+		"json":    "false",
+	}
+	for name, def := range want {
+		flag := cmd.Flags().Lookup(name)
+		if flag == nil {
+			t.Errorf("control flag %q is not registered", name)
+			continue
+		}
+		if flag.DefValue != def {
+			t.Errorf("control flag %q default = %q, want %q", name, flag.DefValue, def)
+		}
+	}
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stdout

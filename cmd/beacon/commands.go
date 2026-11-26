@@ -94,16 +94,22 @@ func newDispatchCommand(configPath *string, fn wireFn) *cobra.Command {
 	}
 }
 
+// statusFlags holds the values parsed from the status command flags.
+type statusFlags struct {
+	recent         bool
+	snapshot       bool
+	recentLimit    int
+	decisionsLimit int
+	daemon         bool
+}
+
 func newStatusCommand(configPath *string) *cobra.Command {
+	f := &statusFlags{}
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Print active runs",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			daemon, err := cmd.Flags().GetBool("daemon")
-			if err != nil {
-				return err
-			}
-			if daemon {
+			if f.daemon {
 				cfg, _, err := loadConfig(*configPath)
 				if err != nil {
 					return err
@@ -115,21 +121,9 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			snapshot, err := cmd.Flags().GetBool("snapshot")
-			if err != nil {
-				return err
-			}
-			if snapshot {
-				recentLimit, err := cmd.Flags().GetInt("recent-limit")
-				if err != nil {
-					return err
-				}
-				decisionsLimit, err := cmd.Flags().GetInt("decisions-limit")
-				if err != nil {
-					return err
-				}
+			if f.snapshot {
 				result, err := (app.SnapshotService{
-					Store: store, RecentLimit: recentLimit, DecisionsLimit: decisionsLimit,
+					Store: store, RecentLimit: f.recentLimit, DecisionsLimit: f.decisionsLimit,
 					Repo:   cfg.SCM.Owner + "/" + cfg.SCM.Repo,
 					Daemon: daemonSnapshot(readDaemonStatus(filepath.Dir(cfg.StateDB))),
 				}).Snapshot(cmd.Context())
@@ -138,11 +132,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				}
 				return printJSON(result)
 			}
-			recent, err := cmd.Flags().GetBool("recent")
-			if err != nil {
-				return err
-			}
-			if recent {
+			if f.recent {
 				runs, err := (app.StatusService{Store: store}).Recent(cmd.Context(), 0)
 				if err != nil {
 					return err
@@ -156,11 +146,11 @@ func newStatusCommand(configPath *string) *cobra.Command {
 			return printJSON(runs)
 		},
 	}
-	cmd.Flags().Bool("recent", false, "print recently finished runs instead of active ones")
-	cmd.Flags().Bool("snapshot", false, "print one batched snapshot with runs, history and metrics")
-	cmd.Flags().Int("recent-limit", 0, "cap finished runs in a snapshot (0 uses the default)")
-	cmd.Flags().Int("decisions-limit", 0, "cap decisions per run and run-less decisions in a snapshot (0 uses the default)")
-	cmd.Flags().Bool("daemon", false, "print daemon liveness and heartbeat age instead of runs")
+	cmd.Flags().BoolVar(&f.recent, "recent", false, "print recently finished runs instead of active ones")
+	cmd.Flags().BoolVar(&f.snapshot, "snapshot", false, "print one batched snapshot with runs, history and metrics")
+	cmd.Flags().IntVar(&f.recentLimit, "recent-limit", 0, "cap finished runs in a snapshot (0 uses the default)")
+	cmd.Flags().IntVar(&f.decisionsLimit, "decisions-limit", 0, "cap decisions per run and run-less decisions in a snapshot (0 uses the default)")
+	cmd.Flags().BoolVar(&f.daemon, "daemon", false, "print daemon liveness and heartbeat age instead of runs")
 	return cmd
 }
 
@@ -232,49 +222,41 @@ func controlMessage(messages []string) string {
 	return messages[0]
 }
 
+// controlFlags holds the values parsed from the control command flags. The
+// json field stays bound because older scripts still pass the flag.
+type controlFlags struct {
+	action  string
+	runID   string
+	sha     string
+	pr      int
+	message string
+	json    bool
+}
+
 // newControlCommand freezes the CLI contract. The json flag is accepted for
 // scripting compatibility; a successful control action always prints JSON.
 func newControlCommand(configPath *string, fn wireFn) *cobra.Command {
+	f := &controlFlags{}
 	cmd := &cobra.Command{
 		Use:   "control",
 		Short: "Control a run: " + strings.Join(core.ControlActionNames(), ", "),
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			action, err := cmd.Flags().GetString("action")
-			if err != nil {
+			if err := validateControl(f.action, f.runID, f.message); err != nil {
 				return err
 			}
-			runID, err := cmd.Flags().GetString("run-id")
-			if err != nil {
+			if err := dispatchControlWithPR(cmd.Context(), fn, *configPath, f.action, f.runID, f.sha, f.pr, f.message); err != nil {
 				return err
 			}
-			sha, err := cmd.Flags().GetString("sha")
-			if err != nil {
-				return err
-			}
-			pr, err := cmd.Flags().GetInt("pr")
-			if err != nil {
-				return err
-			}
-			message, err := cmd.Flags().GetString("message")
-			if err != nil {
-				return err
-			}
-			if err := validateControl(action, runID, message); err != nil {
-				return err
-			}
-			if err := dispatchControlWithPR(cmd.Context(), fn, *configPath, action, runID, sha, pr, message); err != nil {
-				return err
-			}
-			return printJSON(controlResult{OK: true, Action: action, RunID: runID})
+			return printJSON(controlResult{OK: true, Action: f.action, RunID: f.runID})
 		},
 	}
-	cmd.Flags().String("action", "", "one of "+strings.Join(core.ControlActionNames(), ", "))
-	cmd.Flags().String("run-id", "", "run ID to control")
-	cmd.Flags().String("sha", "", "observed SHA used by an approve action")
-	cmd.Flags().Int("pr", 0, "PR number bound by a watch action")
-	cmd.Flags().String("message", "", "guidance sent to the worker by a nudge action")
-	cmd.Flags().Bool("json", false, "print a machine readable result")
+	cmd.Flags().StringVar(&f.action, "action", "", "one of "+strings.Join(core.ControlActionNames(), ", "))
+	cmd.Flags().StringVar(&f.runID, "run-id", "", "run ID to control")
+	cmd.Flags().StringVar(&f.sha, "sha", "", "observed SHA used by an approve action")
+	cmd.Flags().IntVar(&f.pr, "pr", 0, "PR number bound by a watch action")
+	cmd.Flags().StringVar(&f.message, "message", "", "guidance sent to the worker by a nudge action")
+	cmd.Flags().BoolVar(&f.json, "json", false, "print a machine readable result")
 	return cmd
 }
 
