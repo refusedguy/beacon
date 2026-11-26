@@ -16,16 +16,42 @@ gofmt -w internal/bench/*.go
 go test -bench=. -benchmem -count=5 ./internal/bench/
 ```
 
-Node command:
+Node commands:
 
 ```sh
 node docs/perf/plugin_grouping_bench.mjs
+node internal/bench/ui_bench.js
 ```
 
 Toolchain and machine are recorded in the captured output appendix. The Go
-harness lives in `internal/bench/`. The Node harness lives in
-`docs/perf/plugin_grouping_bench.mjs`. Neither edits a production file, a CI
-workflow or an existing test.
+harness lives in `internal/bench/`. The Node harnesses live in
+`docs/perf/plugin_grouping_bench.mjs` and `internal/bench/ui_bench.js`.
+Neither edits a production file, a CI workflow or an existing test.
+
+### Bounded smoke mode
+
+CI runs both Node harnesses with a fixed iteration count and no warm-up:
+
+```sh
+BENCH_ITERATIONS=50 BENCH_WARMUP=0 node docs/perf/plugin_grouping_bench.mjs
+BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js
+```
+
+`BENCH_ITERATIONS` defaults to 2000 in both harnesses. `BENCH_WARMUP` defaults
+to 200 in the plugin harness and to 0 in the sidebar harness. Each override
+must be a non-negative integer, and `BENCH_ITERATIONS` must be at least 1, or
+the harness exits before measuring. Work counts, error counts and report
+columns stay the same in both modes, so a smoke pass exercises the same code
+path as a nightly pass. The two smoke commands finish under 2 seconds. Nightly
+runs use the defaults and produce the numbers in Appendix B.
+
+Every report prints the seed and a `fixture hash` line. The hash is the first
+16 hex characters of the SHA-256 of the fixture together with the seed. Each
+harness compares it with a constant baked into the file and exits before
+measuring when they differ. The plugin fixture hash is `3122a21ce9316569`. The
+sidebar fixture hash is `8b649f17d1b4b680`. Editing a fixture size, a generated
+row or the seed changes the hash and fails the run, so a comparison never mixes
+two fixture shapes.
 
 Fixtures are seeded with a fixed integer, so every pass sees the same data:
 
@@ -423,6 +449,10 @@ queueGroups          0.8057     2.6862    393      0  93.3%  Map/Set allocation
 queueLineItems       0.8634     3.6596    168      0 100.0%  row building + Map allocation
 end-to-end median: 0.8634ms (queueLineItems, which calls queueGroups)
 ```
+
+Current reports add `warmup=200` to the plugin header and a `fixture hash` line
+to both harnesses. Those fields were added after these runs were captured. The
+timings, work counts and error counts are unchanged.
 
 ## Stability check
 
