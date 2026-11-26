@@ -121,8 +121,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		return core.MergeDecision{}, err
 	}
 	defer r.Decisions.logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
-	if closed := closedPRVerdict(obs.PRState); closed != nil {
-		return *closed, r.finalizeExternal(ctx, run, obs)
+	if core.DecideFinalState(obs.PRState).Closed {
+		return core.MergeDecision{Verdict: core.VerdictWait, Reason: "pull request " + obs.PRState}, r.finalizeExternal(ctx, run, obs)
 	}
 	if ok, err := r.Store.Approved(ctx, run.ID, obs.HeadSHA); err != nil {
 		return core.MergeDecision{}, err

@@ -34,16 +34,6 @@ func (r *Reconciler) autoRebaseCap() int {
 	return DefaultMaxAutoRebases
 }
 
-// closedPRVerdict returns the decision for a PR the provider no longer keeps
-// open. It shares the core final-state classification with every other
-// final-state handler, so locked counts as final here and in Decide.
-func closedPRVerdict(state string) *core.MergeDecision {
-	if !core.DecideFinalState(state).Closed {
-		return nil
-	}
-	return &core.MergeDecision{Verdict: core.VerdictWait, Reason: "pull request " + state}
-}
-
 func (r *Reconciler) applyDecision(
 	ctx context.Context,
 	run *core.Run,
