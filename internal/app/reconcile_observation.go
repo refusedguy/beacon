@@ -85,7 +85,7 @@ func (r *Reconciler) handleNeedsRebase(
 		}
 		return decision, nil
 	}
-	if run.State == core.RunWaitingCI || run.State == core.RunRunning {
+	if run.State.CanTakeBehind() {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBehind, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}
@@ -131,7 +131,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 	if sameObservation(run, obs) {
 		return decision, nil
 	}
-	if run.State == core.RunWaitingCI || run.State == core.RunRunning {
+	if run.State.CanTakeCheckFailed() {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksFailed, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}
@@ -167,7 +167,7 @@ func (r *Reconciler) handlePending(
 	obs core.Observation,
 	decision core.MergeDecision,
 ) (core.MergeDecision, error) {
-	if run.State != core.RunWaitingCI && run.State != core.RunRunning {
+	if !run.State.CanTakeCheckPending() {
 		return decision, nil
 	}
 	if err := run.Apply(core.Event{Kind: core.EvChecksPending, HeadSHA: obs.HeadSHA}); err != nil {

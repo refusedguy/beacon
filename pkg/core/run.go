@@ -120,6 +120,23 @@ var transitions = map[RunState]map[EventKind]RunState{
 	RunBlocked:       {EvUnblock: RunWaitingCI, EvCancel: RunClosed},
 }
 
+// canTake reports whether transitions accepts kind from s. Each exported query
+// names one event, so its eligible states stay tied to that event and cannot
+// drift into another event's set.
+func (s RunState) canTake(kind EventKind) bool {
+	_, ok := transitions[s][kind]
+	return ok
+}
+
+// CanTakeBehind reports whether s accepts EvBehind.
+func (s RunState) CanTakeBehind() bool { return s.canTake(EvBehind) }
+
+// CanTakeCheckFailed reports whether s accepts EvChecksFailed.
+func (s RunState) CanTakeCheckFailed() bool { return s.canTake(EvChecksFailed) }
+
+// CanTakeCheckPending reports whether s accepts EvChecksPending.
+func (s RunState) CanTakeCheckPending() bool { return s.canTake(EvChecksPending) }
+
 // Run is the full persisted state of one task execution.
 type Run struct {
 	ID                RunID
