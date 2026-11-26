@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"reflect"
 	"strings"
 	"testing"
@@ -438,7 +441,11 @@ func TestBlockedMetricMapStaysBoundedWithDistinctReasons(t *testing.T) {
 		}}
 	}
 
-	m := makeMetrics(active, nil, nil, histories, nil, now)
+	snapshots := make([]RunSnapshot, 0, len(active))
+	for _, run := range active {
+		snapshots = append(snapshots, makeRunSnapshot(run, nil, nil, now))
+	}
+	m := makeMetrics(snapshots, nil, nil, histories, nil)
 	if len(m.Blocked) > 6 {
 		t.Fatalf("blocked keys = %d, want at most 6: %+v", len(m.Blocked), m.Blocked)
 	}
@@ -503,4 +510,148 @@ func TestSnapshotSerializesLaunchSourceAndMetrics(t *testing.T) {
 	if !reflect.DeepEqual(decoded.Metrics.LaunchSources, want) {
 		t.Fatalf("json launch sources = %+v, want %+v", decoded.Metrics.LaunchSources, want)
 	}
+}
+
+type durationStubStore struct {
+	active    []*core.Run
+	events    []RunEvent
+	decisions []Decision
+}
+
+func (s *durationStubStore) ListActive(context.Context) ([]*core.Run, error) {
+	return s.active, nil
+}
+func (s *durationStubStore) ListRecent(context.Context, int) ([]*core.Run, error) {
+	return nil, nil
+}
+func (s *durationStubStore) ListRunEvents(context.Context, []string) ([]RunEvent, error) {
+	return s.events, nil
+}
+func (s *durationStubStore) ListDecisions(context.Context, []string, int, int) ([]Decision, error) {
+	return s.decisions, nil
+}
+func (s *durationStubStore) DecisionCounts(context.Context, []string) ([]DecisionCount, error) {
+	return nil, nil
+}
+
+func TestSnapshotUsesOneDurationPass(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	const runCount = 3
+	active := make([]*core.Run, 0, runCount)
+	var events []RunEvent
+	var want int64
+	for i := 0; i < runCount; i++ {
+		id := fmt.Sprintf("run-%d", i)
+		run := core.NewRun(core.RunID(id), core.TaskID(fmt.Sprintf("T-%d", i)), now.Add(-10*time.Minute))
+		run.State = core.RunMerged
+		run.UpdatedAt = now.Add(-5 * time.Minute)
+		active = append(active, run)
+		runEvents := []RunEvent{{RunID: id, State: string(core.RunWaitingCI), At: now.Add(-9 * time.Minute)}}
+		events = append(events, runEvents...)
+		want += deriveDurations(run, runEvents, now).WaitingCI
+	}
+	store := &durationStubStore{active: active, events: events}
+	snap, err := (SnapshotService{Store: store}).Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf(`svc.Snapshot(ctx): %v`, err)
+	}
+	var sum int64
+	for _, rs := range snap.Active {
+		sum += rs.Durations.WaitingCI
+	}
+	if sum != want {
+		t.Fatalf("snapshot durations sum = %d, want %d", sum, want)
+	}
+	if snap.Metrics.CIWaitSeconds != want {
+		t.Fatalf("CI wait = %d, want %d from one duration pass", snap.Metrics.CIWaitSeconds, want)
+	}
+}
+
+func TestMetricsConsumeSnapshotDurations(t *testing.T) {
+	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
+	run := core.NewRun("run-dur", "T-DUR", now.Add(-10*time.Minute))
+	run.State = core.RunWaitingCI
+	run.UpdatedAt = now.Add(-5 * time.Minute)
+	snap := makeRunSnapshot(run, map[string][]RunEvent{
+		string(run.ID): {{State: string(core.RunWaitingCI), At: run.UpdatedAt}},
+	}, nil, now)
+
+	// A timeline that would yield 60 seconds if metrics walked it again. The
+	// snapshot carries 300 seconds, and metrics must use that value.
+	stale := map[string][]RunEvent{
+		string(run.ID): {{Kind: "state", State: string(core.RunWaitingCI), At: now.Add(-time.Minute)}},
+	}
+	m := makeMetrics([]RunSnapshot{snap}, nil, stale, nil, nil)
+	if m.CIWaitSeconds != snap.Durations.WaitingCI {
+		t.Fatalf("CI wait = %d, want snapshot duration %d", m.CIWaitSeconds, snap.Durations.WaitingCI)
+	}
+	if m.CIWaitSeconds != 300 {
+		t.Fatalf("CI wait = %d, want 300", m.CIWaitSeconds)
+	}
+}
+
+func TestDurationsDerivedOnce(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "status.go", nil, 0)
+	if err != nil {
+		t.Fatalf(`parser.ParseFile("status.go"): %v`, err)
+	}
+	calls := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "deriveDurations" {
+			calls++
+		}
+		return true
+	})
+	if calls != 1 {
+		t.Fatalf("deriveDurations call sites in status.go = %d, want 1", calls)
+	}
+}
+
+func BenchmarkSnapshotDurationPass(b *testing.B) {
+	now := time.Now().UTC()
+	const runCount = 500
+	const perRun = 20
+	active := make([]*core.Run, 0, runCount)
+	events := make([]RunEvent, 0, runCount*perRun)
+	decisions := make([]Decision, 0, runCount*perRun)
+	for i := 0; i < runCount; i++ {
+		id := fmt.Sprintf("run-%04d", i)
+		run := core.NewRun(core.RunID(id), core.TaskID(fmt.Sprintf("T-%04d", i)), now.Add(-time.Hour))
+		run.State = core.RunWaitingCI
+		run.UpdatedAt = now.Add(-30 * time.Minute)
+		active = append(active, run)
+		for j := 0; j < perRun; j++ {
+			events = append(events, RunEvent{
+				RunID: id, Kind: "state", State: string(core.RunWaitingCI),
+				At: run.CreatedAt.Add(time.Duration(j) * time.Minute),
+			})
+			decisions = append(decisions, Decision{RunID: id, Kind: "transition.spawn"})
+		}
+	}
+	store := &durationStubStore{active: active, events: events, decisions: decisions}
+	svc := SnapshotService{Store: store}
+	ctx := context.Background()
+	base, err := svc.Snapshot(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < b.N; i++ {
+		got, err := svc.Snapshot(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if got.Metrics.CIWaitSeconds != base.Metrics.CIWaitSeconds {
+			b.Fatalf("CI wait = %d, want %d", got.Metrics.CIWaitSeconds, base.Metrics.CIWaitSeconds)
+		}
+		if len(got.Active) != len(base.Active) {
+			b.Fatalf("active = %d, want %d", len(got.Active), len(base.Active))
+		}
+	}
+	b.ReportMetric(float64(runCount), "runs/op")
+	b.ReportMetric(float64(len(events)), "events/op")
 }
