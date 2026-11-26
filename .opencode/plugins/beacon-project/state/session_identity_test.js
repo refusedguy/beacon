@@ -93,6 +93,46 @@ test("worker names match exactly and a configured name overrides the default", (
   assert.equal(agentRole(null), null)
 })
 
+test("guardedAgents freezes the configured list once per config", () => {
+  let reads = 0
+  const config = { get shellGuardAgents() { reads++; return ["worker", "beacon-worker"] } }
+  const first = guardedAgents(config)
+  assert.deepEqual(first, ["worker", "beacon-worker"])
+  assert.equal(Object.isFrozen(first), true)
+  for (let i = 0; i < 10000; i++) assert.equal(guardedAgents(config), first)
+  assert.equal(reads, 1, "the config is read once, not on every call")
+  const other = { shellGuardAgents: ["beacon-worker"] }
+  assert.notEqual(guardedAgents(other), first)
+  assert.deepEqual(guardedAgents(other), ["beacon-worker"])
+})
+
+test("agentRole reuses the frozen worker list across repeated checks", () => {
+  let reads = 0
+  const config = { get shellGuardAgents() { reads++; return ["worker"] } }
+  for (let i = 0; i < 10000; i++) assert.equal(agentRole("worker", config), "worker")
+  assert.equal(reads, 1)
+  assert.equal(agentRole("networker", config), null)
+  assert.equal(reads, 1)
+})
+
+test("sessionIdentity memoizes the resolved identity per session ID", async () => {
+  let gets = 0
+  const ctx = {
+    sessionID: "ses_memo_1",
+    session: {
+      get: async ({ sessionID }) => {
+        gets++
+        assert.equal(sessionID, "ses_memo_1")
+        return { data: { model: { id: "memo-model" }, agent: "worker" } }
+      },
+    },
+  }
+  const first = await sessionIdentity(ctx)
+  assert.deepEqual(first, { sessionID: "ses_memo_1", agent: "worker", model: "memo-model" })
+  for (let i = 0; i < 10000; i++) assert.deepEqual(await sessionIdentity(ctx), first)
+  assert.equal(gets, 1, "the session record is fetched once, not on every call")
+})
+
 const source = (opts, execFile) => new CliStatusSource({
   root: "/p", ...opts,
   deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false },

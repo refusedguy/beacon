@@ -1,7 +1,7 @@
 ---
 id: T-f448ee5a
 title: Stop normalizing unchanged snapshots in plugin watcher
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/run_watcher.js
     - .opencode/plugins/beacon-project/run_watcher_test.js
