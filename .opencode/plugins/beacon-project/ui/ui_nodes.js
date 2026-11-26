@@ -37,10 +37,23 @@ export function createLineMount(ui, {
     setProp(box, "visible", false)
     lines.push(box)
   }
+  // A render usually changes a handful of rows. Remember the rendered props
+  // per pooled slot so an unchanged row costs an item assignment, not six
+  // setProp calls that invalidate host nodes.
+  const appliedKeys = []
+  const rowKey = (item) => item ? [
+    item.text ?? item.name ?? "", item.marker ?? "", item.status ?? "",
+    item.color ?? "base", item.markerColor ?? "", item.nameColor ?? "",
+    item.statusColor ?? "", item.markerSpace === true ? 1 : Number(item.markerSpace) || 0,
+    (item.nameBold ?? item.bold) ? 1 : 0,
+  ].join("\u0000") : ""
   const apply = (items = []) => {
     lines.forEach((box, i) => {
       const item = items[i]
       box.item = item
+      const key = rowKey(item)
+      if (appliedKeys[i] === key) return
+      appliedKeys[i] = key
       if (!item) { setProp(box, "visible", false); return }
       const [marker, name, status] = cellsByLine[i]
       const fg = color(item.color ?? "base")
