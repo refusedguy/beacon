@@ -291,8 +291,12 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 }
 
 func mergePolicy(cfg config.Config) core.MergePolicy {
+	// Load resolves workflow job names into RequiredChecks in workflow mode.
+	// Feeding that field here is what makes reconcile follow a workflow rename
+	// after the config watcher reloads, without a config edit.
+	requiredChecks := cfg.Merge.RequiredChecks
 	return policy.New(policy.Config{
-		RequiredChecks: cfg.Merge.RequiredChecks, RequiredApprovals: cfg.Merge.RequiredApprovals,
+		RequiredChecks: requiredChecks, RequiredApprovals: cfg.Merge.RequiredApprovals,
 		Labels: cfg.Merge.Labels, CommandGate: cfg.Merge.CommandGate,
 	})
 }

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -268,7 +267,11 @@ func buildInitConfig(root string, o initOptions, r remote, base string) config.C
 			Provider: o.harness, Endpoint: o.endpoint, Command: "worker",
 			WorkerInstructions: stack.workerInstructions(o.weakPC),
 		},
-		Merge:     config.Merge{RequiredChecks: detectRequiredChecks(root), MaxAttempts: 12, AutoRebase: true, Labels: []string{}},
+		Merge: config.Merge{
+			RequiredChecksMode: config.RequiredChecksWorkflow,
+			RequiredChecks:     detectRequiredChecks(root),
+			MaxAttempts:        12, AutoRebase: true, Labels: []string{},
+		},
 		OnBaseRed: config.OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
 }
@@ -358,55 +361,10 @@ func hasMarker(root, pattern string) bool {
 	return err == nil && len(matches) > 0
 }
 
-// detectRequiredChecks collects job names from CI workflow files.
+// detectRequiredChecks collects job names from CI workflow files. The parser
+// lives in the config package so init and config load resolve the same names.
 func detectRequiredChecks(root string) []string {
-	files, err := filepath.Glob(filepath.Join(root, ".github", "workflows", "*.y*ml"))
-	if err != nil {
-		return []string{}
-	}
-	seen := make(map[string]bool)
-	for _, file := range files {
-		data, err := os.ReadFile(file)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: skipping workflow %s: %v\n", file, err)
-			continue
-		}
-		for _, name := range parseJobNames(string(data)) {
-			seen[name] = true
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for name := range seen {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// parseJobNames extracts job names from a workflow document.
-func parseJobNames(content string) []string {
-	var names []string
-	inJobs := false
-	for _, line := range strings.Split(content, "\n") {
-		if strings.HasPrefix(line, "jobs:") {
-			inJobs = true
-			continue
-		}
-		if !inJobs {
-			continue
-		}
-		if line != "" && !strings.HasPrefix(line, " ") {
-			break
-		}
-		if !strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "    ") {
-			continue
-		}
-		name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if ok && name != "" && !strings.HasPrefix(name, "#") {
-			names = append(names, name)
-		}
-	}
-	return names
+	return config.DetectRequiredChecks(root)
 }
 
 // mergeOpenCodeConfig adds agents, permissions and the beacon MCP server to opencode.json.

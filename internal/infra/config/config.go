@@ -5,10 +5,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+)
+
+// Required check sources. Manual keeps the explicit merge.required_checks
+// list. Workflow resolves the names from .github/workflows on every load.
+const (
+	RequiredChecksManual   = "manual"
+	RequiredChecksWorkflow = "workflow"
 )
 
 // DefaultWorkerInstructions is prepended to worker spawn prompts when the
@@ -74,14 +82,16 @@ type Harness struct {
 	WorkerInstructions string `yaml:"worker_instructions"`
 }
 
-// Merge holds the automerge settings.
+// Merge holds the automerge settings. RequiredChecksMode selects where the
+// required check names come from. An empty mode means manual.
 type Merge struct {
-	RequiredChecks    []string `yaml:"required_checks"`
-	RequiredApprovals int      `yaml:"required_approvals"`
-	Labels            []string `yaml:"labels"`
-	CommandGate       string   `yaml:"command_gate"`
-	AutoRebase        bool     `yaml:"auto_rebase"`
-	MaxAttempts       int      `yaml:"max_attempts"`
+	RequiredChecksMode string   `yaml:"required_checks_mode"`
+	RequiredChecks     []string `yaml:"required_checks"`
+	RequiredApprovals  int      `yaml:"required_approvals"`
+	Labels             []string `yaml:"labels"`
+	CommandGate        string   `yaml:"command_gate"`
+	AutoRebase         bool     `yaml:"auto_rebase"`
+	MaxAttempts        int      `yaml:"max_attempts"`
 }
 
 // OnBaseRed configures the response to a failing base branch.
@@ -163,6 +173,11 @@ func (c Config) validate() error {
 	if _, err := parseInterval(c.PollInterval); err != nil {
 		return fmt.Errorf("invalid poll_interval %q: %w", c.PollInterval, err)
 	}
+	switch c.Merge.RequiredChecksMode {
+	case "", RequiredChecksManual, RequiredChecksWorkflow:
+	default:
+		return fmt.Errorf("invalid merge.required_checks_mode %q", c.Merge.RequiredChecksMode)
+	}
 	return nil
 }
 
@@ -222,7 +237,93 @@ func Load(path string) (Config, error) {
 	if c.Harness.WorkerInstructions == "" {
 		c.Harness.WorkerInstructions = DefaultWorkerInstructions
 	}
+	resolveRequiredChecks(&c, path)
 	return c, nil
+}
+
+// resolveRequiredChecks replaces the configured names with the job names in
+// .github/workflows when the config selects workflow mode. A manual config, or
+// a workflow directory with no job names, keeps the explicit list so an
+// operator always has a working fallback.
+func resolveRequiredChecks(c *Config, path string) {
+	if c.Merge.RequiredChecksMode != RequiredChecksWorkflow {
+		return
+	}
+	detected := DetectRequiredChecks(projectRootFromConfigPath(path))
+	if len(detected) > 0 {
+		c.Merge.RequiredChecks = detected
+	}
+}
+
+// projectRootFromConfigPath resolves the repository root from a config path.
+// A config at <root>/.beacon/config.yaml maps to <root>. Any other location
+// maps to the config file's own directory, so a standalone config still reads
+// workflows that sit beside it.
+func projectRootFromConfigPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Dir(path)
+	}
+	dir := filepath.Dir(abs)
+	if filepath.Base(dir) == ".beacon" {
+		return filepath.Dir(dir)
+	}
+	return dir
+}
+
+// DetectRequiredChecks collects job names from .github/workflows/*.yml. It is
+// the shared parser used by beacon init and by config load, so the detected
+// list cannot drift between the two.
+func DetectRequiredChecks(root string) []string {
+	files, err := filepath.Glob(filepath.Join(root, ".github", "workflows", "*.y*ml"))
+	if err != nil {
+		return []string{}
+	}
+	seen := make(map[string]bool)
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping workflow %s: %v\n", file, err)
+			continue
+		}
+		for _, name := range parseJobNames(string(data)) {
+			seen[name] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// parseJobNames extracts job names from a workflow document. Only the two-space
+// indented keys directly under jobs: are names; nested matrix and step keys sit
+// deeper and are ignored.
+func parseJobNames(content string) []string {
+	var names []string
+	inJobs := false
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "jobs:") {
+			inJobs = true
+			continue
+		}
+		if !inJobs {
+			continue
+		}
+		if line != "" && !strings.HasPrefix(line, " ") {
+			break
+		}
+		if !strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "    ") {
+			continue
+		}
+		name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && name != "" && !strings.HasPrefix(name, "#") {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // literalOrEnv returns the environment value when set, else literal.
@@ -278,6 +379,7 @@ func expandNonSecrets(c *Config) {
 	c.Harness.TokenEnv = expandEnv(c.Harness.TokenEnv)
 	c.Harness.ParentSessionID = expandEnv(c.Harness.ParentSessionID)
 	c.Harness.WorkerInstructions = expandEnv(c.Harness.WorkerInstructions)
+	c.Merge.RequiredChecksMode = expandEnv(c.Merge.RequiredChecksMode)
 	for i := range c.Merge.RequiredChecks {
 		c.Merge.RequiredChecks[i] = expandEnv(c.Merge.RequiredChecks[i])
 	}

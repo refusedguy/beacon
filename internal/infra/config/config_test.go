@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/policy"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 func writeConfig(t *testing.T, content string) string {
@@ -452,5 +455,146 @@ func TestLoadSCMTokenFromEnv(t *testing.T) {
 	}
 	if c.SCM.Token != "from-env" {
 		t.Fatalf("SCM.Token = %q, want from-env", c.SCM.Token)
+	}
+}
+
+// writeWorkflowConfig puts a config at <root>/.beacon/config.yaml and an
+// optional workflow at <root>/.github/workflows/ci.yml. Load resolves workflow
+// mode relative to that root.
+func writeWorkflowConfig(t *testing.T, body, workflow string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".beacon"), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(.beacon): %v", err)
+	}
+	path := filepath.Join(root, ".beacon", "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(config.yaml): %v", err)
+	}
+	if workflow != "" {
+		writeProjectWorkflow(t, root, workflow)
+	}
+	return path
+}
+
+func writeProjectWorkflow(t *testing.T, root, workflow string) {
+	t.Helper()
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(.github/workflows): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(ci.yml): %v", err)
+	}
+}
+
+func TestLoadManualRequiredChecksKeepExplicitList(t *testing.T) {
+	const workflow = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n"
+	for _, mode := range []string{"", RequiredChecksManual} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			body := "merge:\n  required_checks: [build, vet]\n"
+			if mode != "" {
+				body = "merge:\n  required_checks_mode: " + mode + "\n  required_checks: [build, vet]\n"
+			}
+			path := writeWorkflowConfig(t, body, workflow)
+			c, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(path): %v", err)
+			}
+			want := []string{"build", "vet"}
+			if !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
+				t.Fatalf("required_checks = %v, want %v", c.Merge.RequiredChecks, want)
+			}
+		})
+	}
+}
+
+func TestLoadWorkflowRequiredChecksResolveJobNames(t *testing.T) {
+	const workflow = "name: CI\non: push\njobs:\n" +
+		"  test:\n    strategy:\n      matrix:\n        os: [ubuntu, macos]\n    steps:\n      - run: echo test\n" +
+		"  lint:\n    runs-on: ubuntu-latest\n" +
+		"  build:\n    runs-on: ubuntu-latest\n" +
+		"  vet:\n    runs-on: ubuntu-latest\n"
+	path := writeWorkflowConfig(t, "merge:\n  required_checks_mode: workflow\n  required_checks: [stale]\n", workflow)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	want := []string{"build", "lint", "test", "vet"}
+	if !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
+		t.Fatalf("required_checks = %v, want %v", c.Merge.RequiredChecks, want)
+	}
+}
+
+func TestWorkflowRequiredChecksFollowRenameOnReload(t *testing.T) {
+	const oldWorkflow = "name: CI\njobs:\n" +
+		"  build:\n    runs-on: ubuntu-latest\n" +
+		"  vet:\n    runs-on: ubuntu-latest\n" +
+		"  test:\n    runs-on: ubuntu-latest\n" +
+		"  lint:\n    runs-on: ubuntu-latest\n"
+	path := writeWorkflowConfig(t, "merge:\n  required_checks_mode: workflow\n", oldWorkflow)
+
+	first, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	wantOld := []string{"build", "lint", "test", "vet"}
+	if !reflect.DeepEqual(first.Merge.RequiredChecks, wantOld) {
+		t.Fatalf("initial required_checks = %v, want %v", first.Merge.RequiredChecks, wantOld)
+	}
+
+	const newWorkflow = "name: CI\njobs:\n" +
+		"  verify:\n    runs-on: ubuntu-latest\n" +
+		"  test:\n    strategy:\n      matrix:\n        os: [ubuntu, macos]\n    steps:\n      - run: echo test\n"
+	writeProjectWorkflow(t, projectRootFromConfigPath(path), newWorkflow)
+
+	// The config file is unchanged. A watcher reload calls Load again and must
+	// pick up the new job names from the workflow alone.
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("reload Load(path): %v", err)
+	}
+	wantNew := []string{"test", "verify"}
+	if !reflect.DeepEqual(reloaded.Merge.RequiredChecks, wantNew) {
+		t.Fatalf("reloaded required_checks = %v, want %v", reloaded.Merge.RequiredChecks, wantNew)
+	}
+
+	p := policy.New(policy.Config{RequiredChecks: reloaded.Merge.RequiredChecks})
+	obs := core.Observation{
+		PRState: "open",
+		Checks: []core.CheckResult{
+			{Name: "verify", State: core.CheckSuccess},
+			{Name: "test", State: core.CheckSuccess},
+		},
+	}
+	if got := p.Evaluate(obs); got.Verdict != core.VerdictMerge {
+		t.Fatalf("policy verdict after rename = %+v, want merge", got)
+	}
+	if got := p.Evaluate(core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "build", State: core.CheckSuccess}, {Name: "vet", State: core.CheckSuccess},
+		{Name: "lint", State: core.CheckSuccess}, {Name: "test", State: core.CheckSuccess},
+	}}); got.Verdict != core.VerdictWait || !strings.Contains(got.Reason, "verify") {
+		t.Fatalf("old check names still satisfy the policy: %+v", got)
+	}
+}
+
+func TestLoadWorkflowRequiredChecksFallsBackToExplicitList(t *testing.T) {
+	path := writeWorkflowConfig(t, "merge:\n  required_checks_mode: workflow\n  required_checks: [manual-gate]\n", "")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	if !reflect.DeepEqual(c.Merge.RequiredChecks, []string{"manual-gate"}) {
+		t.Fatalf("required_checks = %v, want the explicit fallback", c.Merge.RequiredChecks)
+	}
+}
+
+func TestLoadRejectsUnknownRequiredChecksMode(t *testing.T) {
+	_, err := Load(writeConfig(t, "merge:\n  required_checks_mode: magic\n"))
+	if err == nil {
+		t.Fatal("Load accepted an unknown required_checks_mode")
+	}
+	if !strings.Contains(err.Error(), "merge.required_checks_mode") {
+		t.Fatalf("error = %q, want the mode field in the message", err)
 	}
 }
