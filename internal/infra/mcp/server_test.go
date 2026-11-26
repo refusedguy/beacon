@@ -1149,7 +1149,7 @@ func TestOpJournalRunSerializesConcurrentCalls(t *testing.T) {
 		<-release
 		return app.DeleteResult{Pushed: true}, nil
 	}
-	results := make([]app.DeleteResult, 8)
+	results := make([]app.DeleteResult, 32)
 	var wg sync.WaitGroup
 	for i := range results {
 		wg.Add(1)
@@ -1170,6 +1170,61 @@ func TestOpJournalRunSerializesConcurrentCalls(t *testing.T) {
 	for _, got := range results {
 		if got.Status != "duplicate" && got.Status != "applied" {
 			t.Fatalf("unexpected status %q", got.Status)
+		}
+	}
+}
+
+// TestOpJournalConcurrentTouches stresses the indexed LRU from 32 goroutines
+// sharing one journal and checks that the map, list and done store stay in sync.
+func TestOpJournalConcurrentTouches(t *testing.T) {
+	j := newOpJournal()
+	const workers = 32
+	const perWorker = 256
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				// Stay within the journal limit: eviction between a waiter's
+				// wake-up and its cache read is an existing error path, not a
+				// property of the LRU.
+				id := fmt.Sprintf("op-%d", (w+i)%workers)
+				result, err := j.run(context.Background(), id, func(context.Context) (any, error) {
+					return app.DeleteResult{}, nil
+				})
+				if err != nil {
+					errs <- err
+					return
+				}
+				if result == nil {
+					errs <- fmt.Errorf("operation %q returned a nil result", id)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.done) != j.order.Len() || len(j.index) != j.order.Len() {
+		t.Fatalf("journal out of sync: done=%d order=%d index=%d", len(j.done), j.order.Len(), len(j.index))
+	}
+	for e := j.order.Front(); e != nil; e = e.Next() {
+		id, ok := e.Value.(string)
+		if !ok {
+			t.Fatalf("order holds a %T, want string", e.Value)
+		}
+		if j.index[id] != e {
+			t.Fatalf("order id %q does not match its indexed element", id)
+		}
+		if _, ok := j.done[id]; !ok {
+			t.Fatalf("order id %q missing from done", id)
 		}
 	}
 }
@@ -1210,10 +1265,10 @@ func TestOpJournalIsBounded(t *testing.T) {
 		}
 	}
 	j.mu.Lock()
-	size, order := len(j.done), len(j.order)
+	size, order, indexed := len(j.done), j.order.Len(), len(j.index)
 	j.mu.Unlock()
-	if size > operationJournalLimit || order > operationJournalLimit {
-		t.Fatalf("journal grew to %d entries and %d order keys", size, order)
+	if size > operationJournalLimit || order > operationJournalLimit || indexed > operationJournalLimit {
+		t.Fatalf("journal grew to %d entries, %d order keys and %d indexed ids", size, order, indexed)
 	}
 	if _, ok := j.cached("op-0"); ok {
 		t.Fatal("oldest entry was not evicted")
@@ -1402,4 +1457,37 @@ func BenchmarkJSONResult(b *testing.B) {
 			benchResult = jsonResult(runs)
 		}
 	})
+}
+
+// BenchmarkOpJournalDuplicate measures the hot path for repeated operation ids:
+// a full journal and a batch of duplicate claims that only touch the LRU.
+func BenchmarkOpJournalDuplicate(b *testing.B) {
+	j := newOpJournal()
+	for i := 0; i < operationJournalLimit; i++ {
+		if _, err := j.run(context.Background(), fmt.Sprintf("op-%d", i), func(context.Context) (any, error) {
+			return app.DeleteResult{}, nil
+		}); err != nil {
+			b.Fatalf("j.run(op-%d): %v", i, err)
+		}
+	}
+	ids := make([]string, 4096)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("op-%d", i%operationJournalLimit)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, id := range ids {
+			result, err := j.run(context.Background(), id, func(context.Context) (any, error) {
+				b.Fatal("duplicate ran the mutation again")
+				return nil, nil
+			})
+			if err != nil {
+				b.Fatalf("duplicate call: %v", err)
+			}
+			if result == nil {
+				b.Fatal("duplicate returned a nil result")
+			}
+		}
+	}
 }
