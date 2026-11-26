@@ -175,7 +175,7 @@ func (g *GitLabIssues) ListAvailable(ctx context.Context) ([]core.Task, error) {
 }
 
 func (g *GitLabIssues) Claim(ctx context.Context, id core.TaskID) error {
-	iid, err := glIssueNumber(id)
+	iid, err := issueNumber(id, "GL-")
 	if err != nil {
 		return err
 	}
@@ -185,7 +185,7 @@ func (g *GitLabIssues) Claim(ctx context.Context, id core.TaskID) error {
 }
 
 func (g *GitLabIssues) Complete(ctx context.Context, id core.TaskID) error {
-	iid, err := glIssueNumber(id)
+	iid, err := issueNumber(id, "GL-")
 	if err != nil {
 		return err
 	}
@@ -218,15 +218,6 @@ func (g *GitLabIssues) Create(ctx context.Context, task core.Task) (core.Task, e
 		return core.Task{}, err
 	}
 	return parseIssueRecord(glIssueRecord(issue), "GL"), nil
-}
-
-func glIssueNumber(id core.TaskID) (int, error) {
-	s := strings.TrimPrefix(string(id), "GL-")
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, core.Errorf(core.CodeInvalidInput, "issue id %q", id)
-	}
-	return n, nil
 }
 
 // glIssueRecord adapts a GitLab issue to the shared parser input.

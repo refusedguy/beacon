@@ -4,11 +4,11 @@ import assert from "node:assert/strict"
 import { NOW, lines, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
-  BeaconStatusRpc, CliStatusSource, EMPTY_SNAPSHOT, RECENT_LIMIT,
-  cleanErrorMessage, createCliStatusSource, createStatusSource,
-  defineBeaconStatus, errorMessage, normalizeRun, normalizeSnapshot,
-  parseSnapshot, renderSnapshotLines, default: beaconStatus,
-  beaconStatusDefinition,
+  BeaconStatusRpc, CHECK_BUCKETS, CliStatusSource, EMPTY_SNAPSHOT, RECENT_LIMIT,
+  checkRow, checksSummary, cleanErrorMessage, createCliStatusSource, createStatusSource,
+  defineBeaconStatus, errorMessage, eventKey, joinKey, normalizeRun, normalizeSnapshot,
+  parseSnapshot, renderSnapshotLines, runChangedPayload, runSignature,
+  default: beaconStatus, beaconStatusDefinition,
 } = ui
 
 test("default export is a Plugin.define definition", () => {
@@ -431,4 +431,32 @@ test("empty snapshot renders one collapsed queue line", () => {
     "Beacon 0 active", "P0 R0 C0 E0 F0 B0 M0 X0", "▼ Active 0", "No active runs",
     "Queue no tasks ready", "▼ Recent 0", "No recent runs",
   ])
+})
+
+test("one key builder serves run signatures and event dedupe", () => {
+  const run = { id: "r-1", sha: "abc123", state: "waiting_ci", updatedAt: "2026-11-26T10:00:00Z" }
+  const key = "r-1|abc123|waiting_ci|2026-11-26T10:00:00Z"
+  assert.equal(joinKey(run.id, run.sha, run.state, run.updatedAt), key)
+  assert.equal(runSignature(run), key)
+  assert.equal(eventKey({ id: run.id, sha: run.sha, state: run.state, at: run.updatedAt }), key)
+  assert.equal(eventKey({ key: "from-payload", id: run.id }), "from-payload")
+  assert.equal(runChangedPayload(run).key, key)
+})
+
+test("one check-state map drives row labels and summary buckets", () => {
+  const states = {
+    failure: "failed", failed: "failed", error: "failed",
+    pending: "pending", in_progress: "pending", queued: "pending",
+    skipped: "skipped", neutral: "skipped",
+  }
+  assert.deepEqual({ ...CHECK_BUCKETS }, states)
+  assert.equal(Object.getPrototypeOf(CHECK_BUCKETS), null, "an unknown state never inherits an Object key")
+  for (const [state, bucket] of Object.entries(states)) {
+    assert.equal(checkRow({ name: "ci", state }).name, `ci ${bucket}`, `row label for ${state}`)
+    assert.ok(checksSummary([{ name: "ci", state }]).includes(`1 ${bucket}`), `summary bucket for ${state}`)
+  }
+  assert.equal(checkRow({ name: "ci", state: "success" }).name, "ci")
+  assert.equal(checksSummary([{ name: "ci", state: "success" }]), "1/1")
+  assert.equal(checkRow({ name: "ci" }).name, "ci")
+  assert.equal(checksSummary([{ name: "ci" }]), "0/1 · 1 pending")
 })

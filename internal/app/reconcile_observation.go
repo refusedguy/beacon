@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -26,13 +25,14 @@ func recordObservation(run *core.Run, headSHA, baseSHA string) {
 	run.ObservedBaseSHA = baseSHA
 }
 
-// closedPRVerdict returns the decision for a PR GitHub no longer keeps open.
+// closedPRVerdict returns the decision for a PR the provider no longer keeps
+// open. It shares the core final-state classification with every other
+// final-state handler, so locked counts as final here and in Decide.
 func closedPRVerdict(state string) *core.MergeDecision {
-	switch strings.ToLower(state) {
-	case "merged", "closed", "locked":
-		return &core.MergeDecision{Verdict: core.VerdictWait, Reason: "pull request " + state}
+	if !core.DecideFinalState(state).Closed {
+		return nil
 	}
-	return nil
+	return &core.MergeDecision{Verdict: core.VerdictWait, Reason: "pull request " + state}
 }
 
 func (r *Reconciler) applyDecision(

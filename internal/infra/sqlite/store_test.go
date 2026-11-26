@@ -297,6 +297,42 @@ func TestCreateIncidentReopensResolvedSignature(t *testing.T) {
 	}
 }
 
+func TestCurrentIncidentNewestOpenByCreatedAtThenID(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	current, err := store.CurrentIncident(ctx)
+	if err != nil || current != nil {
+		t.Fatalf("empty current = %+v err=%v", current, err)
+	}
+
+	insert := func(id, status string, createdAt int64) {
+		t.Helper()
+		_, err := store.db.ExecContext(ctx, `
+INSERT INTO base_incidents(id, repo, base_branch, signature, failed_checks_json, status, created_at)
+VALUES (?,?,?,?,?,?,?)`, id, "o/r", "main", "sig-"+id, "[]", status, createdAt)
+		if err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+	insert("inc-a", "open", 10)
+	insert("inc-b", "open", 20)
+	insert("inc-c", "open", 20)
+	insert("inc-d", "resolved", 30)
+
+	current, err = store.CurrentIncident(ctx)
+	if err != nil || current == nil {
+		t.Fatalf("current = %+v err=%v", current, err)
+	}
+	if current.ID != "inc-c" {
+		t.Fatalf("current id = %s, want inc-c", current.ID)
+	}
+}
+
 func TestObservedBaseSHARoundTrip(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

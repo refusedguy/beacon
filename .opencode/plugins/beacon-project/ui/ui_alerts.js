@@ -1,7 +1,7 @@
 // Presentation helpers for daemon and incident alerts, the queue, compact
 // reasons, CI checks and human timeline copy. This module keeps ui_view.js
 // under the 350-line limit.
-import { failedCheckCount, REASON_WIDTH, str } from "./ui_model.js"
+import { CHECK_BUCKETS, failedCheckCount, REASON_WIDTH, str } from "./ui_model.js"
 
 const ALERT_STATES = Object.freeze(["dead", "stale"])
 const TIMELINE_TEXT = Object.freeze({
@@ -386,15 +386,10 @@ export function clockDuration(seconds) {
   return `${Math.floor(m / 60)}h${m % 60 ? `${m % 60}m` : ""}`
 }
 
-const CHECK_STATE = Object.freeze({
-  failure: "failed", failed: "failed", error: "failed",
-  pending: "pending", in_progress: "pending", queued: "pending",
-  skipped: "skipped", neutral: "skipped",
-})
 export function checkRow(check) {
   const state = str(check?.state).toLowerCase()
   const failed = state === "failure" || state === "failed" || state === "error"
-  const short = CHECK_STATE[state] ?? ""
+  const short = CHECK_BUCKETS[state] ?? ""
   const name = str(check?.name) || "check"
   return {
     marker: failed ? "✖" : state === "success" ? "✔" : "◐",
@@ -407,11 +402,6 @@ export function checkRow(check) {
   }
 }
 
-const CHECK_BUCKETS = Object.freeze(Object.assign(Object.create(null), {
-  failure: "failed", failed: "failed", error: "failed",
-  skipped: "skipped", neutral: "skipped",
-  pending: "pending", in_progress: "pending", queued: "pending",
-}))
 export function checksSummary(checks = [], ciWallSeconds) {
   const list = Array.isArray(checks) ? checks : []
   if (!list.length) return ""
