@@ -171,6 +171,49 @@ func TestDecideClosedAndMergedAreNoop(t *testing.T) {
 	}
 }
 
+func TestDecideFinalStateClassifiesLockedAsFinal(t *testing.T) {
+	cases := []struct {
+		state      string
+		wantClosed bool
+		wantMerged bool
+	}{
+		{"open", false, false},
+		{"opened", false, false},
+		{"closed", true, false},
+		{"merged", true, true},
+		{"locked", true, false},
+		{"CLOSED", true, false},
+		{"Merged", true, true},
+		{"LOCKED", true, false},
+		{"", false, false},
+		{"unknown", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			got := DecideFinalState(tc.state)
+			if got.Closed != tc.wantClosed || got.Merged != tc.wantMerged {
+				t.Fatalf("DecideFinalState(%q) = %+v, want closed=%t merged=%t", tc.state, got, tc.wantClosed, tc.wantMerged)
+			}
+			state := PRState(tc.state)
+			if state.IsClosed() != tc.wantClosed || state.IsMerged() != tc.wantMerged {
+				t.Fatalf("PRState(%q): IsClosed=%t IsMerged=%t, want %t/%t", tc.state, state.IsClosed(), state.IsMerged(), tc.wantClosed, tc.wantMerged)
+			}
+		})
+	}
+}
+
+func TestDecideLockedNeverMerges(t *testing.T) {
+	for _, state := range []string{"locked", "LOCKED"} {
+		got := Decide(
+			Observation{PRState: state},
+			[]Criterion{fakeCriterion{name: "ok", verdict: VerdictMerge}},
+		)
+		if got.Verdict != VerdictNoop {
+			t.Fatalf("state %q: verdict = %s, want %s", state, got.Verdict, VerdictNoop)
+		}
+	}
+}
+
 func TestAllRequiredPass(t *testing.T) {
 	cases := []struct {
 		name   string
