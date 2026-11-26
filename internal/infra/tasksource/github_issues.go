@@ -20,14 +20,21 @@ func NewGitHubIssues(client *github.Client, owner, repo string) *GitHubIssues {
 	return &GitHubIssues{Client: client, Owner: owner, Repo: repo}
 }
 
-// maxIssuePages caps paginated issue listing so a bad Link header cannot keep
-// the source fetching pages forever. With PerPage=100 it covers 10,000 issues.
-const maxIssuePages = 100
+const (
+	// issuesPerPage is the page size requested from the GitHub issue API.
+	issuesPerPage = 100
+	// maxIssues is the explicit safety bound on one issue listing. It sits well
+	// above a large repository's open issue count so a refresh returns the
+	// whole corpus, while still stopping a broken Link header chain.
+	maxIssues = 100000
+	// maxIssuePages derives the page bound from the issue bound.
+	maxIssuePages = maxIssues / issuesPerPage
+)
 
 // paginateIssues follows NextPage and accumulates every page of issues.
 func paginateIssues[T any](fetch func(*github.ListOptions) ([]T, *github.Response, error)) ([]T, error) {
 	var all []T
-	opts := github.ListOptions{PerPage: 100}
+	opts := github.ListOptions{PerPage: issuesPerPage}
 	for n := 0; n < maxIssuePages; n++ {
 		items, resp, err := fetch(&opts)
 		if err != nil {

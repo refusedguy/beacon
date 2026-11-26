@@ -244,9 +244,11 @@ func (PlanParser) Children(epic core.Task) []core.Task {
 	return core.SetParent(core.ExpandChildren(epic, ""), epic.ID)
 }
 
-// The cache limit keeps one refresh of a large repository from pinning every
-// issue body it has ever seen. Entries are evicted in insertion order.
-const fieldCacheLimit = 256
+// fieldCacheLimit bounds the number of cached parses so a long-running daemon
+// cannot pin every body it has ever seen. It sits above a large card corpus so
+// one refresh of a whole repository fits in the shared cache. Entries are
+// evicted in insertion order only once the bound is reached.
+const fieldCacheLimit = 1 << 16
 
 // parseKey identifies one parse. The source text is part of the key, so an
 // edited card can never return a stale result and dir and depPrefix still

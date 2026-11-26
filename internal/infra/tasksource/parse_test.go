@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log/slog"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -129,6 +130,25 @@ func TestParseTaskFieldsCacheReturnsIndependentSlices(t *testing.T) {
 	second := ParseTaskFields(body, "", "")
 	if second.Scope[0] != "a.go" || second.Depends[0] != "1" {
 		t.Fatalf("cache leaked mutated fields: %+v", second)
+	}
+}
+
+func TestFieldCacheCoversLargeCorpus(t *testing.T) {
+	if fieldCacheLimit < 20000 {
+		t.Fatalf("fieldCacheLimit = %d, want at least 20000", fieldCacheLimit)
+	}
+	c := fieldCache{entries: make(map[parseKey]taskFields)}
+	first := parseKey{body: "TaskID: T-0\n"}
+	c.store(first, parseTaskFields(first.body, "", ""))
+	for i := 1; i < 20000; i++ {
+		key := parseKey{body: "TaskID: T-" + strconv.Itoa(i) + "\n"}
+		c.store(key, parseTaskFields(key.body, "", ""))
+	}
+	if len(c.entries) != 20000 {
+		t.Fatalf("cache entries = %d, want 20000", len(c.entries))
+	}
+	if fields, ok := c.load(first); !ok || fields.ID != "T-0" {
+		t.Fatalf("first entry evicted: ok=%v fields=%+v", ok, fields)
 	}
 }
 

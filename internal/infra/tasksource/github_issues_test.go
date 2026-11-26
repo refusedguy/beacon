@@ -112,6 +112,45 @@ func TestGitHubIssuesFindsReadyTaskOnSecondPage(t *testing.T) {
 	}
 }
 
+func TestPaginateIssuesCoversLargeCorpus(t *testing.T) {
+	const want = 12000
+	fetched, calls := 0, 0
+	got, err := paginateIssues(func(opts *github.ListOptions) ([]int, *github.Response, error) {
+		calls++
+		if opts.PerPage != issuesPerPage {
+			t.Fatalf("per page = %d, want %d", opts.PerPage, issuesPerPage)
+		}
+		remaining := want - fetched
+		if remaining > issuesPerPage {
+			remaining = issuesPerPage
+		}
+		batch := make([]int, remaining)
+		for i := range batch {
+			batch[i] = fetched + i
+		}
+		fetched += remaining
+		resp := &github.Response{}
+		if fetched < want {
+			resp.NextPage = opts.Page + 1
+		}
+		return batch, resp, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != want {
+		t.Fatalf("issues = %d, want %d", len(got), want)
+	}
+	if calls != want/issuesPerPage {
+		t.Fatalf("calls = %d, want %d", calls, want/issuesPerPage)
+	}
+	for i, v := range got {
+		if v != i {
+			t.Fatalf("issue %d = %d", i, v)
+		}
+	}
+}
+
 func TestGitHubIssuesStopsAtPageCap(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
