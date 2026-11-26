@@ -49,8 +49,8 @@ func applyControl(ctx context.Context, sv Services, action, id string, pr int, s
 	if sv.Remote != nil {
 		return sv.Remote(ctx, action, id, pr, sha)
 	}
-	if sv.Control == nil {
-		return core.Errorf(core.CodeUnavailable, "control service is not configured")
+	if err := requireService("control service", sv.Control); err != nil {
+		return err
 	}
 	return applyLocal(ctx, sv.Control, action, id, sha, pr)
 }
@@ -80,8 +80,8 @@ func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToo
 	if !core.ParseControlAction(a.Action).Valid() {
 		return nil, nil, core.Errorf(core.CodeInvalidInput, "unknown action %q", a.Action)
 	}
-	if sv.Remote == nil && sv.Control == nil {
-		return nil, nil, core.Errorf(core.CodeUnavailable, "control service is not configured")
+	if err := requireService("control service", sv.Remote, sv.Control); err != nil {
+		return nil, nil, err
 	}
 	results := make([]controlItem, 0, len(a.RunIDs))
 	for _, id := range a.RunIDs {
