@@ -5,9 +5,11 @@ import { createBox, createLineMount, createSegmentBar, createText } from "./ui_n
 import { REASON_WIDTH } from "./ui_model.js"
 import { isDispatching, truncate } from "./ui_alerts.js"
 import { truncateSidebarTitle } from "./ui_view.js"
-import { propSetter } from "./ui_test_helpers.js"
 
 export const SIDEBAR_LINES = 34
+
+// The real host supplies setProp; test doubles may only expose node.props.
+const propSetter = (source) => source?.setProp ?? ((node, key, value) => { node.props[key] = value })
 
 // Mounted sidebars register here so the dispatch action can repaint its plate
 // on the click, before the RPC settles. Repainting uses the items already

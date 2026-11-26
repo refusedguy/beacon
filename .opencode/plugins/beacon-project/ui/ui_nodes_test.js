@@ -7,7 +7,8 @@ import assert from "node:assert/strict"
 import { createLineMount } from "./ui_nodes.js"
 import { createSidebarMount, sidebarPresentation } from "./ui_sidebar.js"
 import { runLineItems, sidebarModel } from "./ui_view.js"
-import { EMPTY_SNAPSHOT, NOW, hostModule, makeRun, normalizeRun, solidModule } from "./ui_test_helpers.js"
+import { EMPTY_SNAPSHOT, normalizeRun } from "./ui_model.js"
+import { NOW, hostModule, makeRun, solidModule } from "./ui_test_helpers.js"
 
 const deps = {
   color: (key) => `theme.${key}`,

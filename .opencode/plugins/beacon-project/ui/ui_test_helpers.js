@@ -1,6 +1,6 @@
-// Shared fixtures for the Beacon TUI plugin tests.
-export * from "./ui.js"
-import { renderSnapshotLines } from "./ui.js"
+// Shared fixtures for the Beacon TUI plugin tests. No production module
+// imports this file: it pulls in only test doubles and leaf view helpers.
+import { renderSnapshotLines } from "./ui_view.js"
 import { cleanupWrapper } from "../protocol/cleanup.js"
 export { cleanupWrapper }
 
