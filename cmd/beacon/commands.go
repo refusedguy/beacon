@@ -324,10 +324,6 @@ type watchPort interface {
 	WatchPR(ctx context.Context, id core.RunID, pr int) error
 }
 
-func applyControl(ctx context.Context, ctrl controlPort, action, runID, sha string, message ...string) error {
-	return applyControlWithPR(ctx, ctrl, action, runID, sha, 0, message...)
-}
-
 func applyControlWithPR(ctx context.Context, ctrl controlPort, action, runID, sha string, pr int, message ...string) error {
 	id := core.RunID(runID)
 	switch core.ParseControlAction(action) {
@@ -350,10 +346,6 @@ func applyControlWithPR(ctx context.Context, ctrl controlPort, action, runID, sh
 	default:
 		return fmt.Errorf("unknown action %q", action)
 	}
-}
-
-func postControl(ctx context.Context, info *connectionInfo, action, runID, sha string, message ...string) error {
-	return postControlWithPR(ctx, info, action, runID, sha, 0, message...)
 }
 
 func postControlWithPR(ctx context.Context, info *connectionInfo, action, runID, sha string, pr int, message ...string) error {
