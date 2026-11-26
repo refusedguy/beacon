@@ -12,6 +12,7 @@ import (
 	"github.com/google/go-github/v93/github"
 	"github.com/sony/gobreaker/v2"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -25,6 +26,7 @@ type GitHub struct {
 	br     *gobreaker.CircuitBreaker[any]
 	etagMu sync.Mutex
 	etags  map[int]*etagEntry
+	prGet  singleflight.Group
 }
 
 // NewGitHub builds a GitHub gateway for owner and repo.
@@ -74,9 +76,10 @@ func (g *GitHub) guarded(fn func() (any, error)) (any, error) {
 	return guarded(g.br, fn)
 }
 
-// maxGitHubPages caps paginated calls so a bad Link header cannot keep the
-// daemon fetching pages forever. With PerPage=100 it covers 10,000 entries.
-const maxGitHubPages = 100
+// maxGitHubPages is the explicit bound on paginated GitHub calls. A bad Link
+// header must not keep the daemon fetching forever, but the bound must also
+// cover large check and review sets. With PerPage=100 it covers 100,000 entries.
+const maxGitHubPages = 1000
 
 // observeParallelLimit bounds the goroutines that fetch independent PR signals.
 // A single Observe stays within the circuit breaker's burst allowance instead
@@ -344,10 +347,9 @@ const updateBranchMutation = `mutation($id: ID!, $sha: GitObjectID!) {
 // production while the httptest mocked success. The mutation returns the new
 // head SHA directly, so no polling is needed.
 func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (string, error) {
-	p, err := guarded(g.br, func() (*github.PullRequest, error) {
-		got, _, err := g.Client.PullRequests.Get(ctx, g.Owner, g.Repo, pr)
-		return got, err
-	})
+	// Read through the ETag cache so an update after an Observe sends one
+	// conditional GET instead of refetching the whole pull request.
+	p, err := g.getPR(ctx, pr)
 	if err != nil {
 		return "", err
 	}

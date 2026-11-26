@@ -163,10 +163,39 @@ func (g *GitLab) applyObservedChecks(ctx context.Context, o *core.Observation, s
 	}
 }
 
+const (
+	gitlabPageSize = 100
+	maxGitLabPages = 100
+)
+
+// getJSONPages walks GitLab's page-number API until a short page or the
+// explicit cap. Callers use it for every list that can exceed one page, so a
+// check or comment page is never silently dropped.
+func getJSONPages[T any](g *GitLab, ctx context.Context, path string, query url.Values) ([]T, error) {
+	q := url.Values{}
+	for key, values := range query {
+		q[key] = append([]string(nil), values...)
+	}
+	q.Set("per_page", strconv.Itoa(gitlabPageSize))
+	var all []T
+	for page := 1; page <= maxGitLabPages; page++ {
+		q.Set("page", strconv.Itoa(page))
+		var items []T
+		if err := g.getJSON(ctx, path, q, &items); err != nil {
+			return nil, err
+		}
+		all = append(all, items...)
+		if len(items) < gitlabPageSize {
+			break
+		}
+	}
+	return all, nil
+}
+
 func (g *GitLab) unresolvedThreads(ctx context.Context, mrIID int) ([]string, error) {
 	path := g.mrPath(mrIID) + "/threads"
-	var threads []glThread
-	if err := g.getJSON(ctx, path, url.Values{"per_page": {"100"}}, &threads); err != nil {
+	threads, err := getJSONPages[glThread](g, ctx, path, nil)
+	if err != nil {
 		return nil, err
 	}
 	var out []string
@@ -194,6 +223,11 @@ func (g *GitLab) unresolvedThreads(ctx context.Context, mrIID int) ([]string, er
 }
 
 func (g *GitLab) approvals(ctx context.Context, mrIID int, mr glMR) (int, error) {
+	// The MR detail already carries approved_by. Calling /approvals when it is
+	// present adds a round trip without adding information.
+	if len(mr.ApprovedBy) > 0 {
+		return len(mr.ApprovedBy), nil
+	}
 	path := g.mrPath(mrIID) + "/approvals"
 	var result struct {
 		ApprovedBy []glUser `json:"approved_by"`

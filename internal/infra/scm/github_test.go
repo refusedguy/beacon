@@ -2,11 +2,14 @@ package scm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -354,5 +357,147 @@ func TestGitHubObserveFetchesIndependentSignalsInTwoRounds(t *testing.T) {
 	if o.PRNumber != 42 || o.HeadSHA != "abc" || o.PRState != "open" || o.Approvals != 0 ||
 		!o.WorkflowSkipped || o.Behind || o.BaseSHA != "base" || o.Incomplete || o.IncompleteReason != "" {
 		t.Fatalf("observation changed: %+v", o)
+	}
+}
+
+func TestGitHubChecksPaginatesEveryPage(t *testing.T) {
+	const total = 250
+	pages := 0
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/check-runs") {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		pages++
+		page := r.URL.Query().Get("page")
+		start := 0
+		switch page {
+		case "":
+			start = 0
+			w.Header().Set("Link", `</repos/o/r/commits/abc/check-runs?page=2>; rel="next"`)
+		case "2":
+			start = 100
+			w.Header().Set("Link", `</repos/o/r/commits/abc/check-runs?page=3>; rel="next"`)
+		case "3":
+			start = 200
+		default:
+			t.Errorf("unexpected page %q", page)
+			return
+		}
+		runs := make([]map[string]any, 0, 100)
+		for i := start; i < start+100 && i < total; i++ {
+			runs = append(runs, map[string]any{
+				"name":       "check-" + strconv.Itoa(i),
+				"status":     "completed",
+				"conclusion": "success",
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{"total_count": total, "check_runs": runs}); err != nil {
+			t.Error(err)
+		}
+	}))
+	checks, err := g.checks(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checks) != total {
+		t.Fatalf("checks = %d, want %d", len(checks), total)
+	}
+	if pages != 3 {
+		t.Fatalf("check-run pages = %d, want 3", pages)
+	}
+}
+
+func TestConcurrentObservesShareOnePullRequestGet(t *testing.T) {
+	const observers = 8
+	var prGets atomic.Int64
+	arrived := make(chan struct{}, observers)
+	release := make(chan struct{})
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(p, "/pulls/42"):
+			prGets.Add(1)
+			select {
+			case arrived <- struct{}{}:
+			default:
+			}
+			<-release
+			_, _ = w.Write([]byte(`{"number":42,"state":"open","head":{"sha":"abc"}}`))
+		case strings.Contains(p, "/check-runs"):
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+		case strings.HasSuffix(p, "/reviews"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.HasSuffix(p, "/files"):
+			_, _ = w.Write([]byte(`[{"filename":"docs/a.md"}]`))
+		case strings.Contains(p, "/compare/"):
+			_, _ = w.Write([]byte(`{"behind_by":0,"base_commit":{"sha":"base"}}`))
+		default:
+			t.Errorf("unexpected path %s", p)
+			http.NotFound(w, r)
+		}
+	}))
+
+	var wg sync.WaitGroup
+	for i := 0; i < observers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := g.Observe(context.Background(), 42); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	<-arrived
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if got := prGets.Load(); got != 1 {
+		t.Fatalf("pull request GETs = %d, want 1 for concurrent observes", got)
+	}
+}
+
+func TestUpdateBranchUsesConditionalGet(t *testing.T) {
+	const oldSHA, newSHA = "old", "new"
+	var gets, conditional int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/42"):
+			gets++
+			if r.Header.Get("If-None-Match") == `"v1"` {
+				conditional++
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("ETag", `"v1"`)
+			_, _ = w.Write([]byte(`{"number":42,"node_id":"PR_kwDOABC123","head":{"sha":"old"}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/graphql"):
+			_, _ = w.Write([]byte(`{"data":{"updatePullRequestBranch":{"pullRequest":{"headRefOid":"new"}}}}`))
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	client, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithEnterpriseURLs(srv.URL+"/", srv.URL+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := NewGitHub(client, "o", "r", "main")
+	for i := 0; i < 2; i++ {
+		sha, err := g.UpdateBranch(context.Background(), 42, oldSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sha != newSHA {
+			t.Fatalf("sha = %q, want %q", sha, newSHA)
+		}
+	}
+	if gets != 2 || conditional != 1 {
+		t.Fatalf("pull request GETs = %d, conditional = %d; want 2 and 1", gets, conditional)
 	}
 }
