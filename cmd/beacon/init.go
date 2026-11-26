@@ -71,10 +71,10 @@ func newInitCommand() *cobra.Command {
 // and BEACON_OPENCODE_ENDPOINT from older Beacon configurations.
 func resolveInitOptions(f *initFlags) initOptions {
 	o := initOptions{
-		taskSource:      firstNonEmpty(f.taskSource, "markdown"),
+		taskSource:      coalesce(f.taskSource, "markdown"),
 		scm:             f.scm,
-		harness:         firstNonEmpty(f.harness, "opencode"),
-		endpoint:        firstNonEmpty(f.harnessEndpoint, envString("OPENCODE_ENDPOINT", ""), envString("BEACON_OPENCODE_ENDPOINT", ""), "http://127.0.0.1:4096"),
+		harness:         coalesce(f.harness, "opencode"),
+		endpoint:        coalesce(f.harnessEndpoint, envOr("OPENCODE_ENDPOINT", ""), envOr("BEACON_OPENCODE_ENDPOINT", ""), "http://127.0.0.1:4096"),
 		maxInFlight:     f.maxInFlight,
 		maxActiveAgents: f.maxActiveAgents,
 		weakPC:          true,

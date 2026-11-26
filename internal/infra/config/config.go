@@ -241,12 +241,12 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
 	expandNonSecrets(&c)
-	c.Webhook.Secret = LiteralOrEnv(c.Webhook.Secret, c.Webhook.SecretEnv)
+	c.Webhook.Secret = EnvOr(c.Webhook.SecretEnv, c.Webhook.Secret)
 	if err := ValidateWebhook(c.Webhook); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
-	c.Notify.TelegramToken = LiteralOrEnv(c.Notify.TelegramToken, c.Notify.TelegramTokenEnv)
-	c.SCM.Token = LiteralOrEnv(c.SCM.Token, c.SCM.TokenEnv)
+	c.Notify.TelegramToken = EnvOr(c.Notify.TelegramTokenEnv, c.Notify.TelegramToken)
+	c.SCM.Token = EnvOr(c.SCM.TokenEnv, c.SCM.Token)
 	interval, intervalErr := parseInterval(c.PollInterval)
 	if err := c.validate(interval, intervalErr); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
@@ -329,14 +329,20 @@ func DetectRequiredChecks(root string) []string {
 	return shared.DetectWorkflowJobNames(root)
 }
 
-// LiteralOrEnv returns the environment value named by envName when it is set,
-// else literal. Callers that read a secret or token share this resolver so the
-// precedence is the same in config, serve and doctor.
-func LiteralOrEnv(literal, envName string) string {
-	if v := os.Getenv(envName); v != "" {
+// EnvOr returns the non-empty value of the environment variable named key,
+// else fallback. The key stays at the read site so every config name remains
+// visible where it is used. Secrets and regular settings share this resolver.
+func EnvOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
 		return v
 	}
-	return literal
+	return fallback
+}
+
+// LiteralOrEnv keeps the former argument order for callers that still use it.
+// New code should call EnvOr with the environment key first.
+func LiteralOrEnv(literal, envName string) string {
+	return EnvOr(envName, literal)
 }
 
 // defaults returns the config used when no config file exists.

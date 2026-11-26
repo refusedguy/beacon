@@ -92,7 +92,7 @@ var (
 // projectRoot prefers the explicit environment root. The pooled MCP daemon is
 // started with a cwd, but a caller can pin the root without changing that cwd.
 func projectRoot() (string, error) {
-	if fromEnv := envString("BEACON_PROJECT_ROOT", ""); fromEnv != "" {
+	if fromEnv := envOr("BEACON_PROJECT_ROOT", ""); fromEnv != "" {
 		return filepath.Abs(fromEnv)
 	}
 	return filepath.Abs(".")
@@ -149,7 +149,7 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
-	parentSession = firstNonEmpty(parentSession, cfg.Harness.ParentSessionID)
+	parentSession = coalesce(parentSession, cfg.Harness.ParentSessionID)
 	infra, err := wireInfra(cfg, root, parentSession)
 	if err != nil {
 		return nil, err
@@ -283,7 +283,7 @@ func buildInfra(c infraConstructors) (*wiredInfra, error) {
 func wireServices(cfg config.Config, root, parentSession string, infra *wiredInfra, h refreshHarness, p app.ReconcilerPolicy, resolveModel app.ModelResolver) *wiring {
 	// wire passes the resolved parent, but direct callers may supply only the
 	// environment value. Resolve once here so both services agree on it.
-	parentSession = firstNonEmpty(parentSession, cfg.Harness.ParentSessionID)
+	parentSession = coalesce(parentSession, cfg.Harness.ParentSessionID)
 	workspaceRoot := core.Workspace{Path: root, Branch: cfg.BaseBranch}
 	if infra.workspace != nil {
 		infra.workspace.Refresher = h
@@ -392,12 +392,9 @@ func (p *reloadablePolicy) ReviewRequired(mode core.ReviewMode, obs core.Observa
 }
 
 func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) {
-	scmToken = firstNonEmpty(envString(cfg.SCM.TokenEnv, ""), cfg.SCM.Token)
-	sourceToken = envString(cfg.TaskSource.TokenEnv, "")
-	if sourceToken == "" {
-		sourceToken = scmToken
-	}
-	harnessToken = firstNonEmpty(envString(cfg.Harness.TokenEnv, ""), cfg.Harness.Token)
+	scmToken = envOr(cfg.SCM.TokenEnv, cfg.SCM.Token)
+	sourceToken = envOr(cfg.TaskSource.TokenEnv, scmToken)
+	harnessToken = envOr(cfg.Harness.TokenEnv, cfg.Harness.Token)
 	return
 }
 
@@ -432,7 +429,7 @@ func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarnes
 // resolveModel uses the configured model, then BEACON_MODEL, then the model
 // of the orchestrator session so workers run with the user's current choice.
 func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
-	if v := envString("BEACON_MODEL", ""); v != "" {
+	if v := envOr("BEACON_MODEL", ""); v != "" {
 		return core.ModelRef{ProviderID: "opencode", ID: v}
 	}
 	if cfg.Harness.Model != "" {
@@ -481,13 +478,20 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 	}
 }
 
-func firstNonEmpty(values ...string) string {
+// coalesce returns the first non-empty value. Values are used verbatim; callers
+// that need trimmed values trim their own inputs.
+func coalesce(values ...string) string {
 	for _, v := range values {
 		if v != "" {
 			return v
 		}
 	}
 	return ""
+}
+
+// firstNonEmpty keeps the former name for callers outside this task's scope.
+func firstNonEmpty(values ...string) string {
+	return coalesce(values...)
 }
 
 // logDiscard records an error the caller deliberately treats as advisory. The
@@ -502,7 +506,7 @@ func logDiscard(what string, err error) {
 func (w *wiring) close() { _ = w.store.Close() }
 
 func main() {
-	slog.SetDefault(shared.NewLogger(envString("BEACON_LOG_LEVEL", "")))
+	slog.SetDefault(shared.NewLogger(envOr("BEACON_LOG_LEVEL", "")))
 	root := &cobra.Command{Use: "beacon", Short: "Parallel AI agent controller"}
 	configPath := root.PersistentFlags().String("config", "", "path to config.yaml")
 
