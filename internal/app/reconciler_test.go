@@ -215,6 +215,10 @@ func (behindAwarePolicy) Evaluate(o core.Observation) core.MergeDecision {
 	return core.Decide(o, nil)
 }
 
+// ReviewRequired keeps the composed policy satisfied. This fake always holds
+// the epic gate, so callers that omit review approval still block the merge.
+func (behindAwarePolicy) ReviewRequired(core.ReviewMode, core.Observation) bool { return true }
+
 func TestReconcileWaitingCIToAutoRebase(t *testing.T) {
 	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Behind: true})
@@ -1280,7 +1284,7 @@ func TestGreenBehindRecordsObservationOnce(t *testing.T) {
 	cases := []struct {
 		name      string
 		state     core.RunState
-		policy    core.MergePolicy
+		policy    ReconcilerPolicy
 		wantState core.RunState
 	}{
 		{"needs agent fix", core.RunNeedsAgentFix, behindAwarePolicy{}, core.RunWaitingCI},

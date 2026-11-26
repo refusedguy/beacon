@@ -76,6 +76,8 @@ func (e2ePolicy) Evaluate(core.Observation) core.MergeDecision {
 	return core.MergeDecision{Verdict: core.VerdictWait, Reason: "checks pending", Criterion: "invariant"}
 }
 
+func (e2ePolicy) ReviewRequired(core.ReviewMode, core.Observation) bool { return false }
+
 // e2eHarness captures the prompt from Spawn. Capturing the request is the
 // tool-call-to-prompt endpoint: the MCP wrapper calls Dispatcher.Dispatch and
 // does not touch the prompt.
@@ -531,6 +533,8 @@ type dedupPolicy struct{}
 func (dedupPolicy) Evaluate(core.Observation) core.MergeDecision {
 	return core.MergeDecision{Verdict: core.VerdictNeedsAgentFix, Reason: "checks failed", Criterion: "invariant"}
 }
+
+func (dedupPolicy) ReviewRequired(core.ReviewMode, core.Observation) bool { return false }
 
 // countingStore counts only Save calls. Reconcile always saves the run after
 // Observe, so one tick writes exactly one row per PR. A missed SHA guard adds

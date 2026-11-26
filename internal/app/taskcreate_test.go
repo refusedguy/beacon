@@ -699,6 +699,8 @@ type interruptibleCommitter struct {
 	cancel  context.CancelFunc
 }
 
+func (c *interruptibleCommitter) EnsureBranch(context.Context, string, string) error { return nil }
+
 func (c *interruptibleCommitter) CommitPath(context.Context, core.Workspace, string, string) error {
 	c.commits++
 	c.cancel()
@@ -718,6 +720,8 @@ type lateCancelCommitter struct {
 	retryErr error
 	retryVal any
 }
+
+func (c *lateCancelCommitter) EnsureBranch(context.Context, string, string) error { return nil }
 
 func (c *lateCancelCommitter) CommitPath(ctx context.Context, _ core.Workspace, pathspec, _ string) error {
 	c.pushes++

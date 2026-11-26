@@ -59,6 +59,14 @@ type wiring struct {
 	watcher     *configWatcher
 }
 
+// refreshHarness is the harness surface the composition root injects into the
+// workspace. Composing refresh with the base port makes the capability part of
+// the injected dependency instead of a runtime probe at injection.
+type refreshHarness interface {
+	core.AgentHarness
+	core.WorktreeRefresher
+}
+
 // wiredInfra holds the adapters shared by every application service.
 type wiredInfra struct {
 	store     *sqlite.Store
@@ -272,13 +280,13 @@ func buildInfra(c infraConstructors) (*wiredInfra, error) {
 // wireServices builds the application services on top of the adapters. The
 // reloadable wrappers are injected here so no service is built with an
 // original adapter and patched afterwards.
-func wireServices(cfg config.Config, root, parentSession string, infra *wiredInfra, h core.AgentHarness, p core.MergePolicy, resolveModel app.ModelResolver) *wiring {
+func wireServices(cfg config.Config, root, parentSession string, infra *wiredInfra, h refreshHarness, p app.ReconcilerPolicy, resolveModel app.ModelResolver) *wiring {
 	// wire passes the resolved parent, but direct callers may supply only the
 	// environment value. Resolve once here so both services agree on it.
 	parentSession = firstNonEmpty(parentSession, cfg.Harness.ParentSessionID)
 	workspaceRoot := core.Workspace{Path: root, Branch: cfg.BaseBranch}
-	if refresher, ok := h.(core.WorktreeRefresher); ok {
-		infra.workspace.Refresher = refresher
+	if infra.workspace != nil {
+		infra.workspace.Refresher = h
 	}
 	creator := &app.TaskCreator{
 		Store: infra.store, Source: infra.source,
@@ -308,8 +316,17 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		default:
 		}
 	}}
-	recon := newReconciler(cfg, infra.store, infra.scm, h, p,
-		infra.source, infra.workspace, disp, infra.changes, parentSession)
+	recon := newReconciler(app.ReconcilerConfig{
+		Notifier:       notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
+		Repo:           cfg.RepoSlug(),
+		BaseBranch:     cfg.BaseBranch,
+		ParentSession:  parentSession,
+		BaseRedMode:    cfg.OnBaseRed.Mode,
+		MaxFixTries:    cfg.OnBaseRed.MaxFixAttempts,
+		Interval:       cfg.Interval(),
+		AutoRebase:     cfg.Merge.AutoRebase,
+		MaxAutoRebases: cfg.Merge.MaxAutoRebases,
+	}, infra.store, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: h,
@@ -322,7 +339,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 	}
 }
 
-func mergePolicy(cfg config.Config) core.MergePolicy {
+func mergePolicy(cfg config.Config) app.ReconcilerPolicy {
 	// Required checks reach policy only through the source port. Config load
 	// resolves workflow job names into cfg.Merge.RequiredChecks in workflow
 	// mode, and the manual list is the override the source returns on both the
@@ -336,28 +353,42 @@ func mergePolicy(cfg config.Config) core.MergePolicy {
 }
 
 func newReconciler(
-	cfg config.Config,
+	cfg app.ReconcilerConfig,
 	store core.RunStore,
 	scmGW core.ScmGateway,
 	h core.AgentHarness,
-	p core.MergePolicy,
+	p app.ReconcilerPolicy,
 	source core.TaskSource,
 	wt core.WorkspaceManager,
 	disp *app.Dispatcher,
 	changes chan int,
-	parentSession string,
 ) *app.Reconciler {
 	return &app.Reconciler{
 		Store: store, SCM: scmGW, Policy: p, Harness: h,
 		Source: source, Workspace: wt,
-		Notifier:   notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
-		Dispatcher: disp, Changes: changes, Repo: cfg.RepoSlug(),
-		BaseBranch: cfg.BaseBranch, BaseRedMode: cfg.OnBaseRed.Mode,
-		MaxFixTries: cfg.OnBaseRed.MaxFixAttempts, ParentSessionID: parentSession,
-		Interval:       cfg.Interval(),
-		AutoRebase:     cfg.Merge.AutoRebase,
-		MaxAutoRebases: cfg.Merge.MaxAutoRebases,
+		Notifier:        cfg.Notifier,
+		Dispatcher:      disp,
+		Changes:         changes,
+		Repo:            cfg.Repo,
+		BaseBranch:      cfg.BaseBranch,
+		BaseRedMode:     cfg.BaseRedMode,
+		MaxFixTries:     cfg.MaxFixTries,
+		ParentSessionID: cfg.ParentSession,
+		Interval:        cfg.Interval,
+		AutoRebase:      cfg.AutoRebase,
+		MaxAutoRebases:  cfg.MaxAutoRebases,
 	}
+}
+
+// ReviewRequired forwards the epic review gate from the live policy snapshot.
+// The composition root is the only place that probes the snapshot's concrete
+// policy; downstream services receive a policy that already has the gate.
+func (p *reloadablePolicy) ReviewRequired(mode core.ReviewMode, obs core.Observation) bool {
+	gate, ok := (*p.live).Load().policy.(app.ReviewGate)
+	if !ok {
+		return true
+	}
+	return gate.ReviewRequired(mode, obs)
 }
 
 func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) {

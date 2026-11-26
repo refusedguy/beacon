@@ -20,6 +20,8 @@ func (s *stubCommitter) CommitPath(context.Context, core.Workspace, string, stri
 	return nil
 }
 
+func (s *stubCommitter) EnsureBranch(context.Context, string, string) error { return nil }
+
 func TestTaskCreateOverInMemoryTransport(t *testing.T) {
 	dir := t.TempDir()
 	source := tasksource.NewMarkdown(dir)
