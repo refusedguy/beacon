@@ -4,6 +4,7 @@
 import { ACTION_NAMES, DETAIL_OPEN } from "./ui_view.js"
 import { createBox, createLineMount, createText } from "./ui_nodes.js"
 import { propSetter } from "./ui_test_helpers.js"
+import { createButtonPlate, createPanelChrome } from "./ui_card_view.js"
 
 export const DETAIL_LINES = 80
 const ACTION_LABEL = Object.freeze({
@@ -15,29 +16,17 @@ const BUTTON_FG = Object.freeze({
   retry: "success", approve: "success", cancel: "error",
   pr: "base", help: "action", copy: "base",
 })
-const fieldKey = (text) => text.padEnd(8, " ")
-
+// The detail panel owns its header labels; the shared builder owns the layout.
+const HEADER_LABEL = Object.freeze({ hint: "ctrl+g", close: "✕" })
 export function createDetailMount(ui, deps) {
   const { insert } = ui
   const { color, BOLD, onAction, onToggle, onClose } = deps
   const set = propSetter(deps)
-  const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
-
-  const header = createBox(ui, {
-    flexDirection: "row", justifyContent: "space-between", minWidth: 0, flexShrink: 0,
+  const chrome = createPanelChrome(ui, deps, {
+    title: "Beacon", onHint: onToggle, onClose, padding: 8,
+    hintLabel: HEADER_LABEL.hint, closeLabel: HEADER_LABEL.close,
   })
-  const title = createText(ui, { content: "Beacon", fg: color("base"), bold: true })
-  set(title, "attributes", BOLD)
-  insert(header, title)
-  const controls = createBox(ui, { flexDirection: "row", minWidth: 0, flexShrink: 0 })
-  const hint = createText(ui, { content: "ctrl+g", fg: color("action"), onMouseUp: onToggle })
-  set(hint, "paddingLeft", 1); set(hint, "paddingRight", 1)
-  const gap = createText(ui, { content: " ", fg: color("muted") })
-  const close = createText(ui, { content: "✕", fg: color("error"), onMouseUp: onClose })
-  set(close, "paddingLeft", 1); set(close, "paddingRight", 1)
-  insert(controls, hint); insert(controls, gap); insert(controls, close)
-  insert(header, controls)
-  insert(container, header)
+  const { container, fieldKey } = chrome
 
   // The hero uses the darker panel token so the raised button plates stand out.
   const heroCard = createBox(ui, {
@@ -93,22 +82,12 @@ export function createDetailMount(ui, deps) {
   const buttons = Object.create(null)
   const buttonBoxes = Object.create(null)
   for (const name of ACTION_NAMES) {
-    const baseBg = color("raised")
-    const box = createBox(ui, {
-      flexDirection: "row", flexShrink: 0, paddingLeft: 1, paddingRight: 1,
-      marginRight: name === "copy" ? 0 : 1, backgroundColor: baseBg,
-      onMouseOver: () => set(box, "backgroundColor", color("panel")),
-      onMouseOut: () => set(box, "backgroundColor", baseBg),
-    })
-    const text = createText(ui, {
-      content: ACTION_LABEL[name], fg: color(BUTTON_FG[name]),
-      name: `beacon-action-${name}`,
+    const { box, text } = createButtonPlate(ui, deps, {
+      content: ACTION_LABEL[name], fg: BUTTON_FG[name], name: `beacon-action-${name}`,
+      marginRight: name === "copy" ? 0 : 1, boxClick: true,
       onMouseUp: () => (name === "cancel" ? showConfirm(true) : onAction(name)),
+      visible: name === "copy",
     })
-    set(box, "onMouseUp", () => (name === "cancel" ? showConfirm(true) : onAction(name)))
-    set(box, "visible", name === "copy")
-    set(text, "visible", name === "copy")
-    insert(box, text)
     insert(actions, box)
     buttons[name] = text
     buttonBoxes[name] = box
@@ -126,23 +105,20 @@ export function createDetailMount(ui, deps) {
   const confirmActions = createBox(ui, {
     flexDirection: "row", minWidth: 0, marginTop: 1, flexShrink: 0,
   })
-  const yesBox = createBox(ui, {
-    flexDirection: "row", flexShrink: 0, paddingLeft: 1, paddingRight: 1,
-    marginRight: 1, backgroundColor: color("raised"),
+  const confirmYesPlate = createButtonPlate(ui, deps, {
+    content: "[ Confirm Cancel ]", fg: "error", marginRight: 1, hover: false,
+    onMouseUp: () => { showConfirm(false); onAction("cancel", { confirmed: true }) },
   })
-  const confirmYes = createText(ui, { content: "[ Confirm Cancel ]", fg: color("error"),
-    onMouseUp: () => { showConfirm(false); onAction("cancel", { confirmed: true }) } })
-  insert(yesBox, confirmYes)
+  const confirmYes = confirmYesPlate.text
   const confirmSpacer = createText(ui, { content: " ", fg: color("muted") })
   set(confirmSpacer, "flexShrink", 0)
-  const noBox = createBox(ui, {
-    flexDirection: "row", flexShrink: 0, paddingLeft: 1, paddingRight: 1,
-    backgroundColor: color("raised"),
+  const confirmNoPlate = createButtonPlate(ui, deps, {
+    content: "[ Keep ]", fg: "muted", hover: false, onMouseUp: () => showConfirm(false),
   })
-  const confirmNo = createText(ui, { content: "[ Keep ]", fg: color("muted"),
-    onMouseUp: () => showConfirm(false) })
-  insert(noBox, confirmNo)
-  insert(confirmActions, yesBox); insert(confirmActions, confirmSpacer); insert(confirmActions, noBox)
+  const confirmNo = confirmNoPlate.text
+  insert(confirmActions, confirmYesPlate.box)
+  insert(confirmActions, confirmSpacer)
+  insert(confirmActions, confirmNoPlate.box)
   insert(confirmBox, confirmText); insert(confirmBox, confirmActions)
   insert(heroCard, confirmBox)
   insert(container, heroCard)

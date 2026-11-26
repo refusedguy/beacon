@@ -28,8 +28,82 @@ export function runTotalTime(run) {
 
 export const CARD_PANEL_NAME = "beacon.card"
 export const CARD_LINES = CARD_BODY_LINES + 8
-const fieldKey = (text) => text.padEnd(10, " ")
 export const cardRelativePath = (card) => card?.relativePath || `docs/tasks/${card?.id}.md`
+
+// Both mounts build the same panel chrome inside their render callback. The
+// builder owns the container, header, title, hint, gap and close nodes.
+// `padding` is the field-label column width: cards use 10, detail uses 8.
+export const panelFieldKey = (padding) => (text) => str(text).padEnd(padding, " ")
+
+export function createPanelChrome(ui, deps, options = {}) {
+  const { insert } = ui
+  const { color, BOLD } = deps
+  const set = propSetter(deps)
+  const {
+    title = "", titleColor = "base", onHint, onClose,
+    hintLabel = "ctrl+g", closeLabel = "✕",
+    padding = 8, wrapControls = false, beforeHint = [], afterHint = [], afterControls = [],
+  } = options
+  const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
+  const header = createBox(ui, {
+    flexDirection: "row", justifyContent: "space-between", minWidth: 0, flexShrink: 0,
+  })
+  const titleNode = createText(ui, { content: title, fg: color(titleColor), bold: true })
+  set(titleNode, "attributes", BOLD)
+  const controls = createBox(ui, {
+    flexDirection: "row", minWidth: 0, flexShrink: 0,
+    ...(wrapControls ? { flexWrap: "wrap", rowGap: 1 } : {}),
+  })
+  const hint = createText(ui, { content: hintLabel, fg: color("action"), onMouseUp: onHint ?? onClose })
+  set(hint, "paddingLeft", 1); set(hint, "paddingRight", 1)
+  const gap = createText(ui, { content: " ", fg: color("muted") })
+  const close = createText(ui, { content: closeLabel, fg: color("error"), onMouseUp: onClose })
+  set(close, "paddingLeft", 1); set(close, "paddingRight", 1)
+  for (const node of beforeHint) insert(controls, node)
+  insert(controls, hint)
+  for (const node of afterHint) insert(controls, node)
+  insert(controls, gap)
+  insert(controls, close)
+  insert(header, titleNode)
+  insert(header, controls)
+  for (const node of afterControls) insert(header, node)
+  insert(container, header)
+  return { container, header, title: titleNode, controls, hint, gap, close, fieldKey: panelFieldKey(padding) }
+}
+
+// One raised plate reused by both mounts. `padding` is the horizontal plate
+// padding and `marginRight` the gap after it. Confirm plates pass hover:false
+// and omit boxClick so they keep their original prop set.
+export function createButtonPlate(ui, deps, options = {}) {
+  const { insert } = ui
+  const { color } = deps
+  const set = propSetter(deps)
+  const {
+    content = "", fg = "base", name, padding = 1, marginRight,
+    onMouseUp, hover = true, boxClick = false, visible,
+  } = options
+  const baseBg = color("raised")
+  const box = createBox(ui, {
+    flexDirection: "row", flexShrink: 0, paddingLeft: padding, paddingRight: padding,
+    ...(marginRight !== undefined ? { marginRight } : {}),
+    backgroundColor: baseBg,
+    ...(hover ? {
+      onMouseOver: () => set(box, "backgroundColor", color("panel")),
+      onMouseOut: () => set(box, "backgroundColor", baseBg),
+    } : {}),
+  })
+  const text = createText(ui, {
+    content, fg: color(fg),
+    ...(name ? { name } : {}),
+    ...(onMouseUp ? { onMouseUp } : {}),
+  })
+  if (boxClick && onMouseUp) set(box, "onMouseUp", onMouseUp)
+  if (visible !== undefined) { set(box, "visible", visible); set(text, "visible", visible) }
+  insert(box, text)
+  return { box, text }
+}
+
+const fieldKey = panelFieldKey(10)
 
 export function fixPrompt(card) {
   if (!card) return ""
@@ -156,37 +230,24 @@ export function cardBackCommand(back) {
 
 export function createCardMount(ui, deps) {
   const { insert } = ui
-  const { color, BOLD, onCopy, onClose, onBack, onItem } = deps
+  const { color, onCopy, onClose, onBack, onItem } = deps
   const set = propSetter(deps)
-  const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
-
-  const header = createBox(ui, {
-    flexDirection: "row", justifyContent: "space-between", minWidth: 0, flexShrink: 0,
+  const back = createText(ui, { content: "← Back", fg: color("action"), onMouseUp: onBack })
+  set(back, "paddingLeft", 1); set(back, "paddingRight", 1)
+  const readonly = createText(ui, { content: "read-only", fg: color("muted") })
+  set(readonly, "paddingLeft", 1); set(readonly, "paddingRight", 1)
+  const duration = createText(ui, { content: "", fg: color("muted") })
+  set(duration, "paddingLeft", 1)
+  set(duration, "visible", false)
+  const chrome = createPanelChrome(ui, deps, {
+    title: "Task card", titleColor: "action", onClose, padding: 10, wrapControls: true,
+    beforeHint: [back], afterHint: [readonly], afterControls: [duration],
   })
-  const title = createText(ui, { content: "Task card", fg: color("action"), bold: true })
-  set(title, "attributes", BOLD)
+  const { container, header, title, controls } = chrome
   // The title absorbs the free space, so the controls keep their old position
   // at the right and the duration sits just past them at the header edge.
   set(title, "flexGrow", 1)
   set(title, "minWidth", 0)
-  const duration = createText(ui, { content: "", fg: color("muted") })
-  set(duration, "paddingLeft", 1)
-  set(duration, "visible", false)
-  const controls = createBox(ui, {
-    flexDirection: "row", minWidth: 0, flexShrink: 0, flexWrap: "wrap", rowGap: 1,
-  })
-  const back = createText(ui, { content: "← Back", fg: color("action"), onMouseUp: onBack })
-  set(back, "paddingLeft", 1); set(back, "paddingRight", 1)
-  const hint = createText(ui, { content: "ctrl+g", fg: color("action"), onMouseUp: onClose })
-  set(hint, "paddingLeft", 1); set(hint, "paddingRight", 1)
-  const readonly = createText(ui, { content: "read-only", fg: color("muted") })
-  set(readonly, "paddingLeft", 1); set(readonly, "paddingRight", 1)
-  const gap = createText(ui, { content: " ", fg: color("muted") })
-  const close = createText(ui, { content: "✕", fg: color("error"), onMouseUp: onClose })
-  set(close, "paddingLeft", 1); set(close, "paddingRight", 1)
-  insert(controls, back); insert(controls, hint); insert(controls, readonly); insert(controls, gap); insert(controls, close)
-  insert(header, title); insert(header, controls); insert(header, duration)
-  insert(container, header)
 
   // A bordered, padded card holds the full metadata and body. Body cells are
   // word-wrapped and never truncated, so the operator can read the whole card.
@@ -209,19 +270,11 @@ export function createCardMount(ui, deps) {
   // The operator pastes the copied fix prompt into the session.
   const buttons = Object.create(null)
   for (const name of Object.keys(COPY_LABEL)) {
-    const baseBg = color("raised")
-    const box = createBox(ui, {
-      flexDirection: "row", flexShrink: 0, paddingLeft: 1, paddingRight: 1,
-      marginRight: 1, backgroundColor: baseBg,
-      onMouseOver: () => set(box, "backgroundColor", color("panel")),
-      onMouseOut: () => set(box, "backgroundColor", baseBg),
+    const { box, text } = createButtonPlate(ui, deps, {
+      content: COPY_LABEL[name], fg: "base", name: `beacon-card-copy-${name}`,
+      marginRight: 1, boxClick: true, onMouseUp: () => onCopy?.(name),
     })
-    const text = createText(ui, {
-      content: COPY_LABEL[name], fg: color("base"), name: `beacon-card-copy-${name}`,
-      onMouseUp: () => onCopy?.(name),
-    })
-    set(box, "onMouseUp", () => onCopy?.(name))
-    insert(box, text); insert(container, box)
+    insert(container, box)
     buttons[name] = text
   }
   const note = createText(ui, {
