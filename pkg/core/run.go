@@ -34,6 +34,9 @@ const (
 // Terminal reports whether the state is terminal.
 func (s RunState) Terminal() bool { return s == RunMerged || s == RunClosed }
 
+// Blocked reports whether the state is blocked.
+func (s RunState) Blocked() bool { return s == RunBlocked }
+
 // ActiveAgent reports whether the state expects an active agent session.
 func (s RunState) ActiveAgent() bool { return s == RunRunning || s == RunNeedsAgentFix }
 
