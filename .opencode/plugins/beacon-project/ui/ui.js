@@ -202,7 +202,12 @@ async function setup(ctx, deps = {}) {
     void Promise.resolve(store[1]((draft) => { draft.id = id })).catch(() => {})
     openDetail()
   }
-  const runAction = createActionRunner(ctx, source, { refresh: () => refresh() })
+  const runAction = createActionRunner(ctx, source, {
+    refresh: () => refresh(),
+    // A live watcher supplies the follow-up read. Without one, read again once
+    // dispatch settles because the overlapping read may predate the new run.
+    afterDispatch: () => (bridge?.active ? undefined : refresh()),
+  })
   const handleSidebarItem = (item) => {
     if (item.sectionKey) toggleSection("sidebar", item.sectionKey)
     else if (item.action === "dispatch") void runAction("dispatch")
@@ -250,6 +255,11 @@ async function setup(ctx, deps = {}) {
   }
 
   let pending = false
+  // Every refresh request advances the generation. A read that was started by
+  // an earlier request is discarded when a newer one arrives, so only the final
+  // snapshot wins. Dispatch starts a read while the worker is still running;
+  // the watcher's follow-up read supersedes it without rendering stale data.
+  let generation = 0
   let failures = 0
   let stale = false
   const lastSeenState = new Map()
@@ -260,24 +270,29 @@ async function setup(ctx, deps = {}) {
   }
   const refresh = async () => {
     if (stopped) return
+    const mine = ++generation
     if (inFlight) { pending = true; return }
     inFlight = true
     let rendered = false
     try {
       const next = await source.snapshot()
       if (stopped) return
-      // An empty cwd snapshot is not a baseline. A snapshot taken during an
-      // outage may miss transitions, so toasts wait for a confirmed poll.
-      const empty = !next || (!next.active?.length && !next.recent?.length && !next.queue?.length)
-      if (next != null && !(empty && !source.verified())) { if (!stale) notify(next); setSnapshot(next); rendered = true }
-      failures = 0
-      stale = false
-      setError(null)
+      if (mine === generation) {
+        // An empty cwd snapshot is not a baseline. A snapshot taken during an
+        // outage may miss transitions, so toasts wait for a confirmed poll.
+        const empty = !next || (!next.active?.length && !next.recent?.length && !next.queue?.length)
+        if (next != null && !(empty && !source.verified())) { if (!stale) notify(next); setSnapshot(next); rendered = true }
+        failures = 0
+        stale = false
+        setError(null)
+      }
     } catch (cause) {
       if (stopped) return
-      failures += 1
-      if (failures >= 2) { stale = true; setError(cleanErrorMessage(cause)) }
-      rendered = true
+      if (mine === generation) {
+        failures += 1
+        if (failures >= 2) { stale = true; setError(cleanErrorMessage(cause)) }
+        rendered = true
+      }
     }
     finally { inFlight = false }
     if (rendered && !stopped) applyAll()
