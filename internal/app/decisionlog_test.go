@@ -291,3 +291,113 @@ func TestReconcileEmitsOneDecisionWithRunCorrelation(t *testing.T) {
 		"attempt": 1, "new_sha": "new-sha2", "result": "rebased",
 	})
 }
+
+// countingDecisionSink counts store touches so tests can prove the reconcile
+// cache short-circuits both the read and the write for an unchanged decision.
+type countingDecisionSink struct {
+	mu        sync.Mutex
+	decisions []Decision
+	reads     int
+	writes    int
+}
+
+func (s *countingDecisionSink) RecordDecision(_ context.Context, d Decision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.decisions = append(s.decisions, d)
+	s.writes++
+	return nil
+}
+
+func (s *countingDecisionSink) LastDecision(_ context.Context, runID string) (*Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reads++
+	for i := len(s.decisions) - 1; i >= 0; i-- {
+		if s.decisions[i].RunID == runID {
+			d := s.decisions[i]
+			return &d, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *countingDecisionSink) counts() (reads, writes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads, s.writes
+}
+
+func TestReconcileDecisionCacheSkipsStoreTouches(t *testing.T) {
+	ctx := context.Background()
+	sink := &countingDecisionSink{}
+	logger := DecisionLogger{Sink: sink}
+	run := makeRun("r-cache", 42, core.RunWaitingCI)
+	obs := core.Observation{HeadSHA: "sha1", PRNumber: 42}
+	decision := core.MergeDecision{Verdict: core.VerdictWait, Reason: "checks pending"}
+	emit := func() { logger.logReconcileDecision(ctx, 42, run, obs, decision, "wait") }
+
+	emit()
+	reads, writes := sink.counts()
+	if reads != 1 || writes != 1 {
+		t.Fatalf("after first decision reads=%d writes=%d, want 1/1", reads, writes)
+	}
+
+	for tick := 0; tick < 10; tick++ {
+		for i := 0; i < 50; i++ {
+			emit()
+		}
+	}
+	reads, writes = sink.counts()
+	if reads != 1 || writes != 1 {
+		t.Fatalf("after 500 unchanged decisions reads=%d writes=%d, want 1/1", reads, writes)
+	}
+}
+
+func TestReconcileDecisionCacheWritesAfterChange(t *testing.T) {
+	ctx := context.Background()
+	sink := &countingDecisionSink{}
+	logger := DecisionLogger{Sink: sink}
+	run := makeRun("r-change", 42, core.RunWaitingCI)
+	decision := core.MergeDecision{Verdict: core.VerdictWait, Reason: "checks pending"}
+
+	logger.logReconcileDecision(ctx, 42, run, core.Observation{HeadSHA: "sha1", PRNumber: 42}, decision, "wait")
+	logger.logReconcileDecision(ctx, 42, run, core.Observation{HeadSHA: "sha2", PRNumber: 42}, decision, "wait")
+
+	reads, writes := sink.counts()
+	if reads != 2 || writes != 2 {
+		t.Fatalf("after head change reads=%d writes=%d, want 2/2", reads, writes)
+	}
+	if got := sink.decisions[1].Fields["head_sha"]; got != "sha2" {
+		t.Fatalf("second decision head_sha = %v, want sha2", got)
+	}
+}
+
+func TestReconcileRepeatedCallsSkipDuplicateDecisionWrites(t *testing.T) {
+	ctx := context.Background()
+	sink := &countingDecisionSink{}
+	r, _, _, _, _ := newReconciler(t, core.VerdictNoop, core.Observation{
+		PRNumber: 42, HeadSHA: "sha2", PRState: "open",
+	})
+	r.Decisions = DecisionLogger{Sink: sink}
+
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	reads, writes := sink.counts()
+	if reads != 1 || writes != 1 {
+		t.Fatalf("after first reconcile reads=%d writes=%d, want 1/1", reads, writes)
+	}
+
+	for tick := 0; tick < 10; tick++ {
+		for i := 0; i < 50; i++ {
+			if _, err := r.Reconcile(ctx, 42); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	reads, writes = sink.counts()
+	if reads != 1 || writes != 1 {
+		t.Fatalf("after 500 unchanged reconciles reads=%d writes=%d, want 1/1", reads, writes)
+	}
+}
