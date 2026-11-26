@@ -137,6 +137,35 @@ func newRunID() core.RunID {
 	return core.RunID("run-" + hex.EncodeToString(b[:]))
 }
 
+// dispatchSelection is the result of budgeting and candidate selection. It
+// holds no IO state, so both rules can be tested without a launcher.
+type dispatchSelection struct {
+	Limit   int
+	Chosen  []core.Task
+	Skipped []SkippedTask
+}
+
+// selectDispatchCandidates caps the batch at the free in-flight slots and picks
+// non-overlapping candidates within that cap. It does no IO and starts no
+// agents. A non-positive cap skips planning entirely.
+func selectDispatchCandidates(planner ConflictPlanner, ready []core.Task, active []*core.Run, n, inFlight int, strict bool) (dispatchSelection, error) {
+	limit := n
+	if free := inFlight - len(active); free < limit {
+		limit = free
+	}
+	sel := dispatchSelection{Limit: limit}
+	if limit <= 0 {
+		return sel, nil
+	}
+	chosen, skipped, err := planner.Select(ready, active, limit, strict)
+	if err != nil {
+		return dispatchSelection{}, err
+	}
+	sel.Chosen = chosen
+	sel.Skipped = skipped
+	return sel, nil
+}
+
 // Dispatch starts workers for up to n non-overlapping ready cards and returns
 // the runs it created, the skipped candidates and any start failures.
 func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error) {
@@ -161,26 +190,33 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	if err != nil {
 		return out, err
 	}
-	limit := n
-	if free := d.inFlightLimit() - len(active); free < limit {
-		limit = free
-	}
-	budget := d.Available(ctx)
-	d.Decisions.logDispatchCandidates(ctx, len(ready), len(active), limit, budget)
-	if limit <= 0 {
-		return out, nil
-	}
-	chosen, skipped, err := d.Planner.Select(ready, active, limit, d.StrictScope)
+	sel, err := selectDispatchCandidates(d.Planner, ready, active, n, d.inFlightLimit(), d.StrictScope)
 	if err != nil {
 		return out, err
 	}
-	out.Skipped = skipped
-	for _, s := range skipped {
+	budget := d.Available(ctx)
+	d.Decisions.logDispatchCandidates(ctx, len(ready), len(active), sel.Limit, budget)
+	if sel.Limit <= 0 {
+		return out, nil
+	}
+	out.Skipped = sel.Skipped
+	for _, s := range sel.Skipped {
 		d.Decisions.logDispatchSkip(ctx, s)
 	}
+	if err := d.launch(ctx, sel.Chosen, budget, &out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// launch starts a run for each chosen task within the agent budget and adds
+// skipped and failed candidates to out. The caller holds slotsMu from the
+// budget check through this call, so the budget re-read after a failed start
+// stays under the lock and cannot oversubscribe the agent limit.
+func (d *Dispatcher) launch(ctx context.Context, chosen []core.Task, budget int, out *DispatchResult) error {
 	for _, task := range chosen {
 		if existing, err := d.Store.FindActiveByTask(ctx, task.ID); err != nil {
-			return out, err
+			return err
 		} else if existing != nil {
 			skip := SkippedTask{
 				TaskID:       task.ID,
@@ -215,12 +251,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 			// can find it. A started run is saved once in startOne, where the
 			// session ID and the final status land in the same write.
 			if err := d.Store.Save(ctx, run); err != nil {
-				return out, err
+				return err
 			}
 		}
 		out.Runs = append(out.Runs, run)
 	}
-	return out, nil
+	return nil
 }
 
 // PromotePending starts queued runs when an agent slot becomes free.
