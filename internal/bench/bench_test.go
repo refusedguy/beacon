@@ -11,6 +11,16 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
 )
 
+func newFanoutBench(n int) *fanoutBench {
+	ctx, cancel := context.WithCancel(context.Background())
+	src := make(chan int, 64)
+	views := fanout(ctx, src, n)
+	for i := 0; i < fanoutBuffer; i++ {
+		views[2] <- -1
+	}
+	return &fanoutBench{src: src, views: views, cancel: cancel}
+}
+
 func newEnv(b *testing.B) *env {
 	dir, err := os.MkdirTemp("", "beacon-bench-")
 	if err != nil {
@@ -70,6 +80,17 @@ func timed(name string, fn func() (int64, int64)) sample {
 	start := time.Now()
 	work, errs := fn()
 	return sample{name: name, d: time.Since(start), work: work, errs: errs}
+}
+
+func withShares(sums []summary, total time.Duration) []summary {
+	out := make([]summary, len(sums))
+	copy(out, sums)
+	for i := range out {
+		if total > 0 {
+			out[i].Share = 100 * float64(out[i].Median) / float64(total)
+		}
+	}
+	return out
 }
 
 // BenchmarkHotPaths is the single repeatable command for the whole dossier.
