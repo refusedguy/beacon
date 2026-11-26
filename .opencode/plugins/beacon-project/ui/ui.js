@@ -31,6 +31,7 @@ import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
 import { createDetailMount } from "./ui_detail_view.js"
 import { clipboardCopier, createActionRunner } from "./ui_actions.js"
+import { cleanupWrapper } from "./ui_test_helpers.js"
 import { CARD_PANEL_NAME, cardBackCommand, cardModel, cardRelativePath, createCardMount, createEpicState, fixPrompt } from "./ui_card_view.js"
 import { createRunChangeBridge } from "./ui_bridge.js"
 import { projectRoot } from "../state/location.js"
@@ -327,11 +328,7 @@ async function setup(ctx, deps = {}) {
     } }),
     ctx.ui.slot({ append: "app", render: () => null }),
   ]
-  const cleanup = (label, dispose) => {
-    try { dispose?.() } catch (error) {
-      console.debug(`beacon status panel: ${label} cleanup failed: ${error?.message ?? error}`)
-    }
-  }
+  const cleanup = cleanupWrapper("beacon status panel: ")
   return () => {
     stopped = true
     cleanup("poll timer", () => timers.clearInterval(pollTimer))

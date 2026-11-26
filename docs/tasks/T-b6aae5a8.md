@@ -1,7 +1,7 @@
 ---
 id: T-b6aae5a8
 title: Merge first-non-empty helpers into pkg/core
-status: available
+status: done
 scope:
     - pkg/core/text.go
     - internal/app/dispatcher.go

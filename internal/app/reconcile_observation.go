@@ -79,7 +79,7 @@ func (r *Reconciler) handleNeedsRebase(
 	if sameObservation(run, obs) {
 		return decision, nil
 	}
-	if run.RebaseAttempts >= maxAutoRebases {
+	if run.RebaseBudgetExhausted(maxAutoRebases) {
 		if run.State != core.RunBlocked {
 			return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase budget exhausted"}, obs)
 		}

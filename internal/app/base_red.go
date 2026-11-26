@@ -302,7 +302,7 @@ func (r *Reconciler) unblockWithRebase(ctx context.Context, run *core.Run) error
 		return err
 	}
 	run.BlockedIncidentID = ""
-	run.RebaseAttempts = 0
+	run.ResetAttempts()
 	run.ObservedSHA = ""
 	if run.PRNumber > 0 {
 		newSHA, err := r.SCM.UpdateBranch(ctx, run.PRNumber, run.HeadSHA)

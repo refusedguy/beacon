@@ -15,6 +15,48 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// State and status literals used by the filtered reads. Each value is defined
+// once here; the SQL builders take the values from these definitions, never
+// from a caller.
+const (
+	stateMerged  = string(core.RunMerged)
+	stateClosed  = string(core.RunClosed)
+	stateDropped = "dropped" // legacy run state, no core constant
+
+	statusAvailable = string(core.TaskAvailable)
+	statusTodo      = "todo" // cards use the YAML literal, no core constant
+	statusDone      = string(core.TaskDone)
+	statusDropped   = string(core.TaskDropped)
+)
+
+var (
+	// terminalStates is the full finished-run set, including the legacy
+	// dropped state still present in older databases.
+	terminalStates = []string{stateMerged, stateClosed, stateDropped}
+	// activeExcludedStates omits dropped, matching core.RunState.Terminal and
+	// the runs_active_updated_idx partial index predicate.
+	activeExcludedStates = []string{stateMerged, stateClosed}
+	// openTaskStatuses are the statuses of cards a worker may claim.
+	openTaskStatuses = []string{statusAvailable, statusTodo}
+	// resolvedTaskStatuses are the statuses that unblock a dependency.
+	resolvedTaskStatuses = []string{statusDone, statusDropped}
+)
+
+// quotedList renders values as a SQL literal list. The active-read predicate
+// uses it because a partial index only matches a literal predicate; bound
+// parameters there would drop the runs_active_updated_idx scan.
+func quotedList(values []string) string {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	}
+	return strings.Join(quoted, ",")
+}
+
+// activeStatesSQL is the literal form of activeExcludedStates for the partial
+// index predicate. Both come from the same definitions above.
+var activeStatesSQL = quotedList(activeExcludedStates)
+
 // Store is the SQLite implementation of the run and decision stores.
 type Store struct{ db *sql.DB }
 
@@ -223,12 +265,14 @@ func (s *Store) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
 
 // FindByPR returns the newest active run bound to pull request pr.
 func (s *Store) FindByPR(ctx context.Context, pr int) (*core.Run, error) {
-	return s.queryOne(ctx, `SELECT `+runColumns+` FROM runs WHERE pr_number=? AND state NOT IN ('merged','closed') ORDER BY updated_at DESC LIMIT 1`, pr)
+	query, states := inQuery(`SELECT `+runColumns+` FROM runs WHERE pr_number=? AND state NOT IN (%s) ORDER BY updated_at DESC LIMIT 1`, activeExcludedStates)
+	return s.queryOne(ctx, query, append([]any{pr}, states...)...)
 }
 
 // FindActiveByTask returns the newest nonterminal run for task.
 func (s *Store) FindActiveByTask(ctx context.Context, task core.TaskID) (*core.Run, error) {
-	return s.queryOne(ctx, `SELECT `+runColumns+` FROM runs WHERE task_id=? AND state NOT IN ('merged','closed','dropped') ORDER BY updated_at DESC LIMIT 1`, string(task))
+	query, states := inQuery(`SELECT `+runColumns+` FROM runs WHERE task_id=? AND state NOT IN (%s) ORDER BY updated_at DESC LIMIT 1`, terminalStates)
+	return s.queryOne(ctx, query, append([]any{string(task)}, states...)...)
 }
 
 // ActiveTaskIDs returns the state of one nonterminal run for each requested
@@ -241,7 +285,7 @@ func (s *Store) ActiveTaskIDs(ctx context.Context, taskIDs []string) (map[string
 		return out, nil
 	}
 	query, args := inQuery(`SELECT task_id, state FROM runs WHERE task_id IN (%s)
-AND state NOT IN ('merged','closed','dropped')`, taskIDs)
+AND state NOT IN (%s)`, taskIDs, terminalStates)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -303,7 +347,9 @@ func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
 	if _, err := s.PruneStale(ctx, deliveryRetention); err != nil {
 		slog.Warn("prune stale delivery rows", "error", err)
 	}
-	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN ('merged','closed') ORDER BY updated_at`)
+	// Keep the state list literal: the partial index predicate must match it
+	// exactly, and bound parameters there would force a full scan and sort.
+	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN (`+activeStatesSQL+`) ORDER BY updated_at`)
 }
 
 // ListRecent returns at most limit finished runs, newest first.
@@ -321,11 +367,11 @@ func (s *Store) ListRecent(ctx context.Context, limit int) ([]*core.Run, error) 
 ORDER BY updated_at DESC LIMIT ` + n + `)`
 	}
 	query := `SELECT ` + runColumns + ` FROM (
-` + terminal("merged") + `
+` + terminal(stateMerged) + `
 UNION ALL
-` + terminal("closed") + `
+` + terminal(stateClosed) + `
 UNION ALL
-` + terminal("dropped") + `
+` + terminal(stateDropped) + `
 ) ORDER BY updated_at DESC LIMIT ` + n
 	return s.queryAll(ctx, query)
 }
@@ -587,11 +633,11 @@ func (s *Store) ListQueueTasks(ctx context.Context) ([]app.QueueTask, error) {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, title, priority FROM tasks
-WHERE status IN ('available','todo')
-  AND id NOT IN (SELECT task_id FROM runs WHERE state NOT IN ('merged','closed','dropped'))
-ORDER BY priority DESC, id`)
+	queueQuery, queueArgs := inQuery(`SELECT id, title, priority FROM tasks
+WHERE status IN (%s)
+  AND id NOT IN (SELECT task_id FROM runs WHERE state NOT IN (%s))
+ORDER BY priority DESC, id`, openTaskStatuses, terminalStates)
+	rows, err := s.db.QueryContext(ctx, queueQuery, queueArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -613,11 +659,11 @@ ORDER BY priority DESC, id`)
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	deps, err := s.db.QueryContext(ctx, `
-SELECT d.task_id, d.depends_on FROM task_deps d
+	depsQuery, depsArgs := inQuery(`SELECT d.task_id, d.depends_on FROM task_deps d
 LEFT JOIN tasks t ON t.id = d.depends_on
-WHERE t.status NOT IN ('done', 'dropped') OR t.id IS NULL
-ORDER BY d.task_id, d.depends_on`)
+WHERE t.status NOT IN (%s) OR t.id IS NULL
+ORDER BY d.task_id, d.depends_on`, resolvedTaskStatuses)
+	deps, err := s.db.QueryContext(ctx, depsQuery, depsArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -641,13 +687,18 @@ func (s *Store) CurrentIncident(ctx context.Context) (*core.BaseIncident, error)
 		`SELECT `+incidentColumns+` FROM base_incidents WHERE status='open' ORDER BY created_at DESC, id DESC LIMIT 1`))
 }
 
-// inQuery expands the placeholder in template into one slot per id.
-func inQuery(template string, ids []string) (string, []any) {
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
+// inQuery expands one %s per list in template into bound placeholders. It
+// returns the values for those placeholders in list order.
+func inQuery(template string, lists ...[]string) (string, []any) {
+	holders := make([]any, len(lists))
+	var args []any
+	for i, list := range lists {
+		holders[i] = strings.TrimSuffix(strings.Repeat("?,", len(list)), ",")
+		for _, v := range list {
+			args = append(args, v)
+		}
 	}
-	return fmt.Sprintf(template, strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")), args
+	return fmt.Sprintf(template, holders...), args
 }
 
 var _ core.RunStore = (*Store)(nil)

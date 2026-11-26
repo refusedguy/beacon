@@ -63,7 +63,7 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 		}
 		status := string(t.Status)
 		if status == "" {
-			status = "available"
+			status = statusAvailable
 		}
 		kind := string(t.Kind)
 		if kind == "" {
@@ -84,25 +84,27 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, 
 	return tx.Commit()
 }
 
-// readyTasksQuery selects tasks with no unresolved dependencies.
-const readyTasksQuery = `
+// readyTasksQuery selects tasks with no unresolved dependencies. Its status
+// lists are bound parameters built from the shared definitions, so no caller
+// value is interpolated into the SQL.
+var readyTasksQuery, readyTasksArgs = inQuery(`
 WITH RECURSIVE blocked_chain(task_id, origin, depth) AS (
   SELECT d.task_id, d.depends_on, 1
   FROM task_deps d
   JOIN tasks t ON t.id = d.depends_on
-  WHERE t.status NOT IN ('done', 'dropped')
+  WHERE t.status NOT IN (%s)
   UNION
   SELECT d.task_id, b.origin, b.depth + 1
   FROM task_deps d
   JOIN blocked_chain b ON d.depends_on = b.task_id
   JOIN tasks t ON t.id = d.depends_on
-  WHERE t.status NOT IN ('done', 'dropped') AND b.depth < 64
+  WHERE t.status NOT IN (%s) AND b.depth < 64
 )
 SELECT id, title, body, priority, scope_json, source_ref, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt
 FROM tasks
-WHERE status IN ('available', 'todo')
+WHERE status IN (%s)
   AND id NOT IN (SELECT task_id FROM blocked_chain)
-ORDER BY priority DESC, id`
+ORDER BY priority DESC, id`, resolvedTaskStatuses, resolvedTaskStatuses, openTaskStatuses)
 
 // SetTaskStatus sets the status of taskID.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
@@ -115,7 +117,7 @@ func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, readyTasksQuery)
+	rows, err := s.db.QueryContext(ctx, readyTasksQuery, readyTasksArgs...)
 	if err != nil {
 		return nil, err
 	}

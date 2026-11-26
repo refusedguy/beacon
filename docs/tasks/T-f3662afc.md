@@ -1,7 +1,7 @@
 ---
 id: T-f3662afc
 title: Extract guarded branch deletion helper
-status: available
+status: done
 scope:
     - internal/infra/workspace/git_worktree.go
 priority: 68

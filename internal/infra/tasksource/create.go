@@ -117,7 +117,7 @@ func issueAvailable(rec issueRecord) bool {
 func parseIssueRecord(rec issueRecord, prefix string) core.Task {
 	fields := ParseTaskFields(rec.Body, "", prefix)
 	return core.Task{
-		ID:        core.TaskID(firstNonEmpty(fields.ID, prefix+"-"+strconv.Itoa(rec.Number))),
+		ID:        core.TaskID(core.FirstNonEmpty(strings.TrimSpace(fields.ID), prefix+"-"+strconv.Itoa(rec.Number))),
 		Title:     rec.Title,
 		Body:      rec.Body,
 		Status:    core.TaskAvailable,

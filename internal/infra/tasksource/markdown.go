@@ -308,7 +308,7 @@ func parseCardFields(content, path string) (core.Task, bool, bool) {
 			slog.Warn("tasksource: malformed card frontmatter", "path", path, "error", err)
 			return t, false, hasFM
 		}
-		t.ID = core.TaskID(firstNonEmpty(fm.TaskID, fm.ID))
+		t.ID = core.TaskID(core.FirstNonEmpty(strings.TrimSpace(fm.TaskID), strings.TrimSpace(fm.ID)))
 		t.Title = strings.TrimSpace(fm.Title)
 		t.Status = normalizeStatus(fm.Status)
 		t.Parent = core.TaskID(strings.TrimSpace(fm.Parent))
