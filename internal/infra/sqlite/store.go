@@ -351,16 +351,7 @@ func (s *Store) queryAll(ctx context.Context, query string, args ...any) ([]*cor
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]*core.Run, 0)
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return collectRows(rows, scanRun)
 }
 
 // queryOne runs query and scans at most one row into a run.
@@ -374,6 +365,29 @@ func (s *Store) queryOne(ctx context.Context, query string, args ...any) (*core.
 
 // scanner is the row interface shared by QueryRow and Rows.
 type scanner interface{ Scan(...any) error }
+
+// collectRows scans every row and returns the decoded values. The loop, the
+// close and the iteration error live here. Each caller supplies its own column
+// list through the scan function.
+func collectRows[T any](rows *sql.Rows, scan func(scanner) (T, error)) ([]T, error) {
+	defer rows.Close()
+	out := make([]T, 0)
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// decodeJSON decodes one JSON text column into dst. Every scanner calls this
+// so the byte conversion lives in one place. Callers keep the error prefix
+// that names the column.
+func decodeJSON(text string, dst any) error {
+	return json.Unmarshal([]byte(text), dst)
+}
 
 // scanRun decodes one database row into a core.Run.
 func scanRun(row scanner) (*core.Run, error) {
@@ -392,10 +406,10 @@ func scanRun(row scanner) (*core.Run, error) {
 	r.TaskID = core.TaskID(task)
 	r.State = core.RunState(state)
 	r.IsFixer = fixer != 0
-	if err := json.Unmarshal([]byte(scopeJSON), &r.Scope); err != nil {
+	if err := decodeJSON(scopeJSON, &r.Scope); err != nil {
 		return nil, fmt.Errorf("scope_json: %w", err)
 	}
-	if err := json.Unmarshal([]byte(checksJSON), &r.Checks); err != nil {
+	if err := decodeJSON(checksJSON, &r.Checks); err != nil {
 		return nil, fmt.Errorf("checks_json: %w", err)
 	}
 	r.Checks = checksForSave(r.Checks)
@@ -456,9 +470,8 @@ VALUES (?,?,?,?,?,?,?,?,?,?)`,
 
 // ListRunEvents returns the timelines of all given runs in one query.
 func (s *Store) ListRunEvents(ctx context.Context, runIDs []string) ([]app.RunEvent, error) {
-	out := []app.RunEvent{}
 	if len(runIDs) == 0 {
-		return out, nil
+		return []app.RunEvent{}, nil
 	}
 	query, args := inQuery(`SELECT id, run_id, kind, state, at, head_sha, pr_number, reason
 FROM run_events WHERE run_id IN (%s) ORDER BY at, id`, runIDs)
@@ -466,18 +479,19 @@ FROM run_events WHERE run_id IN (%s) ORDER BY at, id`, runIDs)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var event app.RunEvent
-		var at int64
-		if err := rows.Scan(&event.ID, &event.RunID, &event.Kind, &event.State,
-			&at, &event.HeadSHA, &event.PRNumber, &event.Reason); err != nil {
-			return nil, err
-		}
-		event.At = time.Unix(0, at).UTC()
-		out = append(out, event)
+	return collectRows(rows, scanRunEvent)
+}
+
+// scanRunEvent decodes one run event row into an app.RunEvent.
+func scanRunEvent(row scanner) (app.RunEvent, error) {
+	var event app.RunEvent
+	var at int64
+	if err := row.Scan(&event.ID, &event.RunID, &event.Kind, &event.State,
+		&at, &event.HeadSHA, &event.PRNumber, &event.Reason); err != nil {
+		return event, err
 	}
-	return out, rows.Err()
+	event.At = time.Unix(0, at).UTC()
+	return event, nil
 }
 
 // decisionColumns lists the decision fields stored in one row.
@@ -487,7 +501,6 @@ const decisionColumns = `id, at, cycle_id, kind, run_id, task_id, pr_number, ver
 // only its newest decisions; run-less decisions are capped separately so a long
 // dispatch history cannot inflate a snapshot. Totals come from DecisionCounts.
 func (s *Store) ListDecisions(ctx context.Context, runIDs []string, limit, orphanLimit int) ([]app.Decision, error) {
-	out := []app.Decision{}
 	if limit <= 0 {
 		limit = app.DefaultDecisionsLimit
 	}
@@ -518,15 +531,13 @@ ORDER BY at, id`
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		d, err := scanDecision(rows)
+	return collectRows(rows, func(row scanner) (app.Decision, error) {
+		d, err := scanDecision(row)
 		if err != nil {
-			return nil, err
+			return app.Decision{}, err
 		}
-		out = append(out, *d)
-	}
-	return out, rows.Err()
+		return *d, nil
+	})
 }
 
 // scanDecision decodes one decision row into an app.Decision. Row-level errors,
@@ -540,7 +551,7 @@ func scanDecision(row scanner) (*app.Decision, error) {
 		return nil, err
 	}
 	d.At = time.Unix(0, at).UTC()
-	if err := json.Unmarshal([]byte(fields), &d.Fields); err != nil {
+	if err := decodeJSON(fields, &d.Fields); err != nil {
 		return nil, fmt.Errorf("fields_json: %w", err)
 	}
 	return &d, nil
@@ -549,7 +560,6 @@ func scanDecision(row scanner) (*app.Decision, error) {
 // DecisionCounts aggregates every decision into a handful of rows. It keeps
 // snapshot metrics exact even though ListDecisions returns a bounded sample.
 func (s *Store) DecisionCounts(ctx context.Context, runIDs []string) ([]app.DecisionCount, error) {
-	out := []app.DecisionCount{}
 	// Read the maintained aggregate instead of scanning decisions. The two
 	// buckets are read separately so both use the primary key on run_id, and
 	// the outer GROUP BY adds overlapping groups exactly as before.
@@ -567,15 +577,16 @@ GROUP BY kind, verdict, action ORDER BY kind, verdict, action`
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var c app.DecisionCount
-		if err := rows.Scan(&c.Kind, &c.Verdict, &c.Action, &c.Count); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
+	return collectRows(rows, scanDecisionCount)
+}
+
+// scanDecisionCount decodes one aggregate row into an app.DecisionCount.
+func scanDecisionCount(row scanner) (app.DecisionCount, error) {
+	var c app.DecisionCount
+	if err := row.Scan(&c.Kind, &c.Verdict, &c.Action, &c.Count); err != nil {
+		return c, err
 	}
-	return out, rows.Err()
+	return c, nil
 }
 
 // LastDecision returns the newest stored decision for a run. It implements

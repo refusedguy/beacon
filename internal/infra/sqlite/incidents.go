@@ -73,16 +73,7 @@ func (s *Store) ListOpenIncidents(ctx context.Context) ([]*core.BaseIncident, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []*core.BaseIncident
-	for rows.Next() {
-		in, err := s.scanIncident(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, in)
-	}
-	return out, rows.Err()
+	return collectRows(rows, s.scanIncident)
 }
 
 // incidentColumns lists the base incident fields stored in one row.
