@@ -1,7 +1,7 @@
 ---
 id: T-85aa33ce
 title: Add acp module require and replace
-status: available
+status: done
 scope:
     - go.mod
 depends:
