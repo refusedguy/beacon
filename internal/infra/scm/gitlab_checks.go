@@ -11,10 +11,6 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-func gitlabRedact(s string) string {
-	return shared.Redact(s)
-}
-
 func gitlabTail(s string, max int) string {
 	r := []rune(s)
 	if len(r) <= max {
@@ -142,10 +138,10 @@ func (g *GitLab) jobFailureOutput(ctx context.Context, job glJob) string {
 	path := fmt.Sprintf("/projects/%s/jobs/%d/trace", g.project(), job.ID)
 	trace, err := g.request(ctx, http.MethodGet, path, nil, nil)
 	if err == nil && len(trace) > 0 {
-		return gitlabRedact(gitlabTail(string(trace), 1200))
+		return shared.Redact(gitlabTail(string(trace), 1200))
 	}
 	if job.FailureReason != "" {
-		return gitlabRedact(job.FailureReason)
+		return shared.Redact(job.FailureReason)
 	}
 	return ""
 }
