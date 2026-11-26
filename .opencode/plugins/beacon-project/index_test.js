@@ -8,11 +8,15 @@ import {
   SHELL_GUARD_RULES,
   beaconProject,
   beaconProjectDefinition,
+  bodyHash,
   buildShellGuardRules,
+  cleanupWrapper,
   commandFromToolInput,
   commandSegments,
   commandSubstitutions,
+  createStatusRpcHandlers,
   currentSessionAgent,
+  dispatchInput,
   findShellGuardHit,
   guardedAgents,
   guardMode,
@@ -20,6 +24,7 @@ import {
   pluginOptions,
   pollIntervalMs,
   registerShellGuard,
+  requestId,
   resolveMcpRegistration,
   snapshotLimits,
   statusPanelEnabled,
@@ -423,4 +428,51 @@ test("neither plugin module caches a resolved Plugin value at import", async () 
     const src = await readFile(new URL(path, import.meta.url), "utf8")
     assert.equal(/\blet\s+Plugin\b/.test(src), false, `${path} has no module-level Plugin cache`)
   }
+})
+
+test("the server plugin has no path to the TUI peer runtime", async () => {
+  const src = await readFile(new URL("./index.js", import.meta.url), "utf8")
+  for (const path of ["./ui/ui.js", "./ui/ui_runtime.js", "./ui/ui_test_helpers.js"]) {
+    assert.equal(src.includes(path), false, `index.js must not import ${path}`)
+  }
+  assert.equal(typeof cleanupWrapper("test: "), "function")
+})
+
+test("dispatch handlers normalize n and log the body hash", async () => {
+  const calls = []
+  const logs = []
+  const handlers = createStatusRpcHandlers({
+    snapshot: async (input) => ({ active: [], recent: [], ...input }),
+    control: async (input) => ({ ok: true, input }),
+    dispatch: async (input) => { calls.push(input); return { started: 1 } },
+  }, { limits: { recentLimit: 2 }, log: (line) => logs.push(line) })
+
+  assert.deepEqual(dispatchInput({ n: "3" }), { n: 3 })
+  assert.deepEqual(dispatchInput({ n: 0 }), { n: 1 })
+  assert.equal(bodyHash({ n: 1 }), bodyHash({ n: 1 }))
+  assert.notEqual(bodyHash({ n: 1 }), bodyHash({ n: 2 }))
+  assert.match(requestId("dispatch", { n: 1 }), /^dispatch:[0-9a-f]{8}$/)
+
+  const result = await handlers.dispatch({ n: "3" })
+  assert.deepEqual(result, { started: 1 })
+  assert.deepEqual(calls, [{ n: 3 }])
+  assert.ok(logs.some((line) => line.includes(`id=${requestId("dispatch", { n: "3" })}`)))
+  assert.ok(logs.some((line) => /dispatch ok/.test(line)))
+})
+
+test("a failed RPC method logs the rejection body and rethrows", async () => {
+  const logs = []
+  const rejection = { type: "rpc.unavailable", status: 400, message: "RPC is unavailable", data: { hint: "retry" } }
+  const handlers = createStatusRpcHandlers({
+    snapshot: async () => ({ active: [], recent: [] }),
+    control: async () => ({}),
+    dispatch: async () => { throw rejection },
+  }, { log: (line) => logs.push(line) })
+
+  await assert.rejects(() => handlers.dispatch({ n: 1 }), (error) => error === rejection)
+  const failed = logs.find((line) => /dispatch failed/.test(line))
+  assert.ok(failed, "the rejection is logged")
+  assert.match(failed, /rpc\.unavailable/)
+  assert.match(failed, /"status":400/)
+  assert.match(failed, /retry/)
 })

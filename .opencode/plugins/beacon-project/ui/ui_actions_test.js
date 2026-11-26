@@ -2,7 +2,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
-import { beaconStatusDefinition, createActionRunner, normalizeRun } from "./ui.js"
+import { beaconStatusDefinition, createActionRunner, dispatchRequestId, normalizeRun } from "./ui.js"
 
 const run = () => normalizeRun(makeRun({ ID: "run-1", State: "blocked" }))
 
@@ -162,6 +162,46 @@ test("Dispatch starts one task, toasts the result and refreshes", async () => {
   assert.deepEqual(h.dispatches, [{ n: 1 }])
   assert.equal(h.toasts[0].message, "Dispatched 1 task")
   assert.equal(h.refreshes, 1)
+})
+
+test("one dispatch gesture makes one call even when both mouse handlers fire", async () => {
+  const logs = []
+  const toasts = []
+  const calls = []
+  let refreshes = 0
+  const source = { dispatch: async (input) => { calls.push(input); return { started: 1 } } }
+  const invoke = createActionRunner(
+    { ui: { toast: { show: (options) => toasts.push(options) } } },
+    source,
+    { refresh: async () => { refreshes++ }, log: (line) => logs.push(line) },
+  )
+
+  await Promise.all([invoke("dispatch"), invoke("dispatch")])
+
+  assert.deepEqual(calls, [{ n: 1 }])
+  assert.deepEqual(toasts.map((t) => t.message), ["Dispatched 1 task"])
+  assert.equal(refreshes, 1)
+  assert.equal(logs.filter((line) => /dispatch click/.test(line)).length, 1)
+  assert.ok(logs.some((line) => line.includes(`id=${dispatchRequestId({ n: 1 })}`)))
+  assert.ok(logs.some((line) => /duplicate suppressed/.test(line)))
+})
+
+test("a dispatch after the dedupe window makes a second call", async () => {
+  const calls = []
+  const invoke = createActionRunner(
+    { ui: { toast: { show: () => {} } } },
+    { dispatch: async (input) => { calls.push(input); return { started: 1 } } },
+    { refresh: async () => {} },
+  )
+  const realNow = Date.now
+  try {
+    await invoke("dispatch")
+    Date.now = () => realNow() + 1000
+    await invoke("dispatch")
+  } finally {
+    Date.now = realNow
+  }
+  assert.deepEqual(calls, [{ n: 1 }, { n: 1 }])
 })
 
 test("panel buttons and the Dispatch row call the RPC through the real setup", async () => {
