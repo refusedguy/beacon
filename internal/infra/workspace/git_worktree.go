@@ -50,12 +50,13 @@ func New(repo, base, dir string) (*GitWorktree, error) {
 	return g, nil
 }
 
-// unsafeBranchChars matches characters that a branch name may not contain.
+// unsafeBranchChars matches characters a worktree path may not contain. Branch
+// refs use the shared sanitizer in app so every generated ref stays identical.
 var unsafeBranchChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
-// branchName maps a task id to its beacon branch name.
+// branchName maps a task id to its sanitized beacon branch name.
 func branchName(id core.TaskID) string {
-	return "beacon/" + unsafeBranchChars.ReplaceAllString(string(id), "-")
+	return app.BeaconBranch(string(id), app.SafeBranch)
 }
 
 // run executes git in the repository with a bounded context.
@@ -267,10 +268,7 @@ func (g *GitWorktree) EnsureBranch(ctx context.Context, branch, base string) err
 // branchName does, so children fetch the ref that EnsureBranch publishes.
 func safeEpicBranch(branch string) string {
 	branch = strings.TrimSpace(branch)
-	if !strings.HasPrefix(branch, "beacon/") {
-		branch = "beacon/" + branch
-	}
-	return "beacon/" + unsafeBranchChars.ReplaceAllString(strings.TrimPrefix(branch, "beacon/"), "-")
+	return app.BeaconBranch(strings.TrimPrefix(branch, app.BeaconBranchPrefix), app.SafeBranch)
 }
 
 // Clean reports whether the workspace has no uncommitted changes.

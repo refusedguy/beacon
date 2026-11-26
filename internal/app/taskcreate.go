@@ -208,7 +208,7 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 // injected into TaskCreator. Tasks on the configured base need no branch work.
 func ensureEpicBranch(ctx context.Context, ws TaskWorkspace, branch, base string) error {
 	branch = strings.TrimSpace(branch)
-	if !strings.HasPrefix(branch, epicBranchPrefix) {
+	if !IsEpicBranch(branch) {
 		return nil
 	}
 	return ws.EnsureBranch(ctx, branch, base)

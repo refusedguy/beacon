@@ -340,7 +340,7 @@ func (d *Dispatcher) timed(ctx context.Context, name string, fn func() error) er
 // by the next child instead of being remembered for the rest of the batch.
 func (d *Dispatcher) ensureOnce(ctx context.Context, branch string) error {
 	branch = strings.TrimSpace(branch)
-	if !strings.HasPrefix(branch, epicBranchPrefix) {
+	if !IsEpicBranch(branch) {
 		return nil
 	}
 	if _, ok := d.ensured[branch]; ok {
