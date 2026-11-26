@@ -425,6 +425,37 @@ test("adding runs does not add CLI calls", async () => {
   assert.equal(normalizeSnapshot({ active: runs, recent: [] }).active.length, 25)
 })
 
+test("one refresh normalizes the snapshot once and renders the same state", async () => {
+  const raw = {
+    generated_at: "2026-11-23T10:00:00Z",
+    active: [makeRun({ ID: "run-1", TaskID: "T-1", State: "running", title: "Alpha" })],
+    recent: [makeRun({
+      ID: "run-2", TaskID: "T-2", State: "merged", title: "Beta",
+      Decisions: [{ at: "2026-11-23T10:06:00Z", kind: "reconcile.decision", verdict: "merge" }],
+    })],
+    queue: [{ id: "T-3", title: "Ready", status: "ready" }],
+    metrics: { dispatch_count: 2 },
+  }
+  let normalizations = 0
+  let produced = null
+  const counting = (value) => { normalizations++; produced = normalizeSnapshot(value); return produced }
+  const deps = {
+    command: () => ["/bin/beacon"],
+    execFile: async () => ({ stdout: JSON.stringify(raw) }),
+    existsSync: () => false,
+    normalizeSnapshot: counting,
+  }
+  const source = createStatusSource({}, { deps })
+  const snap = await source.snapshot()
+
+  assert.equal(normalizations, 1, "one CLI refresh normalizes the whole snapshot once")
+  assert.equal(snap.active[0], produced.active[0], "the source reuses the normalized runs")
+  assert.equal(snap.recent[0], produced.recent[0], "the source does not rebuild recent runs")
+  assert.equal(snap.recent[0].decisions[0].verdict, "merge")
+  assert.equal(snap.metrics.dispatchCount, 2)
+  assert.deepEqual(renderSnapshotLines(snap), renderSnapshotLines(normalizeSnapshot(raw)))
+})
+
 test("errorMessage handles Error, plain object and string", () => {
   assert.equal(errorMessage(new Error("boom")), "boom")
   assert.equal(errorMessage({ message: "rpc failed" }), "rpc failed")
