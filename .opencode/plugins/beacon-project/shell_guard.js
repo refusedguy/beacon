@@ -1,4 +1,4 @@
-import { agentIdentity, agentRole, guardedAgents } from "./state/session_identity.js"
+import { WORKER_ROLE, agentIdentity, agentRole, guardedAgents } from "./state/session_identity.js"
 
 export { guardedAgents }
 
@@ -178,7 +178,7 @@ function guardAppliesToAgent(event, config = {}) {
   const agent = agentIdentity(null, event)
   // When the event carries no agent, keep the guard as a safety net.
   if (!agent) return true
-  return agentRole(agent, config) === "worker"
+  return agentRole(agent, config) === WORKER_ROLE
 }
 
 export function guardMode(config = {}, env = process.env) {
@@ -191,7 +191,7 @@ export function guardMode(config = {}, env = process.env) {
 // agentRole classifier answers this, so MCP, the shell guard and the rules
 // agree on who is a worker. Names such as "networker" never match by substring.
 export function isWorkerAgent(agent, config = {}) {
-  return agentRole(agent, config) === "worker"
+  return agentRole(agent, config) === WORKER_ROLE
 }
 
 export async function registerShellGuard(ctx, config = {}, env = process.env) {

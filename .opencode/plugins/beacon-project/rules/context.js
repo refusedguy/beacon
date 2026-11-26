@@ -1,7 +1,7 @@
 import { existsSync as fsExistsSync } from "node:fs"
 import { join } from "node:path"
 import { BEACON_BUILD_SCRIPT } from "../mcp/mcp.js"
-import { agentFromSession, agentIdentity, agentRole, latestSession } from "../state/session_identity.js"
+import { ORCHESTRATOR_ROLE, WORKER_ROLE, agentRole, resolveAgent, sessionIDOf } from "../state/session_identity.js"
 
 export const SURVIVAL_KEY = "beacon/survival-rules"
 export const ORCHESTRATOR_KEY = "beacon/orchestrator-rules"
@@ -46,21 +46,6 @@ export function contextOptions(config = {}) {
   }
 }
 
-// OpenCode puts the agent on the context event when it is available. Some
-// versions only expose a session ID, so read the session record through the
-// shared lookup and extraction helpers.
-async function resolvedAgent(ctx, event) {
-  const direct = agentIdentity(ctx, event)
-  if (direct) return direct
-  const sessionID = event?.sessionID ?? event?.session?.id
-  if (typeof sessionID !== "string" || !sessionID) return null
-  try {
-    return agentFromSession(ctx, await latestSession(ctx, sessionID))
-  } catch {
-    return null
-  }
-}
-
 // Rules follow the same classifier as the shell guard and MCP. Read-only
 // research agents and unknown names get no commit or card rules. The default
 // OpenCode agent is `build`, which is the operator's orchestration session.
@@ -85,18 +70,18 @@ function hasBuildScript(root, existsSync) {
 export async function sessionInstructions(ctx, event, config = {}, root = "", deps = {}) {
   const options = contextOptions(config)
   if (!options.enabled) return null
-  const role = roleFor(await resolvedAgent(ctx, event), config)
-  if (role !== "worker" && role !== "orchestrator") return null
-  let value = role === "orchestrator" ? options.orchestratorRules : options.workerRules
+  const role = roleFor(await resolveAgent(ctx, event), config)
+  if (role !== WORKER_ROLE && role !== ORCHESTRATOR_ROLE) return null
+  let value = role === ORCHESTRATOR_ROLE ? options.orchestratorRules : options.workerRules
   const existsSync = deps.existsSync ?? fsExistsSync
-  if (role === "orchestrator" && typeof root === "string" && root
+  if (role === ORCHESTRATOR_ROLE && typeof root === "string" && root
       && hasBuildScript(root, existsSync)) {
     value = `${value}\n${BUILD_REMINDER}`
   }
   return {
-    key: role === "orchestrator" ? ORCHESTRATOR_KEY : SURVIVAL_KEY,
+    key: role === ORCHESTRATOR_ROLE ? ORCHESTRATOR_KEY : SURVIVAL_KEY,
     value,
-    sessionID: event?.sessionID ?? event?.session?.id,
+    sessionID: sessionIDOf(event),
   }
 }
 

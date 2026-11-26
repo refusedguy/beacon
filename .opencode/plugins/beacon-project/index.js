@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { projectRoot } from "./state/location.js"
 import { createMcpRegistrar, noopMcpRegistration, registerBeaconMcp } from "./mcp/mcp.js"
 import { installProjectContext } from "./rules/context.js"
-import { agentFromSession, agentIdentity, latestSession, sessionIdentity } from "./state/session_identity.js"
+import { resolveAgent, sessionIdentity } from "./state/session_identity.js"
 import {
   pluginOptions, pollIntervalMs, snapshotLimits,
   statusPanelEnabled, watcherEnabled,
@@ -59,21 +59,12 @@ export function createStatusRpcHandlers(source, { limits = {}, log = console.deb
   }
 }
 
-// OpenCode does not hand a session ID to plugin setup. Read the agent from the
-// setup context through the shared adapter, then from the session domain. An
-// unknown agent falls back to registering, which is the safe path.
+// OpenCode does not hand a session ID to plugin setup. The shared resolver
+// reads the setup context, then the session domain. An unknown agent falls back
+// to registering, which is the safe path.
 export async function currentSessionAgent(ctx) {
   if (!ctx || typeof ctx !== "object") return null
-  const direct = agentIdentity(ctx)
-  if (direct) return direct
-
-  const sessionID = ctx.sessionID ?? ctx.session?.id ?? ctx.session?.sessionID
-  try {
-    return agentFromSession(ctx, await latestSession(ctx, sessionID))
-  } catch (error) {
-    console.debug(`beacon plugin: session lookup failed: ${error?.message ?? error}`)
-    return null
-  }
+  return resolveAgent(ctx, null, (message) => console.debug(message))
 }
 
 // Resolve once. Workers get a no-op so no command resolution runs and no config
@@ -98,7 +89,7 @@ export const beaconProjectDefinition = {
 
     // Config values may arrive under options or the full config object.
     const options = pluginOptions(ctx)
-    const agent = agentIdentity(ctx) ?? (await currentSessionAgent(ctx))
+    const agent = await currentSessionAgent(ctx)
     const isWorker = isWorkerAgent(agent, options)
 
     // Record the server config for the operator's manual attach. No daemon
