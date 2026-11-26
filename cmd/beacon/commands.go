@@ -322,42 +322,33 @@ func dispatchControlWithPR(ctx context.Context, fn wireFn, configPath, action, r
 	return applyControlWithPR(ctx, w.control, action, runID, sha, pr, message...)
 }
 
-// controlPort is the slice of app.Control that the command drives.
+// controlPort is the single verb the command drives. Every action other than
+// watch goes through Apply, so a new verb needs no change in this boundary.
 type controlPort interface {
-	Approve(ctx context.Context, id core.RunID, sha string) error
-	Unblock(ctx context.Context, id core.RunID) error
-	Cancel(ctx context.Context, id core.RunID) error
-	Retry(ctx context.Context, id core.RunID) error
-	Nudge(ctx context.Context, id core.RunID, message string) error
+	Apply(ctx context.Context, action core.ControlAction, args app.ControlArgs) error
 }
 
-// watchPort binds a PR locally when no daemon owns the state database.
+// watchPort binds a PR locally when no daemon owns the state database. The
+// assertion stays in the helper because watch is a local-only capability.
 type watchPort interface {
 	WatchPR(ctx context.Context, id core.RunID, pr int) error
 }
 
 func applyControlWithPR(ctx context.Context, ctrl controlPort, action, runID, sha string, pr int, message ...string) error {
-	id := core.RunID(runID)
-	switch core.ParseControlAction(action) {
-	case core.ControlApprove:
-		return ctrl.Approve(ctx, id, sha)
-	case core.ControlUnblock:
-		return ctrl.Unblock(ctx, id)
-	case core.ControlCancel:
-		return ctrl.Cancel(ctx, id)
-	case core.ControlRetry:
-		return ctrl.Retry(ctx, id)
-	case core.ControlNudge:
-		return ctrl.Nudge(ctx, id, controlMessage(message))
-	case core.ControlWatch:
+	parsed := core.ParseControlAction(action)
+	if !parsed.Valid() {
+		return fmt.Errorf("unknown action %q", action)
+	}
+	if parsed == core.ControlWatch {
 		watcher, ok := ctrl.(watchPort)
 		if !ok {
 			return errors.New("watch requires the daemon API")
 		}
-		return watcher.WatchPR(ctx, id, pr)
-	default:
-		return fmt.Errorf("unknown action %q", action)
+		return watcher.WatchPR(ctx, core.RunID(runID), pr)
 	}
+	return ctrl.Apply(ctx, parsed, app.ControlArgs{
+		RunID: core.RunID(runID), SHA: sha, Message: controlMessage(message),
+	})
 }
 
 func postControlWithPR(ctx context.Context, info *connectionInfo, action, runID, sha string, pr int, message ...string) error {

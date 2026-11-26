@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -315,24 +316,9 @@ func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "unknown action", http.StatusBadRequest)
 		return
 	}
-	var err error
-	switch action {
-	case core.ControlWatch:
-		err = a.services.control.WatchPR(r.Context(), id, in.PR)
-	case core.ControlApprove:
-		err = a.services.control.Approve(r.Context(), id, in.SHA)
-	case core.ControlUnblock:
-		err = a.services.control.Unblock(r.Context(), id)
-	case core.ControlCancel:
-		err = a.services.control.Cancel(r.Context(), id)
-	case core.ControlRetry:
-		err = a.services.control.Retry(r.Context(), id)
-	case core.ControlNudge:
-		err = a.services.control.Nudge(r.Context(), id, in.Message)
-	default:
-		http.Error(rw, "unknown action", http.StatusBadRequest)
-		return
-	}
+	err := app.ApplyControl(r.Context(), a.services.control, action, app.ControlArgs{
+		RunID: id, SHA: in.SHA, PR: in.PR, Message: in.Message,
+	})
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusConflict)
 		return

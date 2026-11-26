@@ -45,6 +45,53 @@ type Control struct {
 	writeMu   sync.Mutex
 }
 
+// ControlArgs carries the arguments of one control action. A boundary fills
+// only the fields its verb uses. The shared dispatch ignores the rest.
+type ControlArgs struct {
+	RunID   core.RunID
+	SHA     string
+	PR      int
+	Message string
+}
+
+// ControlPort is the slice of Control that every boundary drives. Each method
+// maps to one ControlAction, so a port needs no verb-specific switch of its own.
+type ControlPort interface {
+	WatchPR(ctx context.Context, id core.RunID, pr int) error
+	Approve(ctx context.Context, id core.RunID, sha string) error
+	Unblock(ctx context.Context, id core.RunID) error
+	Cancel(ctx context.Context, id core.RunID) error
+	Retry(ctx context.Context, id core.RunID) error
+	Nudge(ctx context.Context, id core.RunID, message string) error
+}
+
+// ApplyControl routes one action through port. This is the only switch over the
+// control vocabulary, so adding a verb here makes it available at every boundary.
+func ApplyControl(ctx context.Context, port ControlPort, action core.ControlAction, args ControlArgs) error {
+	switch action {
+	case core.ControlApprove:
+		return port.Approve(ctx, args.RunID, args.SHA)
+	case core.ControlUnblock:
+		return port.Unblock(ctx, args.RunID)
+	case core.ControlCancel:
+		return port.Cancel(ctx, args.RunID)
+	case core.ControlRetry:
+		return port.Retry(ctx, args.RunID)
+	case core.ControlNudge:
+		return port.Nudge(ctx, args.RunID, args.Message)
+	case core.ControlWatch:
+		return port.WatchPR(ctx, args.RunID, args.PR)
+	default:
+		return core.Errorf(core.CodeInvalidInput, "unknown action %q", action)
+	}
+}
+
+// Apply routes one action through c. The CLI, the loopback API and the MCP
+// tool all call this single port instead of switching over verbs themselves.
+func (c *Control) Apply(ctx context.Context, action core.ControlAction, args ControlArgs) error {
+	return ApplyControl(ctx, c, action, args)
+}
+
 // write serializes control mutations and retries transient SQLite lock
 // conflicts. Read-only services never take this lock. The lock covers one
 // store call at a time, never a backoff sleep, so concurrent writers do not
