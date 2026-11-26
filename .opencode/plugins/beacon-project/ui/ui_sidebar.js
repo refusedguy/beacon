@@ -3,11 +3,22 @@
 // real boxes so they align and hover like the native Context/MCP sections.
 import { createBox, createLineMount, createSegmentBar, createText } from "./ui_nodes.js"
 import { REASON_WIDTH } from "./ui_model.js"
-import { truncate } from "./ui_alerts.js"
+import { isDispatching, truncate } from "./ui_alerts.js"
 import { truncateSidebarTitle } from "./ui_view.js"
 import { propSetter } from "./ui_test_helpers.js"
 
 export const SIDEBAR_LINES = 34
+
+// Mounted sidebars register here so the dispatch action can repaint its plate
+// on the click, before the RPC settles. Repainting uses the items already
+// applied to the pool, so it needs no render context and no new snapshot.
+const sidebarMounts = new Set()
+export function refreshDispatchingViews() {
+  for (const mount of sidebarMounts) {
+    if (mount.node?.isDestroyed) { sidebarMounts.delete(mount); continue }
+    mount.setDispatching(isDispatching())
+  }
+}
 
 // Presentation stays out of the renderer. Active titles keep the base tone and
 // go bold only on attention states; Recent rows stay calm and unbolded. Long
@@ -100,6 +111,8 @@ export function createSidebarMount(ui, deps) {
     set(box, "onMouseOut", () => set(box, "backgroundColor", baseBg))
   })
 
+  let appliedItems = []
+  let baseDispatch = null
   const apply = (model, error = null) => {
     // The header carries its item for the click/refresh contract even though
     // it is no longer allocated by createLineMount.
@@ -111,8 +124,26 @@ export function createSidebarMount(ui, deps) {
     const metaItems = []
     if (error) metaItems.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
     meta.apply(metaItems)
-    list.apply(sidebarPresentation(model.listItems))
+    appliedItems = sidebarPresentation(model.listItems)
+    for (const item of appliedItems) {
+      if (item.action === "dispatch" && !/^Dispatching/.test(item.name)) baseDispatch = item
+    }
+    list.apply(appliedItems)
     decorateRows()
   }
-  return { node: container, apply, header, headerName, headerSummary, legend, bar: bar.node }
+  // Repaint only the Dispatch plate. The next full refresh replaces the whole
+  // model, so keeping the original item here is enough to clear the busy label.
+  const setDispatching = (dispatching) => {
+    if (!baseDispatch) return
+    appliedItems = appliedItems.map((item) => item.action !== "dispatch" ? item
+      : dispatching
+        ? { ...baseDispatch, marker: "◐", name: "Dispatching", color: "warning",
+            nameColor: "warning", markerColor: "warning", bold: true }
+        : { ...baseDispatch })
+    list.apply(appliedItems)
+    decorateRows()
+  }
+  const entry = { node: container, apply, setDispatching, header, headerName, headerSummary, legend, bar: bar.node }
+  sidebarMounts.add(entry)
+  return entry
 }

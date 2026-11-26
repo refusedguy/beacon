@@ -2,6 +2,8 @@
 // through ctx.ui.toast.show and then refreshes the snapshot. The RPC/CLI
 // transport is injected so the same code path is testable in plain Node.
 import { CONTROL_ACTIONS, errorMessage, str } from "./ui_model.js"
+import { isDispatching, setDispatching } from "./ui_alerts.js"
+import { refreshDispatchingViews } from "./ui_sidebar.js"
 import { toastShow } from "./ui_test_helpers.js"
 
 // A mouse gesture on the Dispatch row reaches both onMouseDown and onMouseUp.
@@ -90,7 +92,15 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
       log(`beacon dispatch duplicate suppressed id=${id}`)
       return previous.promise
     }
+    // The time window covers one mouse gesture. The in-flight flag also blocks
+    // a later click that arrives while the first dispatch is still pending.
+    if (isDispatching()) {
+      log(`beacon dispatch already in flight id=${id}`)
+      return previous?.promise ?? null
+    }
     log(`beacon dispatch click id=${id}`)
+    setDispatching(true)
+    refreshDispatchingViews()
     const promise = (async () => {
       try {
         const result = await source.dispatch(input)
@@ -101,7 +111,11 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
       } catch (error) {
         show(`Dispatch failed: ${errorMessage(error)}`, "error")
         return null
-      } finally { await refresh() }
+      } finally {
+        setDispatching(false)
+        refreshDispatchingViews()
+        await refresh()
+      }
     })()
     lastDispatch = { id, at: now, promise }
     return promise

@@ -293,7 +293,23 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree 
 export const readyCount = (queue = []) => (Array.isArray(queue) ? queue : [])
   .filter((item) => str(item?.status).toLowerCase() === "ready").length
 
-export function dispatchItem(ready = 0) {
+// One in-flight flag shared by the action runner and the sidebar view. The
+// click sets it before the RPC settles, so the row can show Dispatching on the
+// same frame as the click instead of waiting for a snapshot.
+let dispatchInFlight = false
+export const isDispatching = () => dispatchInFlight
+export function setDispatching(value) {
+  const next = value === true
+  if (dispatchInFlight === next) return false
+  dispatchInFlight = next
+  return true
+}
+
+export function dispatchItem(ready = 0, dispatching = false) {
+  if (dispatching) return {
+    marker: "◐", name: "Dispatching", status: "", color: "warning",
+    nameColor: "warning", markerColor: "warning", bold: true, action: "dispatch",
+  }
   return ready > 0
     ? { marker: "▶", name: `Dispatch (${ready} ready)`, status: "", color: "success", bold: true, action: "dispatch" }
     : { marker: "", name: "No tasks ready", status: "", color: "muted" }
