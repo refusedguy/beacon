@@ -150,18 +150,15 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	if err := os.MkdirAll(g.Dir, 0o755); err != nil {
 		return core.Workspace{}, err
 	}
-	// A directory removed outside this process can leave a dead administrative
-	// entry. Pruning keeps the later branch and worktree-add steps usable.
-	if _, err := g.run(ctx, "worktree", "prune"); err != nil {
-		slog.Warn("worktree prune failed", "error", err)
-	}
 	if _, err := g.run(ctx, "fetch", "origin", base); err != nil {
 		return core.Workspace{}, err
 	}
 	if _, err := os.Stat(path); err == nil {
 		// A failed spawn can leave only the card status marker behind. That
 		// dirt belongs to Beacon and must not block the next dispatch. Real
-		// agent code still stops the create with a conflict.
+		// agent code still stops the create with a conflict. The stale path is
+		// removed quietly; the editor refresh belongs to public removal, since
+		// this path is immediately re-added below.
 		dirty, onlyCards, err := g.cardOnlyDirt(ctx, path)
 		if err != nil {
 			return core.Workspace{}, err
@@ -169,19 +166,24 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 		if dirty && !onlyCards {
 			return core.Workspace{}, core.Errorf(core.CodeConflict, "refusing to remove dirty worktree %s", path)
 		}
-		if err := g.ForceRemove(ctx, core.Workspace{Path: path}); err != nil {
+		if err := g.removeForce(ctx, core.Workspace{Path: path}); err != nil {
 			return core.Workspace{}, err
 		}
 	} else if !os.IsNotExist(err) {
 		return core.Workspace{}, err
 	}
-	if _, err := g.run(ctx, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
-		if _, err := g.run(ctx, "branch", "-D", branch); err != nil {
-			return core.Workspace{}, fmt.Errorf("delete branch %s: %w", branch, err)
+	// The branch name is unique per task, so add -B can create or reset it in
+	// one call instead of probing show-ref and deleting the branch first.
+	if _, err := g.run(ctx, "worktree", "add", "-B", branch, path, "origin/"+base); err != nil {
+		// A directory removed outside this process can leave a dead
+		// administrative entry that blocks the add. Prune only after a failure
+		// so a clean path does not pay for it on every card.
+		if _, pruneErr := g.run(ctx, "worktree", "prune"); pruneErr != nil {
+			slog.Warn("worktree prune failed", "error", pruneErr)
 		}
-	}
-	if _, err := g.run(ctx, "worktree", "add", "-b", branch, path, "origin/"+base); err != nil {
-		return core.Workspace{}, err
+		if _, retryErr := g.run(ctx, "worktree", "add", "-B", branch, path, "origin/"+base); retryErr != nil {
+			return core.Workspace{}, err
+		}
 	}
 	mergeBase, err := g.run(ctx, "merge-base", "origin/"+base, branch)
 	if err != nil {
@@ -411,9 +413,16 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	return nil
 }
 
-// ForceRemove deletes a worktree and its branch without a clean check.
+// ForceRemove deletes a worktree and its branch without a clean check. A
+// removal is the point where the editor's worktree registry must be refreshed.
 func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error {
 	defer g.refresh(ctx)
+	return g.removeForce(ctx, ws)
+}
+
+// removeForce deletes a worktree and its branch without a clean check or an
+// editor refresh. Create uses it for a stale path it re-adds in the same call.
+func (g *GitWorktree) removeForce(ctx context.Context, ws core.Workspace) error {
 	_, err := g.run(ctx, "worktree", "remove", "--force", ws.Path)
 	if err == nil && ws.Branch != "" {
 		if _, err := g.run(ctx, "branch", "-D", ws.Branch); err != nil {

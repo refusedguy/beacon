@@ -157,6 +157,24 @@ func TestGitWorktreeCreateUsesTaskBaseBranch(t *testing.T) {
 	}
 }
 
+func TestGitWorktreeCreateRecoversFromDeadAdminEntry(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	task := core.Task{ID: "T-DEAD-ADMIN"}
+	path := filepath.Join(wt.Dir, "T-DEAD-ADMIN")
+	gitCmd(t, repo, "worktree", "add", "-b", branchName(task.ID), path, "origin/main")
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("os.RemoveAll(path): %v", err)
+	}
+	ws, err := wt.Create(ctx, task)
+	if err != nil {
+		t.Fatalf("Create() after an out-of-band delete: %v", err)
+	}
+	if _, err := os.Stat(ws.Path); err != nil {
+		t.Fatalf("worktree missing after Create(): %v", err)
+	}
+}
+
 func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 	wt, repo := newTestGitWorktree(t)
 	ctx := context.Background()
@@ -298,11 +316,35 @@ func TestGitWorktreeCreateReportsBranchCheckedOutElsewhere(t *testing.T) {
 	if err == nil {
 		t.Fatal("Create() error = nil, want an error when the branch is checked out elsewhere")
 	}
-	if !strings.Contains(err.Error(), "delete branch "+branch) {
-		t.Fatalf("Create() error = %q, want it to name the branch it could not delete", err)
+	if !strings.Contains(err.Error(), branch) {
+		t.Fatalf("Create() error = %q, want it to name the branch that is in use", err)
 	}
-	if !strings.Contains(err.Error(), "cannot delete branch") {
+	if !strings.Contains(err.Error(), "already used by worktree") {
 		t.Fatalf("Create() error = %q, want git's refusal detail", err)
+	}
+}
+
+func TestGitWorktreeCreateCleanPathLimitsGitCalls(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	var calls [][]string
+	wt.commandHook = func(_ string, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	if _, err := wt.Create(ctx, core.Task{ID: "T-COUNT"}); err != nil {
+		t.Fatalf("Create(): %v", err)
+	}
+	if len(calls) > 4 {
+		t.Fatalf("Create() ran %d git commands, want at most 4: %v", len(calls), calls)
+	}
+	for _, call := range calls {
+		if len(call) > 1 && call[0] == "worktree" && call[1] == "prune" {
+			t.Fatalf("Create() pruned on a clean path: %v", calls)
+		}
+		if len(call) > 1 && call[0] == "show-ref" {
+			t.Fatalf("Create() probed show-ref on a clean path: %v", calls)
+		}
 	}
 }
 
@@ -695,7 +737,7 @@ func TestForceRemoveRefreshesWhenGitCannotRemove(t *testing.T) {
 	}
 }
 
-func TestWorktreeCreateRefreshesAfterStaleCleanup(t *testing.T) {
+func TestWorktreeCreateStaleCleanupSkipsRefresh(t *testing.T) {
 	wt, rec := worktreeWithRefresher(t, 0)
 	ctx := context.Background()
 	task := core.Task{ID: "T-CREATE-STALE"}
@@ -703,15 +745,16 @@ func TestWorktreeCreateRefreshesAfterStaleCleanup(t *testing.T) {
 		t.Fatalf("wt.Create(ctx, task): %v", err)
 	}
 	// A retry finds the previous worktree still on disk. Create removes it as
-	// stale, so the editor's registration must be refreshed again.
+	// stale and re-adds the same path, so the editor never sees a gap and the
+	// refresh belongs to the eventual removal instead.
 	if _, err := wt.Create(ctx, task); err != nil {
 		t.Fatalf("Create() retry error = %v", err)
 	}
-	if got := len(rec.snapshot()); got != 1 {
-		t.Fatalf("worktree refresh calls = %d, want 1 after stale cleanup", got)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("worktree refresh calls = %d, want 0 after stale cleanup", got)
 	}
-	if got := rec.reloadCount(); got != 1 {
-		t.Fatalf("location reloads = %d, want 1 after stale cleanup", got)
+	if got := rec.reloadCount(); got != 0 {
+		t.Fatalf("location reloads = %d, want 0 after stale cleanup", got)
 	}
 }
 
