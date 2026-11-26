@@ -468,3 +468,213 @@ func BenchmarkE2EOperatorPaths(b *testing.B) {
 	}
 	printE2EReport(os.Stdout, sums, total, b.N, reconSubs, dispSubs)
 }
+
+// The dedup benchmark covers the other missing branch. The e2e SCM above
+// returns a fresh head SHA on every poll, so sameObservation never returns
+// true and the reconciler wakes a run again for an unchanged PR. Here the SCM
+// returns one fixed head and base pair, and every run already recorded that
+// pair. Each poll therefore hits the SHA guard and skips the wake write.
+//
+// The assertions after the timed loop fail if the guard stops being used:
+// a wake would add a second store write per PR and change the run state.
+const (
+	dedupHeadSHA = "dedup-head-000000000000000000000000000000000000"
+	dedupBaseSHA = "dedup-base-000000000000000000000000000000000000"
+)
+
+// dedupSCM embeds the e2e provider and overrides the two calls that matter.
+// Observe returns a fixed pair; UpdateBranch counts any rebase the reconciler
+// attempted. The other provider calls stay no-ops.
+type dedupSCM struct {
+	*e2eSCM
+	observes atomic.Int64
+	updates  atomic.Int64
+}
+
+func newDedupSCM() *dedupSCM { return &dedupSCM{e2eSCM: &e2eSCM{}} }
+
+func (s *dedupSCM) Observe(_ context.Context, pr int) (core.Observation, error) {
+	s.observes.Add(1)
+	return core.Observation{
+		PRNumber: pr,
+		HeadSHA:  dedupHeadSHA,
+		BaseSHA:  dedupBaseSHA,
+		PRState:  "open",
+		Checks:   []core.CheckResult{{Name: "go test", State: core.CheckFailure}},
+	}, nil
+}
+
+func (s *dedupSCM) UpdateBranch(context.Context, int, string) (string, error) {
+	s.updates.Add(1)
+	return "", nil
+}
+
+// dedupHarness counts wake calls. A working SHA guard leaves the count at zero.
+type dedupHarness struct {
+	*e2eHarness
+	wakes atomic.Int64
+}
+
+func newDedupHarness() *dedupHarness {
+	return &dedupHarness{e2eHarness: newE2EHarness()}
+}
+
+func (h *dedupHarness) Wake(context.Context, string, core.WakeContext) error {
+	h.wakes.Add(1)
+	return nil
+}
+
+// dedupPolicy keeps every PR in needs-agent-fix, the state whose handler
+// checks the observation before waking the worker.
+type dedupPolicy struct{}
+
+func (dedupPolicy) Evaluate(core.Observation) core.MergeDecision {
+	return core.MergeDecision{Verdict: core.VerdictNeedsAgentFix, Reason: "checks failed", Criterion: "invariant"}
+}
+
+// countingStore counts only Save calls. Reconcile always saves the run after
+// Observe, so one tick writes exactly one row per PR. A missed SHA guard adds
+// one more write per PR from the wake handler.
+type countingStore struct {
+	*sqlite.Store
+	saves atomic.Int64
+}
+
+func (s *countingStore) Save(ctx context.Context, run *core.Run) error {
+	s.saves.Add(1)
+	return s.Store.Save(ctx, run)
+}
+
+type dedupEnv struct {
+	ctx     context.Context
+	store   *countingStore
+	prs     []int
+	recon   *app.Reconciler
+	scm     *dedupSCM
+	harness *dedupHarness
+	sink    *e2eSink
+}
+
+func newDedupEnv(b *testing.B) *dedupEnv {
+	b.Helper()
+	raw, err := sqlite.Open(filepath.Join(b.TempDir(), "dedup.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = raw.Close() })
+
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	store := &countingStore{Store: raw}
+	scm := newDedupSCM()
+	harness := newDedupHarness()
+	sink := &e2eSink{store: raw}
+	e := &dedupEnv{ctx: ctx, store: store, scm: scm, harness: harness, sink: sink}
+
+	for i := 0; i < e2eActivePRs; i++ {
+		pr := 4000 + i
+		run := core.NewRun(core.RunID(fmt.Sprintf("run-dedup-%04d", i)), core.TaskID(fmt.Sprintf("T-DEDUP-%04d", i)), now)
+		run.State = core.RunNeedsAgentFix
+		run.PRNumber = pr
+		run.HeadSHA = dedupHeadSHA
+		run.ObservedSHA = dedupHeadSHA
+		run.ObservedBaseSHA = dedupBaseSHA
+		run.SessionID = fmt.Sprintf("sess-dedup-%04d", i)
+		run.WorkspacePath = fmt.Sprintf("/ws/T-DEDUP-%04d", i)
+		run.Branch = fmt.Sprintf("beacon/T-DEDUP-%04d", i)
+		run.Scope = []core.ScopePath{core.ScopeFile(fmt.Sprintf("internal/bench/dedup_%02d.go", i))}
+		if err := raw.Save(ctx, run); err != nil {
+			b.Fatal(err)
+		}
+		e.prs = append(e.prs, pr)
+	}
+
+	e.recon = &app.Reconciler{
+		Store:      store,
+		SCM:        scm,
+		Policy:     dedupPolicy{},
+		Harness:    harness,
+		Source:     &e2eSource{},
+		Workspace:  e2eWorkspace{},
+		Decisions:  app.DecisionLogger{Sink: sink},
+		Repo:       "example/beacon",
+		BaseBranch: "main",
+		Interval:   time.Hour,
+	}
+	return e
+}
+
+func (e *dedupEnv) tick(b *testing.B) {
+	b.Helper()
+	for _, pr := range e.prs {
+		if _, err := e.recon.Reconcile(e.ctx, pr); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func (e *dedupEnv) resetCounters() {
+	e.store.saves.Store(0)
+	e.scm.observes.Store(0)
+	e.scm.updates.Store(0)
+	e.harness.wakes.Store(0)
+	e.sink.records.Store(0)
+}
+
+func printDedupReport(w io.Writer, prs, ticks int, saves, decisions, wakes, updates, skips int64) {
+	fmt.Fprintf(w, "reconcile dedup: prs=%d ticks=%d\n", prs, ticks)
+	fmt.Fprintf(w, "store-writes/tick=%.1f decision-writes/tick=%.1f wake-calls=%d rebase-calls=%d skipped-observations=%d\n",
+		float64(saves)/float64(ticks), float64(decisions)/float64(ticks), wakes, updates, skips)
+}
+
+// BenchmarkReconcileUnchangedObservation measures one reconcile tick over 20
+// PRs whose observations never change. It reports store writes, decision writes
+// and skipped observations. CI runs a bounded smoke pass with
+// BEACON_BENCH_SMOKE=1 and -benchtime=1x:
+//
+//	BEACON_BENCH_SMOKE=1 GOMAXPROCS=1 go test -run '^$' -bench '^BenchmarkReconcileUnchangedObservation$' -benchtime=1x -count=1 ./internal/bench/
+//
+// Smoke mode skips the warm-up tick. The fixture, counts and assertions stay
+// the same.
+func BenchmarkReconcileUnchangedObservation(b *testing.B) {
+	previousLog := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(previousLog)
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	e := newDedupEnv(b)
+	if !smokeMode() {
+		e.tick(b)
+	}
+
+	observations := int64(e2eActivePRs) * int64(b.N)
+	e.resetCounters()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.tick(b)
+	}
+	b.StopTimer()
+
+	saves := e.store.saves.Load()
+	wakes := e.harness.wakes.Load()
+	updates := e.scm.updates.Load()
+	observes := e.scm.observes.Load()
+	decisions := e.sink.records.Load()
+
+	if observes != observations {
+		b.Fatalf("observations = %d, want %d", observes, observations)
+	}
+	if wakes != 0 || updates != 0 {
+		b.Fatalf("SHA guard skipped no work: wake calls = %d, rebase calls = %d, want zero of each", wakes, updates)
+	}
+	wantSaves := observations
+	if saves != wantSaves {
+		b.Fatalf("store writes = %d, want %d; the SHA guard no longer skips the wake write", saves, wantSaves)
+	}
+
+	b.ReportMetric(float64(saves)/float64(b.N), "store-writes-per-tick")
+	b.ReportMetric(float64(decisions)/float64(b.N), "decision-writes-per-tick")
+	b.ReportMetric(float64(observations), "skipped-observations")
+	printDedupReport(os.Stdout, e2eActivePRs, b.N, saves, decisions, wakes, updates, observations)
+}

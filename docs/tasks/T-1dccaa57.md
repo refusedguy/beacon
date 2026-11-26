@@ -1,7 +1,7 @@
 ---
 id: T-1dccaa57
 title: Benchmark planner and reconcile dedup
-status: available
+status: done
 scope:
     - internal/bench/e2e_bench_test.go
     - internal/bench/planner_bench_test.go
