@@ -205,8 +205,22 @@ type apiServer struct {
 	changes  *changeSubscribers
 }
 
+// runHTTP serves handler at addr until ctx ends and reports its exit on errCh.
+// The loopback API and the webhook share this lifecycle, so both use the same
+// read-header timeout and both shut down gracefully when ctx is cancelled.
+func runHTTP(ctx context.Context, errCh chan<- error, addr string, handler http.Handler) {
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+	go func() { errCh <- srv.ListenAndServe() }()
+}
+
 // startAPIServer serves the loopback API until ctx ends and reports its exit
-// on errCh. It owns the server lifecycle so the serve command stays short.
+// on errCh. It owns the handler wiring, while runHTTP owns the server lifecycle.
 func startAPIServer(ctx context.Context, services apiServices, token string, events <-chan core.HarnessEvent, changes *changeSubscribers, addr string, errCh chan<- error) {
 	// One view feeds the frame broadcaster and one ends the snapshot
 	// generation. A single consumer owns the invalidation view, so one harness
@@ -216,14 +230,7 @@ func startAPIServer(ctx context.Context, services apiServices, token string, eve
 	frames := newEventFrames(views[0], json.Marshal)
 	go frames.run(ctx)
 	api := &apiServer{services: services, token: token, frames: frames, changes: changes}
-	srv := &http.Server{Addr: addr, Handler: api.handler(), ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdown)
-	}()
-	go func() { errCh <- srv.ListenAndServe() }()
+	runHTTP(ctx, errCh, addr, api.handler())
 }
 
 // invalidateOnHarness ends the current snapshot generation whenever the

@@ -690,6 +690,26 @@ func TestHarnessEventInvalidatesRunsSnapshot(t *testing.T) {
 	}
 }
 
+// TestRunHTTPShutsDownOnContextCancel proves the shared server lifecycle used
+// by the loopback API and the webhook. Cancelling ctx shuts the server down and
+// reports http.ErrServerClosed, which the serve command treats as a clean exit.
+func TestRunHTTPShutsDownOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	runHTTP(ctx, errCh, "127.0.0.1:0", http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != http.ErrServerClosed {
+			t.Fatalf("runHTTP exit = %v, want %v", err, http.ErrServerClosed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runHTTP did not shut down after ctx was cancelled")
+	}
+}
+
 func TestHTTPControlAcceptsKnownActionAndRejectsUnknownAction(t *testing.T) {
 	services := &recordingAPIServices{}
 	srv := newRecordingAPIServer(t, services)
