@@ -720,6 +720,12 @@ The gofmt -l and targeted go test checks are required on every machine.
 
 func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
 	var b strings.Builder
+	// Reserve the fixed text plus the variable fields in one allocation. The
+	// stock prompt is a few kilobytes, so growing from zero reallocates several
+	// times for every dispatch.
+	b.Grow(len(prePRCheck) + len(core.OpenPRAndWatchInstruction) + len(instructions) +
+		len(id) + len(t.ID) + len(t.Title) + len(ws) +
+		len(t.BaseBranch) + len(t.WorkerPrompt) + 256)
 	prependWorkerInstructions(&b, instructions)
 	fmt.Fprintf(&b, "Run ID: %s\nTask: %s (%s)\nWorkspace: %s\n", id, t.ID, t.Title, ws)
 	if base := strings.TrimSpace(t.BaseBranch); base != "" {
@@ -729,6 +735,12 @@ func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
 	b.WriteString(prePRCheck)
 	appendWorkerPrompt(&b, t)
 	return b.String()
+}
+
+// BuildSpawnPrompt builds the prompt a dispatched task receives. The bench
+// harness calls it to time prompt construction without running a Dispatcher.
+func BuildSpawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
+	return spawnPrompt(t, id, ws, instructions)
 }
 
 // prependWorkerInstructions puts the operator's worker instructions at the

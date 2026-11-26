@@ -190,6 +190,68 @@ func (f *eventFrames) run(ctx context.Context) {
 	}
 }
 
+// pingBroadcaster owns the one keepalive ticker for every SSE connection. Each
+// tick builds a single payload and hands the same frame bytes to all subscribers,
+// so neither the timer nor the JSON work grows with the monitor count.
+type pingBroadcaster struct {
+	mu   sync.Mutex
+	subs map[chan []byte]struct{}
+	tick *time.Ticker
+}
+
+func newPingBroadcaster() *pingBroadcaster {
+	return &pingBroadcaster{
+		subs: make(map[chan []byte]struct{}),
+		tick: time.NewTicker(10 * time.Second),
+	}
+}
+
+// subscribe returns a channel of complete ping frames and an unsubscribe
+// function. The caller must unsubscribe when the connection closes.
+func (p *pingBroadcaster) subscribe() (<-chan []byte, func()) {
+	ch := make(chan []byte, 1)
+	p.mu.Lock()
+	p.subs[ch] = struct{}{}
+	p.mu.Unlock()
+	return ch, func() {
+		p.mu.Lock()
+		delete(p.subs, ch)
+		p.mu.Unlock()
+	}
+}
+
+// pingFrame builds one keepalive frame per tick. Each monitor writes these same
+// bytes after its own SSE id line.
+func pingFrame(now time.Time) []byte {
+	b, err := json.Marshal(wirePing{Time: now.UTC().Format(time.RFC3339)})
+	if err != nil {
+		return nil
+	}
+	return fmt.Appendf(nil, "event: ping\ndata: %s\n\n", b)
+}
+
+// run broadcasts one ping per tick. A full subscriber channel is skipped so a
+// slow monitor cannot stall the other connections.
+func (p *pingBroadcaster) run(ctx context.Context) {
+	defer p.tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-p.tick.C:
+			frame := pingFrame(now)
+			p.mu.Lock()
+			for ch := range p.subs {
+				select {
+				case ch <- frame:
+				default:
+				}
+			}
+			p.mu.Unlock()
+		}
+	}
+}
+
 // apiStatus and apiControl are the whole service surface the loopback API
 // needs. Keeping them as interfaces prevents handlers from reaching the
 // dispatcher, SCM, harness or task services behind the wiring root.
@@ -219,6 +281,7 @@ type apiServer struct {
 	token   []byte
 	frames  *eventFrames
 	changes *changeSubscribers
+	pings   *pingBroadcaster
 }
 
 // stringBytes returns a read-only byte view of s without allocating. Callers
@@ -253,7 +316,9 @@ func startAPIServer(ctx context.Context, services apiServices, token string, eve
 	go invalidateOnHarness(ctx, views[1], changes.snapshot)
 	frames := newEventFrames(views[0], json.Marshal)
 	go frames.run(ctx)
-	api := &apiServer{services: services, token: []byte(token), frames: frames, changes: changes}
+	pings := newPingBroadcaster()
+	go pings.run(ctx)
+	api := &apiServer{services: services, token: []byte(token), frames: frames, changes: changes, pings: pings}
 	runHTTP(ctx, errCh, addr, api.handler())
 }
 
@@ -358,6 +423,14 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 	defer unsubscribeFrames()
 	changes, unsubscribeChanges := a.changes.subscribe()
 	defer unsubscribeChanges()
+	// The server owns one keepalive ticker. A handler built without a
+	// broadcaster (as in the wire-shape tests) simply receives no pings.
+	var pings <-chan []byte
+	if a.pings != nil {
+		var unsubscribePings func()
+		pings, unsubscribePings = a.pings.subscribe()
+		defer unsubscribePings()
+	}
 	rw.Header().Set("Content-Type", "text/event-stream")
 	rw.Header().Set("Cache-Control", "no-cache")
 	// Send the headers now so the monitor's request returns before the first
@@ -380,8 +453,6 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(rw, "id: %d\n", nextID)
 	}
 
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
@@ -394,9 +465,9 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 			writeID()
 			writeSSE(rw, "pr_changed", wirePRChanged{PR: pr})
 			flusher.Flush()
-		case <-ticker.C:
+		case frame := <-pings:
 			writeID()
-			writeSSE(rw, "ping", wirePing{Time: time.Now().UTC().Format(time.RFC3339)})
+			_, _ = rw.Write(frame)
 			flusher.Flush()
 		}
 	}

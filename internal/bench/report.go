@@ -19,6 +19,10 @@ const (
 
 var hotspotOrder = []string{nameSQLite, nameCard, nameWire, nameRedact, nameJournal, nameFanout}
 
+// namePrompt names the standalone prompt benchmark. Prompt construction is not
+// one of the six alternating hotspots, so it gets its own report line.
+const namePrompt = "prompt-build"
+
 // limiters name the resource that bounds each hotspot. The dossier explains
 // why each one is the limiter and points at the annotated production code.
 var limiters = map[string]string{
@@ -238,4 +242,12 @@ func printSnapshotRepeatability(w io.Writer, name string, ds []time.Duration) {
 	}
 	fmt.Fprintf(w, "%s: five alternating passes median=%s range=%s repeatability=%.1f%% of median\n",
 		name, median, max-min, pct)
+}
+
+// printPromptReport writes the standalone prompt benchmark line to stdout so
+// `go test -bench=BenchmarkSpawnPrompt -benchmem` emits it without -v. Work is
+// the total prompt bytes and does not depend on timer resolution.
+func printPromptReport(w io.Writer, work, errs int64, tasks, iterations int) {
+	fmt.Fprintf(w, "%s: tasks=%d iterations=%d work=%d errs=%d\n",
+		namePrompt, tasks, iterations, work, errs)
 }

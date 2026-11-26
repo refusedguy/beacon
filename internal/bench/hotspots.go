@@ -3,6 +3,7 @@ package bench
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
@@ -154,6 +155,41 @@ func itoa(n int) string {
 		return string(rune('0' + n))
 	}
 	return string(rune('0'+n/10)) + string(rune('0'+n%10))
+}
+
+// promptFixtures builds the tasks the standalone prompt benchmark times. Some
+// tasks drop the base branch and the worker override so both optional branches
+// of spawnPrompt run. The fixture is built once outside the timed loop.
+func promptFixtures() []core.Task {
+	tasks := taskFixtures(fixtureTasks)
+	for i := range tasks {
+		if i%3 == 0 {
+			tasks[i].BaseBranch = ""
+		}
+		if i%4 == 0 {
+			tasks[i].WorkerPrompt = ""
+		}
+	}
+	return tasks
+}
+
+// runPromptBuild builds one prompt per fixture task through the same exported
+// entry point the dispatcher uses. Work counts prompt bytes; an empty prompt
+// is an error. Both counts stay fixed across runs because the tasks are fixed.
+func runPromptBuild(tasks []core.Task) (int64, int64) {
+	var work, errs int64
+	for i, task := range tasks {
+		instructions := ""
+		if i%2 == 0 {
+			instructions = "Operator instructions for the worker."
+		}
+		prompt := app.BuildSpawnPrompt(task, core.RunID(fmt.Sprintf("run-%04d", i)), "/ws/"+string(task.ID), instructions)
+		if prompt == "" {
+			errs++
+		}
+		work += int64(len(prompt))
+	}
+	return work, errs
 }
 
 // SSE fanout subcases. Each monitor subscribes to both harness frames and PR
