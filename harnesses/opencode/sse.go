@@ -25,12 +25,6 @@ func (h *Harness) WatchIdle(ctx context.Context) {
 	h.watchOnce.Do(func() { go h.watchLoop(ctx) })
 }
 
-// RunIdleWatch runs the idle stream watcher until ctx is cancelled.
-func (h *Harness) RunIdleWatch(ctx context.Context) {
-	h.init()
-	h.watchLoop(ctx)
-}
-
 // watchLoop reconnects to the idle stream with exponential backoff.
 func (h *Harness) watchLoop(ctx context.Context) {
 	delay := h.ReconnectMin

@@ -706,65 +706,6 @@ func TestSpawnDispatchModelRefDoesNotReplaceCachedDefault(t *testing.T) {
 	}
 }
 
-// TestRunIdleWatchStopsReconnectOnCancel exercises the reconnect loop with a
-// short backoff. The loop reuses one timer and stops reconnecting when the
-// context is cancelled.
-func TestRunIdleWatchStopsReconnectOnCancel(t *testing.T) {
-	var mu sync.Mutex
-	var connects int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/event" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		mu.Lock()
-		connects++
-		mu.Unlock()
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	h := New(Config{Endpoint: srv.URL})
-	h.ReconnectMin = time.Millisecond
-	h.ReconnectMax = 2 * time.Millisecond
-	done := make(chan struct{})
-	go func() {
-		h.RunIdleWatch(ctx)
-		close(done)
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		n := connects
-		mu.Unlock()
-		if n >= 2 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunIdleWatch did not stop on cancel")
-	}
-
-	mu.Lock()
-	n := connects
-	mu.Unlock()
-	time.Sleep(10 * time.Millisecond)
-	mu.Lock()
-	defer mu.Unlock()
-	if connects != n {
-		t.Fatalf("reconnected after cancel: %d -> %d", n, connects)
-	}
-	if n < 2 {
-		t.Fatalf("event stream connections = %d, want at least 2", n)
-	}
-}
-
 func TestNewUsesConfiguredClientAndTrimsEndpoint(t *testing.T) {
 	var gotURL string
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {

@@ -50,9 +50,6 @@ type Harness struct {
 	modelDefault core.ModelRef
 }
 
-// OpenCode is an alias kept for callers that use the older name.
-type OpenCode = Harness
-
 // Config holds the settings used to build a Harness.
 type Config struct {
 	Endpoint        string
@@ -407,10 +404,9 @@ func (h *Harness) Events() <-chan core.HarnessEvent {
 	return h.events
 }
 
-// Harness and OpenCode satisfy the core harness, worktree and idle ports.
+// Harness satisfies the core harness, worktree and idle ports.
 var (
 	_ core.AgentHarness      = (*Harness)(nil)
-	_ core.AgentHarness      = (*OpenCode)(nil)
 	_ core.WorktreeRefresher = (*Harness)(nil)
 	_ core.IdleWatcher       = (*Harness)(nil)
 )
