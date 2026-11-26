@@ -128,10 +128,12 @@ func resolvedConfigPath(path, root string) string {
 	if path == "" {
 		return filepath.Join(root, ".beacon", "config.yaml")
 	}
-	if abs, err := filepath.Abs(path); err == nil {
-		return abs
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		logDiscard("resolve config path", err)
+		return path
 	}
-	return path
+	return abs
 }
 
 func wire(path, parentSession string) (*wiring, error) {
@@ -251,8 +253,9 @@ func buildInfra(c infraConstructors) (*wiredInfra, error) {
 	group.Go(func() error { h, errHarness = c.harness(); return errHarness })
 	group.Go(func() error { wt, errWorkspace = c.workspace(); return errWorkspace })
 	// Wait's aggregate error is order-dependent. The slots below are inspected
-	// in a fixed order instead so failures stay reproducible.
-	_ = group.Wait()
+	// in a fixed order instead so failures stay reproducible. The aggregate is
+	// still logged so a constructor failure is never invisible.
+	logDiscard("wait for infra constructors", group.Wait())
 
 	for _, err := range []error{errStore, errSource, errSCM, errHarness, errWorkspace} {
 		if err != nil {
@@ -457,6 +460,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// logDiscard records an error the caller deliberately treats as advisory. The
+// error never reaches the CLI exit path, so the log is the only place a user
+// can see it. A nil error logs nothing.
+func logDiscard(what string, err error) {
+	if err != nil {
+		slog.Warn("discarded error", "what", what, "error", err)
+	}
 }
 
 func (w *wiring) close() { _ = w.store.Close() }

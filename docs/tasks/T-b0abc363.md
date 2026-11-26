@@ -1,7 +1,7 @@
 ---
 id: T-b0abc363
 title: Surface discarded CLI errors
-status: available
+status: in_progress
 scope:
     - cmd/beacon/commands.go
     - cmd/beacon/main.go
