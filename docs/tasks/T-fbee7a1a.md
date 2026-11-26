@@ -1,7 +1,7 @@
 ---
 id: T-fbee7a1a
 title: Generate MCP registration and wire field tables
-status: available
+status: done
 scope:
     - internal/infra/mcp/registry.go
     - internal/infra/mcp/catalog.go
