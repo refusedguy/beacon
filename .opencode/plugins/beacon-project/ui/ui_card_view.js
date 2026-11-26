@@ -3,24 +3,8 @@
 import { CARD_BODY_LINES, str } from "./ui_model.js"
 import { createBox, createLineMount, createText } from "./ui_nodes.js"
 import { taskTree } from "./ui_alerts.js"
-
-const timeOf = (v) => {
-  if (v == null || v === "") return 0
-  if (typeof v === "number") return Number.isFinite(v) ? v : 0
-  const n = Number(v)
-  if (Number.isFinite(n) && n > 0) return n
-  const t = Date.parse(str(v))
-  return Number.isFinite(t) ? t : 0
-}
-export function durationText(ms) {
-  if (!Number.isFinite(ms) || ms < 0) return ""
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m`
-  const h = Math.floor(m / 60)
-  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`
-}
+import { clockTime, elapsed, timeOf } from "./time_format.js"
+export { elapsed as durationText }
 // Timeline and decision events carry the `at` stamp. Their first and last
 // stamps bound the whole run, which is the number the card header shows.
 export function runEventTimes(run) {
@@ -35,12 +19,9 @@ export function runEventTimes(run) {
 // mistaken for an elapsed duration.
 export function runTotalTime(run) {
   const times = runEventTimes(run)
-  if (times.length) return { text: durationText(times[times.length - 1] - times[0]), label: "total" }
+  if (times.length) return { text: elapsed(times[times.length - 1] - times[0]), label: "total" }
   const updated = run?.updatedAt
-  if (updated != null && updated !== "") {
-    const s = str(updated)
-    return { text: s.length >= 19 ? s.slice(11, 19) : s, label: "updated" }
-  }
+  if (updated != null && updated !== "") return { text: clockTime(updated), label: "updated" }
   return { text: "", label: "" }
 }
 
