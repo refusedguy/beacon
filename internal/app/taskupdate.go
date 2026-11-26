@@ -65,12 +65,16 @@ func (u *TaskUpdater) Update(ctx context.Context, updates []UpdateInput) (Update
 	}
 	var refused []string
 	if u.Store != nil {
+		ids := make([]string, len(batch))
+		for i, in := range batch {
+			ids[i] = in.ID
+		}
+		active, err := activeTaskStates(ctx, u.Store, ids)
+		if err != nil {
+			return out, err
+		}
 		for _, in := range batch {
-			run, err := u.Store.FindActiveByTask(ctx, core.TaskID(in.ID))
-			if err != nil {
-				return out, err
-			}
-			if run != nil {
+			if _, ok := active[in.ID]; ok {
 				refused = append(refused, in.ID)
 			}
 		}

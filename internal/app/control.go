@@ -248,12 +248,13 @@ func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 }
 
 func (c *Control) retryClosed(ctx context.Context, run *core.Run) error {
-	active, err := c.Store.FindActiveByTask(ctx, run.TaskID)
+	task := string(run.TaskID)
+	active, err := activeTaskStates(ctx, c.Store, []string{task})
 	if err != nil {
 		return err
 	}
-	if active != nil && active.ID != run.ID {
-		return core.Errorf(core.CodeConflict, "task %s already has active run %s", run.TaskID, active.ID)
+	if _, ok := active[task]; ok {
+		return core.Errorf(core.CodeConflict, "task %s already has an active run", run.TaskID)
 	}
 	if err := run.Retry("retried by operator"); err != nil {
 		return err
