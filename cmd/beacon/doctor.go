@@ -130,23 +130,14 @@ func doctorConfigPath(root, flag string) string {
 	return filepath.Join(root, ".beacon", "config.yaml")
 }
 
-// gitOutputAt runs a git command in root and returns trimmed output, or an empty string.
-func gitOutputAt(root string, args ...string) string {
-	out, err := exec.Command("git", append([]string{"-C", root}, args...)...).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 // doctorGitChecks verifies the work tree and the origin remote.
 func doctorGitChecks(root string) []doctorCheck {
-	inside, err := exec.Command("git", "-C", root, "rev-parse", "--is-inside-work-tree").Output()
-	if err != nil || strings.TrimSpace(string(inside)) != "true" {
+	inside, err := git(root, "rev-parse", "--is-inside-work-tree")
+	if err != nil || strings.TrimSpace(inside) != "true" {
 		return []doctorCheck{{"git repo", checkFail, root + " is not a git work tree"}}
 	}
 	checks := []doctorCheck{{"git repo", checkOK, root}}
-	if gitOutputAt(root, "remote", "get-url", "origin") == "" {
+	if gitTrim(root, "remote", "get-url", "origin") == "" {
 		checks = append(checks, doctorCheck{"origin remote", checkWarn, "no origin remote configured"})
 	} else {
 		checks = append(checks, doctorCheck{"origin remote", checkOK, "configured"})
@@ -186,7 +177,7 @@ func doctorBaseBranch(root string, cfg config.Config) doctorCheck {
 		return doctorCheck{"base branch", checkFail, "base_branch is empty"}
 	}
 	for _, ref := range []string{cfg.BaseBranch, "origin/" + cfg.BaseBranch} {
-		if gitOutputAt(root, "rev-parse", "--verify", "--quiet", ref) != "" {
+		if gitTrim(root, "rev-parse", "--verify", "--quiet", ref) != "" {
 			return doctorCheck{"base branch", checkOK, cfg.BaseBranch}
 		}
 	}

@@ -155,22 +155,32 @@ func allDigits(s string) bool {
 	return true
 }
 
-// gitOutput runs a git command and returns trimmed output, or an empty string.
-func gitOutput(args ...string) string {
+// git runs a git command and returns its output and error. An empty root runs
+// git in the current directory; otherwise the command runs at root.
+func git(root string, args ...string) (string, error) {
+	if root != "" {
+		args = append([]string{"-C", root}, args...)
+	}
 	out, err := exec.Command("git", args...).Output()
+	return string(out), err
+}
+
+// gitTrim runs a git command and returns trimmed output, or an empty string on error.
+func gitTrim(root string, args ...string) string {
+	out, err := git(root, args...)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(out)
 }
 
 // detectRemoteAndBase reads the origin URL and the default base branch.
 func detectRemoteAndBase() (remote, string, error) {
-	r, err := parseRemote(gitOutput("remote", "get-url", "origin"))
+	r, err := parseRemote(gitTrim("", "remote", "get-url", "origin"))
 	if err != nil {
 		return remote{}, "", err
 	}
-	base := strings.TrimPrefix(gitOutput("rev-parse", "--abbrev-ref", "origin/HEAD"), "origin/")
+	base := strings.TrimPrefix(gitTrim("", "rev-parse", "--abbrev-ref", "origin/HEAD"), "origin/")
 	if base == "" || base == "origin/HEAD" {
 		base = "main"
 	}
