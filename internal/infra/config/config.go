@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/infra/shared"
 	"gopkg.in/yaml.v3"
 )
 
@@ -318,97 +318,11 @@ func projectRootFromConfigPath(path string) string {
 	return dir
 }
 
-// DetectRequiredChecks collects job names from .github/workflows/*.yml. It is
-// the shared parser used by beacon init and by config load, so the detected
-// list cannot drift between the two.
+// DetectRequiredChecks collects job names from .github/workflows/*.yml. It
+// delegates to the shared parser so beacon init and config load cannot drift
+// from the workflow check source.
 func DetectRequiredChecks(root string) []string {
-	files, err := filepath.Glob(filepath.Join(root, ".github", "workflows", "*.y*ml"))
-	if err != nil {
-		return []string{}
-	}
-	seen := make(map[string]bool)
-	for _, file := range files {
-		data, err := os.ReadFile(file)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: skipping workflow %s: %v\n", file, err)
-			continue
-		}
-		for _, name := range parseJobNames(string(data)) {
-			seen[name] = true
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for name := range seen {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// parseJobNames extracts job names from a workflow document. Only the two-space
-// indented keys directly under jobs: are names; nested matrix and step keys sit
-// deeper and are ignored. A job with strategy.matrix is omitted because GitHub
-// reports only the expanded cell names, so the bare job name can never be
-// satisfied as a required check.
-func parseJobNames(content string) []string {
-	var names []string
-	inJobs := false
-	var current string
-	var body []string
-	flush := func() {
-		if current == "" || hasMatrix(body) {
-			return
-		}
-		names = append(names, current)
-	}
-	for _, line := range strings.Split(content, "\n") {
-		if strings.HasPrefix(line, "jobs:") {
-			inJobs = true
-			continue
-		}
-		if !inJobs {
-			continue
-		}
-		if line != "" && !strings.HasPrefix(line, " ") {
-			break
-		}
-		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") {
-			name, _, ok := strings.Cut(strings.TrimSpace(line), ":")
-			if ok && name != "" && !strings.HasPrefix(name, "#") {
-				flush()
-				current = name
-				body = nil
-				continue
-			}
-		}
-		if current != "" {
-			body = append(body, line)
-		}
-	}
-	flush()
-	return names
-}
-
-// hasMatrix reports whether a job body declares strategy.matrix.
-func hasMatrix(lines []string) bool {
-	inStrategy := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "strategy:" {
-			inStrategy = true
-			continue
-		}
-		if inStrategy && trimmed == "matrix:" {
-			return true
-		}
-		if line != "" && !strings.HasPrefix(line, " ") {
-			break
-		}
-		if inStrategy && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && trimmed != "" {
-			inStrategy = false
-		}
-	}
-	return false
+	return shared.DetectWorkflowJobNames(root)
 }
 
 // LiteralOrEnv returns the environment value named by envName when it is set,
