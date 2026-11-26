@@ -167,10 +167,15 @@ type RunEvent struct {
 }
 
 // Durations are seconds spent in a state, derived from timeline entries.
+// WaitingCI is the total; the three cycle fields split that total by the
+// rebase and fix transitions seen so far in the timeline.
 type Durations struct {
-	WaitingCI int64 `json:"waiting_ci_seconds"`
-	Running   int64 `json:"running_seconds"`
-	Blocked   int64 `json:"blocked_seconds"`
+	WaitingCI        int64 `json:"waiting_ci_seconds"`
+	WaitingCIInitial int64 `json:"waiting_ci_initial_seconds"`
+	WaitingCIRebase  int64 `json:"waiting_ci_rebase_seconds"`
+	WaitingCIFix     int64 `json:"waiting_ci_fix_seconds"`
+	Running          int64 `json:"running_seconds"`
+	Blocked          int64 `json:"blocked_seconds"`
 }
 
 // CheckSnapshot is the UI-facing view of one CI check.
@@ -202,6 +207,7 @@ type RunSnapshot struct {
 	UpdatedAt         time.Time       `json:"updated_at"`
 	Durations         Durations       `json:"durations"`
 	CIWallSeconds     int64           `json:"ci_wall_seconds"`
+	CICriticalPath    int64           `json:"ci_critical_path_seconds"`
 	Timeline          []RunEvent      `json:"timeline"`
 	Decisions         []Decision      `json:"decisions"`
 	Checks            []CheckSnapshot `json:"checks"`
@@ -220,6 +226,9 @@ type Metrics struct {
 	BlockedCount   int            `json:"blocked_count"`
 	Blocked        map[string]int `json:"blocked"`
 	CIWaitSeconds  int64          `json:"ci_wait_seconds"`
+	CIWaitInitial  int64          `json:"ci_wait_initial_seconds"`
+	CIWaitRebase   int64          `json:"ci_wait_rebase_seconds"`
+	CIWaitFix      int64          `json:"ci_wait_fix_seconds"`
 	ActiveCount    int            `json:"active_count"`
 	RecentCount    int            `json:"recent_count"`
 }
@@ -504,6 +513,7 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		MaxAttempts: run.MaxAttempts, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 		Durations: deriveDurations(run, events, now), Timeline: events, Decisions: decisions,
 		Checks: checkSnapshots(run.Checks), CIWallSeconds: core.CIWallSeconds(run.Checks),
+		CICriticalPath: criticalPathSeconds(run.Checks),
 	}
 }
 
@@ -532,28 +542,96 @@ func checkSnapshots(checks []core.CheckResult) []CheckSnapshot {
 	return out
 }
 
+// criticalPathSeconds is the span from the first check completion to the last
+// one. Checks missing either endpoint are ignored. A staged pipeline pays this
+// span in sequence, so it explains the CI wait that remains after the first
+// check finishes. It is zero when no check reports both endpoints.
+func criticalPathSeconds(checks []core.CheckResult) int64 {
+	var first, last time.Time
+	for _, c := range checks {
+		if c.StartedAt.IsZero() || c.CompletedAt.IsZero() || c.CompletedAt.Before(c.StartedAt) {
+			continue
+		}
+		if first.IsZero() || c.CompletedAt.Before(first) {
+			first = c.CompletedAt
+		}
+		if last.IsZero() || c.CompletedAt.After(last) {
+			last = c.CompletedAt
+		}
+	}
+	if first.IsZero() {
+		return 0
+	}
+	return int64(last.Sub(first).Seconds())
+}
+
+// ciCycle is the part of a run's CI wait the current timeline event belongs
+// to. A run starts in its initial cycle. A rebase or an agent fix starts a new
+// cycle that keeps its name until the next transition.
+type ciCycle int
+
+const (
+	ciInitial ciCycle = iota
+	ciRebase
+	ciFix
+)
+
+func cycleForState(state core.RunState, current ciCycle) ciCycle {
+	switch state {
+	case core.RunNeedsRebase:
+		return ciRebase
+	case core.RunNeedsAgentFix:
+		return ciFix
+	default:
+		return current
+	}
+}
+
+func addCycleDuration(out *Durations, cycle ciCycle, seconds int64) {
+	switch cycle {
+	case ciRebase:
+		out.WaitingCIRebase += seconds
+	case ciFix:
+		out.WaitingCIFix += seconds
+	default:
+		out.WaitingCIInitial += seconds
+	}
+}
+
 // deriveDurations measures each state interval. A live run has no closing
 // event, so its last interval runs until now and the panel sees a ticking
-// timer. Terminal runs keep the fixed UpdatedAt boundary.
+// timer. Terminal runs keep the fixed UpdatedAt boundary. Waiting CI is also
+// split by the cycle the timeline was in at each interval.
 func deriveDurations(run *core.Run, events []RunEvent, now time.Time) Durations {
 	var out Durations
 	endOfRun := run.UpdatedAt
 	if !run.State.Terminal() && now.After(endOfRun) {
 		endOfRun = now
 	}
+	cycle := ciInitial
 	for i, event := range events {
+		state := core.RunState(event.State)
+		cycle = cycleForState(state, cycle)
 		end := endOfRun
 		if i+1 < len(events) {
 			end = events[i+1].At
 		}
 		if end.After(event.At) {
-			addDuration(&out, core.RunState(event.State), int64(end.Sub(event.At).Seconds()))
+			seconds := int64(end.Sub(event.At).Seconds())
+			addDuration(&out, state, seconds)
+			if state == core.RunWaitingCI {
+				addCycleDuration(&out, cycle, seconds)
+			}
 		}
 	}
 	// Older state databases have no events. Use the run's own window so the
 	// panel still shows an elapsed time.
 	if len(events) == 0 && endOfRun.After(run.CreatedAt) {
-		addDuration(&out, run.State, int64(endOfRun.Sub(run.CreatedAt).Seconds()))
+		seconds := int64(endOfRun.Sub(run.CreatedAt).Seconds())
+		addDuration(&out, run.State, seconds)
+		if run.State == core.RunWaitingCI {
+			addCycleDuration(&out, cycleForState(run.State, cycle), seconds)
+		}
 	}
 	return out
 }
@@ -644,6 +722,9 @@ func addRunMetrics(m *Metrics, active, recent []RunSnapshot, merged, blocked map
 	for _, group := range [][]RunSnapshot{active, recent} {
 		for _, snap := range group {
 			m.CIWaitSeconds += snap.Durations.WaitingCI
+			m.CIWaitInitial += snap.Durations.WaitingCIInitial
+			m.CIWaitRebase += snap.Durations.WaitingCIRebase
+			m.CIWaitFix += snap.Durations.WaitingCIFix
 			id := snap.ID
 			if snap.State == string(core.RunMerged) {
 				merged[id] = true
