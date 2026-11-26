@@ -258,6 +258,166 @@ func TestHTTPRoutesRejectMissingBearerToken(t *testing.T) {
 	t.Logf("service calls after three rejected requests: %d", len(services.recorded()))
 }
 
+// countingStatus returns a fixed run list and counts every Active call. It
+// stands in for the status service so a test can observe store reads.
+type countingStatus struct {
+	mu    sync.Mutex
+	calls int
+	runs  []*core.Run
+}
+
+func (s *countingStatus) Active(context.Context) ([]*core.Run, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return s.runs, nil
+}
+
+func (s *countingStatus) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestRunsSnapshotSharedAcrossMonitorsPerGeneration proves that eight monitors
+// reacting to one PR change share a single store read. The whole scenario runs
+// twenty times; one Active call per generation means twenty calls in total.
+func TestRunsSnapshotSharedAcrossMonitorsPerGeneration(t *testing.T) {
+	const (
+		monitors    = 8
+		repetitions = 20
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := make(chan int, 1)
+	subs := newChangeSubscribers()
+	go subs.run(ctx, src)
+
+	runs := []*core.Run{{
+		ID:        "r1",
+		TaskID:    "T-1",
+		State:     core.RunRunning,
+		PRNumber:  7,
+		HeadSHA:   "abc123",
+		Branch:    "beacon/T-1",
+		Reason:    "queued",
+		UpdatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+	}}
+	status := &countingStatus{runs: runs}
+	api := &apiServer{
+		services: apiServices{status: status},
+		token:    "secret",
+		changes:  subs,
+	}
+	srv := httptest.NewServer(api.handler())
+	defer srv.Close()
+
+	streams := make([]*bufio.Scanner, monitors)
+	closers := make([]func(), monitors)
+	for i := range streams {
+		streams[i], closers[i] = connectSSE(t, srv, "secret")
+	}
+	defer func() {
+		for _, close := range closers {
+			close()
+		}
+	}()
+
+	// The cached bytes must match what writeJSON produced before the cache.
+	recorder := httptest.NewRecorder()
+	writeJSON(recorder, core.NewWireRuns(runs))
+	want := recorder.Body.String()
+
+	for rep := 0; rep < repetitions; rep++ {
+		src <- rep
+		for i, stream := range streams {
+			data := sseData(t, stream, "pr_changed")
+			if wantData := fmt.Sprintf(`"pr":%d`, rep); !strings.Contains(data, wantData) {
+				t.Fatalf("repetition %d monitor %d got %q, want %s", rep, i, data, wantData)
+			}
+		}
+
+		bodies := make([]string, monitors)
+		var wg sync.WaitGroup
+		for i := range streams {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/runs", nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				req.Header.Set("Authorization", "Bearer secret")
+				resp, err := srv.Client().Do(req)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				bodies[i] = string(body)
+			}(i)
+		}
+		wg.Wait()
+
+		for i, body := range bodies {
+			if body != want {
+				t.Fatalf("repetition %d monitor %d body = %q, want byte-identical %q", rep, i, body, want)
+			}
+		}
+		if got := status.count(); got != rep+1 {
+			t.Fatalf("after %d generations Active calls = %d, want %d", rep+1, got, rep+1)
+		}
+	}
+}
+
+// TestHarnessEventInvalidatesRunsSnapshot proves that a harness change ends the
+// current generation even with no monitor attached to the event stream.
+func TestHarnessEventInvalidatesRunsSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	status := &countingStatus{}
+	cache := &runsCache{}
+	load := func() string {
+		t.Helper()
+		body, err := cache.snapshot(context.Background(), status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	if first, second := load(), load(); first != second {
+		t.Fatalf("reads in one generation differ: %q vs %q", first, second)
+	}
+	if got := status.count(); got != 1 {
+		t.Fatalf("Active calls before harness change = %d, want 1", got)
+	}
+
+	events := make(chan core.HarnessEvent, 1)
+	done := make(chan struct{})
+	go func() {
+		invalidateOnHarness(ctx, events, cache)
+		close(done)
+	}()
+	events <- core.HarnessEvent{}
+	close(events)
+	<-done
+
+	_ = load()
+	if got := status.count(); got != 2 {
+		t.Fatalf("Active calls after harness change = %d, want 2", got)
+	}
+}
+
 func TestHTTPControlAcceptsKnownActionAndRejectsUnknownAction(t *testing.T) {
 	services := &recordingAPIServices{}
 	srv := newRecordingAPIServer(t, services)
