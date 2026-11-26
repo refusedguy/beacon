@@ -45,7 +45,7 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 			w := core.WakeContext{
 				RunID: run.ID, Reason: "idle without PR", Branch: run.Branch,
 				Workspace: run.WorkspacePath,
-				Excerpt:   fmt.Sprintf("You finished a turn but no PR is open for branch %s. Push your changes, open the PR and call beacon_watch_pr.", run.Branch),
+				Excerpt:   fmt.Sprintf("You finished a turn but no PR is open for branch %s. Push your changes, %s", run.Branch, core.OpenPRAndWatchInstruction),
 			}
 			wakeErr := r.Harness.Wake(ctx, run.SessionID, w)
 			// The claim guards one idle event, not the run's lifetime. Release it

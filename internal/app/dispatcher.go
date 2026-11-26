@@ -566,7 +566,7 @@ func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
 	if base := strings.TrimSpace(t.BaseBranch); base != "" {
 		fmt.Fprintf(&b, "BaseBranch: %s\nOpen the pull request against %s, not the default branch.\n", base, base)
 	}
-	b.WriteString("Implement the task, open a pull request, then call beacon_watch_pr with the run ID and PR number.\n")
+	b.WriteString("Implement the task, " + core.OpenPRAndWatchInstruction + "\n")
 	b.WriteString(prePRCheck)
 	appendWorkerPrompt(&b, t)
 	return b.String()

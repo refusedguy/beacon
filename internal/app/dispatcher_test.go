@@ -533,6 +533,44 @@ func TestSpawnPromptSharesWeakMachineRule(t *testing.T) {
 	}
 }
 
+func TestPRWatchInstructionIsSharedAcrossPrompts(t *testing.T) {
+	ctx := context.Background()
+	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	d := newInstructionDispatcher(h, "")
+	if _, err := d.Dispatch(ctx, 1); err != nil {
+		t.Fatalf(`d.Dispatch(ctx, 1): %v`, err)
+	}
+
+	idleHarness := &fakeHarness{}
+	store := newFakeStore()
+	run := makeRun("r1", 0, core.RunRunning)
+	run.Branch = "beacon/T-1"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	r := &Reconciler{
+		Store: store, SCM: &fakeSCM{}, Harness: idleHarness,
+		Workspace:  &changedWorkspace{fakeWorkspace: &fakeWorkspace{}, changed: true},
+		BaseBranch: "main",
+	}
+	r.HandleHarnessEvent(ctx, core.HarnessEvent{RunID: "r1", Kind: "idle"})
+	if len(idleHarness.wakes) != 1 {
+		t.Fatalf("idle wakes = %d, want 1", len(idleHarness.wakes))
+	}
+
+	w := core.WakeContext{RunID: "run-1", PRNumber: 17}
+	for name, text := range map[string]string{
+		"spawn":        h.requests[0].Prompt,
+		"wake":         core.WakeText(w),
+		"limited wake": core.WakeTextLimited(w, 0),
+		"idle nudge":   idleHarness.wakes[0].Excerpt,
+	} {
+		if !strings.Contains(text, core.OpenPRAndWatchInstruction) {
+			t.Errorf("%s prompt missing shared PR/watch instruction: %q", name, text)
+		}
+	}
+}
+
 func TestDispatchResolvesModelFromParentSession(t *testing.T) {
 	ref := core.ModelRef{ID: "hy4-flash-free", ProviderID: "opencode"}
 	var parents []string
