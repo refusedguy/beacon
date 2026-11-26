@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -40,33 +41,87 @@ type DecisionLookup interface {
 }
 
 // DecisionLogger writes decisions to an injected sink. A nil sink disables
-// persistence without touching the stderr log.
+// persistence without touching the stderr log. The reconcile cache lives
+// behind a pointer so Record can create and retain it across calls.
 type DecisionLogger struct {
-	Sink DecisionSink
+	Sink  DecisionSink
+	cache *decisionCache
+}
+
+// decisionCache holds the last written reconcile signature for each run. A
+// hit lets Record skip both the store read and the write when an observation
+// has not changed.
+type decisionCache struct {
+	mu   sync.Mutex
+	sigs map[string]string
+}
+
+func (c *decisionCache) get(runID string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sig, ok := c.sigs[runID]
+	return sig, ok
+}
+
+func (c *decisionCache) set(runID, sig string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sigs == nil {
+		c.sigs = make(map[string]string)
+	}
+	c.sigs[runID] = sig
+}
+
+// decisionCacheInitMu guards the lazy creation of cache on a DecisionLogger.
+var decisionCacheInitMu sync.Mutex
+
+func (l *DecisionLogger) cacheFor() *decisionCache {
+	decisionCacheInitMu.Lock()
+	defer decisionCacheInitMu.Unlock()
+	if l.cache == nil {
+		l.cache = &decisionCache{}
+	}
+	return l.cache
 }
 
 // Record forwards a decision to the logger's sink.
-func (l DecisionLogger) Record(ctx context.Context, d Decision) {
+func (l *DecisionLogger) Record(ctx context.Context, d Decision) {
 	sink := l.Sink
 	if sink == nil {
 		return
 	}
-	if d.Kind == "reconcile.decision" && d.RunID != "" && duplicateDecision(ctx, sink, d) {
-		slog.DebugContext(ctx, "decision.duplicate_skipped", "kind", d.Kind, "run_id", d.RunID)
-		return
+	reconcile := d.Kind == "reconcile.decision" && d.RunID != ""
+	var sig string
+	if reconcile {
+		sig = decisionSignature(d)
+		cache := l.cacheFor()
+		if cached, ok := cache.get(d.RunID); ok && cached == sig {
+			slog.DebugContext(ctx, "decision.duplicate_skipped", "kind", d.Kind, "run_id", d.RunID)
+			return
+		}
+		if duplicateDecision(ctx, sink, d, sig) {
+			cache.set(d.RunID, sig)
+			slog.DebugContext(ctx, "decision.duplicate_skipped", "kind", d.Kind, "run_id", d.RunID)
+			return
+		}
 	}
 	if d.At.IsZero() {
 		d.At = time.Now().UTC()
 	}
 	if err := sink.RecordDecision(ctx, d); err != nil {
 		slog.WarnContext(ctx, "decision.persist_failed", "kind", d.Kind, "error", err)
+		return
+	}
+	if reconcile {
+		l.cache.set(d.RunID, sig)
 	}
 }
 
 // duplicateDecision compares a decision with the newest stored one for the
 // same run. Only reconcile decisions are deduplicated; every other kind is a
-// distinct event in a run's timeline.
-func duplicateDecision(ctx context.Context, sink DecisionSink, d Decision) bool {
+// distinct event in a run's timeline. sig is the caller's signature of d, so d
+// is not signed a second time.
+func duplicateDecision(ctx context.Context, sink DecisionSink, d Decision, sig string) bool {
 	lookup, ok := sink.(DecisionLookup)
 	if !ok {
 		return false
@@ -76,7 +131,7 @@ func duplicateDecision(ctx context.Context, sink DecisionSink, d Decision) bool 
 		slog.WarnContext(ctx, "decision.last_lookup_failed", "run_id", d.RunID, "error", err)
 		return false
 	}
-	return last != nil && decisionSignature(*last) == decisionSignature(d)
+	return last != nil && decisionSignature(*last) == sig
 }
 
 // decisionSignature is the part of a reconcile decision that describes a real
@@ -114,7 +169,7 @@ func decisionAttrs(ctx context.Context, fields ...any) []any {
 	return append([]any{"cycle_id", cycleID(ctx)}, fields...)
 }
 
-func (l DecisionLogger) logDispatchCandidates(ctx context.Context, candidates, active, limit, budget int) {
+func (l *DecisionLogger) logDispatchCandidates(ctx context.Context, candidates, active, limit, budget int) {
 	slog.InfoContext(ctx, "dispatch.candidates", decisionAttrs(ctx,
 		"candidates", candidates,
 		"active", active,
@@ -129,7 +184,7 @@ func (l DecisionLogger) logDispatchCandidates(ctx context.Context, candidates, a
 	})
 }
 
-func (l DecisionLogger) logDispatchSkip(ctx context.Context, s SkippedTask) {
+func (l *DecisionLogger) logDispatchSkip(ctx context.Context, s SkippedTask) {
 	slog.InfoContext(ctx, "dispatch.skip", decisionAttrs(ctx,
 		"task_id", string(s.TaskID),
 		"code", string(s.Code),
@@ -167,7 +222,7 @@ func reconcileAction(d core.MergeDecision) string {
 	}
 }
 
-func (l DecisionLogger) logReconcileDecision(ctx context.Context, pr int, run *core.Run, obs core.Observation, decision core.MergeDecision, action string) {
+func (l *DecisionLogger) logReconcileDecision(ctx context.Context, pr int, run *core.Run, obs core.Observation, decision core.MergeDecision, action string) {
 	slog.InfoContext(ctx, "reconcile.decision", decisionAttrs(ctx,
 		"pr", pr,
 		"run_id", string(run.ID),
@@ -192,13 +247,13 @@ func (l DecisionLogger) logReconcileDecision(ctx context.Context, pr int, run *c
 }
 
 // logReconcileDecisionDeferred logs the final decision after Reconcile returns.
-func (l DecisionLogger) logReconcileDecisionDeferred(ctx context.Context, pr int, run *core.Run, obs core.Observation, decision *core.MergeDecision) {
+func (l *DecisionLogger) logReconcileDecisionDeferred(ctx context.Context, pr int, run *core.Run, obs core.Observation, decision *core.MergeDecision) {
 	if decision.Verdict != "" {
 		l.logReconcileDecision(ctx, pr, run, obs, *decision, reconcileAction(*decision))
 	}
 }
 
-func (l DecisionLogger) logTransitionSpawn(ctx context.Context, runID core.RunID, taskID core.TaskID, branch string) {
+func (l *DecisionLogger) logTransitionSpawn(ctx context.Context, runID core.RunID, taskID core.TaskID, branch string) {
 	slog.InfoContext(ctx, "transition.spawn", decisionAttrs(ctx,
 		"run_id", string(runID),
 		"task_id", string(taskID),
@@ -214,7 +269,7 @@ func (l DecisionLogger) logTransitionSpawn(ctx context.Context, runID core.RunID
 // emitTransition writes the shared slog record and Decision for a run
 // transition. An empty result leaves out the result attribute and Action field,
 // which keeps watch_pr's decision shape unchanged.
-func (l DecisionLogger) emitTransition(ctx context.Context, kind string, runID core.RunID, pr int, result string) {
+func (l *DecisionLogger) emitTransition(ctx context.Context, kind string, runID core.RunID, pr int, result string) {
 	attrs := decisionAttrs(ctx, "run_id", string(runID), "pr", pr)
 	d := Decision{
 		CycleID: cycleID(ctx), Kind: kind,
@@ -228,11 +283,11 @@ func (l DecisionLogger) emitTransition(ctx context.Context, kind string, runID c
 	l.Record(ctx, d)
 }
 
-func (l DecisionLogger) logTransitionWatchPR(ctx context.Context, runID core.RunID, pr int) {
+func (l *DecisionLogger) logTransitionWatchPR(ctx context.Context, runID core.RunID, pr int) {
 	l.emitTransition(ctx, "transition.watch_pr", runID, pr, "")
 }
 
-func (l DecisionLogger) logTransitionRebase(ctx context.Context, runID core.RunID, pr, attempt int, newSHA, result string) {
+func (l *DecisionLogger) logTransitionRebase(ctx context.Context, runID core.RunID, pr, attempt int, newSHA, result string) {
 	slog.InfoContext(ctx, "transition.rebase", decisionAttrs(ctx,
 		"run_id", string(runID),
 		"pr", pr,
@@ -247,15 +302,15 @@ func (l DecisionLogger) logTransitionRebase(ctx context.Context, runID core.RunI
 	})
 }
 
-func (l DecisionLogger) logTransitionWake(ctx context.Context, runID core.RunID, pr int, result string) {
+func (l *DecisionLogger) logTransitionWake(ctx context.Context, runID core.RunID, pr int, result string) {
 	l.emitTransition(ctx, "transition.wake", runID, pr, result)
 }
 
-func (l DecisionLogger) logTransitionMerge(ctx context.Context, runID core.RunID, pr int, result string) {
+func (l *DecisionLogger) logTransitionMerge(ctx context.Context, runID core.RunID, pr int, result string) {
 	l.emitTransition(ctx, "transition.merge", runID, pr, result)
 }
 
-func (l DecisionLogger) logTransitionDeliveryClaim(ctx context.Context, runID core.RunID, pr int, claimed bool) {
+func (l *DecisionLogger) logTransitionDeliveryClaim(ctx context.Context, runID core.RunID, pr int, claimed bool) {
 	slog.InfoContext(ctx, "transition.delivery_claim", decisionAttrs(ctx,
 		"run_id", string(runID),
 		"pr", pr,
@@ -268,6 +323,6 @@ func (l DecisionLogger) logTransitionDeliveryClaim(ctx context.Context, runID co
 	})
 }
 
-func (l DecisionLogger) logTransitionParentNotify(ctx context.Context, runID core.RunID, pr int, result string) {
+func (l *DecisionLogger) logTransitionParentNotify(ctx context.Context, runID core.RunID, pr int, result string) {
 	l.emitTransition(ctx, "transition.parent_notify", runID, pr, result)
 }
