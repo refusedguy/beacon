@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -232,29 +231,12 @@ func (r *Reconciler) canStartFixer(ctx context.Context, in *core.BaseIncident, o
 
 const excerptRuneLimit = 1200
 
-// compactExcerpt trims s and truncates it to excerptRuneLimit runes. A byte
-// length check handles strings that fit without converting them to runes. Long
-// valid UTF-8 strings are walked rune by rune up to the limit, so an 8 KB
-// excerpt allocates no rune slice. Invalid UTF-8 falls back to compact so the
-// output stays byte for byte identical to the shared helper.
+// compactExcerpt trims s and applies the shared core truncator. Trimming and
+// carriage-return removal stay local; the rune limit, rune-safe scan and marker
+// live in core so wake text and fixer prompts truncate the same way.
 func compactExcerpt(s string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\r", ""))
-	if len(s) <= excerptRuneLimit {
-		return s
-	}
-	if !utf8.ValidString(s) {
-		return compact(s)
-	}
-	i, n := 0, 0
-	for i < len(s) && n < excerptRuneLimit {
-		_, size := utf8.DecodeRuneInString(s[i:])
-		i += size
-		n++
-	}
-	if i == len(s) {
-		return s
-	}
-	return s[:i] + "\n...[truncated]"
+	return core.TruncateExcerpt(s, excerptRuneLimit)
 }
 
 func fixerPrompt(base core.BaseStatus, in *core.BaseIncident, task core.Task, instructions string) string {

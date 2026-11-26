@@ -53,16 +53,21 @@ func WakeTextLimited(w WakeContext, limit int) string {
 		w.RunID, w.PRNumber, w.HeadSHA, w.RebaseTry, w.FixTry)
 	fmt.Fprintf(&b, "reason: %s\n", w.Reason)
 	if w.Excerpt != "" {
-		fmt.Fprintf(&b, "excerpt: %s\n", truncate(w.Excerpt, limit))
+		fmt.Fprintf(&b, "excerpt: %s\n", TruncateExcerpt(w.Excerpt, limit))
 	}
 	b.WriteString("fix the issue, push, " + OpenPRAndWatchInstruction)
 	return b.String()
 }
 
-// truncate caps s at limit runes. A byte length check keeps short strings
-// allocation free, and valid UTF-8 is walked only up to the cap. Invalid UTF-8
-// keeps the eager conversion so replacement bytes stay identical.
-func truncate(s string, limit int) string {
+// excerptMarker is the single suffix appended when an excerpt is cut short.
+// Wake text and fixer prompts share it so fixtures parse one marker.
+const excerptMarker = "..."
+
+// TruncateExcerpt caps s at limit runes and appends excerptMarker when text is
+// removed. A byte length check keeps short strings allocation free, and valid
+// UTF-8 is walked only up to the cap. Invalid UTF-8 keeps the eager conversion
+// so replacement bytes stay identical.
+func TruncateExcerpt(s string, limit int) string {
 	if limit <= 0 || len(s) <= limit {
 		return s
 	}
@@ -71,7 +76,7 @@ func truncate(s string, limit int) string {
 		if len(r) <= limit {
 			return s
 		}
-		return string(r[:limit]) + "..."
+		return string(r[:limit]) + excerptMarker
 	}
 	i, n := 0, 0
 	for i < len(s) && n < limit {
@@ -82,5 +87,5 @@ func truncate(s string, limit int) string {
 	if i == len(s) {
 		return s
 	}
-	return s[:i] + "..."
+	return s[:i] + excerptMarker
 }
