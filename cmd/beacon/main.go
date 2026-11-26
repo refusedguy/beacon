@@ -317,15 +317,17 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		}
 	}}
 	recon := newReconciler(app.ReconcilerConfig{
-		Notifier:       notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
-		Repo:           cfg.RepoSlug(),
-		BaseBranch:     cfg.BaseBranch,
-		ParentSession:  parentSession,
-		BaseRedMode:    cfg.OnBaseRed.Mode,
-		MaxFixTries:    cfg.OnBaseRed.MaxFixAttempts,
-		Interval:       cfg.Interval(),
-		AutoRebase:     cfg.Merge.AutoRebase,
-		MaxAutoRebases: cfg.Merge.MaxAutoRebases,
+		Notifier:           notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
+		Repo:               cfg.RepoSlug(),
+		BaseBranch:         cfg.BaseBranch,
+		ParentSession:      parentSession,
+		BaseRedMode:        cfg.OnBaseRed.Mode,
+		WorkerInstructions: cfg.Harness.WorkerInstructions,
+		MaxFixTries:        cfg.OnBaseRed.MaxFixAttempts,
+		MaxAttempts:        cfg.Merge.MaxAttempts,
+		Interval:           cfg.Interval(),
+		AutoRebase:         cfg.Merge.AutoRebase,
+		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
 	}, infra.store, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
 	return &wiring{
@@ -366,17 +368,20 @@ func newReconciler(
 	return &app.Reconciler{
 		Store: store, SCM: scmGW, Policy: p, Harness: h,
 		Source: source, Workspace: wt,
-		Notifier:        cfg.Notifier,
-		Dispatcher:      disp,
-		Changes:         changes,
-		Repo:            cfg.Repo,
-		BaseBranch:      cfg.BaseBranch,
-		BaseRedMode:     cfg.BaseRedMode,
-		MaxFixTries:     cfg.MaxFixTries,
-		ParentSessionID: cfg.ParentSession,
-		Interval:        cfg.Interval,
-		AutoRebase:      cfg.AutoRebase,
-		MaxAutoRebases:  cfg.MaxAutoRebases,
+		Notifier:           cfg.Notifier,
+		Promoter:           disp,
+		AgentSlots:         disp,
+		Changes:            changes,
+		Repo:               cfg.Repo,
+		BaseBranch:         cfg.BaseBranch,
+		BaseRedMode:        cfg.BaseRedMode,
+		WorkerInstructions: cfg.WorkerInstructions,
+		MaxFixTries:        cfg.MaxFixTries,
+		MaxAttempts:        cfg.MaxAttempts,
+		ParentSessionID:    cfg.ParentSession,
+		Interval:           cfg.Interval,
+		AutoRebase:         cfg.AutoRebase,
+		MaxAutoRebases:     cfg.MaxAutoRebases,
 	}
 }
 

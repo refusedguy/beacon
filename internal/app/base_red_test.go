@@ -190,9 +190,9 @@ func TestRedBaseParentNoticeCarriesReason(t *testing.T) {
 	}
 }
 
-func TestFixerInheritsDispatcherMaxAttempts(t *testing.T) {
+func TestFixerInheritsConfiguredMaxAttempts(t *testing.T) {
 	r, store, _, _, _ := redReconciler(t)
-	r.Dispatcher = &Dispatcher{MaxAttempts: 17}
+	r.MaxAttempts = 17
 	ctx := context.Background()
 	if _, err := r.Reconcile(ctx, 42); err != nil {
 		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)

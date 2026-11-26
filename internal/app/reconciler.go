@@ -48,45 +48,56 @@ type ReconcilerPolicy interface {
 	ReviewGate
 }
 
+// Promoter starts queued runs when an agent slot becomes free. Reconciler
+// calls this port on each tick instead of reaching into a concrete Dispatcher,
+// so a test can supply a fake without building a dispatcher.
+type Promoter interface {
+	PromotePending(ctx context.Context) ([]*core.Run, error)
+}
+
 // ReconcilerConfig holds the settings the reconciler reads at construction.
 // The composition root copies them from config.Config, so the service never
 // receives unrelated configuration.
 type ReconcilerConfig struct {
-	Notifier       core.Notifier
-	Repo           string
-	BaseBranch     string
-	ParentSession  string
-	BaseRedMode    string
-	MaxFixTries    int
-	Interval       time.Duration
-	AutoRebase     bool
-	MaxAutoRebases int
+	Notifier           core.Notifier
+	Repo               string
+	BaseBranch         string
+	ParentSession      string
+	BaseRedMode        string
+	WorkerInstructions string
+	MaxFixTries        int
+	MaxAttempts        int
+	Interval           time.Duration
+	AutoRebase         bool
+	MaxAutoRebases     int
 }
 
 // Reconciler observes pull requests, applies merge policy to their runs and
 // drains the harness and timer events that drive the daemon loop.
 type Reconciler struct {
-	Store           ReconcilerStore
-	SCM             core.ScmGateway
-	Policy          ReconcilerPolicy
-	Harness         core.AgentHarness
-	Source          core.TaskSource
-	Workspace       core.WorkspaceManager
-	Notifier        core.Notifier
-	Dispatcher      *Dispatcher
-	AgentSlots      core.AgentSlots
-	Changes         chan<- int
-	Repo            string
-	BaseBranch      string
-	ParentSessionID string
-	BaseRedMode     string
-	MaxFixTries     int
-	Interval        time.Duration
-	OrphanTimeout   time.Duration
-	Events          <-chan core.HarnessEvent
-	AutoRebase      bool
-	MaxAutoRebases  int
-	Decisions       DecisionLogger
+	Store              ReconcilerStore
+	SCM                core.ScmGateway
+	Policy             ReconcilerPolicy
+	Harness            core.AgentHarness
+	Source             core.TaskSource
+	Workspace          core.WorkspaceManager
+	Notifier           core.Notifier
+	Promoter           Promoter
+	AgentSlots         core.AgentSlots
+	Changes            chan<- int
+	Repo               string
+	BaseBranch         string
+	ParentSessionID    string
+	BaseRedMode        string
+	WorkerInstructions string
+	MaxFixTries        int
+	MaxAttempts        int
+	Interval           time.Duration
+	OrphanTimeout      time.Duration
+	Events             <-chan core.HarnessEvent
+	AutoRebase         bool
+	MaxAutoRebases     int
+	Decisions          DecisionLogger
 }
 
 // Reconcile observes pr once, evaluates the merge policy and applies the
@@ -254,24 +265,13 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed, Reason: reason}, obs)
 }
 
-// agentSlots resolves the slot policy through the port. The concrete
-// dispatcher remains wired for promotion and retry settings, and satisfies the
-// port itself, so existing wiring keeps working while tests can inject a fake.
-func (r *Reconciler) agentSlots() core.AgentSlots {
-	if r.AgentSlots != nil {
-		return r.AgentSlots
-	}
-	if r.Dispatcher != nil {
-		return r.Dispatcher
-	}
-	return nil
-}
-
-// hasAgentSlot delegates the wake decision to the same AgentSlots policy used
-// by dispatch and promotion. A store error makes Available return zero, so a
-// wake is skipped rather than started on an unreadable budget.
+// hasAgentSlot delegates the wake decision to the injected AgentSlots policy.
+// The composition root injects the dispatcher as the port, so reconciliation
+// no longer probes a concrete type for the budget. A missing port fails open;
+// a store error makes Available return zero, so a wake is skipped rather than
+// started on an unreadable budget.
 func (r *Reconciler) hasAgentSlot(ctx context.Context) bool {
-	slots := r.agentSlots()
+	slots := r.AgentSlots
 	if slots == nil {
 		return true
 	}
@@ -324,8 +324,8 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 					r.safeReconcile(ctx, run.PRNumber)
 				}
 			}
-			if r.Dispatcher != nil {
-				if _, err := r.Dispatcher.PromotePending(ctx); err != nil {
+			if r.Promoter != nil {
+				if _, err := r.Promoter.PromotePending(ctx); err != nil {
 					slog.Error("promote pending", "error", err)
 				}
 			}
