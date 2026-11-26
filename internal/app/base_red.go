@@ -181,9 +181,9 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	if err != nil {
 		// The fixer never started. A failed workspace cleanup is logged with the
 		// run and task IDs so the next reconcile can still retry.
-		if cleanupErr := r.Workspace.Remove(ctx, ws); cleanupErr != nil {
-			slog.Error("remove fixer workspace", "run", id, "task", task.ID, "error", cleanupErr)
-		}
+		bestEffort("remove fixer workspace", func() error {
+			return r.Workspace.Remove(ctx, ws)
+		}, "run", id, "task", task.ID)
 		return err
 	}
 	run.SessionID = session.ID

@@ -288,9 +288,9 @@ func (r *Reconciler) cleanupRun(ctx context.Context, run *core.Run) error {
 	if run.SessionID != "" {
 		// The run is already finalized. A failed stop leaves a session that the
 		// next orphan sweep can close, so cleanup stays best effort.
-		if err := r.Harness.Stop(ctx, run.SessionID); err != nil {
-			slog.Error("cleanup session stop", "run", run.ID, "task", run.TaskID, "error", err)
-		}
+		bestEffort("cleanup session stop", func() error {
+			return r.Harness.Stop(ctx, run.SessionID)
+		}, "run", run.ID, "task", run.TaskID)
 	}
 	if run.WorkspacePath == "" {
 		return nil
@@ -307,13 +307,13 @@ func (r *Reconciler) cleanupRun(ctx context.Context, run *core.Run) error {
 			return nil
 		}
 		slog.Info("force removing worktree of terminal run", "run", run.ID, "path", ws.Path)
-		if err := r.Workspace.ForceRemove(ctx, ws); err != nil {
-			slog.Error("force remove worktree", "run", run.ID, "error", err)
-		}
+		bestEffort("force remove worktree", func() error {
+			return r.Workspace.ForceRemove(ctx, ws)
+		}, "run", run.ID)
 		return nil
 	}
-	if err := r.Workspace.Remove(ctx, ws); err != nil {
-		slog.Error("remove worktree", "run", run.ID, "error", err)
-	}
+	bestEffort("remove worktree", func() error {
+		return r.Workspace.Remove(ctx, ws)
+	}, "run", run.ID)
 	return nil
 }
