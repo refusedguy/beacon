@@ -441,3 +441,131 @@ func TestNewerSnapshotWins(t *testing.T) {
 		t.Fatalf("late response overwrote newer snapshot:\n%s\nwant:\n%s", got, want)
 	}
 }
+
+// controlFixture serves a run list and one control response, counting every
+// control POST. It drives apply() from a selected run to the rendered status.
+type controlFixture struct {
+	server  *httptest.Server
+	control string
+	posts   *int64
+}
+
+func newControlFixture(t *testing.T, runID, controlBody string) *controlFixture {
+	t.Helper()
+	var posts int64
+	f := &controlFixture{control: controlBody, posts: &posts}
+	runsJSON := `{"runs":[{"id":"` + runID + `","task_id":"T-control","state":"closed","pr":42,"head_sha":"abc123","updated_at":"2026-11-26T10:00:00Z"}]}`
+	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case apiRunsPath:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, runsJSON)
+		case apiControlPath:
+			atomic.AddInt64(&posts, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, f.control)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+func (f *controlFixture) loaded(t *testing.T) model {
+	t.Helper()
+	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
+	return m
+}
+
+// TestRefusalRendersReason is the task check. A control refusal carrying a
+// daemon reason renders that reason in the status line.
+func TestRefusalRendersReason(t *testing.T) {
+	const reason = "run is closed"
+	f := newControlFixture(t, "run-control", `{"ok":false,"reason":"`+reason+`"}`)
+	m := f.loaded(t)
+
+	raw := m.apply(ActionApprove)()
+	msg, ok := raw.(actionMsg)
+	if !ok {
+		t.Fatalf("apply returned %T, want actionMsg", raw)
+	}
+	if msg.err != nil {
+		t.Fatalf("apply: %v", msg.err)
+	}
+	next, followUp := m.Update(msg)
+	if followUp != nil {
+		t.Fatalf("refusal returned an unexpected command: %v", followUp)
+	}
+	view := next.(model).View()
+	if !strings.Contains(view, "refused") {
+		t.Fatalf("view missing refusal status:\n%s", view)
+	}
+	if !strings.Contains(view, reason) {
+		t.Fatalf("view missing daemon reason %q:\n%s", reason, view)
+	}
+	if got := atomic.LoadInt64(f.posts); got != 1 {
+		t.Fatalf("control POSTs = %d, want 1", got)
+	}
+}
+
+// TestApprovedKeepsDisplay proves an approved action keeps the existing status
+// and still schedules a reload.
+func TestApprovedKeepsDisplay(t *testing.T) {
+	f := newControlFixture(t, "run-control", `{"ok":true,"action":"approve","run_id":"run-control","applied":true}`)
+	m := f.loaded(t)
+
+	msg := m.apply(ActionApprove)().(actionMsg)
+	next, followUp := m.Update(msg)
+	if followUp == nil {
+		t.Fatal("approved action must schedule a reload")
+	}
+	view := next.(model).View()
+	if !strings.Contains(view, "approve run-control: applied") {
+		t.Fatalf("approved display changed:\n%s", view)
+	}
+	if strings.Contains(view, "refused") {
+		t.Fatalf("approved action reported a refusal:\n%s", view)
+	}
+}
+
+// TestMissingAppliedUsesOK proves an omitted applied field does not turn an
+// accepted response into a refusal.
+func TestMissingAppliedUsesOK(t *testing.T) {
+	f := newControlFixture(t, "run-control", `{"ok":true,"action":"approve","run_id":"run-control"}`)
+	m := f.loaded(t)
+
+	msg := m.apply(ActionApprove)().(actionMsg)
+	if msg.applied != nil {
+		t.Fatalf("omitted applied decoded as %v, want nil", *msg.applied)
+	}
+	next, followUp := m.Update(msg)
+	if followUp == nil {
+		t.Fatal("ok true with no applied must be treated as applied")
+	}
+	view := next.(model).View()
+	if !strings.Contains(view, "approve run-control: applied") || strings.Contains(view, "refused") {
+		t.Fatalf("view for missing applied:\n%s", view)
+	}
+}
+
+// TestAppliedFalseRendersReason proves an explicit applied false is a refusal,
+// even when ok is true, and shows the daemon reason.
+func TestAppliedFalseRendersReason(t *testing.T) {
+	const reason = "blocked by policy"
+	f := newControlFixture(t, "run-control", `{"ok":true,"applied":false,"reason":"`+reason+`"}`)
+	m := f.loaded(t)
+
+	msg := m.apply(ActionApprove)().(actionMsg)
+	if msg.applied == nil || *msg.applied {
+		t.Fatalf("applied = %v, want explicit false", msg.applied)
+	}
+	next, followUp := m.Update(msg)
+	if followUp != nil {
+		t.Fatal("refusal must not schedule a reload")
+	}
+	view := next.(model).View()
+	if !strings.Contains(view, "refused") || !strings.Contains(view, reason) {
+		t.Fatalf("view missing refusal reason %q:\n%s", reason, view)
+	}
+}
