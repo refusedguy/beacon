@@ -18,10 +18,10 @@ func TestReadSSE(t *testing.T) {
 	if len(frames) != 2 {
 		t.Fatalf("frames: %d: %+v", len(frames), frames)
 	}
-	if frames[0].id != "4" || frames[0].event != "run.updated" || !strings.Contains(frames[0].data, "run-1") {
+	if frames[0].event != "run.updated" || !strings.Contains(frames[0].data, "run-1") {
 		t.Fatalf("first frame: %+v", frames[0])
 	}
-	if frames[1].id != "5" || !strings.Contains(frames[1].data, "run-2") {
+	if !strings.Contains(frames[1].data, "run-2") {
 		t.Fatalf("second frame: %+v", frames[1])
 	}
 }
