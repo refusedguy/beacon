@@ -3,15 +3,21 @@
 // safe outside a renderer context. No TUI imports: the caller injects them.
 import { STATE_BAR_KEYS } from "./ui_view.js"
 
+// The four props every text baseline shares. Callers add flex and colour on
+// top, so a wrapping cell and a static label start from the same host state.
+export const baseTextProps = (wrap = false) => ({
+  wrapMode: wrap ? "word" : "none",
+  selectable: false,
+  truncate: !wrap,
+})
+
 export function createLineMount(ui, {
   color, BOLD = 0, onItem, hoverBg, maxLines, wrap = false, shrinkStatus = false,
 }) {
   const { createElement, insert, setProp } = ui
   const cell = (grow = false, shrinkable = false, right = false) => {
     const node = createElement("text")
-    setProp(node, "wrapMode", wrap && grow ? "word" : "none")
-    setProp(node, "selectable", false)
-    setProp(node, "truncate", !(wrap && grow))
+    for (const [key, value] of Object.entries(baseTextProps(wrap && grow))) setProp(node, key, value)
     setProp(node, "flexShrink", grow || shrinkable ? 1 : 0)
     if (grow || shrinkable || right) setProp(node, "minWidth", 0)
     if (grow || right) setProp(node, "flexGrow", 1)
@@ -84,6 +90,52 @@ export function createLineMount(ui, {
   return { node: lines, apply }
 }
 
+// The visual props of every rounded plate. These nine keys stay identical
+// across the card hero, the detail hero, the confirm box and pooled reason
+// rows. Layout props are supplied by the caller.
+const PLATE_KEYS = [
+  "border", "borderStyle", "borderColor", "backgroundColor",
+  "paddingLeft", "paddingRight", "paddingTop", "paddingBottom", "marginTop",
+]
+
+export function createCardPlate(ui, deps, options = {}) {
+  const { color } = deps
+  const { border = "action", background = "panel", target, ...props } = options
+  const plate = {
+    border: true, borderStyle: "rounded", borderColor: color(border),
+    backgroundColor: color(background),
+    paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, marginTop: 1,
+  }
+  // A pooled row keeps its node identity, so the same plate props are applied
+  // through setProp instead of allocating a new box.
+  if (target) {
+    const set = deps.setProp ?? ((node, key, value) => { node.props[key] = value })
+    for (const [key, value] of Object.entries(plate)) set(target, key, value)
+    return target
+  }
+  return createBox(ui, { ...plate, ...props })
+}
+
+// A scroll host and a fixed line pool are mounted together in both panels.
+// Sidebar passes scroll:false so its rows stay direct children of the slot.
+export function mountLines(ui, parent, deps, options = {}) {
+  const { insert } = ui
+  const { scroll = false, ...lineOptions } = options
+  const host = scroll
+    ? createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0, minHeight: 0 })
+    : parent
+  const mount = createLineMount(ui, { ...deps, ...lineOptions })
+  mount.node.forEach((node) => insert(host, node))
+  if (scroll) insert(parent, host)
+  return { ...mount, scroll: scroll ? host : null }
+}
+
+// Pooled boxes must lose the plate styling of a previous row. Resetting the
+// same key list keeps a plain row from inheriting a border or padding.
+export function resetProps(set, node, keys = PLATE_KEYS) {
+  for (const key of keys) set(node, key, undefined)
+}
+
 // One row of proportional segments, each with its own theme color. One fixed
 // cell per state plus the muted remainder, allocated once so refresh never
 // creates a node.
@@ -118,9 +170,7 @@ export function createText(ui, { content = "", fg, wrap = false, grow = false, b
   if (name) setProp(node, "name", name)
   setProp(node, "content", content)
   if (fg) setProp(node, "fg", fg)
-  setProp(node, "wrapMode", wrap ? "word" : "none")
-  setProp(node, "selectable", false)
-  setProp(node, "truncate", !wrap)
+  for (const [key, value] of Object.entries(baseTextProps(wrap))) setProp(node, key, value)
   setProp(node, "flexShrink", grow ? 1 : 0)
   if (grow) { setProp(node, "flexGrow", 1); setProp(node, "minWidth", 0) }
   if (bold) setProp(node, "attributes", 1)

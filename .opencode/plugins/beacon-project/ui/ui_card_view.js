@@ -1,7 +1,7 @@
 // Read-only task card view for session.panel. Nodes are allocated only inside
 // the render callback that opens the panel. apply() changes props in place.
 import { CARD_BODY_LINES, str } from "./ui_model.js"
-import { createBox, createLineMount, createText } from "./ui_nodes.js"
+import { createBox, createCardPlate, createText, mountLines } from "./ui_nodes.js"
 import { taskTree } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
 
@@ -252,18 +252,10 @@ export function createCardMount(ui, deps) {
 
   // A bordered, padded card holds the full metadata and body. Body cells are
   // word-wrapped and never truncated, so the operator can read the whole card.
-  const plate = createBox(ui, {
-    border: true, borderStyle: "rounded", borderColor: color("action"),
-    backgroundColor: color("panel"), paddingLeft: 1, paddingRight: 1,
-    paddingTop: 1, paddingBottom: 1, marginTop: 1,
-    flexDirection: "column", minWidth: 0,
+  const plate = createCardPlate(ui, deps, { flexDirection: "column", minWidth: 0 })
+  const body = mountLines(ui, plate, deps, {
+    scroll: true, onItem, maxLines: CARD_LINES, wrap: true, shrinkStatus: true,
   })
-  const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0, minHeight: 0 })
-  const body = createLineMount(ui, {
-    ...deps, onItem, maxLines: CARD_LINES, wrap: true, shrinkStatus: true,
-  })
-  body.node.forEach((node) => insert(scroll, node))
-  insert(plate, scroll)
   insert(container, plate)
 
   // Clipboard is the supported path into the current session. OpenCode 2.3.2

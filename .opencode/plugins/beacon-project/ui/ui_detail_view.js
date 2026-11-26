@@ -2,7 +2,9 @@
 // are fixed nodes built in one render callback. apply() changes props only, so
 // a collapse, a refresh or a new selection never allocates a node.
 import { ACTION_NAMES, DETAIL_OPEN } from "./ui_view.js"
-import { createBox, createLineMount, createText } from "./ui_nodes.js"
+import {
+  createBox, createCardPlate, createText, mountLines, resetProps,
+} from "./ui_nodes.js"
 import { createButtonPlate, createPanelChrome } from "./ui_card_view.js"
 
 export const DETAIL_LINES = 80
@@ -31,11 +33,8 @@ export function createDetailMount(ui, deps) {
   const { container, fieldKey } = chrome
 
   // The hero uses the darker panel token so the raised button plates stand out.
-  const heroCard = createBox(ui, {
-    border: true, borderStyle: "rounded", borderColor: color("action"),
-    backgroundColor: color("panel"), paddingLeft: 1, paddingRight: 1,
-    paddingTop: 1, paddingBottom: 1, marginTop: 1, flexShrink: 0,
-    flexDirection: "column", minWidth: 0, overflow: "hidden",
+  const heroCard = createCardPlate(ui, deps, {
+    flexShrink: 0, flexDirection: "column", minWidth: 0, overflow: "hidden",
   })
   const badgeRow = createBox(ui, {
     flexDirection: "row", justifyContent: "space-between", minWidth: 0, flexShrink: 0,
@@ -96,10 +95,8 @@ export function createDetailMount(ui, deps) {
   }
   insert(heroCard, actions)
 
-  const confirmBox = createBox(ui, {
-    border: true, borderStyle: "rounded", borderColor: color("error"),
-    backgroundColor: color("raised"), paddingLeft: 1, paddingRight: 1,
-    paddingTop: 1, paddingBottom: 1, marginTop: 1, flexShrink: 0,
+  const confirmBox = createCardPlate(ui, deps, {
+    border: "error", background: "raised", flexShrink: 0,
     flexDirection: "column", minWidth: 0, visible: false,
   })
   const confirmText = createText(ui, { content: "Cancel this run?", fg: color("error"), bold: true })
@@ -125,29 +122,19 @@ export function createDetailMount(ui, deps) {
   insert(heroCard, confirmBox)
   insert(container, heroCard)
 
-  const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0, minHeight: 0 })
-  const body = createLineMount(ui, { ...deps, maxLines: DETAIL_LINES, wrap: true })
-  body.node.forEach((node) => insert(scroll, node))
-  insert(container, scroll)
+  const body = mountLines(ui, container, deps, {
+    scroll: true, maxLines: DETAIL_LINES, wrap: true,
+  })
 
   // Section cards and padded keys are host-side props on the pooled row box.
   // Nothing here reads box.children, so the real host without children works.
   const decorate = (box, item) => {
-    for (const key of ["border", "borderStyle", "borderColor", "backgroundColor",
-      "paddingLeft", "paddingRight", "paddingTop", "paddingBottom", "marginTop"]) set(box, key, undefined)
+    resetProps(set, box)
     if (!item) return
     if (item.kind === "section") set(box, "marginTop", item.name === "Why / Blocker" ? 0 : 1)
-    if (item.kind === "reason") {
-      set(box, "border", true)
-      set(box, "borderStyle", "rounded")
-      set(box, "borderColor", color(item.color === "error" ? "error" : "action"))
-      set(box, "backgroundColor", color("raised"))
-      set(box, "paddingLeft", 1)
-      set(box, "paddingRight", 1)
-      set(box, "paddingTop", 1)
-      set(box, "paddingBottom", 1)
-      set(box, "marginTop", 1)
-    }
+    if (item.kind === "reason") createCardPlate(ui, deps, {
+      target: box, border: item.color === "error" ? "error" : "action", background: "raised",
+    })
   }
 
   const apply = (model = {}, run = null) => {
