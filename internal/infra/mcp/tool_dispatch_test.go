@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -306,5 +307,118 @@ func TestDispatchToolReportsStartedAndFailedRunsInSummary(t *testing.T) {
 	}
 	if byTask["T-OK"].id == byTask["T-BAD"].id || !strings.HasPrefix(byTask["T-BAD"].id, "run-") {
 		t.Fatalf("run ids = %q and %q", byTask["T-OK"].id, byTask["T-BAD"].id)
+	}
+}
+
+// countingDispatchStore serves recent runs and records how often and with
+// which limit they were requested. Only ListRecent matters to failedRuns; the
+// other DispatchStore methods keep the interface satisfied.
+type countingDispatchStore struct {
+	runs     []*core.Run
+	calls    int
+	gotLimit int
+}
+
+func (*countingDispatchStore) SyncTasks(context.Context, []core.Task) error        { return nil }
+func (*countingDispatchStore) ListReadyTasks(context.Context) ([]core.Task, error) { return nil, nil }
+func (*countingDispatchStore) ListActive(context.Context) ([]*core.Run, error)     { return nil, nil }
+func (s *countingDispatchStore) ListRecent(_ context.Context, limit int) ([]*core.Run, error) {
+	s.calls++
+	s.gotLimit = limit
+	return s.runs, nil
+}
+func (*countingDispatchStore) FindActiveByTask(context.Context, core.TaskID) (*core.Run, error) {
+	return nil, nil
+}
+func (*countingDispatchStore) Save(context.Context, *core.Run) error                    { return nil }
+func (*countingDispatchStore) SetTaskStatus(context.Context, core.TaskID, string) error { return nil }
+
+func TestFailedRunsIndexesRecentOnce(t *testing.T) {
+	const total, failed = 200, 50
+	store := &countingDispatchStore{}
+	failures := make([]app.DispatchFailure, 0, failed)
+
+	// ListRecent returns newest first. The newest 50 tasks failed to start.
+	for i := total - 1; i >= 0; i-- {
+		taskID := core.TaskID(fmt.Sprintf("T-%03d", i))
+		state := core.RunMerged
+		if i >= total-failed {
+			state = core.RunClosed
+		}
+		store.runs = append(store.runs, &core.Run{
+			ID:            core.RunID(fmt.Sprintf("run-%03d", i)),
+			TaskID:        taskID,
+			State:         state,
+			Reason:        string(state),
+			LaunchSource:  core.LaunchMCP,
+			AgentIdentity: "worker",
+		})
+		if i >= total-failed {
+			failures = append(failures, app.DispatchFailure{TaskID: taskID, Err: "workspace: conflict"})
+		}
+	}
+
+	got := failedRuns(context.Background(), &app.Dispatcher{Store: store}, failures)
+	if store.calls != 1 {
+		t.Fatalf("ListRecent calls = %d, want 1 with %d failures", store.calls, failed)
+	}
+	if store.gotLimit != failed+app.DefaultRecentLimit {
+		t.Fatalf("ListRecent limit = %d, want %d", store.gotLimit, failed+app.DefaultRecentLimit)
+	}
+	if len(got) != failed {
+		t.Fatalf("resolved failures = %d, want %d", len(got), failed)
+	}
+
+	// The previous nested scan is the reference for unchanged output.
+	reference := map[core.TaskID]*core.Run{}
+	for _, failure := range failures {
+		for _, run := range store.runs {
+			if run.TaskID == failure.TaskID {
+				reference[failure.TaskID] = run
+				break
+			}
+		}
+	}
+	if !reflect.DeepEqual(got, reference) {
+		t.Fatalf("resolved runs differ from the previous scan")
+	}
+
+	// Build the caller-facing summary the same way registerDispatch does and
+	// compare the wire JSON. Order follows the failure list, not the index.
+	summaryFor := func(byTask map[core.TaskID]*core.Run) []dispatchOutcome {
+		out := make([]dispatchOutcome, 0, len(failures))
+		for _, failure := range failures {
+			if run := byTask[failure.TaskID]; run != nil {
+				out = append(out, outcomeForRun(run))
+				continue
+			}
+			out = append(out, dispatchOutcome{
+				ID: string(failure.TaskID), TaskID: string(failure.TaskID),
+				State: "failed", Reason: failure.Err,
+				Launch: string(core.LaunchMCP), Identity: "worker",
+			})
+		}
+		return out
+	}
+	gotJSON, err := json.Marshal(summaryFor(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, err := json.Marshal(summaryFor(reference))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("summary JSON changed:\n got %s\nwant %s", gotJSON, wantJSON)
+	}
+}
+
+func TestFailedRunsKeepsNewestRunForTask(t *testing.T) {
+	older := &core.Run{ID: "run-old", TaskID: "T-DUP", State: core.RunClosed, Reason: "old"}
+	newer := &core.Run{ID: "run-new", TaskID: "T-DUP", State: core.RunClosed, Reason: "new"}
+	store := &countingDispatchStore{runs: []*core.Run{newer, older}}
+	got := failedRuns(context.Background(), &app.Dispatcher{Store: store}, []app.DispatchFailure{{TaskID: "T-DUP"}})
+	if got["T-DUP"] != newer {
+		t.Fatalf("resolved run = %v, want the newest %v", got["T-DUP"], newer)
 	}
 }

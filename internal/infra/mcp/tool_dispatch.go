@@ -126,12 +126,15 @@ func failedRuns(ctx context.Context, d *app.Dispatcher, failures []app.DispatchF
 	if err != nil {
 		return out
 	}
+	byTask := make(map[core.TaskID]*core.Run, len(recent))
+	for _, run := range recent {
+		if _, seen := byTask[run.TaskID]; !seen {
+			byTask[run.TaskID] = run
+		}
+	}
 	for _, failure := range failures {
-		for _, run := range recent {
-			if run.TaskID == failure.TaskID {
-				out[failure.TaskID] = run
-				break
-			}
+		if run, ok := byTask[failure.TaskID]; ok {
+			out[failure.TaskID] = run
 		}
 	}
 	return out
