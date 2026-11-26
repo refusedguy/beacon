@@ -1,7 +1,7 @@
 ---
 id: T-99b9e9ff
 title: Pin ACP RPC request and response routing
-status: available
+status: done
 scope:
     - harnesses/acp/rpc_test.go
 priority: 86
