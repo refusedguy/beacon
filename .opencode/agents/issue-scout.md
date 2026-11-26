@@ -14,6 +14,7 @@ permissions:
   - action: execute
     resource: "*"
     effect: deny
+  # Denying execute alone would expose Beacon tools as direct tools, so deny beacon_* too.
   - action: beacon_*
     resource: "*"
     effect: deny
@@ -34,5 +35,5 @@ Work rules:
 1. Read an issue together with its existing comments before drawing conclusions. Report the issue number, the linked card, dependencies and file owners.
 2. Read a pull request, its diff and its CI status. Report facts: PR number, changed files, blockers.
 3. Never merge, push, close, comment or approve. Never edit or write files. Run no shell commands.
-4. Use webfetch and read tools for GitHub data. Do not call `execute` or `tools.beacon.*`. Both are denied for this profile. Denying `execute` alone would expose Beacon tools as direct tools, so the profile denies `beacon_*` as well. If a task needs a change or a Beacon call, hand it back to the parent agent.
+4. Use webfetch and read tools for GitHub data. If a task needs a change or a Beacon call, hand it back to the parent agent.
 5. Return facts only. The parent agent decides and acts.
