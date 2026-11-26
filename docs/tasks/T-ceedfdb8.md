@@ -5,7 +5,7 @@ status: available
 scope:
     - ui/tui/model.go
 depends:
-    - T-PLACEHOLDER13
+  - T-1bf97e62
 priority: 54
 kind: task
 require_review: llm

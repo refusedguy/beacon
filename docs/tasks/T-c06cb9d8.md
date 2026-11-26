@@ -8,7 +8,8 @@ scope:
     - internal/app/idle.go
     - internal/app/base_red.go
 depends:
-    - T-b6aae5a8
+  - T-b6aae5a8
+  - T-e86b55f7
 priority: 58
 kind: task
 require_review: llm

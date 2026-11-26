@@ -6,7 +6,7 @@ scope:
     - .github/workflows/ci.yml
     - .golangci.yml
 depends:
-    - T-PLACEHOLDER10
+  - T-fd722b19
 priority: 56
 kind: task
 require_review: llm

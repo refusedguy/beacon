@@ -6,7 +6,7 @@ scope:
     - ui/tui/model.go
     - ui/tui/model_test.go
 depends:
-    - T-PLACEHOLDER11
+  - T-02866adf
 priority: 80
 kind: task
 require_review: llm

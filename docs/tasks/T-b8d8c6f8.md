@@ -6,7 +6,7 @@ scope:
     - ui/tui/wire_contract_test.go
     - cmd/beacon/http.go
 depends:
-    - T-PLACEHOLDER12
+  - T-3f0a09be
 priority: 78
 kind: task
 require_review: llm
