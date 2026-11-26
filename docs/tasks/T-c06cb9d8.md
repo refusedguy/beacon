@@ -1,7 +1,7 @@
 ---
 id: T-c06cb9d8
 title: Add step and logStep helpers
-status: available
+status: done
 scope:
     - internal/app/dispatcher.go
     - internal/app/finalize.go

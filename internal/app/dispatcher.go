@@ -14,6 +14,17 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// step labels err with the operation that failed. Keeping the operation name
+// in the text lets a caller tell which step of a run failed without a log.
+func step(label string, err error) error {
+	return fmt.Errorf("%s: %w", label, err)
+}
+
+// logStep logs a failed operation step with the run and task that owned it.
+func logStep(what string, run *core.Run, err error) {
+	slog.Error(what, "run", run.ID, "task", run.TaskID, "error", err)
+}
+
 // ModelResolver resolves a worker model from its parent session. The
 // composition root supplies the OpenCode session lookup. A nil resolver keeps
 // the harness default.
@@ -299,14 +310,14 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	if err := d.timed(ctx, "ensureBranch", func() error {
 		return d.ensureOnce(ctx, task.BaseBranch)
 	}); err != nil {
-		return fmt.Errorf("base branch: %w", err)
+		return step("base branch", err)
 	}
 	var ws core.Workspace
 	if err := d.timed(ctx, "Create", func() (err error) {
 		ws, err = d.Workspace.Create(ctx, task)
 		return err
 	}); err != nil {
-		return fmt.Errorf("workspace: %w", err)
+		return step("workspace", err)
 	}
 	run.WorkspacePath = ws.Path
 	run.Branch = ws.Branch
@@ -314,7 +325,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	if err := d.timed(ctx, "MarkInWorkspace", func() error {
 		return d.Source.MarkInWorkspace(ctx, task.ID, ws.Path, "in_progress")
 	}); err != nil {
-		return fmt.Errorf("mark in workspace: %w", err)
+		return step("mark in workspace", err)
 	}
 	var session core.Session
 	if err := d.timed(ctx, "Spawn", func() (err error) {
@@ -326,7 +337,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 		})
 		return err
 	}); err != nil {
-		return fmt.Errorf("spawn: %w", err)
+		return step("spawn", err)
 	}
 	run.SessionID = session.ID
 	if session.PR != 0 {
@@ -339,7 +350,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	if err := d.timed(ctx, "Save", func() error {
 		return d.Store.Save(ctx, run)
 	}); err != nil {
-		return fmt.Errorf("save: %w", err)
+		return step("save", err)
 	}
 	d.Decisions.logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
 	// MarkInWorkspace already sets in_progress inside the worker branch, and
@@ -354,33 +365,33 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 // handleStartFailure closes a run only after its worker is gone. A worker that
 // survived the failure can still open a PR, and a closed run cannot receive it.
 func (d *Dispatcher) handleStartFailure(ctx context.Context, run *core.Run, cause error) {
-	slog.Error("dispatch task", "task", run.TaskID, "run", run.ID, "error", cause)
+	logStep("dispatch task", run, cause)
 	if d.workerAlive(ctx, run) {
 		if run.State == core.RunPending {
 			// The worker is alive and the cause is recorded on the run. A newer
 			// event may already have moved it out of pending, so this is best effort.
 			if err := run.Apply(core.Event{Kind: core.EvStart}); err != nil {
-				slog.Error("start live run", "task", run.TaskID, "run", run.ID, "error", err)
+				logStep("start live run", run, err)
 			}
 		}
 		run.Reason = cause.Error()
 		run.UpdatedAt = time.Now().UTC()
 		if err := d.Store.Save(ctx, run); err != nil {
-			slog.Error("save live run", "task", run.TaskID, "run", run.ID, "error", err)
+			logStep("save live run", run, err)
 		}
 		return
 	}
 	// A failed cancel transition means the run already reached a terminal state
 	// or moved on. The cause is logged above; the transition error is not silent.
 	if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: cause.Error()}); err != nil {
-		slog.Error("cancel failed start", "task", run.TaskID, "run", run.ID, "error", err)
+		logStep("cancel failed start", run, err)
 	}
 	if err := d.Store.Save(ctx, run); err != nil {
-		slog.Error("save cancelled run", "task", run.TaskID, "run", run.ID, "error", err)
+		logStep("save cancelled run", run, err)
 	}
 	if run.SessionID != "" {
 		if err := d.Harness.Stop(ctx, run.SessionID); err != nil {
-			slog.Error("stop failed worker", "task", run.TaskID, "run", run.ID, "error", err)
+			logStep("stop failed worker", run, err)
 		}
 	}
 	if run.WorkspacePath != "" {
@@ -388,7 +399,7 @@ func (d *Dispatcher) handleStartFailure(ctx context.Context, run *core.Run, caus
 		// worktree, making it dirty. A plain Remove would refuse it and leave a
 		// stale path that blocks the next dispatch, so force the removal.
 		if err := d.Workspace.ForceRemove(ctx, core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}); err != nil {
-			slog.Error("force remove failed start worktree", "task", run.TaskID, "run", run.ID, "error", err)
+			logStep("force remove failed start worktree", run, err)
 		}
 	}
 }
