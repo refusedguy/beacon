@@ -4,10 +4,6 @@ import { Plugin } from "@opencode/plugin/tui"
 import { runtimeImport } from "./ui_runtime.js"
 
 export * from "./ui_model.js"
-export {
-  BeaconStatusRpc, RUN_CHANGED_EVENT,
-  createCliStatusSource, normalizeSnapshot,
-} from "./status_rpc.js"
 export * from "./ui_view.js"
 export * from "./ui_bridge.js"
 export * from "./ui_nodes.js"

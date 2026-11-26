@@ -78,7 +78,7 @@ const BACKTICK_SUBSTITUTION = /`([^`]*)`/g
 // A command often hides the interesting call behind assignments, `env` or
 // `sudo`. Remove those wrappers repeatedly so nested forms such as
 // `PATH=/bin sudo -u admin find /` reduce to the command being run.
-export function stripCommandPrefix(part) {
+function stripCommandPrefix(part) {
   let text = typeof part === "string" ? part.trim() : ""
   for (;;) {
     const before = text
@@ -130,7 +130,7 @@ export function commandSegments(command, depth = 0) {
   return segments
 }
 
-export function compileShellGuardRule(entry, log = console.warn) {
+function compileShellGuardRule(entry, log = console.warn) {
   if (!entry || typeof entry !== "object") return null
   const { id, replacement } = entry
   if (typeof id !== "string" || !id || typeof replacement !== "string") return null
@@ -174,7 +174,7 @@ export function findShellGuardHit(tool, input, rules = SHELL_GUARD_RULES) {
   return null
 }
 
-export function guardAppliesToAgent(event, config = {}) {
+function guardAppliesToAgent(event, config = {}) {
   const agent = agentIdentity(null, event)
   // When the event carries no agent, keep the guard as a safety net.
   if (!agent) return true

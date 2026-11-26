@@ -169,8 +169,8 @@ export const beaconProject = Plugin.define(beaconProjectDefinition)
 export { agentIdentity } from "./state/session_identity.js"
 export {
   SHELL_GUARD_RULES, buildShellGuardRules, commandFromToolInput, commandSegments,
-  commandSubstitutions, compileShellGuardRule, findShellGuardHit, guardAppliesToAgent,
-  guardedAgents, guardMode, isWorkerAgent, registerShellGuard, stripCommandPrefix,
+  commandSubstitutions, findShellGuardHit, guardedAgents, guardMode,
+  isWorkerAgent, registerShellGuard,
 } from "./shell_guard.js"
 export { createRunChangeWatcher } from "./run_watcher.js"
 export { pluginOptions, pollIntervalMs, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./state/options.js"

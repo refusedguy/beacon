@@ -9,7 +9,6 @@ import {
   dispatchItem, isDispatching, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
 } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
-export { shortTaskID }
 export { elapsed }
 
 export const STATE_BAR_WIDTH = 30
