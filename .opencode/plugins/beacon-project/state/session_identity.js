@@ -26,6 +26,31 @@ export function agentIdentity(ctx, event) {
   return null
 }
 
+// One latest-session lookup for identity, rules and MCP. A known ID uses
+// session.get and falls back to the newest entry when that fails. Records come
+// bare from session.list and under `data` from session.get, so unwrap here.
+export async function latestSession(ctx, sessionID = null) {
+  if (!ctx || typeof ctx !== "object") return null
+  if (typeof sessionID === "string" && sessionID && typeof ctx.session?.get === "function") {
+    try {
+      const info = await ctx.session.get({ sessionID })
+      return info?.data ?? info ?? null
+    } catch {}
+  }
+  if (typeof ctx.session?.list === "function") {
+    const listed = await ctx.session.list({ order: "desc", limit: 1 })
+    const sessions = Array.isArray(listed) ? listed : listed?.data ?? []
+    return sessions[0] ?? null
+  }
+  return null
+}
+
+// One agent extraction from a session record. The agent travels under several
+// keys, so read the union in one place and let every caller agree on the id.
+export function agentFromSession(ctx, data) {
+  return agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
+}
+
 export const WORKER_ROLE = "worker"
 export const ORCHESTRATOR_ROLE = "orchestrator"
 export const NO_ROLE = "none"
@@ -86,11 +111,9 @@ export async function sessionIdentity(ctx) {
   if (!ctx || typeof ctx !== "object") return {}
   let sessionID = ctx.sessionID ?? ctx.session?.id ?? ctx.session?.sessionID
   if (typeof sessionID !== "string" || !sessionID) {
-    if (typeof ctx.session?.list !== "function") return {}
     try {
-      const listed = await ctx.session.list({ order: "desc", limit: 1 })
-      const sessions = Array.isArray(listed) ? listed : listed?.data ?? []
-      sessionID = sessions[0]?.id ?? sessions[0]?.sessionID
+      const latest = await latestSession(ctx)
+      sessionID = latest?.id ?? latest?.sessionID
     } catch { return {} }
   }
   if (typeof sessionID !== "string" || !sessionID) return {}
@@ -98,19 +121,18 @@ export async function sessionIdentity(ctx) {
   const identity = { sessionID }
   const direct = agentIdentity(ctx)
   if (direct) identity.agent = direct
-  if (typeof ctx.session?.get === "function") {
-    try {
-      const info = await ctx.session.get({ sessionID })
-      const data = info?.data ?? info
-      const ref = data?.model
-      const model = ref?.id ?? ref?.modelID ?? ref?.modelId ?? data?.modelID ?? data?.modelId
+  try {
+    const data = await latestSession(ctx, sessionID)
+    if (data) {
+      const ref = data.model
+      const model = ref?.id ?? ref?.modelID ?? ref?.modelId ?? data.modelID ?? data.modelId
       if (typeof model === "string" && model) identity.model = model
       if (!identity.agent) {
-        const agent = agentIdentity(ctx, data) ?? data?.agent?.id ?? data?.agentID ?? null
+        const agent = agentFromSession(ctx, data)
         if (agent) identity.agent = agent
       }
-    } catch {}
-  }
+    }
+  } catch {}
   identityCache.set(sessionID, identity)
   return identity
 }
