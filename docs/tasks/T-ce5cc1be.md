@@ -1,7 +1,7 @@
 ---
 id: T-ce5cc1be
 title: Delete dead markdown wrappers
-status: available
+status: done
 scope:
     - internal/infra/tasksource/markdown.go
 priority: 88
