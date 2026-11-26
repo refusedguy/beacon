@@ -1,7 +1,7 @@
 ---
 id: T-df4e42ba
 title: Parse poll interval once in config
-status: available
+status: done
 scope:
     - internal/infra/config/config.go
     - internal/infra/config/config_test.go
