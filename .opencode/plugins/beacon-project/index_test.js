@@ -31,6 +31,10 @@ import {
   watcherEnabled,
 } from "./index.js"
 import { beaconStatusDefinition, defineBeaconStatus } from "./ui/ui.js"
+import {
+  createCliStatusSource, createStatusSource,
+  REQUEST_ID_HEADER, STARTED_AT_HEADER, timingMeta,
+} from "./ui/ui_model.js"
 import { noopMcpRegistration, registeredBeaconConfig } from "./mcp/mcp.js"
 
 function fakeCtx() {
@@ -475,4 +479,110 @@ test("a failed RPC method logs the rejection body and rethrows", async () => {
   assert.match(failed, /rpc\.unavailable/)
   assert.match(failed, /"status":400/)
   assert.match(failed, /retry/)
+})
+
+test("RPC handler carries the click id and logs durationMs", async () => {
+  let seen = null
+  const logs = []
+  const handlers = createStatusRpcHandlers({
+    snapshot: async () => ({ active: [], recent: [] }),
+    control: async () => ({}),
+    dispatch: async (input, timing) => { seen = { input, timing }; return { started: 1 } },
+  }, { log: (line) => logs.push(line), now: () => 1000 })
+  const id = requestId("dispatch", { n: 1 })
+  const context = { headers: timingMeta({ id, startedAt: 900 }) }
+
+  const result = await handlers.dispatch({ n: 1 }, context)
+
+  assert.deepEqual(result, { started: 1 })
+  assert.equal(seen.input.n, 1)
+  assert.equal(seen.timing.id, id)
+  assert.equal(seen.timing.startedAt, 900)
+  assert.ok(logs.some((line) => line.includes(`id=${id} phase=start`)))
+  const ok = logs.find((line) => /dispatch ok/.test(line))
+  assert.ok(ok)
+  assert.match(ok, /durationMs=0/)
+  assert.match(ok, /elapsedMs=100/)
+})
+
+test("RPC handler logs the 400 reason with durationMs", async () => {
+  const logs = []
+  const rejection = {
+    type: "rpc.bad_request", status: 400,
+    message: "bad n", data: { reason: "n must be positive" },
+  }
+  const handlers = createStatusRpcHandlers({
+    snapshot: async () => ({ active: [], recent: [] }),
+    control: async () => ({}),
+    dispatch: async () => { throw rejection },
+  }, { log: (line) => logs.push(line), now: () => 5000 })
+  const id = requestId("dispatch", { n: 1 })
+  const context = { headers: timingMeta({ id, startedAt: 4000 }) }
+
+  await assert.rejects(() => handlers.dispatch({ n: 1 }, context), (error) => error === rejection)
+  const failed = logs.find((line) => /dispatch failed/.test(line))
+  assert.ok(failed)
+  assert.match(failed, /durationMs=0/)
+  assert.match(failed, /elapsedMs=1000/)
+  assert.match(failed, /"status":400/)
+  assert.match(failed, /n must be positive/)
+})
+
+test("CLI source logs the exit duration with the click id and no arguments", async () => {
+  const logs = []
+  let tick = 100
+  const now = () => { tick += 25; return tick }
+  const id = requestId("dispatch", { n: 1 })
+  const source = createCliStatusSource({
+    root: "/cli-timing",
+    log: (line) => logs.push(line),
+    deps: {
+      command: () => ["/bin/beacon", "mcp"],
+      execFile: async () => ({ stdout: '{"started":1}', stderr: "" }),
+      now,
+    },
+  })
+
+  const result = await source.dispatch({ n: 1 }, { id, startedAt: 50 })
+
+  assert.deepEqual(result, { started: 1 })
+  const line = logs.find((entry) => /beacon CLI dispatch/.test(entry))
+  assert.ok(line)
+  assert.ok(line.includes(`id=${id}`))
+  assert.match(line, /ok durationMs=25/)
+  assert.match(line, /elapsedMs=/)
+  assert.equal(line.includes("dispatch 1"), false)
+  assert.equal(line.includes("--message"), false)
+})
+
+test("a dispatch click produces one linked timing chain", async () => {
+  const logs = []
+  let tick = 1000
+  const now = () => { tick += 10; return tick }
+  const calls = []
+  const rpc = {
+    dispatch: async (input, opts) => { calls.push({ input, opts }); return { started: 1 } },
+    snapshot: async () => ({ active: [], recent: [] }),
+    control: async () => ({}),
+  }
+  const ctx = { client: { rpc: () => rpc }, location: { project: { canonical: "/chain" } } }
+  const source = createStatusSource(ctx, {
+    root: "/chain", log: (line) => logs.push(line), now,
+    deps: { existsSync: () => false },
+  })
+  const id = requestId("dispatch", { n: 1 })
+
+  const result = await source.dispatch({ n: 1 })
+  await source.snapshot()
+
+  assert.deepEqual(result, { started: 1 })
+  assert.deepEqual(calls[0].input, { n: 1 })
+  assert.equal(calls[0].opts.headers[REQUEST_ID_HEADER], id)
+  assert.ok(Number(calls[0].opts.headers[STARTED_AT_HEADER]) > 0)
+  assert.ok(logs.some((line) => line.includes(`beacon dispatch click id=${id}`)))
+  assert.ok(logs.some((line) => /beacon dispatch rpc ok/.test(line)))
+  const refresh = logs.filter((line) => /beacon status refresh ok/.test(line)).pop()
+  assert.ok(refresh)
+  assert.ok(refresh.includes(`parent=${id}`))
+  assert.match(refresh, /durationMs=/)
 })

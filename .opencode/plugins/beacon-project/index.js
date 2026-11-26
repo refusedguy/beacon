@@ -9,8 +9,10 @@ import {
 } from "./state/options.js"
 import {
   BeaconStatusRpc, RUN_CHANGED_EVENT,
-  createCliStatusSource, normalizeSnapshot,
+  bodyHash, createCliStatusSource, elapsedMs, normalizeSnapshot,
+  requestId, timingFromContext,
 } from "./ui/status_rpc.js"
+export { bodyHash, requestId }
 import { createRunChangeWatcher } from "./run_watcher.js"
 import { isWorkerAgent, registerShellGuard } from "./shell_guard.js"
 
@@ -30,19 +32,6 @@ export function cleanupWrapper(prefix) {
   }
 }
 
-// A body hash in the log proves whether two POSTs carried the same payload.
-// FNV-1a over stable JSON keeps this server-safe and free of peer imports.
-export function bodyHash(input) {
-  const text = JSON.stringify(input ?? null)
-  let hash = 0x811c9dc5
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i)
-    hash = Math.imul(hash, 0x01000193)
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0")
-}
-export const requestId = (method, input) => `${method}:${bodyHash(input)}`
-
 // Normalize at the handler boundary so a malformed n never reaches the CLI.
 // The RPC schema still rejects it first; this keeps a direct caller safe.
 export function dispatchInput(input) {
@@ -50,29 +39,36 @@ export function dispatchInput(input) {
   return { ...(input ?? {}), n: Number.isFinite(n) && n > 0 ? Math.floor(n) : 1 }
 }
 
-// Log each RPC with its body hash and report the rejection body on failure.
+// Log each RPC with one correlation id and its elapsed time. The TUI carries
+// the id and click start in the request headers, so the click, RPC, CLI and
+// refresh lines can be read as one chain. The request body is never logged.
 // The TUI swallows RPC errors before falling back to the CLI, so the server is
-// the only place the 400 reason is still visible.
-export function createStatusRpcHandlers(source, { limits = {}, log = console.debug } = {}) {
-  const call = async (method, input, run) => {
-    const id = requestId(method, input)
-    log(`beacon status RPC ${method} id=${id}`)
+// the only place the 400 rejection reason is still visible.
+export function createStatusRpcHandlers(source, { limits = {}, log = console.debug, now = () => Date.now() } = {}) {
+  const call = async (method, input, run, context) => {
+    const meta = timingFromContext(context)
+    const id = meta.id ?? requestId(method, input)
+    const clickStart = meta.startedAt
+    const startedAt = now()
+    log(`beacon status RPC ${method} id=${id} phase=start`)
     try {
-      const result = await run()
-      log(`beacon status RPC ${method} ok id=${id}`)
+      const result = await run({ id, startedAt: clickStart ?? startedAt })
+      const chain = clickStart == null ? "" : ` elapsedMs=${elapsedMs(now(), clickStart)}`
+      log(`beacon status RPC ${method} ok id=${id} durationMs=${elapsedMs(now(), startedAt)}${chain}`)
       return result
     } catch (error) {
+      const chain = clickStart == null ? "" : ` elapsedMs=${elapsedMs(now(), clickStart)}`
       const body = error && typeof error === "object"
         ? { type: error.type, status: error.status, message: error.message, data: error.data }
         : { message: String(error) }
-      log(`beacon status RPC ${method} failed id=${id} body=${JSON.stringify(body)}`)
+      log(`beacon status RPC ${method} failed id=${id} durationMs=${elapsedMs(now(), startedAt)}${chain} body=${JSON.stringify(body)}`)
       throw error
     }
   }
   return {
-    snapshot: (input) => call("snapshot", input, async () => normalizeSnapshot(await source.snapshot(input ?? limits))),
-    control: (input) => call("control", input, async () => source.control(input ?? {})),
-    dispatch: (input) => call("dispatch", input, async () => source.dispatch(dispatchInput(input))),
+    snapshot: (input, context) => call("snapshot", input, async () => normalizeSnapshot(await source.snapshot(input ?? limits)), context),
+    control: (input, context) => call("control", input, async () => source.control(input ?? {}), context),
+    dispatch: (input, context) => call("dispatch", input, async (timing) => source.dispatch(dispatchInput(input), timing), context),
   }
 }
 
