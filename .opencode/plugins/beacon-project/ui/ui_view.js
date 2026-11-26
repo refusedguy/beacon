@@ -1,7 +1,7 @@
 // Pure view helpers for the Beacon panels. No TUI imports live here so these
 // functions stay testable with plain Node and shared by every slot.
 import {
-  DECISION_LIMIT, PANEL_NAME, REASON_WIDTH, RECENT_LIMIT,
+  DECISION_LIMIT, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH, RECENT_LIMIT,
   normalizeSnapshot, str,
 } from "./ui_model.js"
 import {
