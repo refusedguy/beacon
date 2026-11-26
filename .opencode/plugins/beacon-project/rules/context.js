@@ -1,10 +1,11 @@
 import { existsSync as fsExistsSync } from "node:fs"
 import { join } from "node:path"
+import { BEACON_BUILD_SCRIPT } from "../mcp/mcp.js"
 import { agentFromSession, agentIdentity, agentRole, latestSession } from "../state/session_identity.js"
 
 export const SURVIVAL_KEY = "beacon/survival-rules"
 export const ORCHESTRATOR_KEY = "beacon/orchestrator-rules"
-export const BUILD_REMINDER = 'After a change lands on main, rebuild the local binary with bash scripts/build-beacon.sh, then tell the operator to restart the MCP daemon and the OpenCode TUI.'
+export const BUILD_REMINDER = `After a change lands on main, rebuild the local binary with bash ${BEACON_BUILD_SCRIPT}, then tell the operator to restart the MCP daemon and the OpenCode TUI.`
 
 // Worker rules. Kept short because they are injected on every context hook.
 export const SURVIVAL_RULES = [
@@ -77,7 +78,7 @@ let cachedBuildScript = false
 function hasBuildScript(root, existsSync) {
   if (cachedRoot === root) return cachedBuildScript
   cachedRoot = root
-  cachedBuildScript = !!existsSync(join(root, "scripts", "build-beacon.sh"))
+  cachedBuildScript = !!existsSync(join(root, ...BEACON_BUILD_SCRIPT.split("/")))
   return cachedBuildScript
 }
 
