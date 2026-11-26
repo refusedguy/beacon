@@ -72,16 +72,7 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 	if limit <= 0 {
 		return selected, skipped, nil
 	}
-	busyIDs := make(map[core.TaskID]*core.Run)
-	var live []*core.Run
-	for _, r := range active {
-		if r == nil || r.State.Terminal() {
-			continue
-		}
-		busyIDs[r.TaskID] = r
-		live = append(live, r)
-	}
-	index := newActiveScopeIndex(live)
+	busyIDs, index := newActiveRunIndex(active)
 
 	for _, t := range candidates {
 		if len(selected) >= limit {
@@ -148,6 +139,21 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 		selected = append(selected, t)
 	}
 	return selected, skipped, nil
+}
+
+// newActiveRunIndex builds the per-cycle view of active runs: busy task IDs and
+// an index of live scope claims. Terminal and nil runs are ignored.
+func newActiveRunIndex(active []*core.Run) (map[core.TaskID]*core.Run, *activeScopeIndex) {
+	busyIDs := make(map[core.TaskID]*core.Run)
+	var live []*core.Run
+	for _, r := range active {
+		if r == nil || r.State.Terminal() {
+			continue
+		}
+		busyIDs[r.TaskID] = r
+		live = append(live, r)
+	}
+	return busyIDs, newActiveScopeIndex(live)
 }
 
 // activeScopeIndex maps scope claims of live runs to the runs that carry them.
