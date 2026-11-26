@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -25,14 +26,19 @@ func failedNames(checks []core.CheckResult) []string {
 	return names
 }
 
+// intersects reports whether two name lists share a value. Both callers pass
+// output from failedNames, so the sorted lists are walked together instead of
+// allocating a set on every comparison.
 func intersects(a, b []string) bool {
-	set := make(map[string]bool, len(a))
-	for _, v := range a {
-		set[v] = true
-	}
-	for _, v := range b {
-		if set[v] {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
 			return true
+		case a[i] < b[j]:
+			i++
+		default:
+			j++
 		}
 	}
 	return false
@@ -55,7 +61,8 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 		return nil
 	}
 	prFailed := failedNames(obs.Checks)
-	if !intersects(prFailed, failedNames(base.FailedChecks)) {
+	baseFailed := failedNames(base.FailedChecks)
+	if !intersects(prFailed, baseFailed) {
 		return nil
 	}
 	in, err := r.Store.CreateIncident(ctx, &core.BaseIncident{
@@ -69,7 +76,7 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 	if in == nil {
 		return nil
 	}
-	if err := r.blockRunsOnRedBase(ctx, in, baseBranch, base.FailedChecks); err != nil {
+	if err := r.blockRunsOnRedBaseNames(ctx, in, baseBranch, baseFailed); err != nil {
 		return err
 	}
 	if strings.EqualFold(r.BaseRedMode, "notify_orchestrator") {
@@ -85,12 +92,17 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 // blockRunsOnRedBase moves every run sharing a red base into blocked state.
 // Each failure is logged with the run and incident IDs so no block is silent.
 func (r *Reconciler) blockRunsOnRedBase(ctx context.Context, in *core.BaseIncident, baseBranch string, failed []core.CheckResult) error {
+	return r.blockRunsOnRedBaseNames(ctx, in, baseBranch, failedNames(failed))
+}
+
+// blockRunsOnRedBaseNames takes names already sorted by failedNames. Callers
+// that compared the same base checks do not sort them a second time.
+func (r *Reconciler) blockRunsOnRedBaseNames(ctx context.Context, in *core.BaseIncident, baseBranch string, baseFailed []string) error {
 	active, err := r.Store.ListActive(ctx)
 	if err != nil {
 		return err
 	}
 	tree := r.taskTree(ctx)
-	baseFailed := failedNames(failed)
 	for _, other := range active {
 		if other.IsFixer || other.PRNumber == 0 {
 			continue
@@ -218,11 +230,38 @@ func (r *Reconciler) canStartFixer(ctx context.Context, in *core.BaseIncident, o
 	return true, nil
 }
 
+const excerptRuneLimit = 1200
+
+// compactExcerpt trims s and truncates it to excerptRuneLimit runes. A byte
+// length check handles strings that fit without converting them to runes. Long
+// valid UTF-8 strings are walked rune by rune up to the limit, so an 8 KB
+// excerpt allocates no rune slice. Invalid UTF-8 falls back to compact so the
+// output stays byte for byte identical to the shared helper.
+func compactExcerpt(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\r", ""))
+	if len(s) <= excerptRuneLimit {
+		return s
+	}
+	if !utf8.ValidString(s) {
+		return compact(s)
+	}
+	i, n := 0, 0
+	for i < len(s) && n < excerptRuneLimit {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		n++
+	}
+	if i == len(s) {
+		return s
+	}
+	return s[:i] + "\n...[truncated]"
+}
+
 func fixerPrompt(base core.BaseStatus, in *core.BaseIncident, task core.Task, instructions string) string {
 	var b strings.Builder
 	prependWorkerInstructions(&b, instructions)
 	fmt.Fprintf(&b, "Base branch %s is red. Failed checks: %s\n%s\nFix the base branch and open a PR.",
-		base.BaseBranch, in.FailedChecksJSON, compact(base.FailureExcerpt))
+		base.BaseBranch, in.FailedChecksJSON, compactExcerpt(base.FailureExcerpt))
 	appendWorkerPrompt(&b, task)
 	return b.String()
 }

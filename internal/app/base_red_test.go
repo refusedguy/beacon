@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -324,5 +325,107 @@ func TestIdleAutoAttachesPRByBranch(t *testing.T) {
 		}
 	default:
 		t.Fatal("no pr change signal")
+	}
+}
+
+func TestIntersectsOnSortedNames(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"empty", nil, nil, false},
+		{"single overlap", []string{"a"}, []string{"a"}, true},
+		{"no overlap", []string{"a", "c"}, []string{"b", "d"}, false},
+		{"overlap after skip", []string{"a", "c", "e"}, []string{"b", "e"}, true},
+		{"duplicates", []string{"a", "a", "c"}, []string{"a", "b"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := intersects(tt.a, tt.b); got != tt.want {
+				t.Fatalf("intersects(%q, %q) = %t, want %t", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompactExcerptMatchesCompact(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{"empty", ""},
+		{"short ascii", "test failed"},
+		{"trim and cr", " \r\n short \r\n "},
+		{"long ascii", strings.Repeat("failure output line\n", 700)},
+		{"short multibyte", "日本語のテスト"},
+		{"bytes over limit runes under", strings.Repeat("日", excerptRuneLimit-1)},
+		{"long multibyte", strings.Repeat("日本語のテスト行\n", 400)},
+		{"exactly limit", strings.Repeat("a", excerptRuneLimit)},
+		{"over limit by one", strings.Repeat("a", excerptRuneLimit+1)},
+		{"invalid utf8", "bad \xff byte " + strings.Repeat("x", 1300)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := compact(tt.in)
+			got := compactExcerpt(tt.in)
+			if got != want {
+				t.Fatalf("compactExcerpt differs from compact: got %d bytes, want %d bytes", len(got), len(want))
+			}
+		})
+	}
+}
+
+func TestCompactExcerptAvoidsRuneSliceAllocation(t *testing.T) {
+	excerpt := strings.Repeat("failure output line\n", 700)
+	if len(excerpt) < 8*1024 {
+		t.Fatalf("excerpt too short: %d bytes", len(excerpt))
+	}
+	if got, want := compactExcerpt(excerpt), compact(excerpt); got != want {
+		t.Fatal("compactExcerpt changed the output")
+	}
+	oldAllocs := testing.AllocsPerRun(100, func() { _ = compact(excerpt) })
+	newAllocs := testing.AllocsPerRun(100, func() { _ = compactExcerpt(excerpt) })
+	if newAllocs >= oldAllocs {
+		t.Fatalf("allocs: compactExcerpt %.1f, compact %.1f", newAllocs, oldAllocs)
+	}
+}
+
+func benchChecks(n int) []core.CheckResult {
+	checks := make([]core.CheckResult, n)
+	for i := range checks {
+		checks[i] = core.CheckResult{Name: fmt.Sprintf("check-%02d", i), State: core.CheckFailure}
+	}
+	return checks
+}
+
+// BenchmarkBaseRedChecks500Pairs runs 500 comparisons of 20 checks with 8 KB
+// failure excerpts. It reports allocs/op and bytes/op for the shared work in
+// checkBaseRed and fixerPrompt.
+func BenchmarkBaseRedChecks500Pairs(b *testing.B) {
+	type pair struct {
+		checks  []core.CheckResult
+		excerpt string
+	}
+	pairs := make([]pair, 500)
+	for i := range pairs {
+		pairs[i] = pair{
+			checks:  benchChecks(20),
+			excerpt: strings.Repeat("failure output line\n", 400),
+		}
+	}
+	in := &core.BaseIncident{FailedChecksJSON: "[]"}
+	task := core.Task{ID: "FIX-1"}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		for _, p := range pairs {
+			prFailed := failedNames(p.checks)
+			baseFailed := failedNames(p.checks)
+			if !intersects(prFailed, baseFailed) {
+				b.Fatal("no overlap between identical check lists")
+			}
+			base := core.BaseStatus{BaseBranch: "main", FailureExcerpt: p.excerpt}
+			_ = fixerPrompt(base, in, task, "")
+		}
 	}
 }
