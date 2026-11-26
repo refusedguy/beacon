@@ -157,11 +157,7 @@ func (g *GitLab) pipelineChecks(ctx context.Context, pipelineID int) ([]core.Che
 
 func (g *GitLab) pipelineJobs(ctx context.Context, pipelineID int) ([]glJob, error) {
 	path := fmt.Sprintf("/projects/%s/pipelines/%d/jobs", g.project(), pipelineID)
-	var jobs []glJob
-	if err := g.getJSON(ctx, path, url.Values{"per_page": {"100"}}, &jobs); err != nil {
-		return nil, err
-	}
-	return jobs, nil
+	return getJSONPages[glJob](g, ctx, path, nil)
 }
 
 // checksFromJobs fetches failure traces concurrently but fills checks and the

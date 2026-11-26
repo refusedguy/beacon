@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -87,7 +88,8 @@ func TestGitLabObserveUnresolvedThreads(t *testing.T) {
 	if len(o.Labels) != 1 || o.Labels[0] != "ready" {
 		t.Fatalf("bad labels: %v", o.Labels)
 	}
-	if o.Approvals != 2 {
+	// The MR body carries one approver, so the /approvals endpoint is skipped.
+	if o.Approvals != 1 {
 		t.Fatalf("approvals = %d", o.Approvals)
 	}
 	if len(o.UnresolvedThreads) != 1 || !strings.Contains(o.UnresolvedThreads[0], "[REDACTED]") {
@@ -626,5 +628,105 @@ func TestGitLabObserveFetchesIndependentSignalsInTwoRounds(t *testing.T) {
 	}
 	if o.FailureExcerpt != "unit failed" {
 		t.Fatalf("FailureExcerpt = %q, want the first failed job's output", o.FailureExcerpt)
+	}
+}
+
+func TestGitLabObservePaginatesEveryJobPage(t *testing.T) {
+	const total = 250
+	var jobPages int
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/merge_requests/7") && r.Method == http.MethodGet:
+			glWriteJSON(t, w, map[string]any{
+				"iid": 7, "state": "opened", "sha": "head1", "target_branch": "main",
+				"head_pipeline": map[string]any{"id": 11, "status": "success"},
+				"approved_by":   []map[string]any{{"user": map[string]string{"username": "alice"}}},
+			})
+		case strings.HasSuffix(p, "/threads"):
+			glWriteJSON(t, w, []any{})
+		case strings.HasSuffix(p, "/pipelines/11/jobs"):
+			jobPages++
+			page, err := strconv.Atoi(r.URL.Query().Get("page"))
+			if err != nil || page < 1 {
+				t.Errorf("jobs page = %q", r.URL.Query().Get("page"))
+				page = 1
+			}
+			if got := r.URL.Query().Get("per_page"); got != strconv.Itoa(gitlabPageSize) {
+				t.Errorf("jobs per_page = %q", got)
+			}
+			start := (page - 1) * gitlabPageSize
+			jobs := make([]map[string]any, 0, gitlabPageSize)
+			for i := start; i < start+gitlabPageSize && i < total; i++ {
+				jobs = append(jobs, map[string]any{
+					"id": i + 1, "name": "job-" + strconv.Itoa(i), "status": "success",
+				})
+			}
+			glWriteJSON(t, w, jobs)
+		case strings.HasSuffix(p, "/repository/compare"):
+			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, p)
+			http.NotFound(w, r)
+		}
+	}))
+	o, err := g.Observe(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Checks) != total {
+		t.Fatalf("checks = %d, want %d", len(o.Checks), total)
+	}
+	if jobPages != 3 {
+		t.Fatalf("job pages = %d, want 3", jobPages)
+	}
+	if o.Incomplete || o.IncompleteReason != "" {
+		t.Fatalf("incomplete = %t, reason = %q; want a complete observation", o.Incomplete, o.IncompleteReason)
+	}
+	if got := core.Decide(o, nil); got.Verdict != core.VerdictMerge {
+		t.Fatalf("decision = %+v, want %s", got, core.VerdictMerge)
+	}
+}
+
+func TestGitLabObserveReusesBodyApprovals(t *testing.T) {
+	var approvalsCalls int
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/merge_requests/7") && r.Method == http.MethodGet:
+			glWriteJSON(t, w, map[string]any{
+				"iid": 7, "state": "opened", "sha": "head1", "target_branch": "main",
+				"head_pipeline": map[string]any{"id": 11, "status": "success"},
+				"approved_by": []map[string]any{
+					{"user": map[string]string{"username": "alice"}},
+					{"user": map[string]string{"username": "bob"}},
+				},
+			})
+		case strings.HasSuffix(p, "/threads"):
+			glWriteJSON(t, w, []any{})
+		case strings.HasSuffix(p, "/approvals"):
+			approvalsCalls++
+			t.Error("/approvals called even though the MR body carried approved_by")
+			glWriteJSON(t, w, map[string]any{"approved_by": []map[string]any{
+				{"user": map[string]string{"username": "carol"}},
+			}})
+		case strings.HasSuffix(p, "/pipelines/11/jobs"):
+			glWriteJSON(t, w, []any{})
+		case strings.HasSuffix(p, "/repository/compare"):
+			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, p)
+			http.NotFound(w, r)
+		}
+	}))
+	o, err := g.Observe(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Approvals != 2 {
+		t.Fatalf("approvals = %d, want 2 from the MR body", o.Approvals)
+	}
+	if approvalsCalls != 0 {
+		t.Fatalf("/approvals calls = %d, want 0", approvalsCalls)
 	}
 }

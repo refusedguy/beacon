@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/google/go-github/v93/github"
 )
@@ -13,7 +14,20 @@ type etagEntry struct {
 	pr   *github.PullRequest
 }
 
+// getPR shares one fetch among concurrent callers for the same PR. Without
+// this, two Observes racing on a cold cache both miss and send unconditional
+// GETs, and the second writer overwrites the first ETag entry.
 func (g *GitHub) getPR(ctx context.Context, number int) (*github.PullRequest, error) {
+	v, err, _ := g.prGet.Do(strconv.Itoa(number), func() (any, error) {
+		return g.fetchPR(ctx, number)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*github.PullRequest), nil
+}
+
+func (g *GitHub) fetchPR(ctx context.Context, number int) (*github.PullRequest, error) {
 	g.etagMu.Lock()
 	cached := g.etags[number]
 	g.etagMu.Unlock()
