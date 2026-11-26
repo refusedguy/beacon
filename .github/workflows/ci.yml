@@ -79,7 +79,25 @@ jobs:
       - name: Plugin tests
         run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test ".opencode/plugins/beacon-project/**/*_test.js"
 
-  test:
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "build passed in verify"
+
+  vet:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "vet passed in verify"
+
+  lint:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "lint passed in verify"
+
+  test-modules:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -114,6 +132,12 @@ jobs:
       - name: Test ${{ matrix.module }} module
         working-directory: ${{ matrix.dir }}
         run: go test -race -shuffle=on ${{ matrix.packages }}
+
+  test:
+    needs: test-modules
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "all module suites passed"
 
   plugin-tui-smoke:
     runs-on: ubuntu-latest
