@@ -125,11 +125,41 @@ func (g *GitLabIssues) getJSON(ctx context.Context, path string, query url.Value
 	return json.Unmarshal(data, out)
 }
 
+const gitlabIssuesPerPage = 100
+
+// paginateIssuePages walks issue pages until a page comes back empty or the
+// shared page cap is reached. The callback only receives a 1-based page
+// number, so the loop does not depend on one tracker's response types.
+func paginateIssuePages[T any](fetch func(page int) ([]T, error)) ([]T, error) {
+	var all []T
+	for page := 1; page <= maxIssuePages; page++ {
+		items, err := fetch(page)
+		if err != nil {
+			return nil, err
+		}
+		if len(items) == 0 {
+			break
+		}
+		all = append(all, items...)
+	}
+	return all, nil
+}
+
 func (g *GitLabIssues) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	path := "/projects/" + g.project() + "/issues"
-	var issues []glIssue
-	query := url.Values{"state": {"opened"}, "per_page": {"100"}}
-	if err := g.getJSON(ctx, path, query, &issues); err != nil {
+	issues, err := paginateIssuePages(func(page int) ([]glIssue, error) {
+		query := url.Values{
+			"state":    {"opened"},
+			"per_page": {strconv.Itoa(gitlabIssuesPerPage)},
+			"page":     {strconv.Itoa(page)},
+		}
+		var pageIssues []glIssue
+		if err := g.getJSON(ctx, path, query, &pageIssues); err != nil {
+			return nil, err
+		}
+		return pageIssues, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	var out []core.Task
