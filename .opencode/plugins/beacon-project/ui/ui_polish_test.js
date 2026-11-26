@@ -166,7 +166,7 @@ test("recent rows use calm markers and a two-space second line", () => {
   }, null, NOW)
   const rows = model.listItems.filter((i) => i.recent && (i.marker === "✔" || i.marker === "✖"))
   assert.deepEqual(rows.map((i) => [i.marker, i.status, i.markerColor]), [
-    ["✔", "OK", "success"], ["✖", "ERR", "error"], ["✖", "DUP", "muted"],
+    ["✔", "OK", "action"], ["✖", "ERR", "error"], ["✖", "DUP", "muted"],
   ])
   assert.ok(rows.every((i) => i.markerSpace === true && i.nameBold === false && i.nameColor === "muted"))
   const second = model.listItems.filter((i) => i.recent && i.marker.startsWith("#"))
