@@ -201,8 +201,8 @@ func finishMutation(ctx context.Context, tx *cardTx, g mutationGraph, ws PathCom
 // when any id has an active run, and restores removed cards if publishing fails.
 func (d *TaskDeleter) Delete(ctx context.Context, ids []string) (DeleteResult, error) {
 	var out DeleteResult
-	normalized := normalizeIDs(ids)
-	if err := validateIDs(normalized); err != nil {
+	normalized, err := normalizeIDs(ids)
+	if err != nil {
 		return out, err
 	}
 	refused, err := d.refused(ctx, normalized)
@@ -295,16 +295,10 @@ func withoutTasks(tasks []core.Task, ids []string) []core.Task {
 	return out
 }
 
-func validateIDs(ids []string) error {
-	for _, id := range ids {
-		if !validTaskID(id) {
-			return core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
-		}
-	}
-	return nil
-}
-
-func normalizeIDs(ids []string) []string {
+// normalizeIDs is the one id rule shared by task deletion and task update. It
+// trims space, drops blanks and repeats, and rejects any id that cannot name a
+// card. The first occurrence of an id wins.
+func normalizeIDs(ids []string) ([]string, error) {
 	out := make([]string, 0, len(ids))
 	seen := make(map[string]bool, len(ids))
 	for _, raw := range ids {
@@ -312,10 +306,13 @@ func normalizeIDs(ids []string) []string {
 		if id == "" || seen[id] {
 			continue
 		}
+		if !validTaskID(id) {
+			return nil, core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
+		}
 		seen[id] = true
 		out = append(out, id)
 	}
-	return out
+	return out, nil
 }
 
 func validTaskID(id string) bool {

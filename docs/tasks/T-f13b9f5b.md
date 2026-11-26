@@ -1,7 +1,7 @@
 ---
 id: T-f13b9f5b
 title: Unify ID normalization in task mutations
-status: available
+status: done
 scope:
     - internal/app/taskdelete.go
     - internal/app/taskdelete_test.go

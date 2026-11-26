@@ -101,19 +101,26 @@ func (u *TaskUpdater) Update(ctx context.Context, updates []UpdateInput) (Update
 }
 
 func normalizeUpdates(updates []UpdateInput) ([]UpdateInput, error) {
-	out := make([]UpdateInput, 0, len(updates))
-	seen := make(map[string]bool, len(updates))
-	for _, in := range updates {
-		id := strings.TrimSpace(in.ID)
-		if id == "" || seen[id] {
+	ids := make([]string, len(updates))
+	for i, in := range updates {
+		ids[i] = strings.TrimSpace(in.ID)
+	}
+	normalized, err := normalizeIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	first := make(map[string]UpdateInput, len(normalized))
+	for i, id := range ids {
+		if _, ok := first[id]; ok {
 			continue
 		}
-		if !validTaskID(id) {
-			return nil, core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
-		}
-		seen[id] = true
+		in := updates[i]
 		in.ID = id
-		out = append(out, in)
+		first[id] = in
+	}
+	out := make([]UpdateInput, 0, len(normalized))
+	for _, id := range normalized {
+		out = append(out, first[id])
 	}
 	return out, nil
 }
