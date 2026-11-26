@@ -82,7 +82,7 @@ func TestPRChangeReachesReconcilerAndEveryMonitor(t *testing.T) {
 		}
 	}()
 
-	api := &apiServer{token: "secret", changes: subs, frames: newEventFrames(nil, json.Marshal)}
+	api := &apiServer{token: []byte("secret"), changes: subs, frames: newEventFrames(nil, json.Marshal)}
 	srv := httptest.NewServer(api.handler())
 	defer srv.Close()
 
@@ -307,7 +307,7 @@ func TestHarnessFramesReachEveryMonitorOverHTTP(t *testing.T) {
 	frames := newEventFrames(src, json.Marshal)
 	go frames.run(ctx)
 
-	api := &apiServer{token: "secret", frames: frames, changes: newChangeSubscribers()}
+	api := &apiServer{token: []byte("secret"), frames: frames, changes: newChangeSubscribers()}
 	srv := httptest.NewServer(api.handler())
 	defer srv.Close()
 
@@ -364,7 +364,7 @@ func TestCombinedHarnessAndPRChangeReachOneMonitor(t *testing.T) {
 	go frames.run(ctx)
 	go subs.run(ctx, changeSrc)
 
-	api := &apiServer{token: "secret", frames: frames, changes: subs}
+	api := &apiServer{token: []byte("secret"), frames: frames, changes: subs}
 	srv := httptest.NewServer(api.handler())
 	defer srv.Close()
 
@@ -480,7 +480,7 @@ func newRecordingAPIServer(t *testing.T, services *recordingAPIServices) *httpte
 	t.Helper()
 	api := &apiServer{
 		services: apiServices{status: services, control: services},
-		token:    "secret",
+		token:    []byte("secret"),
 		changes:  newChangeSubscribers(),
 	}
 	srv := httptest.NewServer(api.handler())
@@ -527,6 +527,73 @@ func TestHTTPRoutesRejectMissingBearerToken(t *testing.T) {
 		t.Fatalf("service calls after rejected requests = %v, want none", calls)
 	}
 	t.Logf("service calls after three rejected requests: %d", len(services.recorded()))
+}
+
+func TestAuthAcceptsOnlyTheExactToken(t *testing.T) {
+	services := &recordingAPIServices{}
+	srv := newRecordingAPIServer(t, services)
+
+	for _, tc := range []struct {
+		name   string
+		header string
+		want   int
+	}{
+		{"exact", "Bearer secret", http.StatusOK},
+		{"wrong", "Bearer wrong", http.StatusUnauthorized},
+		{"longer", "Bearer secretx", http.StatusUnauthorized},
+		{"shorter", "Bearer secre", http.StatusUnauthorized},
+		{"empty token", "Bearer ", http.StatusUnauthorized},
+		{"no scheme", "secret", http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/runs", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", tc.header)
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+			t.Logf("Authorization %q -> %d", tc.header, resp.StatusCode)
+		})
+	}
+
+	// The one accepted request reaches Active; every rejected request stops at
+	// the HTTP boundary.
+	if calls := services.recorded(); len(calls) != 1 || calls[0] != "active" {
+		t.Fatalf("service calls = %v, want [active] from the accepted request only", calls)
+	}
+}
+
+// TestAuthDoesNotAllocatePerRequest proves the token bytes are stored once at
+// construction and the header is viewed, not copied, on each request.
+func TestAuthDoesNotAllocatePerRequest(t *testing.T) {
+	const iterations = 100
+
+	api := &apiServer{token: []byte("secret")}
+	passed := 0
+	handler := api.auth(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		passed++
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+
+	allocs := testing.AllocsPerRun(iterations, func() {
+		handler.ServeHTTP(rec, req)
+	})
+	if allocs != 0 {
+		t.Fatalf("auth allocations per request = %v, want 0", allocs)
+	}
+	// AllocsPerRun calls f once to warm up before the measured iterations.
+	if passed != iterations+1 {
+		t.Fatalf("requests passed to the next handler = %d, want %d", passed, iterations+1)
+	}
 }
 
 // countingStatus returns a fixed run list and counts every Active call. It
@@ -579,7 +646,7 @@ func TestRunsSnapshotSharedAcrossMonitorsPerGeneration(t *testing.T) {
 	status := &countingStatus{runs: runs}
 	api := &apiServer{
 		services: apiServices{status: status},
-		token:    "secret",
+		token:    []byte("secret"),
 		frames:   newEventFrames(nil, json.Marshal),
 		changes:  subs,
 	}
