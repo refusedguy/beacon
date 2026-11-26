@@ -343,6 +343,85 @@ func TestHarnessFramesReachEveryMonitorOverHTTP(t *testing.T) {
 	t.Logf("harness frame over HTTP: %q", recorder.Body.String())
 }
 
+// TestCombinedHarnessAndPRChangeReachOneMonitor drives a harness event and a
+// PR change from their sources in one tick and asserts one connected monitor
+// receives both frames with the documented notification shapes. The harness
+// frame reaches the monitor through frames.run; the PR frame reaches it through
+// changeSubscribers. Arriving together must not drop either frame.
+func TestCombinedHarnessAndPRChangeReachOneMonitor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Mirror serve and startAPIServer wiring: one harness view feeds frames.run
+	// while a second ends the snapshot generation, and one PR stream feeds the
+	// change broadcaster. Both sources reach the same SSE handler.
+	harnessSrc := make(chan core.HarnessEvent)
+	changeSrc := make(chan int)
+	views := fanout(ctx, harnessSrc, 2)
+	subs := newChangeSubscribers()
+	go invalidateOnHarness(ctx, views[1], subs.snapshot)
+	frames := newEventFrames(views[0], json.Marshal)
+	go frames.run(ctx)
+	go subs.run(ctx, changeSrc)
+
+	api := &apiServer{token: "secret", frames: frames, changes: subs}
+	srv := httptest.NewServer(api.handler())
+	defer srv.Close()
+
+	stream, closeStream := connectSSE(t, srv, "secret")
+	defer closeStream()
+
+	ev := core.HarnessEvent{RunID: "r-combined", Kind: "progress"}
+	const pr = 73
+
+	// Both expected frames go through the documented SSE writer, so the data
+	// lines below are the wire shape a monitor is promised.
+	expect := func(event string, payload any) string {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		writeSSE(recorder, event, payload)
+		lines := strings.Split(recorder.Body.String(), "\n")
+		if len(lines) < 2 || lines[0] != "event: "+event {
+			t.Fatalf("unexpected wire frame %q", recorder.Body.String())
+		}
+		return strings.TrimPrefix(lines[1], "data: ")
+	}
+	wantHarness := expect("harness", core.NewWireEvent(ev))
+	wantPR := expect("pr_changed", map[string]int{"pr": pr})
+
+	// Drive both sources before reading either frame. The SSE handler may write
+	// them in either order, so collect by event name instead of reading in a
+	// fixed sequence.
+	harnessSrc <- ev
+	changeSrc <- pr
+
+	got := make(map[string]string, 2)
+	for len(got) < 2 && stream.Scan() {
+		line := stream.Text()
+		if !strings.HasPrefix(line, "event: ") {
+			continue
+		}
+		name := strings.TrimPrefix(line, "event: ")
+		if name != "harness" && name != "pr_changed" {
+			continue
+		}
+		if !stream.Scan() {
+			t.Fatalf("SSE stream closed before %s data: %v", name, stream.Err())
+		}
+		got[name] = strings.TrimPrefix(stream.Text(), "data: ")
+	}
+	if len(got) != 2 {
+		t.Fatalf("SSE stream closed before both frames: got %v, err %v", got, stream.Err())
+	}
+	if got["harness"] != wantHarness {
+		t.Fatalf("harness data = %q, want %q", got["harness"], wantHarness)
+	}
+	if got["pr_changed"] != wantPR {
+		t.Fatalf("pr_changed data = %q, want %q", got["pr_changed"], wantPR)
+	}
+	t.Logf("combined stream delivered harness %q and pr_changed %q", got["harness"], got["pr_changed"])
+}
+
 // recordingAPIServices records every call that reaches the service layer. A
 // request rejected at the HTTP boundary must leave the record empty.
 type recordingAPIServices struct {
