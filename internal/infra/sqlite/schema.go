@@ -162,6 +162,82 @@ func openDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// dropRedundantRunIndexes removes runs_state_idx. Its keys are a strict prefix
+// of runs_state_updated_idx, which the snapshot indexes supply on every open,
+// so keeping it only adds write cost. Databases created before the composite
+// index existed still carry it, hence the idempotent drop on open.
+func dropRedundantRunIndexes(db *sql.DB) error {
+	_, err := db.Exec(`DROP INDEX IF EXISTS runs_state_idx`)
+	return err
+}
+
+// ensureSnapshotIndexes adds the covering indexes the snapshot reads rely on.
+// They live on the read side, next to the queries they serve, so an older
+// state database gains them on the next open without a schema version bump.
+func ensureSnapshotIndexes(db *sql.DB) error {
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS runs_state_updated_idx ON runs(state, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS decisions_run_kind_verdict_action_idx ON decisions(run_id, kind, verdict, action)`,
+		`CREATE INDEX IF NOT EXISTS decisions_orphan_at_idx ON decisions(run_id, at DESC) WHERE run_id = ''`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureDecisionSummary keeps a small aggregate of decision counts so a
+// snapshot never scans the decision table to build its metrics. A trigger
+// maintains the aggregate on every insert; the backfill makes an older state
+// database correct on the next open.
+func ensureDecisionSummary(db *sql.DB) error {
+	const table = `CREATE TABLE IF NOT EXISTS decision_summary (
+run_id TEXT NOT NULL, kind TEXT NOT NULL, verdict TEXT NOT NULL, action TEXT NOT NULL,
+n INTEGER NOT NULL, PRIMARY KEY (run_id, kind, verdict, action))`
+	if _, err := db.Exec(table); err != nil {
+		return err
+	}
+	const insertTrigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_insert
+AFTER INSERT ON decisions BEGIN
+INSERT INTO decision_summary (run_id, kind, verdict, action, n)
+VALUES (NEW.run_id, NEW.kind, NEW.verdict, NEW.action, 1)
+ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = n + 1;
+END`
+	if _, err := db.Exec(insertTrigger); err != nil {
+		return err
+	}
+	// Retention deletes old decisions. Without the matching decrement the
+	// summary would keep counting rows that no longer exist, so DecisionCounts
+	// would report totals larger than the bounded history it summarizes.
+	const deleteTrigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_delete
+AFTER DELETE ON decisions BEGIN
+UPDATE decision_summary SET n = n - 1
+WHERE run_id = OLD.run_id AND kind = OLD.kind
+  AND verdict = OLD.verdict AND action = OLD.action;
+DELETE FROM decision_summary WHERE run_id = OLD.run_id AND kind = OLD.kind
+  AND verdict = OLD.verdict AND action = OLD.action AND n <= 0;
+END`
+	if _, err := db.Exec(deleteTrigger); err != nil {
+		return err
+	}
+	// Backfill only when the aggregate is empty. A populated summary is kept
+	// current by the trigger, so a restart must not regroup a large decision
+	// table for no reason.
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM decision_summary`).Scan(&rows); err != nil {
+		return err
+	}
+	if rows > 0 {
+		return nil
+	}
+	_, err := db.Exec(`INSERT INTO decision_summary (run_id, kind, verdict, action, n)
+SELECT run_id, kind, verdict, action, COUNT(*) FROM decisions
+GROUP BY run_id, kind, verdict, action
+ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = excluded.n`)
+	return err
+}
+
 // backfillRunEvents gives runs saved before the event table existed a start
 // and an observation using their existing timestamps. It only inserts into the
 // new table and skips runs that already have events, so repeated opens and
