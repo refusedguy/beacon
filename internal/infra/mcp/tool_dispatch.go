@@ -42,26 +42,18 @@ func registerDispatch(s *msdk.Server, sv Services) {
 			return nil, nil, err
 		}
 		source, agent := dispatchCaller(req)
-		failed := failedRuns(ctx, sv.Dispatcher, res.Failures)
-		summary := make([]dispatchOutcome, 0, len(res.Runs)+len(failed)+len(res.Skipped))
-		runs := make([]*core.Run, 0, len(res.Runs)+len(failed))
+		summary := make([]dispatchOutcome, 0, len(res.Runs)+len(res.Failures)+len(res.Skipped))
+		runs := make([]*core.Run, 0, len(res.Runs))
 		for _, run := range res.Runs {
 			run.RecordLaunch(source, agent)
 			runs = append(runs, run)
 			summary = append(summary, outcomeForRun(run))
 		}
 		for _, failure := range res.Failures {
-			run := failed[failure.TaskID]
-			if run == nil {
-				summary = append(summary, dispatchOutcome{
-					ID: string(failure.TaskID), TaskID: string(failure.TaskID),
-					State: "failed", Reason: failure.Err, Launch: string(source), Identity: agent,
-				})
-				continue
-			}
-			run.RecordLaunch(source, agent)
-			runs = append(runs, run)
-			summary = append(summary, outcomeForRun(run))
+			summary = append(summary, dispatchOutcome{
+				ID: string(failure.TaskID), TaskID: string(failure.TaskID),
+				State: "failed", Reason: failure.Err, Launch: string(source), Identity: agent,
+			})
 		}
 		for _, skip := range res.Skipped {
 			summary = append(summary, dispatchOutcome{
@@ -112,33 +104,6 @@ func metaString(req *msdk.CallToolRequest, keys ...string) string {
 		}
 	}
 	return ""
-}
-
-// failedRuns recovers the persisted records for runs that failed to start.
-// Dispatch reports those only as task IDs, so the caller-facing summary looks
-// them up by task to give back a real run ID, state and reason.
-func failedRuns(ctx context.Context, d *app.Dispatcher, failures []app.DispatchFailure) map[core.TaskID]*core.Run {
-	out := map[core.TaskID]*core.Run{}
-	if d == nil || d.Store == nil || len(failures) == 0 {
-		return out
-	}
-	limit := len(failures) + app.DefaultRecentLimit
-	recent, err := d.Store.ListRecent(ctx, limit)
-	if err != nil {
-		return out
-	}
-	byTask := make(map[core.TaskID]*core.Run, len(recent))
-	for _, run := range recent {
-		if _, seen := byTask[run.TaskID]; !seen {
-			byTask[run.TaskID] = run
-		}
-	}
-	for _, failure := range failures {
-		if run, ok := byTask[failure.TaskID]; ok {
-			out[failure.TaskID] = run
-		}
-	}
-	return out
 }
 
 // parentSession reads the operator session from call metadata. A worker that
