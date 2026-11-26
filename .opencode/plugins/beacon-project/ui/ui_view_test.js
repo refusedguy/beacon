@@ -36,7 +36,7 @@ test("state bar builds proportional colored segments and a human summary", () =>
   assert.equal(item.bar.length, STATE_BAR_WIDTH)
   assert.equal(item.segments.reduce((n, s) => n + s.text.length, 0), STATE_BAR_WIDTH)
   assert.deepEqual(item.segments.map((s) => s.color), [
-    "muted", "success", "info", "warning", "warning", "error", "success", "muted", "muted",
+    "muted", "success", "info", "warning", "warning", "error", "action", "muted", "muted",
   ])
   assert.equal(item.legend, "P0 R2 C1 E0 F0 B1 M51 X0")
   assert.equal(item.summary, "2 running · 1 in CI · 1 blocked · 1 done")
@@ -49,6 +49,25 @@ test("state bar builds proportional colored segments and a human summary", () =>
   assert.equal(empty.segments[0].text, "")
   assert.equal(empty.segments.at(-1).text, "─".repeat(STATE_BAR_WIDTH))
   assert.ok(empty.content.includes("P0 R0 C0 E0 F0 B0 M0 X0"))
+})
+
+test("RUN and MERGED keep distinct colors in the bar and recent rows", () => {
+  const bar = stateBarItem({
+    active: [makeRun({ ID: "a", TaskID: "T-A", State: "running" })],
+    recent: [makeRun({ ID: "m", TaskID: "T-M", State: "merged" })],
+  })
+  const running = bar.segments.find((s) => s.color === "success")
+  const merged = bar.segments.find((s) => s.color === "action")
+  assert.ok(running.text, "running fills a success segment")
+  assert.ok(merged.text, "merged fills an accent segment")
+  assert.notEqual(running.color, merged.color)
+
+  const runningRow = runLineItems(normalizeRun(makeRun({ State: "running" })), NOW)[0]
+  const mergedRow = runLineItems(normalizeRun(makeRun({ State: "merged" })), NOW, true)[0]
+  assert.equal(runningRow.color, "success")
+  assert.equal(mergedRow.status, "OK")
+  assert.equal(mergedRow.markerColor, "action")
+  assert.notEqual(runningRow.color, mergedRow.markerColor)
 })
 
 test("every run state gets a solid segment and its own legend count", () => {

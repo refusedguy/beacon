@@ -18,9 +18,11 @@ export const STATE_BAR_EMPTY = "─"
 export const STATE_BAR_KEYS = Object.freeze([
   "pending", "running", "waiting_ci", "needs_rebase", "needs_agent_fix", "blocked", "merged", "closed",
 ])
+// Finished work gets the accent tone so RUN and MERGED never share a color.
+const MERGED_COLOR = "action"
 const STATE_BAR_COLOR = Object.freeze({
   pending: "muted", running: "success", waiting_ci: "info", needs_rebase: "warning",
-  needs_agent_fix: "warning", blocked: "error", merged: "success", closed: "muted",
+  needs_agent_fix: "warning", blocked: "error", merged: MERGED_COLOR, closed: "muted",
 })
 const STATE_BAR_LETTER = Object.freeze({
   pending: "P", running: "R", waiting_ci: "C", needs_rebase: "E",
@@ -34,7 +36,7 @@ const STATE_VIEW = Object.freeze({
   needs_rebase: { marker: "◆", color: "warning", label: "REBASE" },
   needs_agent_fix: { marker: "◆", color: "warning", label: "FIX" },
   blocked: { marker: "▲", color: "error", label: "BLK" },
-  merged: { marker: "✔", color: "success", label: "MERGED" },
+  merged: { marker: "✔", color: MERGED_COLOR, label: "MERGED" },
   closed: { marker: "✖", color: "muted", label: "CLOSED" },
 })
 export const stateView = (state) => STATE_VIEW[str(state).toLowerCase()] ?? { marker: "·", color: "muted", label: "?" }
@@ -178,7 +180,8 @@ export function runLineItems(run, now = Date.now(), recent = false) {
     color: "muted", statusColor: errorReason ? "error" : "muted", runID: run.id }
   if (recent) {
     const badge = recentBadge(run)
-    const tone = badge === "DUP" ? "muted" : badge === "ERR" ? "error" : "success"
+    const tone = badge === "DUP" ? "muted" : badge === "ERR" ? "error"
+      : state === "merged" ? MERGED_COLOR : "success"
     return [
       { marker: badge === "OK" ? "✔" : "✖", markerSpace: true, name: title, status: badge,
         color: tone, markerColor: tone, nameColor: "muted", nameBold: false, statusColor: tone,
