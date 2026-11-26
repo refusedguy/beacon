@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -353,6 +354,22 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 	// event. Otherwise the connection appears to hang until the first ping.
 	rw.WriteHeader(http.StatusOK)
 	flusher.Flush()
+
+	// Every frame carries a monotonic id so a monitor that reconnects can send
+	// Last-Event-ID and ask to resume. Seeding from that header keeps the id
+	// sequence increasing across reconnects. The event and data lines keep
+	// their documented shape; the id line is an SSE field before them.
+	nextID := int64(0)
+	if raw := r.Header.Get("Last-Event-ID"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			nextID = n
+		}
+	}
+	writeID := func() {
+		nextID++
+		_, _ = fmt.Fprintf(rw, "id: %d\n", nextID)
+	}
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -360,12 +377,15 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case frame := <-frames:
+			writeID()
 			_, _ = rw.Write(frame)
 			flusher.Flush()
 		case pr := <-changes:
+			writeID()
 			writeSSE(rw, "pr_changed", map[string]int{"pr": pr})
 			flusher.Flush()
 		case <-ticker.C:
+			writeID()
 			writeSSE(rw, "ping", map[string]string{"time": time.Now().UTC().Format(time.RFC3339)})
 			flusher.Flush()
 		}
