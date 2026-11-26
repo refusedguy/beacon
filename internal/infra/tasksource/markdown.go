@@ -283,11 +283,6 @@ func splitFrontmatterLines(lines []string) (yamlText, body string, ok bool) {
 	return "", "", false
 }
 
-// splitFrontmatter separates a card's YAML header from its body.
-func splitFrontmatter(s string) (yamlText, body string, ok bool) {
-	return splitFrontmatterLines(cardLines(s))
-}
-
 // parseCard parses one card's content and records its path.
 func parseCard(content, path string) (core.Task, bool) {
 	t, ok, _ := parseCardFields(content, path)
@@ -357,11 +352,6 @@ func headingIDLines(lines []string) (core.TaskID, string) {
 	return "", ""
 }
 
-// headingID extracts an identifier and title from a card heading.
-func headingID(s string) (core.TaskID, string) {
-	return headingIDLines(cardLines(s))
-}
-
 // parseLegacyLines parses a card without frontmatter from pre-split lines.
 func parseLegacyLines(lines []string, dir string) core.Task {
 	t := core.Task{}
@@ -386,11 +376,6 @@ func parseLegacyLines(lines []string, dir string) core.Task {
 	}
 	t.Body = strings.Join(extra, "\n")
 	return t
-}
-
-// parseLegacy parses a card that has no YAML frontmatter.
-func parseLegacy(content, dir string) core.Task {
-	return parseLegacyLines(cardLines(content), dir)
 }
 
 // Children returns the child tasks declared in an epic card's plan. A card
