@@ -1,7 +1,7 @@
 ---
 id: T-4a47e8cc
 title: Remove redundant issue-scout permission explanation
-status: available
+status: done
 scope:
     - .opencode/agents/issue-scout.md
 priority: 48
