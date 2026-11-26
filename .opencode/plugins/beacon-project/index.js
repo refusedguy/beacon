@@ -9,8 +9,9 @@ import {
 } from "./state/options.js"
 import {
   BeaconStatusRpc, RUN_CHANGED_EVENT,
-  createCliStatusSource, normalizeSnapshot, createRunChangeWatcher,
+  createCliStatusSource, normalizeSnapshot,
 } from "./ui/status_rpc.js"
+import { createRunChangeWatcher } from "./run_watcher.js"
 import { isWorkerAgent, registerShellGuard } from "./shell_guard.js"
 
 // OpenCode does not hand a session ID to plugin setup. Read the agent from the
@@ -138,6 +139,6 @@ export {
   commandSubstitutions, compileShellGuardRule, findShellGuardHit, guardAppliesToAgent,
   guardedAgents, guardMode, isWorkerAgent, registerShellGuard, stripCommandPrefix,
 } from "./shell_guard.js"
-export { createRunChangeWatcher } from "./ui/status_rpc.js"
+export { createRunChangeWatcher } from "./run_watcher.js"
 export { pluginOptions, pollIntervalMs, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./state/options.js"
 export default beaconProject

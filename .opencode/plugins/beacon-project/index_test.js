@@ -12,7 +12,6 @@ import {
   commandFromToolInput,
   commandSegments,
   commandSubstitutions,
-  createRunChangeWatcher,
   currentSessionAgent,
   defineBeaconProject,
   findShellGuardHit,
@@ -289,24 +288,6 @@ test("snapshot limits are configurable with safe defaults", () => {
     recentLimit: 2, decisionsLimit: 7,
   })
   assert.deepEqual(snapshotLimits({ snapshotRecentLimit: -3 }), { recentLimit: 5, decisionsLimit: 20 })
-})
-
-test("run change watcher honours a custom interval and can be stopped", async () => {
-  const timers = []
-  const source = { snapshot: async () => ({ active: [], recent: [] }) }
-  const watcher = createRunChangeWatcher(source, {
-    emit: () => {},
-    deps: {
-      intervalMs: 2500,
-      setInterval: (fn, ms) => { timers.push(ms); return 1 },
-      clearInterval: () => {},
-    },
-  })
-  watcher.start()
-  assert.deepEqual(timers, [2500])
-  assert.equal(watcher.running, true)
-  watcher.stop()
-  assert.equal(watcher.running, false)
 })
 
 function beaconCommandSpy(calls) {

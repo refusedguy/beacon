@@ -1,4 +1,6 @@
-import { REFRESH_MS, changedRuns, normalizeSnapshot } from "./ui/ui.js"
+// Import the model directly so the server half can load this module without
+// pulling in the TUI runtime through ui/ui.js.
+import { REFRESH_MS, changedRuns, normalizeSnapshot } from "./ui/ui_model.js"
 
 // Serializing the raw snapshot is much cheaper than rebuilding the normalized
 // runs, queue and metrics on an idle tick. An unchanged fingerprint means the
