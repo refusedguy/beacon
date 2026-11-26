@@ -101,13 +101,15 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
     log(`beacon dispatch click id=${id}`)
     setDispatching(true)
     refreshDispatchingViews()
-    // Start the snapshot read with dispatch so the two CLI lifetimes overlap.
-    // A watcher event may follow up once the run exists; the refresh coalesces
-    // both reads so only the final snapshot renders.
-    const refreshed = refresh()
+    let refreshed = Promise.resolve()
     const promise = (async () => {
       try {
-        const result = await source.dispatch(input)
+        // Start dispatch first so the source can mark the follow-up read as
+        // covered by it. That read reuses the returned run data instead of
+        // starting a second CLI process, and the watcher can supersede it.
+        const dispatched = source.dispatch(input)
+        refreshed = refresh()
+        const result = await dispatched
         const count = Number(result?.started ?? result?.dispatched ?? result?.runs?.length ?? result?.startedRuns ?? 0)
         show(Number.isFinite(count) && count > 0
           ? `Dispatched ${count} task${count === 1 ? "" : "s"}` : "Nothing to dispatch right now", "success")
