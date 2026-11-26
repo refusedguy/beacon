@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,83 +34,29 @@ jobs:
             go.sum
             ui/tui/go.sum
 
-      - name: Root module
+      - name: Build root module
         run: go build ./...
 
-      - name: OpenCode harness module
+      - name: Build OpenCode harness module
         working-directory: harnesses/opencode
         run: go build ./...
 
-      - name: TUI module
+      - name: Build TUI module
         working-directory: ui/tui
         run: |
           go build ./...
           rm -f tui
 
-  vet:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
-
-      - name: Root module
+      - name: Vet root module
         run: go vet ./...
 
-      - name: OpenCode harness module
+      - name: Vet OpenCode harness module
         working-directory: harnesses/opencode
         run: go vet ./...
 
-      - name: TUI module
+      - name: Vet TUI module
         working-directory: ui/tui
         run: go vet ./...
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
-
-      - name: Root module
-        run: go test -race -shuffle=on ./...
-
-      - name: ACP harness module
-        working-directory: harnesses/acp
-        run: go test -race -shuffle=on ./...
-
-      - name: OpenCode harness module
-        working-directory: harnesses/opencode
-        run: go test -race -shuffle=on ./...
-
-      - name: TUI module
-        working-directory: ui/tui
-        run: go test -race -shuffle=on ./...
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
 
       - name: Format check
         run: test -z "$(gofmt -l cmd internal pkg harnesses ui arch_test.go)"
@@ -133,6 +79,66 @@ jobs:
       - name: Plugin tests
         run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test ".opencode/plugins/beacon-project/**/*_test.js"
 
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "build passed in verify"
+
+  vet:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "vet passed in verify"
+
+  lint:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "lint passed in verify"
+
+  test-modules:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: root command and infra
+            dir: .
+            packages: ./cmd/... ./internal/...
+          - module: root core
+            dir: .
+            packages: . ./pkg/...
+          - module: acp
+            dir: harnesses/acp
+            packages: ./...
+          - module: opencode
+            dir: harnesses/opencode
+            packages: ./...
+          - module: tui
+            dir: ui/tui
+            packages: ./...
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
+
+      - name: Test ${{ matrix.module }} module
+        working-directory: ${{ matrix.dir }}
+        run: go test -race -shuffle=on ${{ matrix.packages }}
+
+  test:
+    needs: test-modules
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "all module suites passed"
+
   plugin-tui-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -143,7 +149,18 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Cache OpenCode CLI
+        id: cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.opencode/bin
+          key: opencode-cli-${{ hashFiles('.opencode/plugins/beacon-project/supported-cli.json') }}
+
+      - name: Add OpenCode CLI to PATH
+        run: echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
       - name: Install the supported OpenCode CLI
+        if: steps.cli-cache.outputs.cache-hit != 'true'
         run: |
           VERSION="$(node -p "require('./.opencode/plugins/beacon-project/supported-cli.json').cliVersion")"
           curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "$VERSION" --no-modify-path
