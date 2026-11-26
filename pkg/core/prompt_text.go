@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 var prPattern = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
@@ -44,13 +45,28 @@ func WakeTextLimited(w WakeContext, limit int) string {
 	return b.String()
 }
 
+// truncate caps s at limit runes. A byte length check keeps short strings
+// allocation free, and valid UTF-8 is walked only up to the cap. Invalid UTF-8
+// keeps the eager conversion so replacement bytes stay identical.
 func truncate(s string, limit int) string {
-	if limit <= 0 {
+	if limit <= 0 || len(s) <= limit {
 		return s
 	}
-	r := []rune(s)
-	if len(r) <= limit {
+	if !utf8.ValidString(s) {
+		r := []rune(s)
+		if len(r) <= limit {
+			return s
+		}
+		return string(r[:limit]) + "..."
+	}
+	i, n := 0, 0
+	for i < len(s) && n < limit {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		n++
+	}
+	if i == len(s) {
 		return s
 	}
-	return string(r[:limit]) + "..."
+	return s[:i] + "..."
 }

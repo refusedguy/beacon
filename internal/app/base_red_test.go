@@ -384,10 +384,13 @@ func TestCompactExcerptAvoidsRuneSliceAllocation(t *testing.T) {
 	if got, want := compactExcerpt(excerpt), compact(excerpt); got != want {
 		t.Fatal("compactExcerpt changed the output")
 	}
-	oldAllocs := testing.AllocsPerRun(100, func() { _ = compact(excerpt) })
+	oldAllocs := testing.AllocsPerRun(100, func() {
+		r := []rune(excerpt)
+		_ = string(r[:excerptRuneLimit]) + "\n...[truncated]"
+	})
 	newAllocs := testing.AllocsPerRun(100, func() { _ = compactExcerpt(excerpt) })
 	if newAllocs >= oldAllocs {
-		t.Fatalf("allocs: compactExcerpt %.1f, compact %.1f", newAllocs, oldAllocs)
+		t.Fatalf("allocs: compactExcerpt %.1f, eager rune baseline %.1f", newAllocs, oldAllocs)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -143,17 +144,33 @@ func decisionSignature(d Decision) string {
 	}, "\x00")
 }
 
-// shortLogReason keeps a log field scalar and bounded. Failure excerpts can be
-// long, so only a short prefix reaches the log. The default handler redacts
-// secrets from every string it sees.
+// shortLogReason keeps a log field scalar and bounded. A byte length check
+// skips the rune conversion for short reasons, and longer valid UTF-8 is
+// walked to the cap. Invalid UTF-8 keeps the eager conversion so the output
+// stays byte identical. The default handler redacts every string it sees.
 func shortLogReason(s string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\r", " "))
 	s = strings.ReplaceAll(s, "\n", " ")
-	runes := []rune(s)
-	if len(runes) <= maxLogReasonRunes {
+	if len(s) <= maxLogReasonRunes {
 		return s
 	}
-	return string(runes[:maxLogReasonRunes]) + "..."
+	if !utf8.ValidString(s) {
+		r := []rune(s)
+		if len(r) <= maxLogReasonRunes {
+			return s
+		}
+		return string(r[:maxLogReasonRunes]) + "..."
+	}
+	i, n := 0, 0
+	for i < len(s) && n < maxLogReasonRunes {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		n++
+	}
+	if i == len(s) {
+		return s
+	}
+	return s[:i] + "..."
 }
 
 func joinLogPaths(paths []core.ScopePath) string {
