@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-github/v93/github"
 )
@@ -245,5 +247,112 @@ func TestGuardedReturnsTypedResults(t *testing.T) {
 	count, err := guarded(br, func() (int, error) { return 0, sentinel })
 	if count != 0 || !errors.Is(err, sentinel) {
 		t.Fatalf("guarded() = %d, %v; want 0, sentinel", count, err)
+	}
+}
+
+// roundGate counts the sequential rounds an Observe makes. The first expected
+// calls wait on a gate before answering, which proves they ran together and
+// keeps them distinct from calls in a later round.
+type roundGate struct {
+	mu       sync.Mutex
+	arrived  int
+	inFlight int
+	peak     int
+	gate     chan struct{}
+	once     sync.Once
+	expected int
+	waves    map[int]bool
+}
+
+func newRoundGate(expected int) *roundGate {
+	return &roundGate{gate: make(chan struct{}), expected: expected, waves: map[int]bool{}}
+}
+
+func (g *roundGate) first() {
+	g.mu.Lock()
+	g.arrived++
+	n := g.arrived
+	g.inFlight++
+	if g.inFlight > g.peak {
+		g.peak = g.inFlight
+	}
+	g.waves[1] = true
+	g.mu.Unlock()
+	if n == g.expected {
+		g.once.Do(func() { close(g.gate) })
+	}
+	select {
+	case <-g.gate:
+	case <-time.After(3 * time.Second):
+	}
+	g.mu.Lock()
+	g.inFlight--
+	g.mu.Unlock()
+}
+
+func (g *roundGate) later() {
+	g.mu.Lock()
+	g.waves[2] = true
+	g.mu.Unlock()
+	select {
+	case <-g.gate:
+	case <-time.After(3 * time.Second):
+	}
+}
+
+func (g *roundGate) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.waves)
+}
+
+func (g *roundGate) peakConcurrency() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.peak
+}
+
+func TestGitHubObserveFetchesIndependentSignalsInTwoRounds(t *testing.T) {
+	// checks, reviews and the base comparison have no data dependency; changed
+	// files wait for the check result.
+	gate := newRoundGate(3)
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		first := strings.Contains(p, "/check-runs") || strings.HasSuffix(p, "/reviews") || strings.Contains(p, "/compare/")
+		if first {
+			gate.first()
+		} else if strings.HasSuffix(p, "/files") {
+			gate.later()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(p, "/pulls/42"):
+			_, _ = w.Write([]byte(`{"number":42,"state":"open","head":{"sha":"abc"}}`))
+		case strings.Contains(p, "/check-runs"):
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+		case strings.HasSuffix(p, "/reviews"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.HasSuffix(p, "/files"):
+			_, _ = w.Write([]byte(`[{"filename":"docs/a.md"}]`))
+		case strings.Contains(p, "/compare/"):
+			_, _ = w.Write([]byte(`{"behind_by":0,"base_commit":{"sha":"base"}}`))
+		default:
+			t.Errorf("unexpected path %s", p)
+			http.NotFound(w, r)
+		}
+	}))
+	o, err := g.Observe(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gate.count(); got != 2 {
+		t.Fatalf("rounds = %d, want 2 (checks and reviews and compare, then files)", got)
+	}
+	if got := gate.peakConcurrency(); got != 3 {
+		t.Fatalf("peak concurrent first-round calls = %d, want 3", got)
+	}
+	if o.PRNumber != 42 || o.HeadSHA != "abc" || o.PRState != "open" || o.Approvals != 0 ||
+		!o.WorkflowSkipped || o.Behind || o.BaseSHA != "base" || o.Incomplete || o.IncompleteReason != "" {
+		t.Fatalf("observation changed: %+v", o)
 	}
 }

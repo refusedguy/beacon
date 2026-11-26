@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -22,7 +24,11 @@ type glMR struct {
 	TargetBranch                string   `json:"target_branch"`
 	Labels                      []string `json:"labels"`
 	ApprovedBy                  []glUser `json:"approved_by"`
-	DiffRefs                    struct {
+	HeadPipeline                struct {
+		ID     int    `json:"id"`
+		Status string `json:"status"`
+	} `json:"head_pipeline"`
+	DiffRefs struct {
 		BaseSHA string `json:"base_sha"`
 		HeadSHA string `json:"head_sha"`
 	} `json:"diff_refs"`
@@ -68,25 +74,75 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 		Approvals: len(mr.ApprovedBy),
 	}
 
-	var failed observationErrors
+	// Everything below depends only on the MR read, so fetch it in one bounded
+	// group. A GitLab MR carries its head pipeline; when present, the jobs can
+	// join the first round and only the failure traces wait for that result.
+	var (
+		threads      []string
+		approvals    int
+		pipeline     glPipeline
+		jobs         []glJob
+		behind       bool
+		baseSHA      string
+		threadsErr   error
+		approvalsErr error
+		pipelineErr  error
+		jobsErr      error
+		compareErr   error
+	)
+	usesHeadPipeline := mr.HeadPipeline.ID != 0
+	var group errgroup.Group
+	group.SetLimit(observeParallelLimit)
+	group.Go(func() error {
+		threads, threadsErr = g.unresolvedThreads(ctx, mrIID)
+		return threadsErr
+	})
+	group.Go(func() error {
+		approvals, approvalsErr = g.approvals(ctx, mrIID, mr)
+		return approvalsErr
+	})
+	group.Go(func() error {
+		if !usesHeadPipeline {
+			pipeline, pipelineErr = g.latestPipeline(ctx, url.Values{"sha": {o.HeadSHA}})
+			return pipelineErr
+		}
+		pipeline.ID = mr.HeadPipeline.ID
+		pipeline.Status = mr.HeadPipeline.Status
+		jobs, jobsErr = g.pipelineJobs(ctx, pipeline.ID)
+		return jobsErr
+	})
+	group.Go(func() error {
+		behind, baseSHA, compareErr = g.behind(ctx, mr)
+		return compareErr
+	})
+	_ = group.Wait()
 
-	threads, err := g.unresolvedThreads(ctx, mrIID)
-	failed.add("threads", err)
-	if err == nil {
+	var failed observationErrors
+	failed.add("threads", threadsErr)
+	if threadsErr == nil {
 		o.UnresolvedThreads = threads
 	}
 	if len(o.UnresolvedThreads) == 0 && mr.BlockingDiscussionsResolved != nil && !*mr.BlockingDiscussionsResolved {
 		o.UnresolvedThreads = []string{"blocking discussions are unresolved"}
 	}
-	approvals, err := g.approvals(ctx, mrIID, mr)
-	failed.add("approvals", err)
-	if err == nil {
+	failed.add("approvals", approvalsErr)
+	if approvalsErr == nil {
 		o.Approvals = approvals
 	}
-	g.observeChecks(ctx, &o, o.HeadSHA, &failed)
-	behind, baseSHA, err := g.behind(ctx, mr)
-	failed.add("compare", err)
-	if err == nil {
+	if usesHeadPipeline {
+		failed.add("jobs", jobsErr)
+		if jobsErr == nil {
+			checks, excerpt := g.checksFromJobs(ctx, jobs)
+			applyChecks(&o, checks, excerpt, pipeline)
+		}
+	} else {
+		failed.add("pipelines", pipelineErr)
+		if pipelineErr == nil && pipeline.ID != 0 {
+			g.observeChecks(ctx, &o, pipeline, &failed)
+		}
+	}
+	failed.add("compare", compareErr)
+	if compareErr == nil {
 		o.Behind = behind
 		o.BaseSHA = baseSHA
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/go-github/v93/github"
 	"github.com/sony/gobreaker/v2"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -77,6 +78,11 @@ func (g *GitHub) guarded(fn func() (any, error)) (any, error) {
 // daemon fetching pages forever. With PerPage=100 it covers 10,000 entries.
 const maxGitHubPages = 100
 
+// observeParallelLimit bounds the goroutines that fetch independent PR signals.
+// A single Observe stays within the circuit breaker's burst allowance instead
+// of opening an unbounded number of requests at once.
+const observeParallelLimit = 4
+
 // githubPage carries one page through the breaker, which stores any.
 type githubPage[T any] struct {
 	items []T
@@ -131,9 +137,44 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		Conflict: conflict,
 	}
 
-	checks, err := g.checks(ctx, sha)
-	if err != nil {
-		return o, err
+	// Checks, approvals and the base comparison need only the PR read. Fetch
+	// them together so one slow call does not hold up the others. Changed files
+	// depend on the check result and stay in a second round.
+	var (
+		checks       []core.CheckResult
+		approvals    int
+		cmp          *github.CommitsComparison
+		checksErr    error
+		approvalsErr error
+		compareErr   error
+	)
+	base := p.GetBase().GetRef()
+	if base == "" {
+		base = g.base
+	}
+	var group errgroup.Group
+	group.SetLimit(observeParallelLimit)
+	group.Go(func() error {
+		checks, checksErr = g.checks(ctx, sha)
+		return checksErr
+	})
+	group.Go(func() error {
+		approvals, approvalsErr = g.approvals(ctx, pr)
+		return approvalsErr
+	})
+	group.Go(func() error {
+		cmp, compareErr = guarded(g.br, func() (*github.CommitsComparison, error) {
+			c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
+			return c, err
+		})
+		return compareErr
+	})
+	_ = group.Wait()
+
+	// Report failures in the original call order so callers see the same first
+	// error and the same partially filled observation.
+	if checksErr != nil {
+		return o, checksErr
 	}
 	o.Checks = checks
 	for _, c := range checks {
@@ -149,26 +190,15 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		}
 		o.WorkflowSkipped = ignoredPathsOnly(files)
 	}
-
-	approvals, err := g.approvals(ctx, pr)
-	if err != nil {
-		return o, err
+	if approvalsErr != nil {
+		return o, approvalsErr
 	}
 	o.Approvals = approvals
 	for _, l := range p.Labels {
 		o.Labels = append(o.Labels, l.GetName())
 	}
-
-	base := p.GetBase().GetRef()
-	if base == "" {
-		base = g.base
-	}
-	cmp, err := guarded(g.br, func() (*github.CommitsComparison, error) {
-		c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
-		return c, err
-	})
-	if err != nil {
-		return o, err
+	if compareErr != nil {
+		return o, compareErr
 	}
 	o.Behind = cmp.GetBehindBy() > 0
 	o.BaseSHA = cmp.GetBaseCommit().GetSHA()
