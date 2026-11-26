@@ -14,24 +14,10 @@ import {
 } from "./ui/status_rpc.js"
 import { bodyHash, requestId } from "./protocol/body_hash.js"
 export { bodyHash, requestId }
+import { cleanupWrapper } from "./protocol/cleanup.js"
+export { cleanupWrapper }
 import { createRunChangeWatcher } from "./run_watcher.js"
 import { isWorkerAgent, registerShellGuard } from "./shell_guard.js"
-
-// ui_test_helpers.js re-exports ui/ui.js, which imports ui_runtime.js and its
-// @opentui/solid peer. Importing it here makes the server plugin fail to load,
-// so no status RPC is registered and every RPC call answers 400. Keep the
-// teardown wrapper local to the server half.
-export function cleanupWrapper(prefix) {
-  return (label, dispose) => {
-    const failed = (error) => console.debug(`${prefix}${label} cleanup failed: ${error?.message ?? error}`)
-    try {
-      const result = dispose?.()
-      if (result && typeof result.then === "function") return result.catch(failed)
-    } catch (error) {
-      failed(error)
-    }
-  }
-}
 
 // Normalize at the handler boundary so a malformed n never reaches the CLI.
 // The RPC schema still rejects it first; this keeps a direct caller safe.

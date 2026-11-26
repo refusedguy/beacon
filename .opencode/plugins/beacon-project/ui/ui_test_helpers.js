@@ -1,6 +1,8 @@
 // Shared fixtures for the Beacon TUI plugin tests.
 export * from "./ui.js"
 import { renderSnapshotLines } from "./ui.js"
+import { cleanupWrapper } from "../protocol/cleanup.js"
+export { cleanupWrapper }
 
 export const NOW = Date.parse("2026-11-23T10:10:00Z")
 
@@ -48,21 +50,6 @@ export function hostModule(created = []) {
     },
     insert: () => {},
     setProp: (node, name, value) => { node.props[name] = value },
-  }
-}
-
-// Share the teardown wrapper between plugin setup and the status panel. A
-// failing disposer is logged and skipped so the rest of cleanup still runs.
-// The returned wrapper handles both sync and promise-returning disposers.
-export function cleanupWrapper(prefix) {
-  return (label, dispose) => {
-    const failed = (error) => console.debug(`${prefix}${label} cleanup failed: ${error?.message ?? error}`)
-    try {
-      const result = dispose?.()
-      if (result && typeof result.then === "function") return result.catch(failed)
-    } catch (error) {
-      failed(error)
-    }
   }
 }
 
