@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -349,30 +350,50 @@ func TestIntersectsOnSortedNames(t *testing.T) {
 	}
 }
 
-func TestCompactExcerptMatchesCompact(t *testing.T) {
+func TestCompactExcerptUsesSharedMarker(t *testing.T) {
+	const marker = "..."
 	tests := []struct {
 		name string
 		in   string
+		want string
 	}{
-		{"empty", ""},
-		{"short ascii", "test failed"},
-		{"trim and cr", " \r\n short \r\n "},
-		{"long ascii", strings.Repeat("failure output line\n", 700)},
-		{"short multibyte", "日本語のテスト"},
-		{"bytes over limit runes under", strings.Repeat("日", excerptRuneLimit-1)},
-		{"long multibyte", strings.Repeat("日本語のテスト行\n", 400)},
-		{"exactly limit", strings.Repeat("a", excerptRuneLimit)},
-		{"over limit by one", strings.Repeat("a", excerptRuneLimit+1)},
-		{"invalid utf8", "bad \xff byte " + strings.Repeat("x", 1300)},
+		{"empty", "", ""},
+		{"short ascii", "test failed", "test failed"},
+		{"trim and cr", " \r\n short \r\n ", "short"},
+		{"short multibyte", "日本語のテスト", "日本語のテスト"},
+		{"bytes over limit runes under", strings.Repeat("日", excerptRuneLimit-1), strings.Repeat("日", excerptRuneLimit-1)},
+		{"exactly limit", strings.Repeat("a", excerptRuneLimit), strings.Repeat("a", excerptRuneLimit)},
+		{"over limit by one", strings.Repeat("a", excerptRuneLimit+1), strings.Repeat("a", excerptRuneLimit) + marker},
+		{"multibyte over limit", strings.Repeat("日", excerptRuneLimit+1), strings.Repeat("日", excerptRuneLimit) + marker},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			want := compact(tt.in)
-			got := compactExcerpt(tt.in)
-			if got != want {
-				t.Fatalf("compactExcerpt differs from compact: got %d bytes, want %d bytes", len(got), len(want))
+			if got := compactExcerpt(tt.in); got != tt.want {
+				t.Fatalf("compactExcerpt() = %d bytes, want %d bytes", len(got), len(tt.want))
 			}
 		})
+	}
+
+	bad := "bad \xff byte " + strings.Repeat("x", 1300)
+	got := compactExcerpt(bad)
+	if !strings.HasSuffix(got, marker) {
+		t.Fatalf("invalid utf8 excerpt = %q, want suffix %q", got, marker)
+	}
+	wantRunes := excerptRuneLimit + utf8.RuneCountInString(marker)
+	if n := utf8.RuneCountInString(got); n != wantRunes {
+		t.Fatalf("invalid utf8 excerpt runes = %d, want %d", n, wantRunes)
+	}
+}
+
+func TestExcerptMarkerSharedByWakeAndFixer(t *testing.T) {
+	long := strings.Repeat("x", excerptRuneLimit+10)
+	want := strings.Repeat("x", excerptRuneLimit) + "..."
+	if got := compactExcerpt(long); got != want {
+		t.Fatalf("compactExcerpt = %d bytes, want %d bytes", len(got), len(want))
+	}
+	wake := core.WakeTextLimited(core.WakeContext{Excerpt: long}, excerptRuneLimit)
+	if !strings.Contains(wake, "excerpt: "+want+"\n") {
+		t.Fatalf("wake text does not carry the shared marker: %q", wake)
 	}
 }
 
@@ -381,12 +402,13 @@ func TestCompactExcerptAvoidsRuneSliceAllocation(t *testing.T) {
 	if len(excerpt) < 8*1024 {
 		t.Fatalf("excerpt too short: %d bytes", len(excerpt))
 	}
-	if got, want := compactExcerpt(excerpt), compact(excerpt); got != want {
+	want := core.TruncateExcerpt(strings.TrimSpace(strings.ReplaceAll(excerpt, "\r", "")), excerptRuneLimit)
+	if got := compactExcerpt(excerpt); got != want {
 		t.Fatal("compactExcerpt changed the output")
 	}
 	oldAllocs := testing.AllocsPerRun(100, func() {
 		r := []rune(excerpt)
-		_ = string(r[:excerptRuneLimit]) + "\n...[truncated]"
+		_ = string(r[:excerptRuneLimit]) + "..."
 	})
 	newAllocs := testing.AllocsPerRun(100, func() { _ = compactExcerpt(excerpt) })
 	if newAllocs >= oldAllocs {
