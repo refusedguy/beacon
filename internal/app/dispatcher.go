@@ -61,19 +61,46 @@ type Dispatcher struct {
 	// Spans records per-step timing when set. It never changes dispatch output.
 	Spans *DispatchSpans
 
-	// ensured holds the epic base branches already published in this batch.
-	// Every access happens under slotsMu and each batch clears it.
-	ensured map[string]struct{}
-
-	// slotsMu makes slot acquisition atomic across dispatch and promotion. A
-	// caller holds it from the Available check until every agent it starts is
-	// saved as active, so a concurrent path sees the updated store state.
+	// slotsMu guards the reservation set and the selection that fills it. A
+	// batch reserves its slots and tasks here, then releases the lock so its
+	// ensureBranch and Spawn calls can overlap with another batch's.
 	slotsMu sync.Mutex
 
-	// modelRefs caches the resolved model per parent session for one batch.
-	// Every access happens under slotsMu, and each batch clears it so a config
-	// reload takes effect on the next dispatch.
+	// reserved holds starts committed by in-progress batches but not yet
+	// visible as active in the store. Every active view used for the cap and
+	// conflict checks includes these entries, so a concurrent call cannot
+	// bypass the in-flight cap, the agent cap or the task and scope guards
+	// while an earlier batch is doing its slow work.
+	reserved map[core.RunID]*slotReservation
+}
+
+// slotReservation is one committed start. agent is set once the start holds an
+// agent slot. A run still waiting for a slot reserves only an in-flight slot.
+type slotReservation struct {
+	runID  core.RunID
+	taskID core.TaskID
+	scope  []core.ScopePath
+	agent  bool
+}
+
+// dispatchBatch holds the caches that live for one dispatch or promotion.
+// Batch-local state needs no lock and cannot leak into a concurrent batch.
+type dispatchBatch struct {
+	ensured   map[string]struct{}
 	modelRefs map[string]core.ModelRef
+	planned   []plannedRun
+	reserved  []core.RunID
+	skipped   []SkippedTask
+	active    map[core.TaskID]*core.Run
+	limit     int
+	budget    int
+}
+
+// plannedRun pairs a created run with the card it will start. The run is
+// already reserved when it reaches the launcher.
+type plannedRun struct {
+	run  *core.Run
+	task core.Task
 }
 
 var _ core.AgentSlots = (*Dispatcher)(nil)
@@ -170,50 +197,87 @@ func selectDispatchCandidates(planner ConflictPlanner, ready []core.Task, active
 // the runs it created, the skipped candidates and any start failures.
 func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error) {
 	defer d.Decisions.flushDeferred()
-	d.slotsMu.Lock()
-	defer d.slotsMu.Unlock()
-	d.modelRefs = nil
-	d.ensured = nil
 
 	var out DispatchResult
-	tasks, err := d.Source.ListAvailable(ctx)
+	batch, err := d.planDispatch(ctx, n)
 	if err != nil {
 		return out, err
 	}
-	if err := d.Store.SyncTasks(ctx, tasks); err != nil {
-		return out, err
-	}
-	ready, err := d.Store.ListReadyTasks(ctx)
-	if err != nil {
-		return out, err
-	}
-	active, err := d.Store.ListActive(ctx)
-	if err != nil {
-		return out, err
-	}
-	sel, err := selectDispatchCandidates(d.Planner, ready, active, n, d.inFlightLimit(), d.StrictScope)
-	if err != nil {
-		return out, err
-	}
-	budget := d.availableFrom(active)
-	d.Decisions.logDispatchCandidates(ctx, len(ready), len(active), sel.Limit, budget)
-	if sel.Limit <= 0 {
-		return out, nil
-	}
-	out.Skipped = sel.Skipped
-	for _, s := range sel.Skipped {
+	defer d.releaseReservations(batch)
+	out.Skipped = batch.skipped
+	for _, s := range batch.skipped {
 		d.Decisions.logDispatchSkip(ctx, s)
 	}
-	if err := d.launch(ctx, sel.Chosen, budget, activeRunsByTask(active), &out); err != nil {
+	if err := d.launch(ctx, batch, &out); err != nil {
 		return out, err
 	}
 	return out, nil
 }
 
+// planDispatch selects and reserves one batch under slotsMu. The reservation
+// is visible to other batches before the lock is released, so none of them
+// can select a reserved task or spend a reserved slot while this batch runs
+// its slow steps.
+func (d *Dispatcher) planDispatch(ctx context.Context, n int) (*dispatchBatch, error) {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+
+	batch := &dispatchBatch{}
+	tasks, err := d.Source.ListAvailable(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Store.SyncTasks(ctx, tasks); err != nil {
+		return nil, err
+	}
+	ready, err := d.Store.ListReadyTasks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stored, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	view := d.withReserved(stored)
+	sel, err := selectDispatchCandidates(d.Planner, ready, view, n, d.inFlightLimit(), d.StrictScope)
+	if err != nil {
+		return nil, err
+	}
+	batch.limit = sel.Limit
+	batch.skipped = sel.Skipped
+	batch.budget = d.availableFrom(view)
+	d.Decisions.logDispatchCandidates(ctx, len(ready), len(stored), sel.Limit, batch.budget)
+	if sel.Limit <= 0 {
+		return batch, nil
+	}
+	batch.active = activeRunsByTask(view)
+	if d.reserved == nil {
+		d.reserved = make(map[core.RunID]*slotReservation)
+	}
+	agentLeft := batch.budget
+	for _, task := range sel.Chosen {
+		run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
+		if d.MaxAttempts > 0 {
+			run.MaxAttempts = d.MaxAttempts
+		}
+		run.Scope = task.Scope
+		run.ParentSessionID = core.FirstNonEmpty(parentSession(ctx), d.ParentSessionID)
+		agent := false
+		if agentLeft > 0 {
+			agent = true
+			agentLeft--
+		}
+		d.reserved[run.ID] = &slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: agent}
+		batch.reserved = append(batch.reserved, run.ID)
+		batch.planned = append(batch.planned, plannedRun{run: run, task: task})
+	}
+	return batch, nil
+}
+
 // activeRunsByTask indexes the active list by the task that owns each run.
 // launch uses it for the per-task guard instead of one store query per task.
-// ListActive is ordered oldest first, so a later entry overwrites an earlier
-// one and the map holds the newest run for a task.
+// Reserved runs from other batches are part of the view, so their tasks are
+// guarded too.
 func activeRunsByTask(active []*core.Run) map[core.TaskID]*core.Run {
 	byTask := make(map[core.TaskID]*core.Run, len(active))
 	for _, run := range active {
@@ -222,70 +286,158 @@ func activeRunsByTask(active []*core.Run) map[core.TaskID]*core.Run {
 	return byTask
 }
 
-// launch starts a run for each chosen task within the agent budget and adds
-// skipped and failed candidates to out. active holds the runs from the single
-// list Dispatch read before selection. The caller holds slotsMu from the
-// budget check through this call, so the re-read after a failed start stays
-// under the lock and cannot oversubscribe the agent limit.
-func (d *Dispatcher) launch(ctx context.Context, chosen []core.Task, budget int, active map[core.TaskID]*core.Run, out *DispatchResult) error {
-	for _, task := range chosen {
-		if existing, ok := active[task.ID]; ok {
-			skip := SkippedTask{
-				TaskID:       task.ID,
-				Code:         SkipActiveRun,
-				BlockedBy:    task.ID,
-				BlockedByRun: existing.ID,
-				Reason:       "already has an active run",
-			}
-			out.Skipped = append(out.Skipped, skip)
-			d.Decisions.logDispatchSkip(ctx, skip)
+// withReserved appends a virtual run for every committed start to a store
+// active list. An agent reservation appears as a running run so the in-flight
+// cap and the agent cap both count it. The caller holds slotsMu.
+func (d *Dispatcher) withReserved(active []*core.Run) []*core.Run {
+	if len(d.reserved) == 0 {
+		return active
+	}
+	view := make([]*core.Run, 0, len(active)+len(d.reserved))
+	view = append(view, active...)
+	for _, res := range d.reserved {
+		r := core.NewRun(res.runID, res.taskID, time.Time{})
+		r.Scope = res.scope
+		if res.agent {
+			r.State = core.RunRunning
+		}
+		view = append(view, r)
+	}
+	return view
+}
+
+// dropReservation frees one committed start. Called after the run lands in the
+// store or after a failed start is closed, so no slot is lost and none is
+// counted twice once the store reflects the run.
+func (d *Dispatcher) dropReservation(id core.RunID) {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+	delete(d.reserved, id)
+}
+
+// releaseReservations is the batch's safety net when a launcher step returns
+// before reaching a planned run. Dropping an already removed ID is a no-op.
+func (d *Dispatcher) releaseReservations(batch *dispatchBatch) {
+	for _, id := range batch.reserved {
+		d.dropReservation(id)
+	}
+}
+
+// hasAgent reports whether run holds an agent slot. The read is under
+// slotsMu, so a concurrent batch cannot claim the slot between this check and
+// the start.
+func (d *Dispatcher) hasAgent(runID core.RunID) bool {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+	res := d.reserved[runID]
+	return res != nil && res.agent
+}
+
+// claimSlots re-reads the active list after a failed start and upgrades the
+// next still-pending planned runs into agent slots. The check and the upgrades
+// share one slotsMu critical section, so another batch cannot take a freed
+// slot between the read and the upgrade.
+func (d *Dispatcher) claimSlots(ctx context.Context, batch *dispatchBatch, from int) {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+	active, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return
+	}
+	free := d.availableFrom(d.withReserved(active))
+	for i := from; i < len(batch.planned) && free > 0; i++ {
+		res := d.reserved[batch.planned[i].run.ID]
+		if res == nil || res.agent {
 			continue
 		}
-		run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
-		if d.MaxAttempts > 0 {
-			run.MaxAttempts = d.MaxAttempts
+		res.agent = true
+		free--
+	}
+}
+
+// launch starts the reserved runs without holding slotsMu. Each run frees its
+// reservation when it lands in the store or fails.
+func (d *Dispatcher) launch(ctx context.Context, batch *dispatchBatch, out *DispatchResult) error {
+	for i, p := range batch.planned {
+		failed, err := d.launchOne(ctx, batch, p, out)
+		if err != nil {
+			return err
 		}
-		run.Scope = task.Scope
-		run.ParentSessionID = core.FirstNonEmpty(parentSession(ctx), d.ParentSessionID)
-		if budget > 0 {
-			if err := d.startOne(ctx, run, task); err != nil {
-				out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
-				d.handleStartFailure(ctx, run, err)
-				// The failed run may still hold a slot when its worker survived.
-				// One re-read under slotsMu refreshes both the budget and the
-				// task guard before the next task starts.
-				budget, active = d.refreshActive(ctx, active)
-				continue
-			}
-			budget--
-		} else {
-			// A run that cannot start yet still needs a row so PromotePending
-			// can find it. A started run is saved once in startOne, where the
-			// session ID and the final status land in the same write.
-			if err := d.Store.Save(ctx, run); err != nil {
-				return err
-			}
+		if failed {
+			d.claimSlots(ctx, batch, i+1)
 		}
-		out.Runs = append(out.Runs, run)
 	}
 	return nil
+}
+
+// launchOne returns failed when a start failed, so launch can hand the freed
+// slot to a later run in the batch.
+func (d *Dispatcher) launchOne(ctx context.Context, batch *dispatchBatch, p plannedRun, out *DispatchResult) (bool, error) {
+	run, task := p.run, p.task
+	defer d.dropReservation(run.ID)
+	if existing, ok := batch.active[task.ID]; ok {
+		skip := SkippedTask{
+			TaskID:       task.ID,
+			Code:         SkipActiveRun,
+			BlockedBy:    task.ID,
+			BlockedByRun: existing.ID,
+			Reason:       "already has an active run",
+		}
+		out.Skipped = append(out.Skipped, skip)
+		d.Decisions.logDispatchSkip(ctx, skip)
+		return false, nil
+	}
+	if d.hasAgent(run.ID) {
+		if err := d.startOne(ctx, batch, run, task); err != nil {
+			out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
+			d.handleStartFailure(ctx, run, err)
+			return true, nil
+		}
+	} else {
+		// A run that cannot start yet still needs a row so PromotePending
+		// can find it. A started run is saved once in startOne, where the
+		// session ID and the final status land in the same write.
+		if err := d.Store.Save(ctx, run); err != nil {
+			return false, err
+		}
+	}
+	out.Runs = append(out.Runs, run)
+	return false, nil
 }
 
 // PromotePending starts queued runs when an agent slot becomes free.
 func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 	defer d.Decisions.flushDeferred()
-	d.slotsMu.Lock()
-	defer d.slotsMu.Unlock()
-	d.modelRefs = nil
-	d.ensured = nil
 
-	active, err := d.Store.ListActive(ctx)
+	batch, err := d.planPromotion(ctx)
 	if err != nil {
 		return nil, err
 	}
-	budget := d.Available(ctx)
+	defer d.releaseReservations(batch)
+	var started []*core.Run
+	for _, p := range batch.planned {
+		if d.promoteOne(ctx, batch, p.run, p.task) {
+			started = append(started, p.run)
+		}
+	}
+	return started, nil
+}
+
+// planPromotion reserves the pending runs it will start under slotsMu, so a
+// concurrent dispatch or promotion sees them as active before the slow steps.
+func (d *Dispatcher) planPromotion(ctx context.Context) (*dispatchBatch, error) {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+
+	batch := &dispatchBatch{}
+	stored, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	view := d.withReserved(stored)
+	budget := d.availableFrom(view)
 	if budget <= 0 {
-		return nil, nil
+		return batch, nil
 	}
 	tasks, err := d.Store.ListReadyTasks(ctx)
 	if err != nil {
@@ -295,26 +447,40 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 	for _, t := range tasks {
 		byID[t.ID] = t
 	}
-	var started []*core.Run
-	for _, run := range active {
+	if d.reserved == nil {
+		d.reserved = make(map[core.RunID]*slotReservation)
+	}
+	for _, run := range stored {
 		if budget <= 0 {
 			break
 		}
 		if run.State != core.RunPending {
 			continue
 		}
+		if _, taken := d.reserved[run.ID]; taken {
+			continue
+		}
 		task, ok := byID[run.TaskID]
 		if !ok {
 			continue
 		}
-		if err := d.startOne(ctx, run, task); err != nil {
-			d.handleStartFailure(ctx, run, err)
-			continue
-		}
+		d.reserved[run.ID] = &slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: true}
+		batch.reserved = append(batch.reserved, run.ID)
+		batch.planned = append(batch.planned, plannedRun{run: run, task: task})
 		budget--
-		started = append(started, run)
 	}
-	return started, nil
+	return batch, nil
+}
+
+// promoteOne starts one reserved pending run. Its reservation is freed once
+// the start lands in the store or is closed after a failure.
+func (d *Dispatcher) promoteOne(ctx context.Context, batch *dispatchBatch, run *core.Run, task core.Task) bool {
+	defer d.dropReservation(run.ID)
+	if err := d.startOne(ctx, batch, run, task); err != nil {
+		d.handleStartFailure(ctx, run, err)
+		return false
+	}
+	return true
 }
 
 // timed runs one named startOne step and records its duration. A nil Spans
@@ -338,30 +504,30 @@ func (d *Dispatcher) timed(ctx context.Context, name string, fn func() error) er
 // even when the branch is already present, so repeating it for every child is
 // redundant git work. Only a successful publish is cached: a failure is retried
 // by the next child instead of being remembered for the rest of the batch.
-func (d *Dispatcher) ensureOnce(ctx context.Context, branch string) error {
+func (d *Dispatcher) ensureOnce(ctx context.Context, batch *dispatchBatch, branch string) error {
 	branch = strings.TrimSpace(branch)
 	if !IsEpicBranch(branch) {
 		return nil
 	}
-	if _, ok := d.ensured[branch]; ok {
+	if _, ok := batch.ensured[branch]; ok {
 		return nil
 	}
 	if err := ensureBranch(ctx, d.Workspace, branch, ""); err != nil {
 		return err
 	}
-	if d.ensured == nil {
-		d.ensured = make(map[string]struct{})
+	if batch.ensured == nil {
+		batch.ensured = make(map[string]struct{})
 	}
-	d.ensured[branch] = struct{}{}
+	batch.ensured[branch] = struct{}{}
 	return nil
 }
 
-func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task) error {
+func (d *Dispatcher) startOne(ctx context.Context, batch *dispatchBatch, run *core.Run, task core.Task) error {
 	ctx = WithCycleID(ctx, string(run.ID))
 	// A child card may outlive the epic creation that was supposed to publish
 	// its base branch. Check again here so a missing branch never closes a run.
 	if err := d.timed(ctx, "ensureBranch", func() error {
-		return d.ensureOnce(ctx, task.BaseBranch)
+		return d.ensureOnce(ctx, batch, task.BaseBranch)
 	}); err != nil {
 		return step("base branch", err)
 	}
@@ -385,7 +551,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 		session, err = d.Harness.Spawn(ctx, core.SpawnRequest{
 			Task: task, Workspace: ws, RunID: run.ID,
 			ParentSessionID: run.ParentSessionID, IsFixer: run.IsFixer,
-			ModelRef: d.modelRef(run.ParentSessionID),
+			ModelRef: d.modelRef(batch, run.ParentSessionID),
 			Prompt:   spawnPrompt(task, run.ID, ws.Path, d.WorkerInstructions),
 		})
 		return err
@@ -480,20 +646,22 @@ func (d *Dispatcher) inFlightLimit() int {
 
 // Available is the single agent-slot operation. It counts free slots against
 // MaxActiveAgents, falling back to the in-flight limit when no agent limit is
-// configured. A failed active-run listing fails closed with zero slots so a
+// configured. Reservations count as used slots until their runs land in the
+// store. A failed active-run listing fails closed with zero slots so a
 // transient store error cannot make dispatch, promotion or wake oversubscribe.
-// Callers that act on the result hold slotsMu from this check through the start.
 func (d *Dispatcher) Available(ctx context.Context) int {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
 	active, err := d.Store.ListActive(ctx)
 	if err != nil {
 		return 0
 	}
-	return d.availableFrom(active)
+	return d.availableFrom(d.withReserved(active))
 }
 
 // availableFrom applies the agent-slot rule to a list the caller already has.
-// Dispatch derives its budget from the first active list instead of calling
-// Available, which would read the same rows a second time.
+// Dispatch derives its budget from the same active view used for selection
+// instead of calling Available, which would read the store a second time.
 func (d *Dispatcher) availableFrom(active []*core.Run) int {
 	limit := d.Concurrency.MaxActiveAgents
 	if limit <= 0 {
@@ -512,33 +680,22 @@ func (d *Dispatcher) availableFrom(active []*core.Run) int {
 	return free
 }
 
-// refreshActive re-reads the active list after a failed start and derives the
-// budget and the task guard from that one read. A store error fails closed by
-// zeroing the budget and keeping the last known task guard.
-func (d *Dispatcher) refreshActive(ctx context.Context, active map[core.TaskID]*core.Run) (int, map[core.TaskID]*core.Run) {
-	runs, err := d.Store.ListActive(ctx)
-	if err != nil {
-		return 0, active
-	}
-	return d.availableFrom(runs), activeRunsByTask(runs)
-}
-
 // modelRef resolves the worker model from the run's parent session. The MCP
 // daemon has no BEACON_PARENT_SESSION, so the parent arrives per dispatch in
 // the request metadata and must be resolved here, not at process start. Every
 // card in a batch shares one parent, so the first lookup serves the rest.
-func (d *Dispatcher) modelRef(parent string) core.ModelRef {
+func (d *Dispatcher) modelRef(batch *dispatchBatch, parent string) core.ModelRef {
 	if d.ResolveModel == nil || parent == "" {
 		return core.ModelRef{}
 	}
-	if d.modelRefs == nil {
-		d.modelRefs = make(map[string]core.ModelRef)
+	if batch.modelRefs == nil {
+		batch.modelRefs = make(map[string]core.ModelRef)
 	}
-	if ref, ok := d.modelRefs[parent]; ok {
+	if ref, ok := batch.modelRefs[parent]; ok {
 		return ref
 	}
 	ref := d.ResolveModel(parent)
-	d.modelRefs[parent] = ref
+	batch.modelRefs[parent] = ref
 	return ref
 }
 

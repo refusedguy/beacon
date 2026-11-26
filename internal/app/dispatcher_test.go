@@ -785,15 +785,132 @@ func TestAgentSlotsAvailableFailsClosed(t *testing.T) {
 	}
 }
 
+// The sync fakes below guard the shared fake state once dispatch steps are
+// allowed to overlap. The production store and source do their own locking.
+type slotSource struct {
+	*fakeSource
+	mu sync.Mutex
+}
+
+func (s *slotSource) ListAvailable(ctx context.Context) ([]core.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeSource.ListAvailable(ctx)
+}
+
+func (s *slotSource) MarkInWorkspace(ctx context.Context, id core.TaskID, path, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeSource.MarkInWorkspace(ctx, id, path, status)
+}
+
+type slotWorkspace struct {
+	*fakeWorkspace
+	mu sync.Mutex
+}
+
+func (w *slotWorkspace) Create(ctx context.Context, t core.Task) (core.Workspace, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.fakeWorkspace.Create(ctx, t)
+}
+
+func (w *slotWorkspace) EnsureBranch(ctx context.Context, branch, base string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.fakeWorkspace.EnsureBranch(ctx, branch, base)
+}
+
+type slotStore struct {
+	*fakeStore
+	mu sync.Mutex
+}
+
+func (s *slotStore) SyncTasks(ctx context.Context, tasks []core.Task) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.SyncTasks(ctx, tasks)
+}
+
+func (s *slotStore) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.ListReadyTasks(ctx)
+}
+
+func (s *slotStore) ListActive(ctx context.Context) ([]*core.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.ListActive(ctx)
+}
+
+func (s *slotStore) Save(ctx context.Context, r *core.Run) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.Save(ctx, r)
+}
+
+func (s *slotStore) SetTaskStatus(ctx context.Context, id core.TaskID, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.SetTaskStatus(ctx, id, status)
+}
+
+// barrierHarness parks each Spawn until release is closed, so a test can prove
+// that two dispatch calls are inside Spawn at the same time.
+type barrierHarness struct {
+	*fakeHarness
+	mu      sync.Mutex
+	arrived chan core.RunID
+	release chan struct{}
+	err     error
+	spawns  int
+}
+
+func (h *barrierHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.mu.Lock()
+	h.spawns++
+	err := h.err
+	h.mu.Unlock()
+	h.arrived <- req.RunID
+	select {
+	case <-h.release:
+	case <-ctx.Done():
+		return core.Session{}, ctx.Err()
+	}
+	if err != nil {
+		return core.Session{}, err
+	}
+	return core.Session{ID: "sess-" + string(req.RunID)}, nil
+}
+
+func (h *barrierHarness) spawnCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.spawns
+}
+
+func newBarrierDeps(tasks []core.Task, inFlight, agents int, err error) (*Dispatcher, *slotStore, *barrierHarness) {
+	store := &slotStore{fakeStore: newFakeStore()}
+	h := &barrierHarness{
+		fakeHarness: &fakeHarness{},
+		arrived:     make(chan core.RunID, inFlight),
+		release:     make(chan struct{}),
+		err:         err,
+	}
+	d := &Dispatcher{
+		Source: &slotSource{fakeSource: &fakeSource{tasks: tasks}}, Planner: NewPlanner(nil),
+		Workspace: &slotWorkspace{fakeWorkspace: &fakeWorkspace{}},
+		Harness:   h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: inFlight, MaxActiveAgents: agents},
+	}
+	return d, store, h
+}
+
 func TestConcurrentDispatchAndPromotionRespectMaxActiveAgents(t *testing.T) {
 	const maxAgents = 3
-	store := newFakeStore()
-	h := &fakeHarness{}
-	d := &Dispatcher{
-		Source: &fakeSource{tasks: twentyTasks()}, Planner: NewPlanner(nil),
-		Workspace: &fakeWorkspace{}, Harness: h, Store: store,
-		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: maxAgents},
-	}
+	d, store, h := newBarrierDeps(twentyTasks(), 20, maxAgents, nil)
+	close(h.release)
 	var wg sync.WaitGroup
 	for i := 0; i < 12; i++ {
 		wg.Add(1)
@@ -826,8 +943,145 @@ func TestConcurrentDispatchAndPromotionRespectMaxActiveAgents(t *testing.T) {
 	if agents != maxAgents {
 		t.Fatalf("active agents = %d, want %d", agents, maxAgents)
 	}
-	if len(h.sessions) != maxAgents {
-		t.Fatalf("spawned agents = %d, want %d", len(h.sessions), maxAgents)
+	if h.spawnCount() != maxAgents {
+		t.Fatalf("spawned agents = %d, want %d", h.spawnCount(), maxAgents)
+	}
+}
+
+// TestConcurrentDispatchOverlapsSpawn is the check for this card: two dispatch
+// calls sit inside Spawn together while sharing one in-flight cap. The harness
+// parks both spawns, so a lock held through Spawn makes the second arrival
+// impossible and this test times out.
+func TestConcurrentDispatchOverlapsSpawn(t *testing.T) {
+	const maxInFlight = 4
+	const maxAgents = 2
+	d, store, h := newBarrierDeps(twentyTasks()[:4], maxInFlight, maxAgents, nil)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := d.Dispatch(context.Background(), 1)
+			errs <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-h.arrived:
+		case <-time.After(3 * time.Second):
+			t.Fatal("concurrent dispatches did not overlap their spawns")
+		}
+	}
+	close(h.release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+	}
+
+	if h.spawnCount() != maxAgents {
+		t.Fatalf("spawns = %d, want %d", h.spawnCount(), maxAgents)
+	}
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(active) != maxAgents {
+		t.Fatalf("active runs = %d, want %d", len(active), maxAgents)
+	}
+	agents := 0
+	for _, r := range active {
+		if r.State.ActiveAgent() {
+			agents++
+		}
+	}
+	if agents != maxAgents {
+		t.Fatalf("active agents = %d, want %d", agents, maxAgents)
+	}
+	if d.Available(context.Background()) != 0 {
+		t.Fatal("agent slots still free after both spawns")
+	}
+	if len(d.reserved) != 0 {
+		t.Fatalf("leftover reservations = %d, want 0", len(d.reserved))
+	}
+}
+
+// TestConcurrentDispatchRespectsInFlightCap drives many dispatches at once and
+// checks the in-flight cap, not just the agent cap.
+func TestConcurrentDispatchRespectsInFlightCap(t *testing.T) {
+	const maxInFlight = 2
+	d, store, h := newBarrierDeps(twentyTasks(), maxInFlight, maxInFlight, nil)
+	close(h.release)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := d.Dispatch(context.Background(), 2); err != nil {
+				t.Errorf("Dispatch: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	active, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(active) != maxInFlight {
+		t.Fatalf("in-flight runs = %d, want %d", len(active), maxInFlight)
+	}
+	if h.spawnCount() != maxInFlight {
+		t.Fatalf("spawns = %d, want %d", h.spawnCount(), maxInFlight)
+	}
+}
+
+// TestFailedSpawnFreesReservation checks that a held agent slot is released
+// when its worker fails, so the next dispatch can use it.
+func TestFailedSpawnFreesReservation(t *testing.T) {
+	ctx := context.Background()
+	d, store, h := newBarrierDeps([]core.Task{{ID: "T-FAIL", Status: core.TaskAvailable}}, 1, 1, errors.New("spawn exploded"))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := d.Dispatch(ctx, 1); err != nil {
+			t.Errorf("Dispatch: %v", err)
+		}
+	}()
+	select {
+	case <-h.arrived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("spawn did not start")
+	}
+	if got := d.Available(ctx); got != 0 {
+		t.Fatalf("Available during held spawn = %d, want 0", got)
+	}
+	close(h.release)
+	<-done
+
+	if got := d.Available(ctx); got != 1 {
+		t.Fatalf("Available after failed spawn = %d, want 1", got)
+	}
+	if len(d.reserved) != 0 {
+		t.Fatalf("reservations after failure = %d, want 0", len(d.reserved))
+	}
+	if active, err := store.ListActive(ctx); err != nil || len(active) != 0 {
+		t.Fatalf("active runs after failure = %d, err=%v, want 0", len(active), err)
+	}
+
+	d.Harness = &fakeHarness{}
+	res, err := d.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatalf("Dispatch after failure: %v", err)
+	}
+	if len(res.Runs) != 1 || len(res.Failures) != 0 {
+		t.Fatalf("dispatch after failure: %+v", res)
 	}
 }
 
@@ -1000,7 +1254,7 @@ func baselineOne(ctx context.Context, deps *profileDeps, run *core.Run, task cor
 		session, err = d.Harness.Spawn(ctx, core.SpawnRequest{
 			Task: task, Workspace: ws, RunID: run.ID,
 			ParentSessionID: run.ParentSessionID, IsFixer: run.IsFixer,
-			ModelRef: d.modelRef(run.ParentSessionID),
+			ModelRef: d.modelRef(&dispatchBatch{}, run.ParentSessionID),
 			Prompt:   spawnPrompt(task, run.ID, ws.Path, d.WorkerInstructions),
 		})
 		return err
