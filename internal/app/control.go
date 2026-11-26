@@ -37,16 +37,16 @@ type Control struct {
 }
 
 // write serializes control mutations and retries transient SQLite lock
-// conflicts. Read-only services never take this lock.
+// conflicts. Read-only services never take this lock. The lock covers one
+// store call at a time, never a backoff sleep, so concurrent writers do not
+// serialize each other's retries.
 func (c *Control) write(ctx context.Context, fn func() error) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	var err error
 	timer := time.NewTimer(controlRetryBase)
 	timer.Stop()
 	defer timer.Stop()
 	for attempt := 0; attempt < controlWriteAttempts; attempt++ {
-		err = fn()
+		err = c.writeOnce(fn)
 		if !isBusy(err) {
 			return err
 		}
@@ -60,6 +60,14 @@ func (c *Control) write(ctx context.Context, fn func() error) error {
 		}
 	}
 	return err
+}
+
+// writeOnce runs a single mutation attempt under the write lock. The lock is
+// released before the caller backs off, keeping it as short as the store call.
+func (c *Control) writeOnce(fn func() error) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return fn()
 }
 
 // isBusy recognises SQLite write-lock conflicts. A typed driver error gives

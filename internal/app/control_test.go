@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -509,4 +510,129 @@ func TestRetryDoesNotSignalWhenRunIsNotBlocked(t *testing.T) {
 	if got := store.runs["r1"]; got.State != core.RunWaitingCI {
 		t.Fatalf("state = %s, want %s", got.State, core.RunWaitingCI)
 	}
+}
+
+// busyApprovalStore injects one SQLite write-lock conflict per run into
+// SetApproval. It stands in for a store whose first write hits SQLITE_BUSY.
+type busyApprovalStore struct {
+	*fakeStore
+	mu       sync.Mutex
+	failures map[core.RunID]int
+}
+
+func newBusyApprovalStore(n int) *busyApprovalStore {
+	ctx := context.Background()
+	s := &busyApprovalStore{
+		fakeStore: newFakeStore(),
+		failures:  map[core.RunID]int{},
+	}
+	for i := 0; i < n; i++ {
+		id := core.RunID(fmt.Sprintf("r-%d", i))
+		if err := s.fakeStore.Save(ctx, core.NewRun(id, "T-1", time.Now())); err != nil {
+			panic(err)
+		}
+	}
+	return s
+}
+
+func (s *busyApprovalStore) resetFailures(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := 0; i < n; i++ {
+		s.failures[core.RunID(fmt.Sprintf("r-%d", i))] = 1
+	}
+}
+
+func (s *busyApprovalStore) SetApproval(ctx context.Context, id core.RunID, sha string) error {
+	s.mu.Lock()
+	failures := s.failures[id]
+	if failures > 0 {
+		s.failures[id]--
+	}
+	s.mu.Unlock()
+	if failures > 0 {
+		return errors.New("database is locked (5) (SQLITE_BUSY)")
+	}
+	return s.fakeStore.SetApproval(ctx, id, sha)
+}
+
+// approveBatch runs n concurrent approvals, each hitting one busy retry.
+// Every goroutine writes its own result slot, so there is no shared write to
+// synchronize beyond the WaitGroup.
+type approveBatch struct {
+	latencies []time.Duration
+	errs      []error
+}
+
+func runApproveBatch(ctx context.Context, c *Control, store *busyApprovalStore, n int) approveBatch {
+	store.resetFailures(n)
+	out := approveBatch{
+		latencies: make([]time.Duration, n),
+		errs:      make([]error, n),
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := core.RunID(fmt.Sprintf("r-%d", i))
+			start := time.Now()
+			out.errs[i] = c.Approve(ctx, id, "sha")
+			out.latencies[i] = time.Since(start)
+		}(i)
+	}
+	wg.Wait()
+	return out
+}
+
+func TestConcurrentApprovesDoNotSerializeRetries(t *testing.T) {
+	ctx := context.Background()
+	const n = 100
+	store := newBusyApprovalStore(n)
+	c := &Control{Store: store}
+
+	start := time.Now()
+	out := runApproveBatch(ctx, c, store, n)
+	elapsed := time.Since(start)
+
+	for i, err := range out.errs {
+		if err != nil {
+			t.Fatalf("approve r-%d: %v", i, err)
+		}
+	}
+	// A serialized retry loop sleeps 10ms per writer, so n writers cost at
+	// least n*controlRetryBase. Overlapping retries finish far below half of
+	// that bound even on a slow machine.
+	if bound := n * controlRetryBase / 2; elapsed >= bound {
+		t.Fatalf("batch took %v; retries appear serialized (want < %v)", elapsed, bound)
+	}
+	for i := 0; i < n; i++ {
+		id := core.RunID(fmt.Sprintf("r-%d", i))
+		ok, err := store.Approved(ctx, id, "sha")
+		if err != nil || !ok {
+			t.Fatalf("approval r-%d = %v, %v; want true, nil", i, ok, err)
+		}
+	}
+}
+
+func BenchmarkControlConcurrentApprove(b *testing.B) {
+	ctx := context.Background()
+	const n = 100
+	store := newBusyApprovalStore(n)
+	c := &Control{Store: store}
+	var all []time.Duration
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := runApproveBatch(ctx, c, store, n)
+		for _, err := range out.errs {
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+		all = append(all, out.latencies...)
+	}
+	b.StopTimer()
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	p95 := all[len(all)*95/100]
+	b.ReportMetric(float64(p95.Microseconds()), "p95-us")
 }
