@@ -91,6 +91,19 @@ type ControlResult struct {
 	Applied bool   `json:"applied"`
 }
 
+// applyAuth sets the Authorization header on a request. A token of the form
+// user:pass uses HTTP Basic; any other token uses a Bearer header. This is the
+// only place the TUI builds an auth header, so the runs and event paths cannot
+// send different credentials. It is a variable so tests can replace it and
+// prove both paths route through it.
+var applyAuth = func(req *http.Request, token string) {
+	if user, pass, ok := strings.Cut(token, ":"); ok {
+		req.SetBasicAuth(user, pass)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 // Client is a loopback HTTP client for the Beacon daemon API.
 type Client struct {
 	Endpoint string
@@ -145,7 +158,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
+		applyAuth(req, c.Token)
 	}
 	httpClient := c.HTTP
 	if httpClient == nil {

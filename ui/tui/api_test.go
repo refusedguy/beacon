@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -210,5 +211,103 @@ func TestLoopbackWireDTO(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Stream: %v", err)
+	}
+}
+
+// waitForStream runs one stream request and returns after its first event.
+func waitForStream(t *testing.T, c *Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	events := make(chan Event, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Stream(ctx, func(ev Event) {
+			select {
+			case events <- ev:
+			default:
+			}
+		})
+	}()
+	select {
+	case <-events:
+	case <-ctx.Done():
+		t.Fatal("no event received")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+}
+
+// TestAuthHelperAppliedToBothPaths proves the runs and event requests share
+// one auth helper. Replacing the helper changes the header on both routes.
+func TestAuthHelperAppliedToBothPaths(t *testing.T) {
+	original := applyAuth
+	defer func() { applyAuth = original }()
+	applyAuth = func(req *http.Request, token string) {
+		req.Header.Set("X-Auth-Helper", "replaced:"+token)
+	}
+
+	var runsHeader, eventsHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case apiRunsPath:
+			runsHeader = r.Header.Get("X-Auth-Helper")
+			_, _ = w.Write([]byte(`{"runs":[]}`))
+		case apiEventsPath:
+			eventsHeader = r.Header.Get("X-Auth-Helper")
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"idle\"}\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "tok")
+	if _, err := c.Runs(context.Background()); err != nil {
+		t.Fatalf("Runs: %v", err)
+	}
+	if runsHeader != "replaced:tok" {
+		t.Fatalf("runs helper header = %q, want %q", runsHeader, "replaced:tok")
+	}
+	waitForStream(t, c)
+	if eventsHeader != "replaced:tok" {
+		t.Fatalf("events helper header = %q, want %q", eventsHeader, "replaced:tok")
+	}
+}
+
+// TestAuthHelperMatchesHarnessCredentials proves a user:pass token becomes
+// Basic auth on both routes, the way the harness ApplyAuth does.
+func TestAuthHelperMatchesHarnessCredentials(t *testing.T) {
+	var runsAuth, eventsAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case apiRunsPath:
+			runsAuth = auth
+			_, _ = w.Write([]byte(`{"runs":[]}`))
+		case apiEventsPath:
+			eventsAuth = auth
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"idle\"}\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
+	c := NewClient(srv.URL, "user:pass")
+	if _, err := c.Runs(context.Background()); err != nil {
+		t.Fatalf("Runs: %v", err)
+	}
+	if runsAuth != want {
+		t.Fatalf("runs authorization = %q, want %q", runsAuth, want)
+	}
+	waitForStream(t, c)
+	if eventsAuth != want {
+		t.Fatalf("events authorization = %q, want %q", eventsAuth, want)
 	}
 }
