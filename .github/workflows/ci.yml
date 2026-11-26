@@ -161,7 +161,9 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-          cache-dependency-path: go.sum
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
 
       # No timing gate. A slow runner fails this step, not the pull request.
       - name: Bounded benchmark smoke
