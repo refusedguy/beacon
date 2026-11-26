@@ -1,7 +1,7 @@
 ---
 id: T-2ad9b0c6
 title: Remove unused TUI control seams
-status: available
+status: done
 scope:
     - ui/tui/api.go
     - ui/tui/api_test.go
