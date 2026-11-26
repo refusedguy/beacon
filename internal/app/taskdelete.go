@@ -85,17 +85,14 @@ func (tx *cardTx) apply() error {
 		tx.applied = i + 1
 		var err error
 		if change.after == nil {
-			err = os.Remove(change.path)
-			if errors.Is(err, os.ErrNotExist) {
-				err = nil
-			}
+			err = removeIfExists(change.path)
 		} else {
 			if err = os.MkdirAll(filepath.Dir(change.path), 0o755); err == nil {
 				err = os.WriteFile(change.path, change.after, 0o644)
 			}
 		}
 		if err != nil {
-			return joinRollback(fmt.Errorf("write %s: %w", change.path, err), tx.rollback())
+			return core.JoinWith(fmt.Errorf("write %s: %w", change.path, err), "rollback", tx.rollback())
 		}
 	}
 	return nil
@@ -109,10 +106,7 @@ func (tx *cardTx) rollback() error {
 		change := tx.changes[i]
 		var err error
 		if change.before == nil {
-			err = os.Remove(change.path)
-			if errors.Is(err, os.ErrNotExist) {
-				err = nil
-			}
+			err = removeIfExists(change.path)
 		} else {
 			err = os.WriteFile(change.path, change.before, 0o644)
 		}
@@ -129,13 +123,23 @@ func cardIDFromPath(path string) string {
 	return strings.TrimSuffix(filepath.Base(path), ".md")
 }
 
-// joinRollback keeps the original failure as the primary error and appends the
-// rollback failure so a caller sees both.
-func joinRollback(primary, rollback error) error {
-	if rollback == nil {
-		return primary
+// removeIfExists removes path and clears os.ErrNotExist so a repeated removal
+// is a no-op. Permission and other failures are returned to the caller.
+func removeIfExists(path string) error {
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	return fmt.Errorf("%w; rollback: %w", primary, rollback)
+	return err
+}
+
+// notFoundStatus maps a missing card to the not_found status. Other errors have
+// no card status, so the caller reports them as failures instead.
+func notFoundStatus(err error) string {
+	if errors.Is(err, os.ErrNotExist) {
+		return string(core.CodeNotFound)
+	}
+	return ""
 }
 
 // mutationGraph holds the graph before a batch and the graph the batch should
@@ -189,10 +193,10 @@ func finishMutation(ctx context.Context, tx *cardTx, g mutationGraph, ws PathCom
 		return err
 	}
 	if err := g.sync(ctx); err != nil {
-		return joinRollback(err, errors.Join(tx.rollback(), g.restore(ctx)))
+		return core.JoinWith(err, "rollback", errors.Join(tx.rollback(), g.restore(ctx)))
 	}
 	if err := publishPath(ctx, ws, root, pathspec, message); err != nil {
-		return joinRollback(err, errors.Join(tx.rollback(), g.restore(ctx)))
+		return core.JoinWith(err, "rollback", errors.Join(tx.rollback(), g.restore(ctx)))
 	}
 	return nil
 }
@@ -260,8 +264,8 @@ func (d *TaskDeleter) stageDeletes(ids []string) (*cardTx, []DeletedTask, error)
 	for _, id := range ids {
 		path := cardFilePath(d.Root, id)
 		content, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			results = append(results, DeletedTask{ID: id, Status: "not_found"})
+		if status := notFoundStatus(err); status != "" {
+			results = append(results, DeletedTask{ID: id, Status: status})
 			continue
 		}
 		if err != nil {

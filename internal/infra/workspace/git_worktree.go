@@ -189,7 +189,7 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	if err != nil {
 		_, cleanupErr := g.run(ctx, "worktree", "remove", path)
 		g.refresh(ctx)
-		return core.Workspace{}, joinCleanup(err, "remove worktree after failed merge-base", cleanupErr)
+		return core.Workspace{}, core.JoinWith(err, "remove worktree after failed merge-base", cleanupErr)
 	}
 	return core.Workspace{Path: path, Branch: branch, Base: strings.TrimSpace(mergeBase)}, nil
 }
@@ -273,7 +273,7 @@ func (g *GitWorktree) RebaseBase(ctx context.Context, ws core.Workspace, base st
 	}
 	args = append(args, "origin/"+base)
 	if _, err := g.runInDir(ctx, ws.Path, args...); err != nil {
-		return joinCleanup(err, "abort rebase", g.abortRebase(ctx, ws.Path))
+		return core.JoinWith(err, "abort rebase", g.abortRebase(ctx, ws.Path))
 	}
 	return nil
 }
@@ -441,13 +441,4 @@ func (g *GitWorktree) removeForce(ctx context.Context, ws core.Workspace) error 
 		err = g.deleteBranch(ctx, ws.Branch, true)
 	}
 	return err
-}
-
-// joinCleanup keeps the primary failure and appends a cleanup failure so a
-// caller sees both. A nil cleanup leaves the primary error unchanged.
-func joinCleanup(primary error, what string, cleanup error) error {
-	if cleanup == nil {
-		return primary
-	}
-	return fmt.Errorf("%w; %s: %w", primary, what, cleanup)
 }
