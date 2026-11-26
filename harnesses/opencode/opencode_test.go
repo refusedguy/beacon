@@ -585,6 +585,186 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+// TestSpawnReusesResolvedModelAcrossWorkers records every setup probe for four
+// spawns. The harness-level model is resolved once, so each worker uses the
+// same ref on the create and model requests without a second resolution.
+func TestSpawnReusesResolvedModelAcrossWorkers(t *testing.T) {
+	var mu sync.Mutex
+	var creates, moves, models, prompts []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			mu.Lock()
+			creates = append(creates, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"id":"ses_worker"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/move"):
+			mu.Lock()
+			moves = append(moves, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/model"):
+			mu.Lock()
+			models = append(models, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			mu.Lock()
+			prompts = append(prompts, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(Config{Endpoint: srv.URL, Agent: "worker", Model: "model-once"})
+	want := map[string]any{"id": "model-once", "providerID": "opencode"}
+	for i := 0; i < 4; i++ {
+		if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
+			t.Fatalf("Spawn %d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	if len(creates) != 4 || len(moves) != 4 || len(models) != 4 || len(prompts) != 4 {
+		mu.Unlock()
+		t.Fatalf("probes: creates=%d moves=%d models=%d prompts=%d, want 4 each",
+			len(creates), len(moves), len(models), len(prompts))
+	}
+	for i := range creates {
+		if !reflect.DeepEqual(creates[i]["model"], want) {
+			t.Errorf("create %d model = %v, want %v", i, creates[i]["model"], want)
+		}
+		if !reflect.DeepEqual(models[i]["model"], want) {
+			t.Errorf("model switch %d = %v, want %v", i, models[i]["model"], want)
+		}
+	}
+	mu.Unlock()
+
+	// A later change to the startup model must not resolve the model again.
+	h.Model = "model-later"
+	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
+		t.Fatalf("Spawn after model change: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(models) != 5 || !reflect.DeepEqual(models[4]["model"], want) {
+		t.Fatalf("model switches after change = %v, want fifth with %v", models, want)
+	}
+}
+
+// TestSpawnDispatchModelRefDoesNotReplaceCachedDefault verifies that a model
+// carried by one dispatch stays local to that spawn and does not replace the
+// harness-level fallback used by later workers.
+func TestSpawnDispatchModelRefDoesNotReplaceCachedDefault(t *testing.T) {
+	var mu sync.Mutex
+	var models []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			_, _ = io.WriteString(w, `{"id":"ses_worker"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/model"):
+			mu.Lock()
+			models = append(models, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(Config{Endpoint: srv.URL, Agent: "worker", Model: "harness-model"})
+	override := core.ModelRef{ID: "dispatch-model", ProviderID: "opencode", Variant: "fast"}
+	req := testSpawnRequest()
+	req.ModelRef = override
+	if _, err := h.Spawn(context.Background(), req); err != nil {
+		t.Fatalf("Spawn with dispatch model: %v", err)
+	}
+	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
+		t.Fatalf("Spawn with harness model: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(models) != 2 {
+		t.Fatalf("model switches = %d, want 2", len(models))
+	}
+	wantOverride := map[string]any{"id": "dispatch-model", "providerID": "opencode", "variant": "fast"}
+	if !reflect.DeepEqual(models[0]["model"], wantOverride) {
+		t.Errorf("first model = %v, want %v", models[0]["model"], wantOverride)
+	}
+	wantDefault := map[string]any{"id": "harness-model", "providerID": "opencode"}
+	if !reflect.DeepEqual(models[1]["model"], wantDefault) {
+		t.Errorf("second model = %v, want %v", models[1]["model"], wantDefault)
+	}
+}
+
+// TestRunIdleWatchStopsReconnectOnCancel exercises the reconnect loop with a
+// short backoff. The loop reuses one timer and stops reconnecting when the
+// context is cancelled.
+func TestRunIdleWatchStopsReconnectOnCancel(t *testing.T) {
+	var mu sync.Mutex
+	var connects int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/event" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		mu.Lock()
+		connects++
+		mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h := New(Config{Endpoint: srv.URL})
+	h.ReconnectMin = time.Millisecond
+	h.ReconnectMax = 2 * time.Millisecond
+	done := make(chan struct{})
+	go func() {
+		h.RunIdleWatch(ctx)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := connects
+		mu.Unlock()
+		if n >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunIdleWatch did not stop on cancel")
+	}
+
+	mu.Lock()
+	n := connects
+	mu.Unlock()
+	time.Sleep(10 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if connects != n {
+		t.Fatalf("reconnected after cancel: %d -> %d", n, connects)
+	}
+	if n < 2 {
+		t.Fatalf("event stream connections = %d, want at least 2", n)
+	}
+}
+
 func TestNewUsesConfiguredClientAndTrimsEndpoint(t *testing.T) {
 	var gotURL string
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {

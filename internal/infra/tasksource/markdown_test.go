@@ -5,8 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -579,6 +582,201 @@ func TestScopeClassification(t *testing.T) {
 	for i := range want {
 		if got.Scope[i] != want[i] {
 			t.Fatalf("scope = %+v, want %+v", got.Scope, want)
+		}
+	}
+}
+
+// resetCardIndex drops the cached index for dir so a test can count the scans
+// its own operations cause.
+func resetCardIndex(dir string) {
+	cardIndexCache.mu.Lock()
+	defer cardIndexCache.mu.Unlock()
+	delete(cardIndexCache.byDir, cardIndexKey(dir))
+}
+
+func writeIndexCard(t testing.TB, dir, id, status string) string {
+	t.Helper()
+	content := "---\nid: " + id + "\ntitle: Card " + id + "\nstatus: " + status + "\n---\n# " + id + ". Card\n"
+	path := filepath.Join(dir, id+".md")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%s): %v", path, err)
+	}
+	return path
+}
+
+func TestCardIndexStateChangesReuseOneScan(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 60; i++ {
+		writeIndexCard(t, dir, "T-"+strconv.Itoa(i), "available")
+	}
+	store := CardStore{Dir: dir}
+	resetCardIndex(dir)
+	cardScanCount.Store(0)
+
+	// The first state change builds the index.
+	if err := store.indexedPatchStatus(context.Background(), "T-0", "in_progress"); err != nil {
+		t.Fatalf("first patch: %v", err)
+	}
+	if got := cardScanCount.Load(); got != 1 {
+		t.Fatalf("scans after first patch = %d, want 1", got)
+	}
+
+	// The indexed card is identical to a fresh parse of the file on disk.
+	c, err := store.indexedFind("T-0")
+	if err != nil {
+		t.Fatalf("indexedFind(T-0): %v", err)
+	}
+	b, err := os.ReadFile(c.path)
+	if err != nil {
+		t.Fatalf("os.ReadFile(c.path): %v", err)
+	}
+	freshTask, ok, hasFM := parseCardFields(string(b), c.path)
+	if !ok {
+		t.Fatal("written card no longer parses")
+	}
+	fresh := card{path: c.path, task: freshTask, content: string(b), hasFM: hasFM}
+	if !reflect.DeepEqual(c, fresh) {
+		t.Fatalf("indexed card differs from fresh parse:\nindexed = %+v\nfresh   = %+v", c, fresh)
+	}
+
+	// Later state changes reuse the index and never walk the directory again.
+	for i := 1; i < 30; i++ {
+		id := core.TaskID("T-" + strconv.Itoa(i))
+		if err := store.indexedPatchStatus(context.Background(), id, "done"); err != nil {
+			t.Fatalf("patch %s: %v", id, err)
+		}
+	}
+	if got := cardScanCount.Load(); got != 1 {
+		t.Fatalf("scans after 30 state changes = %d, want 1", got)
+	}
+	for i := 0; i < 30; i++ {
+		id := core.TaskID("T-" + strconv.Itoa(i))
+		c, err := store.indexedFind(id)
+		if err != nil {
+			t.Fatalf("indexedFind(%s): %v", id, err)
+		}
+		if c.task.ID != id {
+			t.Fatalf("card id = %q, want %q", c.task.ID, id)
+		}
+	}
+
+	if err := store.indexedPatchStatus(context.Background(), "T-MISSING", "done"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing id error = %v, want os.ErrNotExist", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.indexedPatchStatus(ctx, "T-1", "done"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled patch error = %v, want context.Canceled", err)
+	}
+}
+
+func TestCardIndexDetectsExternalEdit(t *testing.T) {
+	dir := t.TempDir()
+	writeIndexCard(t, dir, "T-X", "available")
+	store := CardStore{Dir: dir}
+	resetCardIndex(dir)
+
+	c, err := store.indexedFind("T-X")
+	if err != nil {
+		t.Fatalf("indexedFind before edit: %v", err)
+	}
+	if c.task.Status != core.TaskAvailable {
+		t.Fatalf("status = %q, want available", c.task.Status)
+	}
+
+	// An edit outside the store is picked up from mtime, without a full scan.
+	time.Sleep(5 * time.Millisecond)
+	path := filepath.Join(dir, "T-X.md")
+	content := "---\nid: T-X\ntitle: Externally done\nstatus: done\n---\n# T-X. Card\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(path): %v", err)
+	}
+	before := cardScanCount.Load()
+	c, err = store.indexedFind("T-X")
+	if err != nil {
+		t.Fatalf("indexedFind after edit: %v", err)
+	}
+	if c.task.Status != core.TaskDone || c.task.Title != "Externally done" {
+		t.Fatalf("stale card after external edit: %+v", c.task)
+	}
+	if got := cardScanCount.Load(); got != before {
+		t.Fatalf("external edit caused %d extra scans", got-before)
+	}
+}
+
+func TestCardIndexStateChangesThroughMarkdown(t *testing.T) {
+	dir := t.TempDir()
+	writeIndexCard(t, dir, "T-MD", "available")
+	s := NewMarkdown(dir)
+	resetCardIndex(dir)
+	cardScanCount.Store(0)
+
+	if err := s.Claim(context.Background(), "T-MD"); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := s.Complete(context.Background(), "T-MD"); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "T-MD.md"))
+	if err != nil {
+		t.Fatalf("os.ReadFile: %v", err)
+	}
+	if !strings.Contains(string(b), "status: done") {
+		t.Fatalf("Complete did not write done: %s", b)
+	}
+	if got := cardScanCount.Load(); got != 1 {
+		t.Fatalf("scans after Claim and Complete = %d, want 1", got)
+	}
+
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatalf("ListAvailable: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("completed card still available: %+v", tasks)
+	}
+}
+
+// BenchmarkCardStoreStateChangesOneScan runs 500 state changes over 20,000
+// cards. The index is built once per iteration and reused by every change.
+// Each returned card must match a fresh parse of the file it came from.
+func BenchmarkCardStoreStateChangesOneScan(b *testing.B) {
+	ctx := context.Background()
+	dir := b.TempDir()
+	const totalCards = 20000
+	for i := 0; i < totalCards; i++ {
+		writeIndexCard(b, dir, "T-"+strconv.Itoa(i), "available")
+	}
+	store := CardStore{Dir: dir}
+	ids := make([]core.TaskID, 500)
+	for i := range ids {
+		ids[i] = core.TaskID("T-" + strconv.Itoa(i))
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		resetCardIndex(dir)
+		cardScanCount.Store(0)
+		for _, id := range ids {
+			if err := store.indexedPatchStatus(ctx, id, "in_progress"); err != nil {
+				b.Fatalf("patch %s: %v", id, err)
+			}
+		}
+		if got := cardScanCount.Load(); got != 1 {
+			b.Fatalf("full scans = %d, want 1", got)
+		}
+		for _, id := range ids {
+			c, err := store.indexedFind(id)
+			if err != nil {
+				b.Fatalf("indexedFind(%s): %v", id, err)
+			}
+			bts, err := os.ReadFile(c.path)
+			if err != nil {
+				b.Fatalf("os.ReadFile(%s): %v", c.path, err)
+			}
+			t, ok, hasFM := parseCardFields(string(bts), c.path)
+			if !ok || !reflect.DeepEqual(c, card{path: c.path, task: t, content: string(bts), hasFM: hasFM}) {
+				b.Fatalf("indexed card differs from disk for %s", id)
+			}
 		}
 	}
 }
