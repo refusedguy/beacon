@@ -12,11 +12,12 @@ import (
 // ControlArgs is the input schema for beacon_control. RunIDs is optional;
 // when present it replaces RunID and the call returns one result per id.
 type ControlArgs struct {
-	Action string   `json:"action,omitempty"`
-	RunID  string   `json:"run_id,omitempty"`
-	RunIDs []string `json:"run_ids,omitempty"`
-	SHA    string   `json:"sha,omitempty"`
-	PR     int      `json:"pr,omitempty"`
+	Action  string   `json:"action,omitempty"`
+	RunID   string   `json:"run_id,omitempty"`
+	RunIDs  []string `json:"run_ids,omitempty"`
+	SHA     string   `json:"sha,omitempty"`
+	PR      int      `json:"pr,omitempty"`
+	Message string   `json:"message,omitempty"`
 }
 
 type controlItem struct {
@@ -33,7 +34,7 @@ type controlBatch struct {
 func registerControl(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, catalogTool("beacon_control"), func(ctx context.Context, _ *msdk.CallToolRequest, a ControlArgs) (*msdk.CallToolResult, any, error) {
 		if a.RunIDs == nil {
-			if err := applyControl(ctx, sv, a.Action, a.RunID, a.PR, a.SHA); err != nil {
+			if err := applyControl(ctx, sv, a.Action, a.RunID, a.PR, a.SHA, a.Message); err != nil {
 				return nil, nil, err
 			}
 			return textResult("ok"), nil, nil
@@ -45,32 +46,22 @@ func registerControl(s *msdk.Server, sv Services) {
 // applyControl forwards one action either to the loopback API or to the local
 // control service. The loopback API accepts one run per request, so batches
 // are sent sequentially and each id keeps its own outcome.
-func applyControl(ctx context.Context, sv Services, action, id string, pr int, sha string) error {
+func applyControl(ctx context.Context, sv Services, action, id string, pr int, sha, message string) error {
 	if sv.Remote != nil {
 		return sv.Remote(ctx, action, id, pr, sha)
 	}
 	if err := requireService("control service", sv.Control); err != nil {
 		return err
 	}
-	return applyLocal(ctx, sv.Control, action, id, sha, pr)
+	return applyLocal(ctx, sv.Control, action, id, sha, pr, message)
 }
 
-func applyLocal(ctx context.Context, control *app.Control, action, id, sha string, pr int) error {
-	runID := core.RunID(id)
-	switch core.ParseControlAction(action) {
-	case core.ControlApprove:
-		return control.Approve(ctx, runID, sha)
-	case core.ControlUnblock:
-		return control.Unblock(ctx, runID)
-	case core.ControlCancel:
-		return control.Cancel(ctx, runID)
-	case core.ControlRetry:
-		return control.Retry(ctx, runID)
-	case core.ControlWatch:
-		return control.WatchPR(ctx, runID, pr)
-	default:
-		return core.Errorf(core.CodeInvalidInput, "unknown action %q", action)
-	}
+// applyLocal hands the action to the shared app dispatch. Every advertised
+// verb, including nudge, reaches the same implementation the other boundaries use.
+func applyLocal(ctx context.Context, control *app.Control, action, id, sha string, pr int, message string) error {
+	return control.Apply(ctx, core.ParseControlAction(action), app.ControlArgs{
+		RunID: core.RunID(id), SHA: sha, PR: pr, Message: message,
+	})
 }
 
 func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToolResult, any, error) {
@@ -86,7 +77,7 @@ func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToo
 	results := make([]controlItem, 0, len(a.RunIDs))
 	for _, id := range a.RunIDs {
 		item := controlItem{ID: id, Status: "ok"}
-		if err := applyControl(ctx, sv, a.Action, id, a.PR, a.SHA); err != nil {
+		if err := applyControl(ctx, sv, a.Action, id, a.PR, a.SHA, a.Message); err != nil {
 			item.Status = "error"
 			item.Error = err.Error()
 		}
