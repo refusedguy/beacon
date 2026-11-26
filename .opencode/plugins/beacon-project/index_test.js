@@ -13,7 +13,6 @@ import {
   commandSegments,
   commandSubstitutions,
   currentSessionAgent,
-  defineBeaconProject,
   findShellGuardHit,
   guardedAgents,
   guardMode,
@@ -398,10 +397,11 @@ test("build setup keeps the status panel RPC for the operator TUI", async () => 
 test("both plugins can be defined with different doubles in one test", () => {
   const projectCalls = []
   const statusCalls = []
-  const project = defineBeaconProject((definition) => {
+  const projectDefine = (definition) => {
     projectCalls.push(definition)
     return { builtBy: "project", definition }
-  })
+  }
+  const project = projectDefine(beaconProjectDefinition)
   const status = defineBeaconStatus((definition) => {
     statusCalls.push(definition)
     return { builtBy: "status", definition }
