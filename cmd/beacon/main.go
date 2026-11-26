@@ -326,8 +326,9 @@ func newReconciler(
 		Dispatcher: disp, Changes: changes, Repo: cfg.RepoSlug(),
 		BaseBranch: cfg.BaseBranch, BaseRedMode: cfg.OnBaseRed.Mode,
 		MaxFixTries: cfg.OnBaseRed.MaxFixAttempts, ParentSessionID: parentSession,
-		Interval:   cfg.Interval(),
-		AutoRebase: cfg.Merge.AutoRebase,
+		Interval:       cfg.Interval(),
+		AutoRebase:     cfg.Merge.AutoRebase,
+		MaxAutoRebases: cfg.Merge.MaxAutoRebases,
 	}
 }
 
