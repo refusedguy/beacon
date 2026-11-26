@@ -127,6 +127,14 @@ type MergePolicy interface {
 	Evaluate(Observation) MergeDecision
 }
 
+// RequiredCheckSource supplies the names of checks a merge must pass. Policy
+// reads names through this port, so it does not depend on where they come from:
+// an explicit config list, a CI workflow file and a future provider's check
+// contexts can all implement it without a policy change.
+type RequiredCheckSource interface {
+	Names(ctx context.Context) ([]string, error)
+}
+
 // RunStore is the persistence port for runs, tasks and incidents.
 type RunStore interface {
 	Save(ctx context.Context, run *Run) error

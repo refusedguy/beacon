@@ -1,7 +1,7 @@
 ---
 id: T-4b1bb0a7
 title: Put required checks behind a port
-status: available
+status: done
 scope:
     - pkg/core/ports.go
     - internal/infra/checksource/config.go

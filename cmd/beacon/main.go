@@ -24,6 +24,7 @@ import (
 	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/internal/app"
+	"github.com/refusedguy/beacon/internal/infra/checksource"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/internal/infra/harness"
 	"github.com/refusedguy/beacon/internal/infra/notify"
@@ -291,12 +292,14 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 }
 
 func mergePolicy(cfg config.Config) core.MergePolicy {
-	// Load resolves workflow job names into RequiredChecks in workflow mode.
-	// Feeding that field here is what makes reconcile follow a workflow rename
-	// after the config watcher reloads, without a config edit.
-	requiredChecks := cfg.Merge.RequiredChecks
+	// Required checks reach policy through the port. Config load already
+	// resolves workflow job names into RequiredChecks in workflow mode, so the
+	// explicit list is the override the source returns on both the initial
+	// load and every watcher reload. That keeps the wire shape and behaviour
+	// unchanged while SCM adapters can add their own source later.
+	source := checksource.Config{Explicit: cfg.Merge.RequiredChecks}
 	return policy.New(policy.Config{
-		RequiredChecks: requiredChecks, RequiredApprovals: cfg.Merge.RequiredApprovals,
+		RequiredCheckSource: source, RequiredApprovals: cfg.Merge.RequiredApprovals,
 		Labels: cfg.Merge.Labels, CommandGate: cfg.Merge.CommandGate,
 	})
 }
