@@ -23,6 +23,10 @@ func TestMain(m *testing.M) {
 func runFakeAgent() {
 	dec := json.NewDecoder(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
+	if os.Getenv("ACP_FAKE_AGENT_COLLIDE") == "1" {
+		runCollisionAgent(dec, enc)
+		return
+	}
 	for {
 		var msg struct {
 			ID     *int64          `json:"id"`
@@ -104,6 +108,67 @@ func runFakeAgent() {
 				"error": map[string]any{"code": -32601, "message": "unknown method"},
 			})
 		}
+	}
+}
+
+// runCollisionAgent sends an agent request whose ID matches the pending call
+// ID, followed by a notification. It then reads the reply the harness wrote
+// for that request and folds it into the real response so the test can see
+// whether the request was answered instead of consumed as the call result.
+func runCollisionAgent(dec *json.Decoder, enc *json.Encoder) {
+	for {
+		var incoming struct {
+			ID     *int64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := dec.Decode(&incoming); err != nil {
+			if err == io.EOF {
+				return
+			}
+			os.Exit(2)
+		}
+		if incoming.Method == "" || incoming.ID == nil {
+			continue
+		}
+		_ = enc.Encode(map[string]any{
+			"jsonrpc": "2.0", "id": *incoming.ID, "method": "session/request_permission",
+			"params": map[string]any{
+				"sessionId": "sess_wire",
+				"options": []map[string]any{
+					{"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+				},
+			},
+		})
+		_ = enc.Encode(map[string]any{
+			"jsonrpc": "2.0", "method": "session/update",
+			"params": map[string]any{
+				"sessionId": "sess_wire",
+				"update": map[string]any{
+					"sessionUpdate": "agent_message_chunk",
+					"content":       map[string]string{"type": "text", "text": "note-collision"},
+				},
+			},
+		})
+		var answer struct {
+			ID     int64 `json:"id"`
+			Result struct {
+				Outcome struct {
+					Outcome  string `json:"outcome"`
+					OptionID string `json:"optionId"`
+				} `json:"outcome"`
+			} `json:"result"`
+		}
+		if err := dec.Decode(&answer); err != nil {
+			os.Exit(3)
+		}
+		_ = enc.Encode(map[string]any{
+			"jsonrpc": "2.0", "id": *incoming.ID,
+			"result": map[string]any{
+				"stopReason":     "end_turn",
+				"answerID":       answer.ID,
+				"answerOptionID": answer.Result.Outcome.OptionID,
+			},
+		})
 	}
 }
 
@@ -240,5 +305,50 @@ func TestPermissionWithOnlyRejectOptionsCancels(t *testing.T) {
 	}
 	if len(chunks) != 1 || chunks[0] != "permission:cancelled" {
 		t.Fatalf("agent chunks = %v, want [permission:cancelled]", chunks)
+	}
+}
+
+// TestCallRoutesCollidingRequestAndNotification drives the real transport with
+// an agent request whose ID equals the pending call ID. A response envelope
+// with a method field must be answered, not consumed as the call result.
+func TestCallRoutesCollidingRequestAndNotification(t *testing.T) {
+	t.Setenv("ACP_FAKE_AGENT", "1")
+	t.Setenv("ACP_FAKE_AGENT_COLLIDE", "1")
+	p, err := startProcess(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var notes []string
+	var result struct {
+		StopReason     string `json:"stopReason"`
+		AnswerID       int64  `json:"answerID"`
+		AnswerOptionID string `json:"answerOptionID"`
+	}
+	err = p.call(ctx, "session/prompt", map[string]any{"sessionId": "sess_wire"}, &result,
+		func(raw json.RawMessage) {
+			if text := collectText(raw); text != "" {
+				notes = append(notes, text)
+			}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.StopReason != "end_turn" {
+		t.Fatalf("stop reason = %q, want end_turn (the pending call must resolve from the real response)", result.StopReason)
+	}
+	if result.AnswerID != 1 {
+		t.Fatalf("answer id = %d, want 1 (the colliding request must be answered at its own id)", result.AnswerID)
+	}
+	if result.AnswerOptionID != "allow-once" {
+		t.Fatalf("answer option = %q, want allow-once", result.AnswerOptionID)
+	}
+	if len(notes) != 1 || notes[0] != "note-collision" {
+		t.Fatalf("notifications = %v, want [note-collision]", notes)
 	}
 }
