@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +24,68 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := ensureSnapshotIndexes(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := ensureDecisionSummary(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// ensureSnapshotIndexes adds the covering indexes the snapshot reads rely on.
+// They live on the read side, next to the queries they serve, so an older
+// state database gains them on the next open without a schema version bump.
+func ensureSnapshotIndexes(db *sql.DB) error {
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS runs_state_updated_idx ON runs(state, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS decisions_run_kind_verdict_action_idx ON decisions(run_id, kind, verdict, action)`,
+		`CREATE INDEX IF NOT EXISTS decisions_orphan_at_idx ON decisions(run_id, at DESC) WHERE run_id = ''`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureDecisionSummary keeps a small aggregate of decision counts so a
+// snapshot never scans the decision table to build its metrics. A trigger
+// maintains the aggregate on every insert; the backfill makes an older state
+// database correct on the next open.
+func ensureDecisionSummary(db *sql.DB) error {
+	const table = `CREATE TABLE IF NOT EXISTS decision_summary (
+run_id TEXT NOT NULL, kind TEXT NOT NULL, verdict TEXT NOT NULL, action TEXT NOT NULL,
+n INTEGER NOT NULL, PRIMARY KEY (run_id, kind, verdict, action))`
+	if _, err := db.Exec(table); err != nil {
+		return err
+	}
+	const trigger = `CREATE TRIGGER IF NOT EXISTS decision_summary_insert
+AFTER INSERT ON decisions BEGIN
+INSERT INTO decision_summary (run_id, kind, verdict, action, n)
+VALUES (NEW.run_id, NEW.kind, NEW.verdict, NEW.action, 1)
+ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = n + 1;
+END`
+	if _, err := db.Exec(trigger); err != nil {
+		return err
+	}
+	// Backfill only when the aggregate is empty. A populated summary is kept
+	// current by the trigger, so a restart must not regroup a large decision
+	// table for no reason.
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM decision_summary`).Scan(&rows); err != nil {
+		return err
+	}
+	if rows > 0 {
+		return nil
+	}
+	_, err := db.Exec(`INSERT INTO decision_summary (run_id, kind, verdict, action, n)
+SELECT run_id, kind, verdict, action, COUNT(*) FROM decisions
+GROUP BY run_id, kind, verdict, action
+ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = excluded.n`)
+	return err
 }
 
 // Close closes the database handle.
@@ -207,7 +269,26 @@ func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
 
 // ListRecent returns at most limit finished runs, newest first.
 func (s *Store) ListRecent(ctx context.Context, limit int) ([]*core.Run, error) {
-	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state IN ('merged','closed','dropped') ORDER BY updated_at DESC LIMIT ?`, limit)
+	if limit <= 0 {
+		limit = app.DefaultRecentLimit
+	}
+	// Each terminal state is already ordered by updated_at in the covering
+	// index. Taking limit rows from each state and merging them avoids sorting
+	// every finished run in the database. The overall newest limit rows are
+	// always inside that three-way union, so the result is unchanged.
+	n := strconv.Itoa(limit)
+	terminal := func(state string) string {
+		return `SELECT * FROM (SELECT ` + runColumns + ` FROM runs WHERE state='` + state + `'
+ORDER BY updated_at DESC LIMIT ` + n + `)`
+	}
+	query := `SELECT ` + runColumns + ` FROM (
+` + terminal("merged") + `
+UNION ALL
+` + terminal("closed") + `
+UNION ALL
+` + terminal("dropped") + `
+) ORDER BY updated_at DESC LIMIT ` + n
+	return s.queryAll(ctx, query)
 }
 
 // ListByIncident returns the runs blocked by incidentID.
@@ -364,20 +445,25 @@ func (s *Store) ListDecisions(ctx context.Context, runIDs []string, limit, orpha
 	if orphanLimit <= 0 {
 		orphanLimit = app.DefaultOrphanDecisionsLimit
 	}
-	const orphan = `SELECT ` + decisionColumns + `, ROW_NUMBER() OVER (ORDER BY at DESC, id DESC) AS rn
-FROM decisions WHERE run_id = ''`
+	// The orphan bucket can hold hundreds of thousands of rows. A window
+	// function numbers every one of them before the LIMIT is applied. Because
+	// the caller only wants the newest orphanLimit rows, an ordered index scan
+	// with LIMIT returns the same rows and skips the full sort. The limit is
+	// inlined because modernc/sqlite rejects a bound parameter in this LIMIT.
+	orphan := `SELECT ` + decisionColumns + ` FROM decisions
+WHERE run_id = '' ORDER BY at DESC, id DESC LIMIT ` + strconv.Itoa(orphanLimit)
 	query := `WITH orphan AS (` + orphan + `)
-SELECT ` + decisionColumns + ` FROM orphan WHERE rn <= ? ORDER BY at, id`
-	args := []any{orphanLimit}
+SELECT ` + decisionColumns + ` FROM orphan ORDER BY at, id`
+	var args []any
 	if len(runIDs) > 0 {
 		perRun, ids := inQuery(`per_run AS (SELECT `+decisionColumns+`,
 ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY at DESC, id DESC) AS rn
 FROM decisions WHERE run_id IN (%s))`, runIDs)
 		query = `WITH ` + perRun + `, orphan AS (` + orphan + `)
 SELECT ` + decisionColumns + ` FROM per_run WHERE rn <= ?
-UNION ALL SELECT ` + decisionColumns + ` FROM orphan WHERE rn <= ?
+UNION ALL SELECT ` + decisionColumns + ` FROM orphan
 ORDER BY at, id`
-		args = append(ids, limit, orphanLimit)
+		args = append(ids, limit)
 	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -405,12 +491,18 @@ ORDER BY at, id`
 // snapshot metrics exact even though ListDecisions returns a bounded sample.
 func (s *Store) DecisionCounts(ctx context.Context, runIDs []string) ([]app.DecisionCount, error) {
 	out := []app.DecisionCount{}
-	query := `SELECT kind, verdict, action, COUNT(*) FROM decisions WHERE run_id = ''
-GROUP BY kind, verdict, action`
+	// Read the maintained aggregate instead of scanning decisions. The two
+	// buckets are read separately so both use the primary key on run_id, and
+	// the outer GROUP BY adds overlapping groups exactly as before.
+	const orphan = `SELECT kind, verdict, action, n FROM decision_summary WHERE run_id = ''`
+	query := `SELECT kind, verdict, action, n FROM (` + orphan + `) ORDER BY kind, verdict, action`
 	var args []any
 	if len(runIDs) > 0 {
-		query, args = inQuery(`SELECT kind, verdict, action, COUNT(*) FROM decisions
-WHERE run_id IN (%s) OR run_id = '' GROUP BY kind, verdict, action`, runIDs)
+		runs, ids := inQuery(`SELECT kind, verdict, action, n FROM decision_summary
+WHERE run_id IN (%s)`, runIDs)
+		query = `SELECT kind, verdict, action, SUM(n) AS n FROM (` + runs + ` UNION ALL ` + orphan + `)
+GROUP BY kind, verdict, action ORDER BY kind, verdict, action`
+		args = ids
 	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

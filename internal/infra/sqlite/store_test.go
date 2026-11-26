@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1107,5 +1108,124 @@ func TestConcurrentSavesDoNotReturnBusy(t *testing.T) {
 		if err != nil || got == nil {
 			t.Fatalf("run %d = %+v err=%v", i, got, err)
 		}
+	}
+}
+
+// TestSnapshotReadsKeepExactRows guards the query rewrites that make the deep
+// snapshot benchmark fast. The rewrites must return the same decisions, in the
+// same order, and the same exact counts as the window-function and OR forms.
+func TestSnapshotReadsKeepExactRows(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	base := time.Now().UTC().Add(-time.Hour)
+	type row struct {
+		runID   string
+		kind    string
+		verdict string
+		at      time.Time
+	}
+	rows := []row{
+		{"r1", "k1", "v1", base.Add(5 * time.Second)},
+		{"r1", "k2", "v2", base.Add(time.Second)},
+		{"r1", "k1", "v1", base.Add(3 * time.Second)},
+		{"", "k1", "v1", base.Add(4 * time.Second)},
+		{"", "k2", "v2", base.Add(2 * time.Second)},
+		{"", "k1", "v1", base.Add(6 * time.Second)},
+		{"r2", "k3", "v3", base.Add(7 * time.Second)},
+	}
+	for i, r := range rows {
+		if err := store.RecordDecision(ctx, app.Decision{
+			At: r.at, Kind: r.kind, RunID: r.runID, Verdict: r.verdict, Action: "a1",
+		}); err != nil {
+			t.Fatalf("RecordDecision %d: %v", i, err)
+		}
+	}
+
+	decisions, err := store.ListDecisions(ctx, []string{"r1"}, 2, 2)
+	if err != nil {
+		t.Fatalf("ListDecisions: %v", err)
+	}
+	gotIDs := make([]int64, 0, len(decisions))
+	for _, d := range decisions {
+		gotIDs = append(gotIDs, d.ID)
+	}
+	wantIDs := []int64{3, 4, 1, 6}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("decision ids = %v, want %v", gotIDs, wantIDs)
+	}
+
+	counts, err := store.DecisionCounts(ctx, []string{"r1"})
+	if err != nil {
+		t.Fatalf("DecisionCounts: %v", err)
+	}
+	wantCounts := []app.DecisionCount{
+		{Kind: "k1", Verdict: "v1", Action: "a1", Count: 4},
+		{Kind: "k2", Verdict: "v2", Action: "a1", Count: 2},
+	}
+	if !reflect.DeepEqual(counts, wantCounts) {
+		t.Fatalf("counts = %+v, want %+v", counts, wantCounts)
+	}
+
+	orphanCounts, err := store.DecisionCounts(ctx, nil)
+	if err != nil {
+		t.Fatalf("DecisionCounts(nil): %v", err)
+	}
+	wantOrphans := []app.DecisionCount{
+		{Kind: "k1", Verdict: "v1", Action: "a1", Count: 2},
+		{Kind: "k2", Verdict: "v2", Action: "a1", Count: 1},
+	}
+	if !reflect.DeepEqual(orphanCounts, wantOrphans) {
+		t.Fatalf("orphan counts = %+v, want %+v", orphanCounts, wantOrphans)
+	}
+}
+
+// TestDecisionSummaryBackfillOnOpen checks that a state database written
+// before the summary table existed gains correct totals on the next open.
+func TestDecisionSummaryBackfillOnOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		if err := store.RecordDecision(ctx, app.Decision{
+			Kind: "reconcile", RunID: "r1", Verdict: "keep_working", Action: "retry",
+		}); err != nil {
+			t.Fatalf("RecordDecision: %v", err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := raw.Exec(`DROP TABLE decision_summary`); err != nil {
+		t.Fatalf("DROP TABLE decision_summary: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw.Close: %v", err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer store.Close()
+	counts, err := store.DecisionCounts(ctx, []string{"r1"})
+	if err != nil {
+		t.Fatalf("DecisionCounts: %v", err)
+	}
+	want := []app.DecisionCount{{Kind: "reconcile", Verdict: "keep_working", Action: "retry", Count: 4}}
+	if !reflect.DeepEqual(counts, want) {
+		t.Fatalf("counts after backfill = %+v, want %+v", counts, want)
 	}
 }
