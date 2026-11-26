@@ -66,13 +66,31 @@ export function shortTaskID(value) {
   return id ? id.replace(/^T-\d{8}-/, "") : "-"
 }
 
+// One index per snapshot queue. Snapshots arrive as fresh arrays, so identity
+// is a safe cache key: a tree never outlives the array it was built from. This
+// lets the queue header, the rows and the card panel share a single tree
+// instead of rebuilding it for every consumer in a render.
+const treeCache = new WeakMap()
+const depsOf = (item) => (Array.isArray(item?.dependsOn) ? item.dependsOn
+  : Array.isArray(item?.depends_on) ? item.depends_on : []).map(str).filter(Boolean)
+
 // TaskTree is the single index of parent-child relations for the queue and
 // card panels. An explicit parent field is authoritative. Snapshots that still
 // carry only generated IDs fall back to the longest ID prefix, so older
 // daemons keep their layout until they publish the parent field.
 export function taskTree(items = []) {
   const list = Array.isArray(items) ? items : []
-  const byID = new Map(list.map((item) => [str(item?.id), item]))
+  const cached = treeCache.get(list)
+  if (cached) return cached
+  // Read each card ID once. Blocker grouping and row building look it up in
+  // idOf instead of reading the same field again for every consumer.
+  const byID = new Map()
+  const idOf = new Map()
+  for (const item of list) {
+    const id = str(item?.id)
+    byID.set(id, item)
+    idOf.set(item, id)
+  }
   const parent = new Map()
   const ids = [...byID.keys()]
   for (const id of ids) {
@@ -102,7 +120,9 @@ export function taskTree(items = []) {
     children.get(value).push(child)
     epic.add(value)
   }
-  return { list, byID, parent, children, epic }
+  const index = { list, byID, idOf, ids, parent, children, epic }
+  treeCache.set(list, index)
+  return index
 }
 
 export const spacerItem = () => ({
@@ -112,12 +132,9 @@ const countLabel = (n, one, many) => `${n} ${n === 1 ? one : many}`
 
 // The snapshot carries only unresolved deps. Children of an epic already have
 // their own rows, so they never become blocker headers.
-const queueBlockers = (item, parent) => (Array.isArray(item?.dependsOn) ? item.dependsOn
-  : Array.isArray(item?.depends_on) ? item.depends_on : [])
-  .map(str).filter((dep) => dep && !parent.get(dep))
+const queueBlockers = (item, parent) => depsOf(item).filter((dep) => dep && !parent.get(dep))
 
-function taskRows(item, { epic, parent, blockers, children }) {
-  const id = str(item?.id)
+function taskRows(item, { id, epic, parent, blockers, children }) {
   const blocked = str(item?.status).toLowerCase() === "waiting_deps"
   const status = [
     `P${str(item?.priority) || "?"}`,
@@ -155,9 +172,12 @@ export function queueGroups(queue = [], hidden = null, tree = null) {
   const isEpic = (id) => epic.has(id)
   // A dep that names a child card is an internal edge, not a blocker header.
   // The parent map already holds that answer, so no extra Set is needed.
-  const blockers = new Map(list.map((item) => [str(item?.id), queueBlockers(item, parent)]))
+  const ownIndex = index.list === list
+  const ids = ownIndex ? index.ids : list.map((item) => str(item?.id))
+  const idOf = ownIndex ? index.idOf : null
+  const blockers = new Map(list.map((item, i) => [ids[i], queueBlockers(item, parent)]))
   const groupOf = (item) => {
-    const id = str(item?.id)
+    const id = idOf?.get(item) ?? str(item?.id)
     const own = blockers.get(id) ?? []
     return own[0] || (blockers.get(parent.get(id) || "") ?? [])[0] || ""
   }
@@ -169,12 +189,12 @@ export function queueGroups(queue = [], hidden = null, tree = null) {
     groups.get(key).push(item)
   }
   return {
-    groups, order, parents: parent, blockers, tree: index,
+    groups, order, parents: parent, blockers, tree: index, idOf,
     parentOf, childrenOf, isEpic,
   }
 }
 
-export const blockedGroupKeys = (queue = []) => queueGroups(queue).order.filter(Boolean)
+export const blockedGroupKeys = (queue = [], tree = null) => queueGroups(queue, null, tree).order.filter(Boolean)
 
 // An expanded epic or blocked group shows at most this many member rows. The
 // rest collapse into a "+N more" line so Recent stays inside the sidebar.
@@ -183,7 +203,7 @@ export const QUEUE_CHILD_LIMIT = 3
 // A null blockedOpen keeps the flat legacy rows for pure callers that never
 // drive the toggle. With a map, only groups marked true expand.
 export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tree = null) {
-  const { groups, order, blockers, parentOf, childrenOf, isEpic } = queueGroups(queue, hidden, tree)
+  const { groups, order, blockers, parentOf, childrenOf, isEpic, idOf } = queueGroups(queue, hidden, tree)
   const rows = []
   for (const key of order) {
     if (rows.length) rows.push(spacerItem())
@@ -200,9 +220,9 @@ export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tr
     }
     const capped = Boolean(key) && blockedOpen != null && members.length > QUEUE_CHILD_LIMIT
     for (const item of capped ? members.slice(0, QUEUE_CHILD_LIMIT) : members) {
-      const id = str(item?.id)
+      const id = idOf?.get(item) ?? str(item?.id)
       rows.push(...taskRows(item, {
-        epic: isEpic(id),
+        id, epic: isEpic(id),
         parent: parentOf(id), blockers: blockers.get(id) ?? [],
         children: childrenOf(id).length,
       }))
@@ -215,13 +235,18 @@ export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tr
   return rows
 }
 
-export function queueRows(queue = [], epicOpen = null, blockedOpen = null) {
+export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree = null) {
   const list = Array.isArray(queue) ? queue : []
-  // queueGroups owns parent, child and epic membership. Keep one tree for this
-  // render and let queueLineItems read the same index through its tree argument.
-  const { tree, parentOf, childrenOf, isEpic } = queueGroups(list)
-  if (!epicOpen) return queueLineItems(list, null, blockedOpen, tree)
-  const ids = list.map((item) => str(item?.id))
+  // One tree per snapshot. The caller passes the index it already built for the
+  // queue header; a standalone caller falls back to the cached index for the
+  // same array. queueLineItems reads that index through its tree argument.
+  const index = tree ?? taskTree(list)
+  const { parent, children, epic } = index
+  const parentOf = (id) => parent.get(id) || ""
+  const childrenOf = (id) => children.get(id) ?? []
+  const isEpic = (id) => epic.has(id)
+  if (!epicOpen) return queueLineItems(list, null, blockedOpen, index)
+  const ids = index.list === list ? index.ids : list.map((item) => str(item?.id))
   // Walk up to the direct child under each ancestor epic. This hides the whole
   // subtree of a collapsed epic and of a child beyond the cap.
   const childUnder = (id, ancestor) => {
@@ -244,7 +269,7 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null) {
       parent = parentOf(parent)
     }
   }
-  const rows = queueLineItems(list, hidden, blockedOpen, tree)
+  const rows = queueLineItems(list, hidden, blockedOpen, index)
   const summaries = []
   for (const id of ids) {
     if (!isEpic(id) || epicOpen[id] !== true) continue
@@ -290,14 +315,39 @@ const NEXT_STEPS = Object.freeze({
 
 export const nextStepLine = (run) => run ? (NEXT_STEPS[str(run.state).toLowerCase()] ?? "") : ""
 
-// The host truncates from the middle, so clipped text is cut here from the end.
-// No ellipsis ever appears in the middle of a rendered string.
-export function truncate(value, width) {
-  const chars = Array.from(str(value))
-  if (chars.length <= width) return chars.join("")
+// Truncation is pure, so cache by the pair that determines the answer. Titles,
+// reasons and section names repeat on every poll; the cache keeps the
+// code-point walk to the first render of each string. Each width gets a bounded
+// FIFO map so a long session cannot grow it without limit.
+const TRUNCATE_CACHE_LIMIT = 2048
+const truncateCache = new Map()
+const clip = (text, width) => {
+  // A string shorter than the width in UTF-16 units also fits in code points,
+  // so the common short title skips Array.from entirely.
+  if (text.length <= width) return text
+  const chars = Array.from(text)
+  if (chars.length <= width) return text
   if (width <= 0) return ""
   if (width === 1) return "…"
   return `${chars.slice(0, width - 1).join("")}…`
+}
+
+// The host truncates from the middle, so clipped text is cut here from the end.
+// No ellipsis ever appears in the middle of a rendered string.
+export function truncate(value, width) {
+  const text = str(value)
+  let byText = truncateCache.get(width)
+  if (byText) {
+    const hit = byText.get(text)
+    if (hit !== undefined) return hit
+  } else {
+    byText = new Map()
+    truncateCache.set(width, byText)
+  }
+  const out = clip(text, width)
+  if (byText.size >= TRUNCATE_CACHE_LIMIT) byText.delete(byText.keys().next().value)
+  byText.set(text, out)
+  return out
 }
 
 const REASON_RULES = [
@@ -313,13 +363,22 @@ const REASON_RULES = [
   [/^spawn:\s*/i, "spawn: "],
   [/^status:\s*/i, ""],
 ]
+const reasonCache = new Map()
+const REASON_CACHE_LIMIT = 2048
 export function compactReason(reason) {
-  let text = str(reason).replace(/\s+/g, " ").trim()
-  if (!text) return ""
-  for (const [pattern, replacement] of REASON_RULES) {
-    if (pattern.test(text)) { text = text.replace(pattern, replacement); break }
+  const key = str(reason)
+  const hit = reasonCache.get(key)
+  if (hit !== undefined) return hit
+  let text = key.replace(/\s+/g, " ").trim()
+  if (text) {
+    for (const [pattern, replacement] of REASON_RULES) {
+      if (pattern.test(text)) { text = text.replace(pattern, replacement); break }
+    }
+    text = truncate(text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim(), REASON_WIDTH)
   }
-  return truncate(text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim(), REASON_WIDTH)
+  if (reasonCache.size >= REASON_CACHE_LIMIT) reasonCache.delete(reasonCache.keys().next().value)
+  reasonCache.set(key, text)
+  return text
 }
 
 export function clockDuration(seconds) {

@@ -14,6 +14,11 @@ func sameObservation(run *core.Run, obs core.Observation) bool {
 	return run.ObservedSHA == obs.HeadSHA && run.ObservedBaseSHA == obs.BaseSHA
 }
 
+// maxAutoRebases caps automatic branch updates per run. Rebases get their own
+// small budget so a moving base cannot spend the whole fix budget before a real
+// check failure is handled.
+const maxAutoRebases = 2
+
 // recordObservation stores the head and base SHA pair the reconciler has just
 // acted on, so the next poll can skip an identical observation.
 func recordObservation(run *core.Run, headSHA, baseSHA string) {
@@ -66,7 +71,18 @@ func (r *Reconciler) handleNeedsRebase(
 	if !obs.Conflict && len(obs.Checks) > 0 && obs.AllRequiredPass(nil) {
 		return r.greenButBehind(ctx, run, obs, decision)
 	}
+	// A pending check can still fail. Updating the branch now spends a rebase
+	// attempt and restarts the checks on the new head, so wait for a verdict.
+	if obs.HasPending() {
+		return decision, nil
+	}
 	if sameObservation(run, obs) {
+		return decision, nil
+	}
+	if run.RebaseAttempts >= maxAutoRebases {
+		if run.State != core.RunBlocked {
+			return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase budget exhausted"}, obs)
+		}
 		return decision, nil
 	}
 	if run.State == core.RunWaitingCI || run.State == core.RunRunning {

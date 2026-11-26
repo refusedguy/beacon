@@ -29,6 +29,7 @@ func TestDecide(t *testing.T) {
 		{"wait when rule waits", Observation{PRState: "open"}, fakeCriterion{name: "checks", verdict: VerdictWait}, VerdictWait},
 		{"conflict wins", Observation{PRState: "open", Conflict: true}, fakeCriterion{verdict: VerdictMerge}, VerdictNeedsAgentFix},
 		{"failed check wins", Observation{PRState: "open", Checks: []CheckResult{{Name: "ci", State: CheckFailure}}}, fakeCriterion{verdict: VerdictMerge}, VerdictNeedsAgentFix},
+		{"failed check wins over behind", Observation{PRState: "open", Behind: true, Checks: []CheckResult{{Name: "ci", State: CheckFailure}}}, fakeCriterion{verdict: VerdictMerge}, VerdictNeedsAgentFix},
 		{"behind rebase", Observation{PRState: "open", Behind: true}, fakeCriterion{verdict: VerdictMerge}, VerdictNeedsRebase},
 		{"closed is noop", Observation{PRState: "merged"}, nil, VerdictNoop},
 	}
@@ -40,6 +41,45 @@ func TestDecide(t *testing.T) {
 			}
 			if got := Decide(tc.obs, rules).Verdict; got != tc.want {
 				t.Fatalf("verdict = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecideBehindFailureNamesCheck(t *testing.T) {
+	obs := Observation{
+		PRState:        "open",
+		Behind:         true,
+		Checks:         []CheckResult{{Name: "lint", State: CheckFailure}},
+		FailureExcerpt: "gofmt reported a diff",
+	}
+	got := Decide(obs, []Criterion{fakeCriterion{name: "ok", verdict: VerdictMerge}})
+	if got.Verdict != VerdictNeedsAgentFix {
+		t.Fatalf("verdict = %s, want %s", got.Verdict, VerdictNeedsAgentFix)
+	}
+	if got.Criterion != "invariant" {
+		t.Fatalf("criterion = %q, want invariant", got.Criterion)
+	}
+	if !strings.Contains(got.Reason, "lint") || !strings.Contains(got.Reason, "gofmt reported a diff") {
+		t.Fatalf("reason = %q, want the failed check name and excerpt", got.Reason)
+	}
+}
+
+func TestObservationHasPending(t *testing.T) {
+	cases := []struct {
+		name   string
+		checks []CheckResult
+		want   bool
+	}{
+		{"no checks", nil, false},
+		{"all green", []CheckResult{{Name: "ci", State: CheckSuccess}}, false},
+		{"one pending", []CheckResult{{Name: "ci", State: CheckSuccess}, {Name: "lint", State: CheckPending}}, true},
+		{"failed is not pending", []CheckResult{{Name: "ci", State: CheckFailure}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (Observation{Checks: tc.checks}).HasPending(); got != tc.want {
+				t.Fatalf("HasPending() = %t, want %t", got, tc.want)
 			}
 		})
 	}

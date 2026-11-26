@@ -1,7 +1,7 @@
 ---
 id: T-07f6be5b
 title: Replace linear journal touch with an indexed LRU
-status: available
+status: done
 scope:
     - internal/infra/mcp/server.go
     - internal/infra/mcp/server_test.go

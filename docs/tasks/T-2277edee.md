@@ -1,7 +1,7 @@
 ---
 id: T-2277edee
 title: Cut per-row work in sidebar queue rendering
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_alerts.js
     - .opencode/plugins/beacon-project/ui/ui_view.js
