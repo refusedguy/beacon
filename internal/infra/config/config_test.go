@@ -149,6 +149,53 @@ func TestLoadWebhookSecretEnv(t *testing.T) {
 	}
 }
 
+func TestLiteralOrEnvPrefersEnv(t *testing.T) {
+	const envName = "BEACON_TEST_LITERAL_OR_ENV"
+	t.Setenv(envName, "from-env")
+	if got := LiteralOrEnv("literal", envName); got != "from-env" {
+		t.Fatalf("LiteralOrEnv = %q, want from-env", got)
+	}
+}
+
+func TestLiteralOrEnvFallsBackToLiteral(t *testing.T) {
+	const envName = "BEACON_TEST_LITERAL_OR_ENV_UNSET"
+	t.Setenv(envName, "")
+	if got := LiteralOrEnv("literal", envName); got != "literal" {
+		t.Fatalf("LiteralOrEnv = %q, want literal", got)
+	}
+}
+
+func TestValidateWebhook(t *testing.T) {
+	cases := []struct {
+		name    string
+		webhook Webhook
+		wantErr bool
+	}{
+		{"disabled", Webhook{}, false},
+		{"enabled with literal secret", Webhook{Enabled: true, Secret: "s"}, false},
+		{"enabled without secret", Webhook{Enabled: true}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateWebhook(tc.webhook)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("ValidateWebhook: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ValidateWebhook accepted an enabled webhook without a secret")
+			}
+			for _, want := range []string{"webhook.enabled", "webhook.secret", "webhook.secret_env"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to name %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestLoadDefaultWorkerInstructions(t *testing.T) {
 	c, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
 	if err != nil {
