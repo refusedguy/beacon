@@ -101,7 +101,7 @@ test("English confirm box uses raised plates, a visible spacer and flexShrink 0"
   assert.equal(mount.confirmBox.props.visible, false)
 })
 
-test("state bar uses thin glyphs, never exceeds 30 cells and hides empty segments", () => {
+test("state bar uses solid glyphs, never exceeds 30 cells and hides empty segments", () => {
   assert.ok(STATE_BAR_WIDTH <= 30)
   const busy = stateBarItem({
     active: Array.from({ length: 40 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })),
@@ -110,11 +110,12 @@ test("state bar uses thin glyphs, never exceeds 30 cells and hides empty segment
   assert.equal(busy.bar.length, STATE_BAR_WIDTH)
   assert.equal(busy.segments.reduce((n, s) => n + s.text.length, 0), STATE_BAR_WIDTH)
   assert.ok(!busy.bar.includes("…"), "no middle ellipsis")
-  assert.ok(!/[█░]/.test(busy.bar), "thick blocks and shade blocks are gone")
+  assert.ok(busy.bar.includes("█"), "filled cells use a solid block")
+  assert.ok(!busy.bar.includes("░"), "shade blocks are gone")
   const sidebar = createSidebarMount(solidModule([]), sidebarDeps())
   sidebar.apply(sidebarModel(busy, null, NOW))
   const cells = sidebar.bar.children
-  assert.equal(cells.length, 5)
+  assert.equal(cells.length, 9, "eight states plus the empty remainder")
   const nonEmpty = busy.segments.filter((s) => s.text).length
   assert.equal(cells.filter((cell) => cell.props.visible === true).length, nonEmpty)
   for (const cell of cells) {
@@ -126,7 +127,7 @@ test("state bar uses thin glyphs, never exceeds 30 cells and hides empty segment
   assert.equal(sidebar.bar.children[0].props.visible, false, "empty segments take no column")
   assert.equal(sidebar.bar.children.at(-1).props.visible, true)
   assert.equal(empty.bar, "─".repeat(STATE_BAR_WIDTH))
-  assert.equal(sidebar.legend.props.content, "R0 C0 B0 M0")
+  assert.equal(sidebar.legend.props.content, "P0 R0 C0 E0 F0 B0 M0 X0")
   assert.equal(sidebar.legend.props.paddingLeft, undefined, "legend starts at column 0")
   assert.equal(sidebar.legend.props.marginLeft, undefined)
 })

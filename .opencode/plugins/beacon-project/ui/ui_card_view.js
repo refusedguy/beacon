@@ -4,6 +4,46 @@ import { CARD_BODY_LINES, str } from "./ui_model.js"
 import { createBox, createLineMount, createText } from "./ui_nodes.js"
 import { taskTree } from "./ui_alerts.js"
 
+const timeOf = (v) => {
+  if (v == null || v === "") return 0
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0
+  const n = Number(v)
+  if (Number.isFinite(n) && n > 0) return n
+  const t = Date.parse(str(v))
+  return Number.isFinite(t) ? t : 0
+}
+export function durationText(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return ""
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`
+}
+// Timeline and decision events carry the `at` stamp. Their first and last
+// stamps bound the whole run, which is the number the card header shows.
+export function runEventTimes(run) {
+  const out = []
+  for (const event of [...(run?.timeline ?? []), ...(run?.decisions ?? [])]) {
+    const t = timeOf(event?.at)
+    if (t > 0) out.push(t)
+  }
+  return out.sort((a, b) => a - b)
+}
+// A label is always paired with the fallback value so a bare timestamp is not
+// mistaken for an elapsed duration.
+export function runTotalTime(run) {
+  const times = runEventTimes(run)
+  if (times.length) return { text: durationText(times[times.length - 1] - times[0]), label: "total" }
+  const updated = run?.updatedAt
+  if (updated != null && updated !== "") {
+    const s = str(updated)
+    return { text: s.length >= 19 ? s.slice(11, 19) : s, label: "updated" }
+  }
+  return { text: "", label: "" }
+}
+
 export const CARD_PANEL_NAME = "beacon.card"
 export const CARD_LINES = CARD_BODY_LINES + 8
 const fieldKey = (text) => text.padEnd(10, " ")
@@ -54,12 +94,24 @@ export function createEpicState(ctx, onChange = () => {}) {
   return { open, toggle }
 }
 
+// One compact identity line for the header. The PR is optional so a task with
+// no run yet still shows its ID.
+export function cardHeader(run) {
+  if (!run) return { ref: "", taskID: "", pr: 0, duration: "", label: "" }
+  const taskID = str(run.taskID)
+  const pr = Number(run.pr) || 0
+  const ref = [taskID, pr ? `#${pr}` : ""].filter(Boolean).join(" · ")
+  const { text, label } = runTotalTime(run)
+  return { ref, taskID, pr, duration: text, label }
+}
+
 // A null map keeps the flat legacy rows for pure callers that never drive the
 // toggle. The real panel passes the persisted map so epics start collapsed.
-export function cardModel(card, queue = [], epicOpen = null) {
+export function cardModel(card, queue = [], epicOpen = null, run = null) {
   if (!card) return null
   const { deps, parent, children } = cardFamily(card, queue)
   const queued = new Map((Array.isArray(queue) ? queue : []).map((item) => [str(item?.id), item]))
+  const header = cardHeader(run ?? queued.get(str(card?.id))?.run ?? null)
   const titleOf = (id) => str(queued.get(id)?.title)
   const childIDs = new Set(children)
   const rows = []
@@ -105,7 +157,7 @@ export function cardModel(card, queue = [], epicOpen = null) {
   for (const line of str(card.body).split(/\r?\n/)) rows.push({
     marker: "", name: line, status: "", color: "muted", kind: "card-body",
   })
-  return { card, rows }
+  return { card, header, rows }
 }
 
 const COPY_LABEL = Object.freeze({
@@ -131,6 +183,13 @@ export function createCardMount(ui, deps) {
   })
   const title = createText(ui, { content: "Task card", fg: color("action"), bold: true })
   set(title, "attributes", BOLD)
+  // The title absorbs the free space, so the controls keep their old position
+  // at the right and the duration sits just past them at the header edge.
+  set(title, "flexGrow", 1)
+  set(title, "minWidth", 0)
+  const duration = createText(ui, { content: "", fg: color("muted") })
+  set(duration, "paddingLeft", 1)
+  set(duration, "visible", false)
   const controls = createBox(ui, {
     flexDirection: "row", minWidth: 0, flexShrink: 0, flexWrap: "wrap", rowGap: 1,
   })
@@ -144,7 +203,7 @@ export function createCardMount(ui, deps) {
   const close = createText(ui, { content: "✕", fg: color("error"), onMouseUp: onClose })
   set(close, "paddingLeft", 1); set(close, "paddingRight", 1)
   insert(controls, back); insert(controls, hint); insert(controls, readonly); insert(controls, gap); insert(controls, close)
-  insert(header, title); insert(header, controls)
+  insert(header, title); insert(header, controls); insert(header, duration)
   insert(container, header)
 
   // A bordered, padded card holds the full metadata and body. Body cells are
@@ -190,7 +249,11 @@ export function createCardMount(ui, deps) {
   insert(container, note)
 
   const apply = (model = null) => {
-    set(title, "content", model?.card ? `Card ${model.card.id}` : "Task card")
+    const head = model?.header
+    set(title, "content", head?.ref || (model?.card ? `Card ${model.card.id}` : "Task card"))
+    const total = head?.duration ? [head.label, head.duration].filter(Boolean).join(" ") : ""
+    set(duration, "content", total)
+    set(duration, "visible", Boolean(total))
     body.apply(model?.rows ?? [])
   }
   return { node: container, apply, buttons, body, back }

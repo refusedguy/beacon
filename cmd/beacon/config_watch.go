@@ -21,11 +21,14 @@ const configWatchInterval = 2 * time.Second
 
 // liveState is an immutable snapshot. Reloads build a new one and swap the
 // pointer instead of editing maps or fields that a running worker may read.
+// generation identifies the config that produced this snapshot, so a cached
+// model resolution cannot outlive the config it came from.
 type liveState struct {
-	cfg     config.Config
-	harness core.AgentHarness
-	policy  core.MergePolicy
-	relay   *eventRelay
+	cfg        config.Config
+	harness    core.AgentHarness
+	policy     core.MergePolicy
+	relay      *eventRelay
+	generation uint64
 }
 
 // eventRelay is the one event channel every consumer holds for the life of the
@@ -72,6 +75,13 @@ type configWatcher struct {
 	generations uint64
 
 	live atomic.Pointer[liveState]
+
+	// modelMu guards the model cache. A reload that swaps live state also
+	// invalidates the cache by advancing generation, so no explicit clear is
+	// needed here.
+	modelMu         sync.Mutex
+	models          map[string]core.ModelRef
+	modelGeneration uint64
 }
 
 // newConfigWatcher builds a watcher seeded with the initial state and current file hash.
@@ -143,6 +153,7 @@ func (cw *configWatcher) reload() bool {
 		return false
 	}
 	state.relay = previous.relay
+	state.generation = cw.generations + 1
 	cw.live.Store(state)
 	state.relay.signalReload()
 	cw.generations++
@@ -161,11 +172,24 @@ func (cw *configWatcher) build(cfg config.Config, root string) *liveState {
 }
 
 // modelResolver reads the current snapshot so a dispatch uses the model the
-// operator configured most recently.
+// operator configured most recently. Resolution can be an HTTP session lookup,
+// so the result is cached per parent session and config generation.
 func (cw *configWatcher) modelResolver(parent string) core.ModelRef {
 	state := cw.live.Load()
+	parent = firstNonEmpty(parent, state.cfg.Harness.ParentSessionID)
+	cw.modelMu.Lock()
+	defer cw.modelMu.Unlock()
+	if cw.models == nil || cw.modelGeneration != state.generation {
+		cw.models = make(map[string]core.ModelRef)
+		cw.modelGeneration = state.generation
+	}
+	if ref, ok := cw.models[parent]; ok {
+		return ref
+	}
 	_, _, token := loadTokens(state.cfg)
-	return resolveModel(state.cfg, token, firstNonEmpty(parent, state.cfg.Harness.ParentSessionID))
+	ref := resolveModel(state.cfg, token, parent)
+	cw.models[parent] = ref
+	return ref
 }
 
 // restartFields names changed fields that cannot be applied without replacing

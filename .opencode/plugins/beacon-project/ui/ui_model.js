@@ -121,10 +121,14 @@ export function normalizeMetrics(v) {
 export const normalizeRun = (v) => normalize(v, RUN_SPEC)
 export function normalizeSnapshot(v) {
   const s = v && typeof v === "object" ? v : {}
-  const out = {
-    active: list(s.active, normalizeRun), recent: list(s.recent, normalizeRun),
-    queue: list(pick(s, ["queue", "Queue"]), (item) => normalize(item, QUEUE_SPEC)),
-  }
+  const out = { active: list(s.active, normalizeRun), recent: list(s.recent, normalizeRun), queue: [] }
+  // A queued card shares its task ID with a run. Keep that run on the queue row
+  // so the card header can show its PR and total time without another lookup.
+  const byTask = new Map([...out.recent, ...out.active].filter((r) => r.taskID).map((r) => [r.taskID, r]))
+  out.queue = list(pick(s, ["queue", "Queue"]), (item) => {
+    const row = normalize(item, QUEUE_SPEC)
+    return byTask.has(row.id) ? Object.assign(row, { run: byTask.get(row.id) }) : row
+  })
   const incident = pick(s, ["base_incident", "baseIncident", "BaseIncident"]); if (incident != null) out.baseIncident = normalize(incident, BASE_INCIDENT_SPEC)
   const daemon = pick(s, ["daemon", "Daemon"]); if (daemon != null) out.daemon = normalize(daemon, DAEMON_SPEC)
   if (s.metrics !== undefined) out.metrics = normalizeMetrics(s.metrics)

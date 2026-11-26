@@ -1,7 +1,7 @@
 ---
 id: T-1cb2ac48
 title: Show every run state in a thicker sidebar bar
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_view.js
     - .opencode/plugins/beacon-project/ui/ui_view_test.js

@@ -1,6 +1,8 @@
 // Fixed node pools built once inside a slot render callback. apply() only ever
 // changes props; it never calls createElement or insert, so refresh() stays
 // safe outside a renderer context. No TUI imports: the caller injects them.
+import { STATE_BAR_KEYS } from "./ui_view.js"
+
 export function createLineMount(ui, {
   color, BOLD = 0, onItem, hoverBg, maxLines, wrap = false, shrinkStatus = false,
 }) {
@@ -78,14 +80,15 @@ export function createLineMount(ui, {
   return { node: lines, apply }
 }
 
-// One row of proportional segments, each with its own theme color. Five fixed
-// cells: four states plus the muted remainder.
+// One row of proportional segments, each with its own theme color. One fixed
+// cell per state plus the muted remainder, allocated once so refresh never
+// creates a node.
 export function createSegmentBar(ui, color) {
   const { createElement, insert, setProp } = ui
   const box = createElement("box")
   setProp(box, "flexDirection", "row")
   setProp(box, "minWidth", 0)
-  const cells = Array.from({ length: 5 }, () => {
+  const cells = Array.from({ length: STATE_BAR_KEYS.length + 1 }, () => {
     const node = createElement("text")
     setProp(node, "wrapMode", "none")
     setProp(node, "selectable", false)
