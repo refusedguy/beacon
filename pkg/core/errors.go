@@ -48,6 +48,12 @@ func Errorf(code ErrorCode, format string, args ...any) error {
 	return &AppError{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
+// WorkspaceConflict reports a dirty worktree that cannot be removed safely.
+// The message stays stable because dispatch and MCP callers expose it in JSON.
+func WorkspaceConflict(path string) error {
+	return Errorf(CodeConflict, "refusing to remove dirty worktree %s", path)
+}
+
 // CodeOf returns the code of an AppError in the error chain.
 func CodeOf(err error) ErrorCode {
 	if err == nil {
