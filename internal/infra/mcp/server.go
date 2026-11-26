@@ -2,6 +2,7 @@
 package mcp
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -109,17 +110,21 @@ type journalEntry struct{ result any }
 
 // opJournal stores the result of each completed mutation by operation id. A
 // single-flight channel keeps concurrent calls with the same id from writing
-// twice. Entries are bounded and the oldest are evicted first.
+// twice. Entries are bounded and the oldest are evicted first. Recency is an
+// LRU list, and index maps an id to its list element so touch stays O(1).
 type opJournal struct {
 	mu       sync.Mutex
 	done     map[string]journalEntry
-	order    []string
+	order    *list.List
+	index    map[string]*list.Element
 	inflight map[string]chan struct{}
 }
 
 func newOpJournal() *opJournal {
 	return &opJournal{
 		done:     make(map[string]journalEntry),
+		order:    list.New(),
+		index:    make(map[string]*list.Element),
 		inflight: make(map[string]chan struct{}),
 	}
 }
@@ -141,14 +146,14 @@ func (j *opJournal) claim(id string) (<-chan struct{}, bool) {
 	return wait, true
 }
 
+// touch moves id to the most-recent end of the LRU in constant time. Callers
+// hold mu.
 func (j *opJournal) touch(id string) {
-	for i, key := range j.order {
-		if key == id {
-			j.order = append(j.order[:i], j.order[i+1:]...)
-			break
-		}
+	if elem, ok := j.index[id]; ok {
+		j.order.MoveToBack(elem)
+		return
 	}
-	j.order = append(j.order, id)
+	j.index[id] = j.order.PushBack(id)
 }
 
 func (j *opJournal) finish(id string, result any, err error) {
@@ -158,10 +163,15 @@ func (j *opJournal) finish(id string, result any, err error) {
 	if err == nil {
 		j.done[id] = journalEntry{result: result}
 		j.touch(id)
-		if len(j.order) > operationJournalLimit {
-			oldest := j.order[0]
-			j.order = j.order[1:]
-			delete(j.done, oldest)
+		for len(j.done) > operationJournalLimit {
+			oldest := j.order.Front()
+			if oldest == nil {
+				break
+			}
+			key := oldest.Value.(string)
+			j.order.Remove(oldest)
+			delete(j.index, key)
+			delete(j.done, key)
 		}
 	}
 	j.mu.Unlock()
