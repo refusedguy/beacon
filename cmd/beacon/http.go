@@ -320,7 +320,9 @@ func (a *apiServer) control(rw http.ResponseWriter, r *http.Request) {
 		RunID: id, SHA: in.SHA, PR: in.PR, Message: in.Message,
 	})
 	if err != nil {
-		http.Error(rw, err.Error(), http.StatusConflict)
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(rw).Encode(core.NewWireControlRefusal(action, id, err.Error()))
 		return
 	}
 	writeJSON(rw, core.NewWireControlResult(action, id))

@@ -85,11 +85,13 @@ type ControlRequest struct {
 }
 
 // ControlResult is the monitor's copy of the daemon's loopback control answer.
+// Reason carries the daemon's explanation when a control action is refused.
 type ControlResult struct {
 	OK      bool   `json:"ok"`
 	RunID   string `json:"run_id"`
 	Action  string `json:"action"`
 	Applied bool   `json:"applied"`
+	Reason  string `json:"reason"`
 }
 
 // applyAuth sets the Authorization header on a request. A token of the form
@@ -137,23 +139,25 @@ func (c *Client) endpoint() (string, error) {
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
-// do sends an HTTP request to the daemon and returns the response body.
-func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, error) {
+// do sends an HTTP request to the daemon and returns the response body and
+// status. A non-2xx status also returns an error. The body is still returned so
+// Control can read a structured refusal from the wire.
+func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
 	base, err := c.endpoint()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		reader = bytes.NewReader(data)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, base+path, reader)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -167,22 +171,22 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, responseLimit))
 	if err != nil {
-		return nil, err
+		return nil, resp.StatusCode, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("tui: %s %s: status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
+		return data, resp.StatusCode, fmt.Errorf("tui: %s %s: status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
-	return data, nil
+	return data, resp.StatusCode, nil
 }
 
 // Runs fetches the current run snapshot from the daemon.
 func (c *Client) Runs(ctx context.Context) ([]Run, error) {
-	data, err := c.do(ctx, http.MethodGet, apiRunsPath, nil)
+	data, _, err := c.do(ctx, http.MethodGet, apiRunsPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +203,9 @@ func (c *Client) Runs(ctx context.Context) ([]Run, error) {
 	return runs, nil
 }
 
-// Control sends a control action for a run and returns the daemon's answer.
+// Control sends a control action for a run and returns the daemon's answer. A
+// refusal is a wire result with OK false, not a transport error, so the daemon's
+// reason reaches the monitor. Other non-2xx statuses stay errors.
 func (c *Client) Control(ctx context.Context, req ControlRequest) (ControlResult, error) {
 	if !req.Action.Valid() {
 		return ControlResult{}, fmt.Errorf("tui: unknown action %q", req.Action)
@@ -207,9 +213,15 @@ func (c *Client) Control(ctx context.Context, req ControlRequest) (ControlResult
 	if req.RunID == "" {
 		return ControlResult{}, fmt.Errorf("tui: control needs a run id")
 	}
-	data, err := c.do(ctx, http.MethodPost, apiControlPath, req)
-	if err != nil {
-		return ControlResult{}, err
+	data, status, statusErr := c.do(ctx, http.MethodPost, apiControlPath, req)
+	if status == http.StatusConflict && statusErr != nil {
+		var refusal ControlResult
+		if json.Unmarshal(data, &refusal) == nil && !refusal.OK {
+			return refusal, nil
+		}
+	}
+	if statusErr != nil {
+		return ControlResult{}, statusErr
 	}
 	var result ControlResult
 	if err := json.Unmarshal(data, &result); err != nil {
