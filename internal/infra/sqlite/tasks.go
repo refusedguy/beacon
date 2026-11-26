@@ -22,25 +22,8 @@ var taskColumns = []struct{ name, ddl string }{
 
 // ensureTaskColumns adds epic columns to an older tasks table.
 func (s *Store) ensureTaskColumns(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(tasks)`)
+	present, err := presentColumns(ctx, s.db, "tasks")
 	if err != nil {
-		return err
-	}
-	present := make(map[string]bool)
-	for rows.Next() {
-		var cid, notNull, pk int
-		var name, typ string
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
-		}
-		present[name] = true
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
 	for _, col := range taskColumns {
