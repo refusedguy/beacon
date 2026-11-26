@@ -1,7 +1,7 @@
 ---
 id: T-f80a2aac
 title: Unify env and fallback helpers
-status: in_progress
+status: done
 scope:
     - cmd/beacon/commands.go
     - internal/infra/config/config.go
