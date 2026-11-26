@@ -442,3 +442,39 @@ shapes and order. The migration test opens a database that still carries
 `runs_state_idx` and confirms the index is gone after `Open`. Every recorded
 pass returned the same row count with zero errors, so the work counts match
 across sides.
+
+## perf-smoke timeout (T-be8aa55b)
+
+PRs #2618, #2619 and #2620 failed perf-smoke with exit 124 after exactly 30 s.
+The step runs `timeout 30s bash scripts/bench-e2e.sh --smoke`. Timing the stages
+on the benchmark machine separated two costs.
+
+| Stage | Measured cost |
+| --- | --- |
+| Cold `go test` compile of `./internal/bench/` | 71.63 s |
+| Warm smoke, whole script, five runs | 1.56, 1.57, 1.67, 2.25, 2.16 s |
+| One measured pass of both benchmarks | about 0.2 s |
+
+The cold compile is the stage that crosses 30 s. The perf-smoke job restores the
+Go build cache with `cache-dependency-path: go.sum`, while build, vet, test and
+lint use `go.sum` plus `ui/tui/go.sum`. The two cache keys never match, so
+perf-smoke cannot reuse their objects and recompiles the dependency graph,
+including `modernc.org/sqlite`. That workflow change belongs to T-42ae53b1 and
+is not made here.
+
+The script had a smaller defect of its own. T-c894c2fa added the
+`BEACON_BENCH_SMOKE` override so each benchmark skips its warm-up pass, and both
+benchmarks document a smoke command that sets it. `scripts/bench-e2e.sh --smoke`
+never set the variable. `BenchmarkHotPaths` therefore ran all six hotspots a
+second time, and `BenchmarkE2EOperatorPaths` built two extra state databases and
+ran one reconcile tick and one dispatch call before the measured pair. The
+smoke branch now exports `BEACON_BENCH_SMOKE=1` and `GOMAXPROCS=1` before the
+`go test` call. That removes the redundant passes and keeps the P pin the
+harness already applies inside the timed loop.
+
+Five runs after the change all finished inside the bound and reported identical
+counts: sqlite-snapshot 695/0, card-parse 300/0, wire-encode 7114/0, redaction
+296/0, mcp-journal 64/0, sse-fanout 192/64, reconcile-tick 20/0 and
+dispatch-prompt 4/0. The 64 on sse-fanout is the designed slow-view drop, not a
+failed call. Fixture sizes, the nightly gate and the 30 s step timeout are
+unchanged.
