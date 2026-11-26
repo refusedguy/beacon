@@ -14,7 +14,6 @@ import {
   BEACON_SERVER,
   BEACON_PROJECT_ROOT_ENV,
   BEACON_PARENT_SESSION_ENV,
-  BEACON_BUILD_SCRIPT,
 } from "./mcp.js"
 
 const ROOT = "/project"
@@ -25,11 +24,13 @@ function localPaths(root = ROOT) {
   return { local }
 }
 
-function fakeDeps({ files = {}, env = {}, mtimes = {}, dirs = {}, statErrors = [] } = {}) {
+function fakeDeps({ files = {}, env = {}, mtimes = {}, dirs = {} } = {}) {
   const stored = { ...files }
   const execCalls = []
+  const statCalls = []
   return {
     execCalls,
+    statCalls,
     env,
     existsSync: (path) => Object.hasOwn(stored, path),
     readFileSync: (path) => {
@@ -37,7 +38,7 @@ function fakeDeps({ files = {}, env = {}, mtimes = {}, dirs = {}, statErrors = [
       return stored[path]
     },
     statSync: (path) => {
-      if (statErrors.includes(path)) throw new Error(`EACCES ${path}`)
+      statCalls.push(path)
       const known = Object.hasOwn(mtimes, path) || Object.hasOwn(stored, path) || Object.hasOwn(dirs, path)
       if (!known) throw new Error(`ENOENT ${path}`)
       return { mtimeMs: mtimes[path] ?? 0, isDirectory: () => Object.hasOwn(dirs, path) }
@@ -104,78 +105,39 @@ function buildCalls(deps) {
   return deps.execCalls.filter((call) => call.cmd === "bash")
 }
 
-test("a fresh binary is used without a rebuild", () => {
+test("a local binary resolves without probing sources or spawning a build", () => {
   const { local } = localPaths()
   const deps = localBinaryDeps()
 
   assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
-  assert.equal(buildCalls(deps).length, 0)
+  assert.equal(deps.execCalls.length, 0)
+  assert.equal(deps.statCalls.length, 0)
 })
 
-test("one resolution does not spawn bash more than once", () => {
+test("a newer .go source never delays a repeated dispatch call", () => {
   const { local } = localPaths()
-  const { deps } = sourceTreeDeps(500)
+  const { deps } = sourceTreeDeps(BINARY_MTIME + 1)
 
   for (let i = 0; i < 5; i += 1) {
     assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
   }
 
-  assert.equal(buildCalls(deps).length, 0)
+  assert.equal(deps.execCalls.length, 0)
+  assert.equal(deps.statCalls.length, 0)
 })
 
-test("a newer .go source triggers one rebuild with the build script", () => {
+test("a newer source under pkg or go.mod never triggers a build", () => {
   const { local } = localPaths()
-  const { deps } = sourceTreeDeps(BINARY_MTIME + 1)
-
-  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
-
-  const builds = buildCalls(deps)
-  assert.equal(builds.length, 1)
-  assert.deepEqual(builds[0].args, [join(ROOT, ...BEACON_BUILD_SCRIPT.split("/"))])
-  assert.equal(builds[0].opts.cwd, ROOT)
-})
-
-test("a newer source under pkg triggers a rebuild", () => {
-  const { local } = localPaths()
-  const pkg = join(ROOT, "pkg")
-  const core = join(pkg, "core")
-  const source = join(core, "run.go")
-  const deps = fakeDeps({
-    files: { [local]: "binary", [source]: "package core" },
-    mtimes: { [local]: BINARY_MTIME, [source]: BINARY_MTIME + 1 },
-    dirs: { [pkg]: ["core"], [core]: ["run.go"] },
-  })
-
-  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
-  assert.equal(buildCalls(deps).length, 1)
-})
-
-test("a newer module file triggers a rebuild", () => {
-  const { local } = localPaths()
+  const source = join(ROOT, "pkg", "core", "run.go")
   const goMod = join(ROOT, "go.mod")
   const deps = fakeDeps({
-    files: { [local]: "binary", [goMod]: "module example" },
-    mtimes: { [local]: BINARY_MTIME, [goMod]: BINARY_MTIME + 1 },
+    files: { [local]: "binary", [source]: "package core", [goMod]: "module example" },
+    mtimes: { [local]: BINARY_MTIME, [source]: BINARY_MTIME + 1, [goMod]: BINARY_MTIME + 1 },
   })
 
   assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
-  assert.equal(buildCalls(deps).length, 1)
-})
-
-test("sources older than the binary do not trigger a rebuild", () => {
-  const { local } = localPaths()
-  const deps = sourceTreeDeps(500).deps
-
-  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
-  assert.equal(buildCalls(deps).length, 0)
-})
-
-test("an unreadable binary is treated as stale", () => {
-  const { local } = localPaths()
-  const deps = fakeDeps({ files: { [local]: "binary" }, statErrors: [local] })
-
-  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
-  assert.equal(buildCalls(deps).length, 1)
+  assert.equal(deps.execCalls.length, 0)
+  assert.equal(deps.statCalls.length, 0)
 })
 
 test("BEACON_BIN wins over the local binary and never rebuilds", () => {
@@ -327,7 +289,7 @@ test("registration reads the session id from the plugin context", async (t) => {
   assert.equal(registration.config.environment[BEACON_PARENT_SESSION_ENV], "ses_operator")
 })
 
-test("500 config requests over a 2000-file source tree keep using the local binary", () => {
+test("500 config requests over a 2000-file source tree never walk or build", () => {
   const { local } = localPaths()
   const cmd = join(ROOT, "cmd")
   const files = { [local]: "binary" }
@@ -336,7 +298,7 @@ test("500 config requests over a 2000-file source tree keep using the local bina
   for (let i = 0; i < 2000; i += 1) {
     const name = `source${i}.go`
     files[join(cmd, name)] = "package main"
-    mtimes[join(cmd, name)] = BINARY_MTIME - 1
+    mtimes[join(cmd, name)] = BINARY_MTIME + 1
     names.push(name)
   }
   const deps = fakeDeps({ files, mtimes, dirs: { [cmd]: names } })
@@ -346,6 +308,7 @@ test("500 config requests over a 2000-file source tree keep using the local bina
   }
 
   assert.equal(deps.execCalls.length, 0)
+  assert.equal(deps.statCalls.length, 0)
 })
 
 test("a deps override for beaconCommand is used instead of probing the filesystem", () => {
@@ -389,15 +352,15 @@ test("two registrars keep registration state separate", async (t) => {
   assert.equal(registrarB.registeredBeaconConfig(ROOT), b.config)
 })
 
-test("two registrars do not share rebuild decisions", () => {
+test("two registrars resolve the local binary without a build", () => {
+  const { local } = localPaths()
   const { deps } = sourceTreeDeps(BINARY_MTIME + 1)
   const registrarA = createMcpRegistrar()
   const registrarB = createMcpRegistrar()
 
-  registrarA.beaconCommand(ROOT, deps)
-  registrarA.beaconCommand(ROOT, deps)
-  registrarB.beaconCommand(ROOT, deps)
-  registrarB.beaconCommand(ROOT, deps)
+  assert.deepEqual(registrarA.beaconCommand(ROOT, deps), [local, "mcp"])
+  assert.deepEqual(registrarB.beaconCommand(ROOT, deps), [local, "mcp"])
 
-  assert.equal(buildCalls(deps).length, 2)
+  assert.equal(deps.execCalls.length, 0)
+  assert.equal(deps.statCalls.length, 0)
 })
