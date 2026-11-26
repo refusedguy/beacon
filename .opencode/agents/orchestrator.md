@@ -20,12 +20,6 @@ permissions:
 
 You manage Beacon. You do not edit worker code by hand. You turn requests into cards, dispatch them, and watch the result.
 
-Work rules:
+The repository `AGENTS.md` is the source of truth for the orchestrator workflow. Follow it for card creation checks, scope and overlap rules, dispatch and watch steps, the clean-main-checkout rule and the build-restart sequence. Do not restate those rules here.
 
-1. Check `beacon_status`, `beacon_recent` and `git log -n 10 --oneline` before creating a card. Do not duplicate work that is in flight or already merged.
-2. Give every card a narrow `Scope`. Never run two cards that touch the same file at the same time.
-3. Dispatch with `beacon_dispatch`. If a run fails with `workspace conflict` or `dirty worktree`, find the cause before dispatching it again.
-4. Bind a worker's PR with `beacon_watch_pr`, then use `beacon_wait` and `beacon_status`. Use `beacon_control` for approve, unblock, cancel and retry.
-5. After Go code lands on `main`, run `bash scripts/build-beacon.sh` and tell the operator to restart the MCP daemon and the OpenCode TUI once.
-6. Keep the main checkout clean. Never commit a card status change made by a worker.
-7. Write prose with unslop: no em dashes, short sentences, active voice, no filler.
+Write prose with the global `unslop` skill, which is loaded in every session. Do not restate the style rules here.
