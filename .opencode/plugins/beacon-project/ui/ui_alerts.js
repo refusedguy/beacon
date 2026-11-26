@@ -241,10 +241,7 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree 
   // queue header; a standalone caller falls back to the cached index for the
   // same array. queueLineItems reads that index through its tree argument.
   const index = tree ?? taskTree(list)
-  const { parent, children, epic } = index
-  const parentOf = (id) => parent.get(id) || ""
-  const childrenOf = (id) => children.get(id) ?? []
-  const isEpic = (id) => epic.has(id)
+  const { parentOf, childrenOf, isEpic } = queueGroups(list, null, index)
   if (!epicOpen) return queueLineItems(list, null, blockedOpen, index)
   const ids = index.list === list ? index.ids : list.map((item) => str(item?.id))
   // Walk up to the direct child under each ancestor epic. This hides the whole
