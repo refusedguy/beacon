@@ -81,6 +81,7 @@ func TestSpawnSessionAndPromptBodies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
+	h.waitForSetup()
 	if sess.ID != "ses_42" {
 		t.Fatalf("session id = %q, want ses_42", sess.ID)
 	}
@@ -139,6 +140,7 @@ func TestPerTaskAgentOverridesGlobalAgent(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), req); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
+	h.waitForSetup()
 	if len(rec.sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
 	}
@@ -151,6 +153,7 @@ func TestPerTaskAgentOverridesGlobalAgent(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), plain); err != nil {
 		t.Fatalf("Spawn without override: %v", err)
 	}
+	h.waitForSetup()
 	if len(rec.sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
 	}
@@ -174,6 +177,7 @@ func TestPromptConflictIsAccepted(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn with 409 prompt: %v", err)
 	}
+	h.waitForSetup()
 }
 
 func TestWakeUsesStructuredRedactedPrompt(t *testing.T) {
@@ -255,6 +259,7 @@ func TestWatchIdleEmitsIdleEvent(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
+	h.waitForSetup()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.WatchIdle(ctx)
@@ -341,6 +346,7 @@ func TestSpawnThenStopEmptiesRunMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
+	h.waitForSetup()
 	if _, ok := h.runFor(sess.ID); !ok {
 		t.Fatalf("Spawn did not bind session %q", sess.ID)
 	}
@@ -425,6 +431,7 @@ func TestSpawnUsesDispatchModelRef(t *testing.T) {
 	if err != nil || sess.ID != "ses_worker" {
 		t.Fatalf("Spawn = %q, %v", sess.ID, err)
 	}
+	h.waitForSetup()
 	if len(sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1: %v", len(sessions), sessions)
 	}
@@ -502,6 +509,7 @@ func TestSpawnModelRefOmitsEmptyVariantOnWire(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
+	h.waitForSetup()
 	if len(rec.sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
 	}
@@ -558,6 +566,7 @@ func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
 	if err != nil || sess.ID != "ses_worker" {
 		t.Fatalf("Spawn = %q, %v", sess.ID, err)
 	}
+	h.waitForSetup()
 	if len(sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1: %v", len(sessions), sessions)
 	}
@@ -627,6 +636,7 @@ func TestSpawnReusesResolvedModelAcrossWorkers(t *testing.T) {
 			t.Fatalf("Spawn %d: %v", i, err)
 		}
 	}
+	h.waitForSetup()
 
 	mu.Lock()
 	if len(creates) != 4 || len(moves) != 4 || len(models) != 4 || len(prompts) != 4 {
@@ -649,6 +659,7 @@ func TestSpawnReusesResolvedModelAcrossWorkers(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn after model change: %v", err)
 	}
+	h.waitForSetup()
 	mu.Lock()
 	defer mu.Unlock()
 	if len(models) != 5 || !reflect.DeepEqual(models[4]["model"], want) {
@@ -690,6 +701,7 @@ func TestSpawnDispatchModelRefDoesNotReplaceCachedDefault(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn with harness model: %v", err)
 	}
+	h.waitForSetup()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -703,6 +715,90 @@ func TestSpawnDispatchModelRefDoesNotReplaceCachedDefault(t *testing.T) {
 	wantDefault := map[string]any{"id": "harness-model", "providerID": "opencode"}
 	if !reflect.DeepEqual(models[1]["model"], wantDefault) {
 		t.Errorf("second model = %v, want %v", models[1]["model"], wantDefault)
+	}
+}
+
+// TestSpawnReturnsBeforeDeferredSetup proves the move and model follow-ups are
+// off the Dispatch critical path. Spawn returns after create and prompt even
+// while the first follow-up is blocked at the server.
+func TestSpawnReturnsBeforeDeferredSetup(t *testing.T) {
+	release := make(chan struct{})
+	moveEntered := make(chan struct{}, 1)
+	var mu sync.Mutex
+	var moves, models []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			_, _ = io.WriteString(w, `{"id":"ses_deferred"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/move"):
+			select {
+			case moveEntered <- struct{}{}:
+			default:
+			}
+			<-release
+			mu.Lock()
+			moves = append(moves, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/model"):
+			mu.Lock()
+			models = append(models, decodeBody(r))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(Config{Endpoint: srv.URL, Model: "model-x"})
+	returned := make(chan core.Session, 1)
+	failed := make(chan error, 1)
+	go func() {
+		sess, err := h.Spawn(context.Background(), testSpawnRequest())
+		if err != nil {
+			failed <- err
+			return
+		}
+		returned <- sess
+	}()
+
+	// The move follow-up reaches the server and stays blocked.
+	select {
+	case <-moveEntered:
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("deferred move did not reach the server")
+	}
+
+	// Spawn returns while the follow-up is still in flight.
+	select {
+	case sess := <-returned:
+		if sess.ID != "ses_deferred" {
+			t.Errorf("session id = %q, want ses_deferred", sess.ID)
+		}
+	case err := <-failed:
+		close(release)
+		t.Fatalf("Spawn: %v", err)
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("Spawn blocked on deferred setup")
+	}
+
+	close(release)
+	h.waitForSetup()
+
+	// The worker still receives both follow-up settings.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(moves) != 1 || moves[0]["directory"] != "/tmp/worktrees/widget" {
+		t.Fatalf("deferred moves = %v, want one with the worktree directory", moves)
+	}
+	wantModel := map[string]any{"id": "model-x", "providerID": "opencode"}
+	if len(models) != 1 || !reflect.DeepEqual(models[0]["model"], wantModel) {
+		t.Fatalf("deferred models = %v, want one with %v", models, wantModel)
 	}
 }
 

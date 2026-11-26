@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/url"
 
@@ -29,4 +30,27 @@ func (h *Harness) configureSession(ctx context.Context, id string, req core.Spaw
 		}
 	}
 	return nil
+}
+
+// deferSessionSetup queues the move and model follow-ups after the spawn tool
+// returns. The session create already carries the directory and model, so
+// these calls only repeat values and must not hold up dispatch. The detached
+// context keeps them running after the caller's request context is cancelled;
+// do still bounds each request with requestTimeout. The 404 and 409 tolerance
+// from configureSession is preserved.
+func (h *Harness) deferSessionSetup(ctx context.Context, id string, req core.SpawnRequest, ref core.ModelRef) {
+	setupCtx := context.WithoutCancel(ctx)
+	h.setupWG.Add(1)
+	go func() {
+		defer h.setupWG.Done()
+		if err := h.configureSession(setupCtx, id, req, ref); err != nil {
+			slog.Warn("deferred session setup failed", "session", id, "error", err)
+		}
+	}()
+}
+
+// waitForSetup blocks until every deferred session setup call finishes. Tests
+// use it to observe the follow-up calls deterministically.
+func (h *Harness) waitForSetup() {
+	h.setupWG.Wait()
 }
