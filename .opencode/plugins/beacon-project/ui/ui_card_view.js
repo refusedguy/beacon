@@ -4,6 +4,7 @@ import { CARD_BODY_LINES, str } from "./ui_model.js"
 import { createBox, createLineMount, createText } from "./ui_nodes.js"
 import { taskTree } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
+import { propSetter } from "./ui_test_helpers.js"
 export { elapsed as durationText }
 // Timeline and decision events carry the `at` stamp. Their first and last
 // stamps bound the whole run, which is the number the card header shows.
@@ -155,8 +156,8 @@ export function cardBackCommand(back) {
 
 export function createCardMount(ui, deps) {
   const { insert } = ui
-  const { color, BOLD, onCopy, onClose, onBack, onItem, setProp } = deps
-  const set = setProp ?? ((node, key, value) => { node.props[key] = value })
+  const { color, BOLD, onCopy, onClose, onBack, onItem } = deps
+  const set = propSetter(deps)
   const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
 
   const header = createBox(ui, {
