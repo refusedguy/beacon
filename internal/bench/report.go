@@ -22,12 +22,12 @@ var hotspotOrder = []string{nameSQLite, nameCard, nameWire, nameRedact, nameJour
 // limiters name the resource that bounds each hotspot. The dossier explains
 // why each one is the limiter and points at the annotated production code.
 var limiters = map[string]string{
-	nameSQLite:  "WAL page reads",
+	nameSQLite:  "indexed snapshot reads + WAL pages",
 	nameCard:    "yaml.Unmarshal + line scan",
 	nameWire:    "encoding/json reflection",
 	nameRedact:  "regexp pass chain",
-	nameJournal: "mutex + linear eviction",
-	nameFanout:  "channel send + slow-view drop",
+	nameJournal: "mutex + indexed LRU",
+	nameFanout:  "json.Marshal + subscriber maps + slow-view drop",
 }
 
 type sample struct {
@@ -100,6 +100,8 @@ func printReport(w io.Writer, sums []summary, total time.Duration, iterations in
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %5.1f%%  %s\n",
 			s.Name, s.Median, s.Max-s.Min, s.Work, s.Errors, s.Share, s.Limiter)
 	}
+	marshal, delivered, dropped := takeFanoutCounts()
+	fmt.Fprintf(w, "sse-fanout (8 and 64 subscribers): marshal=%d delivery=%d drop=%d\n", marshal, delivered, dropped)
 	fmt.Fprintf(w, "end-to-end median: %s (sum of hotspot medians)\n", total)
 }
 

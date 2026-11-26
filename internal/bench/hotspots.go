@@ -26,8 +26,11 @@ type env struct {
 	cancel  context.CancelFunc
 }
 
-// runSQLiteSnapshot reads the same six queries a status snapshot issues. Work
-// is the number of rows returned across all queries. Errors are failed calls.
+// runSQLiteSnapshot issues the seven reads SnapshotService.Snapshot performs.
+// Work is the number of rows returned across all reads. Errors are failed
+// calls. The active and recent reads use the covering indexes added for those
+// queries, so the set matches the indexed production shape. The dispatch read
+// ListReadyTasks is gone; ListRecent and CurrentIncident are part of a snapshot.
 func runSQLiteSnapshot(e *env) (int64, int64) {
 	var work, errs int64
 	active, err := e.store.ListActive(e.ctx)
@@ -36,11 +39,17 @@ func runSQLiteSnapshot(e *env) (int64, int64) {
 	} else {
 		work += int64(len(active))
 	}
-	queue, err := e.store.ListQueueTasks(e.ctx)
+	recent, err := e.store.ListRecent(e.ctx, app.DefaultRecentLimit)
 	if err != nil {
 		errs++
 	} else {
-		work += int64(len(queue))
+		work += int64(len(recent))
+	}
+	events, err := e.store.ListRunEvents(e.ctx, e.ids)
+	if err != nil {
+		errs++
+	} else {
+		work += int64(len(events))
 	}
 	decisions, err := e.store.ListDecisions(e.ctx, e.ids, app.DefaultDecisionsLimit, app.DefaultOrphanDecisionsLimit)
 	if err != nil {
@@ -54,17 +63,17 @@ func runSQLiteSnapshot(e *env) (int64, int64) {
 	} else {
 		work += int64(len(counts))
 	}
-	events, err := e.store.ListRunEvents(e.ctx, e.ids)
+	queue, err := e.store.ListQueueTasks(e.ctx)
 	if err != nil {
 		errs++
 	} else {
-		work += int64(len(events))
+		work += int64(len(queue))
 	}
-	ready, err := e.store.ListReadyTasks(e.ctx)
+	incident, err := e.store.CurrentIncident(e.ctx)
 	if err != nil {
 		errs++
-	} else {
-		work += int64(len(ready))
+	} else if incident != nil {
+		work++
 	}
 	return work, errs
 }
@@ -147,23 +156,87 @@ func itoa(n int) string {
 	return string(rune('0'+n/10)) + string(rune('0'+n%10))
 }
 
-// runFanout pushes events through the fanout mirror. Two views drain every
-// event and the third stays full, so the slow-view drop is measured too. Work
-// counts attempted deliveries (events times views). Errors count drops on the
-// slow view.
-func runFanout(e *env) (int64, int64) {
-	const events = 64
-	slowBefore := len(e.fanout.views[2])
-	// Send one event at a time and drain both fast views before the next send.
-	// Flooding src would fill their 16-slot buffers and the production drop
-	// policy would discard events the reader is still waiting for.
-	for i := 0; i < events; i++ {
-		e.fanout.src <- i
-		<-e.fanout.views[0]
-		<-e.fanout.views[1]
+// SSE fanout subcases. Each monitor subscribes to both harness frames and PR
+// changes; one monitor stays slow. One event is delivered at a time and the
+// fast views are drained before the next, so every run performs the same work.
+const (
+	sseFanoutEvents = 64
+	sseSmallSubs    = 8
+	sseLargeSubs    = 64
+)
+
+// fanoutCounts holds the marshal, delivery and drop totals of one benchmark
+// invocation. takeFanoutCounts returns them and resets the accumulator, so
+// each printed report shows only the invocation it belongs to.
+var fanoutCounts struct {
+	marshal   int64
+	delivered int64
+	dropped   int64
+}
+
+func takeFanoutCounts() (int64, int64, int64) {
+	out := [3]int64{fanoutCounts.marshal, fanoutCounts.delivered, fanoutCounts.dropped}
+	fanoutCounts.marshal, fanoutCounts.delivered, fanoutCounts.dropped = 0, 0, 0
+	return out[0], out[1], out[2]
+}
+
+// runSSEFanout mirrors one eventFrames plus changeSubscribers broadcast with
+// subs monitors. The first monitor is slow: both of its channels are full, so
+// every send to it drops. The other monitors drain after each event. Work is
+// the number of marshals and successful deliveries; errors are drops.
+func runSSEFanout(e *env, subs int) (int64, int64) {
+	frames := newEventFrames(json.Marshal)
+	changes := newChangeSubscribers()
+	slowFrames, unsubSlowFrames := frames.subscribe()
+	defer unsubSlowFrames()
+	slowChanges, unsubSlowChanges := changes.subscribe()
+	defer unsubSlowChanges()
+	for i := 0; i < subscriberBuffer; i++ {
+		slowFrames <- nil
+		slowChanges <- 0
 	}
-	dropped := events - (len(e.fanout.views[2]) - slowBefore)
-	return events * int64(len(e.fanout.views)), int64(dropped)
+	fastFrames := make([]<-chan []byte, 0, subs-1)
+	fastChanges := make([]<-chan int, 0, subs-1)
+	for i := 1; i < subs; i++ {
+		frameView, unsubFrames := frames.subscribe()
+		defer unsubFrames()
+		fastFrames = append(fastFrames, frameView)
+		changeView, unsubChanges := changes.subscribe()
+		defer unsubChanges()
+		fastChanges = append(fastChanges, changeView)
+	}
+	var work, errs int64
+	for i := 0; i < sseFanoutEvents; i++ {
+		run := e.wire[i%len(e.wire)]
+		ev := core.HarnessEvent{Kind: string(core.EvPRRegistered), RunID: run.ID}
+		_, frameDelivered, frameDropped := frames.deliver(ev)
+		changeDelivered, changeDropped := changes.deliver(run.PRNumber)
+		work += 1 + frameDelivered + changeDelivered
+		errs += frameDropped + changeDropped
+		fanoutCounts.marshal++
+		fanoutCounts.delivered += frameDelivered + changeDelivered
+		fanoutCounts.dropped += frameDropped + changeDropped
+		for _, ch := range fastFrames {
+			<-ch
+		}
+		for _, ch := range fastChanges {
+			<-ch
+		}
+	}
+	return work, errs
+}
+
+// runFanout measures the production SSE broadcasters at 8 and 64 subscribers.
+// Work and error totals cover both subcases, so five alternating runs report
+// identical counts.
+func runFanout(e *env) (int64, int64) {
+	var work, errs int64
+	for _, subs := range []int{sseSmallSubs, sseLargeSubs} {
+		w, err := runSSEFanout(e, subs)
+		work += w
+		errs += err
+	}
+	return work, errs
 }
 
 // fakeSnapshotStore carries rows read once from SQLite so the assembly phase
