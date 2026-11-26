@@ -60,6 +60,56 @@ func CIWallSeconds(checks []CheckResult) int64 {
 	return int64(end.Sub(start).Seconds())
 }
 
+// PRState is the state a provider reports for a pull request. GitHub and
+// GitLab use different tokens for an open request, so callers classify state
+// through IsClosed and IsMerged instead of comparing raw strings.
+type PRState string
+
+const (
+	// PROpen is GitHub's open pull request state.
+	PROpen PRState = "open"
+	// PROpened is GitLab's open merge request state.
+	PROpened PRState = "opened"
+	// PRClosed is a pull request closed without a merge.
+	PRClosed PRState = "closed"
+	// PRMerged is a pull request closed by a merge.
+	PRMerged PRState = "merged"
+	// PRLocked is a closed and locked pull request.
+	PRLocked PRState = "locked"
+)
+
+// IsClosed reports whether s is a final state. Closed, merged and locked pull
+// requests are final; an open or unknown state is not.
+func (s PRState) IsClosed() bool {
+	switch strings.ToLower(string(s)) {
+	case string(PRClosed), string(PRMerged), string(PRLocked):
+		return true
+	default:
+		return false
+	}
+}
+
+// IsMerged reports whether s is a merged pull request.
+func (s PRState) IsMerged() bool {
+	return strings.ToLower(string(s)) == string(PRMerged)
+}
+
+// FinalState is the shared classification of a provider's pull request state.
+type FinalState struct {
+	// Closed reports whether the request is closed, merged or locked.
+	Closed bool
+	// Merged reports whether the request was merged.
+	Merged bool
+}
+
+// DecideFinalState classifies a raw provider state once for every final-state
+// handler. Open, unknown and empty states are not final, so no handler can
+// finalize a pull request Beacon still treats as open.
+func DecideFinalState(raw string) FinalState {
+	state := PRState(raw)
+	return FinalState{Closed: state.IsClosed(), Merged: state.IsMerged()}
+}
+
 // Observation is a provider snapshot of a pull request at one point in time.
 type Observation struct {
 	PRNumber          int
@@ -240,8 +290,7 @@ type MergeDecision struct {
 // Decide applies invariants, then the configured criteria in order.
 // It returns VerdictMerge only when every invariant and every rule passed.
 func Decide(o Observation, criteria []Criterion) MergeDecision {
-	switch strings.ToLower(o.PRState) {
-	case "closed", "merged":
+	if DecideFinalState(o.PRState).Closed {
 		return MergeDecision{Verdict: VerdictNoop, Reason: "pull request is " + o.PRState}
 	}
 	if o.Incomplete {

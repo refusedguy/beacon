@@ -264,7 +264,7 @@ func (r *Run) ExternalFinalize(obs Observation) error {
 	if r.State.Terminal() {
 		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("run %s is already %s", r.ID, r.State)}
 	}
-	if obs.PRState == "merged" {
+	if DecideFinalState(obs.PRState).Merged {
 		r.State = RunMerged
 		r.Reason = fmt.Sprintf("merged PR #%d via squash", obs.PRNumber)
 	} else {

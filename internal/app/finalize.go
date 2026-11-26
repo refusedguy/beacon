@@ -266,7 +266,7 @@ func (r *Reconciler) mergeIfReviewed(ctx context.Context, run *core.Run, obs cor
 
 // finalizeExternal closes a run whose PR was merged or closed outside Beacon.
 func (r *Reconciler) finalizeExternal(ctx context.Context, run *core.Run, obs core.Observation) error {
-	merged := obs.PRState == "merged"
+	merged := core.DecideFinalState(obs.PRState).Merged
 	if err := run.ExternalFinalize(obs); err != nil {
 		return err
 	}
