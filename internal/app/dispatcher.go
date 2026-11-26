@@ -169,6 +169,7 @@ func selectDispatchCandidates(planner ConflictPlanner, ready []core.Task, active
 // Dispatch starts workers for up to n non-overlapping ready cards and returns
 // the runs it created, the skipped candidates and any start failures.
 func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error) {
+	defer d.Decisions.flushDeferred()
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()
 	d.modelRefs = nil
@@ -272,6 +273,7 @@ func (d *Dispatcher) launch(ctx context.Context, chosen []core.Task, budget int,
 
 // PromotePending starts queued runs when an agent slot becomes free.
 func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
+	defer d.Decisions.flushDeferred()
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()
 	d.modelRefs = nil

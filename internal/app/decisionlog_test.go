@@ -176,6 +176,7 @@ func TestDecisionLogTransitionDecisionFields(t *testing.T) {
 	ctx := WithCycleID(context.Background(), "run-9")
 
 	logger.logTransitionWatchPR(ctx, "run-9", 77)
+	logger.Wait()
 	logger.logTransitionWake(ctx, "run-9", 77, "woke")
 	logger.logTransitionMerge(ctx, "run-9", 77, "attempt")
 	logger.logTransitionParentNotify(ctx, "run-9", 77, "notified")
@@ -207,6 +208,7 @@ func TestDecisionLogTransitionExtraDecisionFields(t *testing.T) {
 	ctx := WithCycleID(context.Background(), "run-9")
 
 	logger.logTransitionSpawn(ctx, "run-9", "T-9", "beacon/T-9")
+	logger.Wait()
 	logger.logTransitionRebase(ctx, "run-9", 77, 2, "sha-new", "rebased")
 	logger.logTransitionDeliveryClaim(ctx, "run-9", 77, true)
 
@@ -432,6 +434,114 @@ func TestReconcileDecisionCacheWritesAfterChange(t *testing.T) {
 	}
 	if got := sink.decisions[1].Fields["head_sha"]; got != "sha2" {
 		t.Fatalf("second decision head_sha = %v, want sha2", got)
+	}
+}
+
+// gatedDecisionSink blocks every write until the gate opens. It proves a
+// dispatch does not wait on the audit sink before returning to its caller.
+type gatedDecisionSink struct {
+	gate      <-chan struct{}
+	mu        sync.Mutex
+	decisions []Decision
+}
+
+func (s *gatedDecisionSink) RecordDecision(_ context.Context, d Decision) error {
+	<-s.gate
+	s.mu.Lock()
+	s.decisions = append(s.decisions, d)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *gatedDecisionSink) snapshot() []Decision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Decision(nil), s.decisions...)
+}
+
+func TestDispatchDecisionWritesAreDeferred(t *testing.T) {
+	gate := make(chan struct{})
+	sink := &gatedDecisionSink{gate: gate}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: []core.Task{
+			{ID: "T-A", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("a.go")}},
+			{ID: "T-B", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("b.go")}},
+		}},
+		Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
+		Harness: &fakeHarness{}, Store: newFakeStore(),
+		Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
+		Decisions:   DecisionLogger{Sink: sink},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := d.Dispatch(context.Background(), 2); err != nil {
+			t.Errorf("Dispatch: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Dispatch blocked on the decision sink")
+	}
+	if got := len(sink.snapshot()); got != 0 {
+		t.Fatalf("sink has %d rows before the gate opens, want 0", got)
+	}
+
+	close(gate)
+	d.Decisions.Wait()
+	got := sink.snapshot()
+	if len(got) != 3 {
+		t.Fatalf("recorded %d decisions, want 3: %+v", len(got), got)
+	}
+	if got[0].Kind != "dispatch.candidates" || got[1].Kind != "transition.spawn" || got[2].Kind != "transition.spawn" {
+		t.Fatalf("decision kinds = %q, %q, %q", got[0].Kind, got[1].Kind, got[2].Kind)
+	}
+}
+
+func TestDeferredDispatchDecisionsKeepRowsAndCycleIDs(t *testing.T) {
+	sink := &countingDecisionSink{}
+	store := newFakeStore()
+	active := core.NewRun("r-active", "T-Z", time.Now().UTC())
+	active.State = core.RunRunning
+	active.Scope = []core.ScopePath{core.ScopeFile("active.go")}
+	if err := store.Save(context.Background(), active); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: []core.Task{
+			{ID: "T-A", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("a.go")}},
+			{ID: "T-B", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("b.go")}},
+			{ID: "T-C", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("active.go")}},
+		}},
+		Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
+		Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 4, MaxActiveAgents: 4},
+		Decisions:   DecisionLogger{Sink: sink},
+	}
+
+	if _, err := d.Dispatch(WithCycleID(context.Background(), "cycle-1"), 4); err != nil {
+		t.Fatal(err)
+	}
+	d.Decisions.Wait()
+	got := sink.decisions
+	if len(got) != 4 {
+		t.Fatalf("recorded %d decisions, want 4: %+v", len(got), got)
+	}
+	if got[0].Kind != "dispatch.candidates" || got[0].CycleID != "cycle-1" {
+		t.Errorf("first decision = %+v, want dispatch.candidates in cycle-1", got[0])
+	}
+	if got[1].Kind != "dispatch.skip" || got[1].CycleID != "cycle-1" || got[1].TaskID != "T-C" {
+		t.Errorf("second decision = %+v, want dispatch.skip for T-C in cycle-1", got[1])
+	}
+	for i := 2; i < len(got); i++ {
+		if got[i].Kind != "transition.spawn" {
+			t.Errorf("decision %d kind = %q, want transition.spawn", i, got[i].Kind)
+		}
+		if got[i].CycleID != got[i].RunID || got[i].RunID == "" {
+			t.Errorf("decision %d cycle_id = %q, run_id = %q, want equal and non-empty", i, got[i].CycleID, got[i].RunID)
+		}
 	}
 }
 
