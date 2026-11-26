@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,6 +26,34 @@ func TestLoadDefaultsToTwelveMergeAttempts(t *testing.T) {
 	}
 	if c.Merge.MaxAttempts != 12 {
 		t.Fatalf("MaxAttempts = %d, want 12", c.Merge.MaxAttempts)
+	}
+}
+
+func TestLoadEmptyFileMatchesMissingFile(t *testing.T) {
+	missing, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatalf("Load(missing): %v", err)
+	}
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"empty", ""},
+		{"whitespace", "  \n\t\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Load(writeConfig(t, tc.content))
+			if err != nil {
+				t.Fatalf("Load(%s file): %v", tc.name, err)
+			}
+			if !reflect.DeepEqual(got, missing) {
+				t.Fatalf("config from %s file = %+v, want %+v", tc.name, got, missing)
+			}
+			if got.Concurrency.MaxActiveAgents != 4 {
+				t.Fatalf("MaxActiveAgents = %d, want 4", got.Concurrency.MaxActiveAgents)
+			}
+		})
 	}
 }
 
