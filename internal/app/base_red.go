@@ -311,17 +311,17 @@ func (r *Reconciler) unblockWithRebase(ctx context.Context, run *core.Run) error
 			// the run is already unblocked, so a rejected transition is best effort
 			// but must be logged with the affected run and task.
 			if applyErr := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); applyErr != nil {
-				slog.Error("rebase rollback behind", "run", run.ID, "task", run.TaskID, "error", applyErr)
+				logStep("rebase rollback behind", run, applyErr)
 			}
 			if applyErr := run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}); applyErr != nil {
-				slog.Error("rebase rollback failure", "run", run.ID, "task", run.TaskID, "error", applyErr)
+				logStep("rebase rollback failure", run, applyErr)
 			}
 			return r.Store.Save(ctx, run)
 		}
 		if err := run.Apply(core.Event{Kind: core.EvBehind, Reason: "base recovered"}); err != nil {
-			slog.Error("rebase behind", "run", run.ID, "task", run.TaskID, "error", err)
+			logStep("rebase behind", run, err)
 		} else if err := run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "base recovered"}); err != nil {
-			slog.Error("rebase success transition", "run", run.ID, "task", run.TaskID, "error", err)
+			logStep("rebase success transition", run, err)
 		}
 	}
 	return r.Store.Save(ctx, run)

@@ -31,14 +31,14 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 	}
 	changed, err := r.Workspace.HasChanges(ctx, core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}, r.BaseBranch)
 	if err != nil {
-		slog.Error("idle change check", "run", run.ID, "task", run.TaskID, "error", err)
+		logStep("idle change check", run, err)
 		return
 	}
 	if changed {
 		key := "idle-nudge:" + string(run.ID)
 		ok, err := r.Store.ClaimDelivery(ctx, key)
 		if err != nil {
-			slog.Error("idle nudge key", "run", run.ID, "task", run.TaskID, "error", err)
+			logStep("idle nudge key", run, err)
 			return
 		}
 		if ok {
@@ -51,24 +51,24 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 			// The claim guards one idle event, not the run's lifetime. Release it
 			// so a later idle turn can nudge again instead of blocking the run.
 			if err := r.Store.ReleaseDelivery(ctx, key); err != nil {
-				slog.Error("release idle nudge key", "run", run.ID, "task", run.TaskID, "error", err)
+				logStep("release idle nudge key", run, err)
 			}
 			if wakeErr != nil {
-				slog.Error("idle nudge", "run", run.ID, "task", run.TaskID, "error", wakeErr)
+				logStep("idle nudge", run, wakeErr)
 			}
 			return
 		}
 	}
 	if err := run.Apply(core.Event{Kind: core.EvBlock, Reason: "idle without PR or changes"}); err != nil {
-		slog.Error("idle block transition", "run", run.ID, "task", run.TaskID, "error", err)
+		logStep("idle block transition", run, err)
 		return
 	}
 	if err := r.Store.Save(ctx, run); err != nil {
-		slog.Error("idle block", "run", run.ID, "task", run.TaskID, "error", err)
+		logStep("idle block", run, err)
 		return
 	}
 	if err := r.notify(run, "idle without PR", "agent finished without opening a PR"); err != nil {
-		slog.Error("idle block notify", "run", run.ID, "task", run.TaskID, "error", err)
+		logStep("idle block notify", run, err)
 	}
 }
 
