@@ -38,6 +38,7 @@ type Run struct {
 
 // Action is a control verb sent to the loopback API. The TUI is a separate
 // module and cannot import pkg/core, so this list mirrors core.ControlActions.
+// TestControlVocabularyMatchesCore compares the two and fails on drift.
 type Action string
 
 // ActionApprove and the other constants name every verb in the control vocabulary.

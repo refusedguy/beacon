@@ -3,8 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -12,6 +16,11 @@ import (
 // TUI is a separate module and imports no Beacon package, so it decodes the
 // shared file with its own wire structs.
 const wireContractPath = "../../docs/wire/loopback.json"
+
+// coreVocabularyPath is the core source that declares the control verbs. The
+// TUI imports no Beacon package, so the contract test resolves core's names
+// from source instead of importing them.
+const coreVocabularyPath = "../../pkg/core/control.go"
 
 type wireContractPayload struct {
 	Runs    []Run         `json:"runs"`
@@ -107,4 +116,85 @@ func TestWireEventPayloadFixtures(t *testing.T) {
 			t.Fatalf("pr_changed fixture decoded as %+v, want %+v", got, want)
 		}
 	})
+}
+
+// coreControlVerbs resolves core.ControlActions through the Control* constants
+// declared beside it. The returned order is the wire order core publishes.
+func coreControlVerbs(t *testing.T) []string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), coreVocabularyPath, nil, 0)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(%q): %v", coreVocabularyPath, err)
+	}
+	constants := map[string]string{}
+	var verbs []string
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			values, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			switch gen.Tok {
+			case token.CONST:
+				for i, name := range values.Names {
+					if i >= len(values.Values) {
+						continue
+					}
+					lit, ok := values.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					value, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("%s: unquote %s: %v", coreVocabularyPath, lit.Value, err)
+					}
+					constants[name.Name] = value
+				}
+			case token.VAR:
+				if len(values.Names) != 1 || values.Names[0].Name != "ControlActions" {
+					continue
+				}
+				if len(values.Values) != 1 {
+					t.Fatalf("%s: ControlActions has %d values", coreVocabularyPath, len(values.Values))
+				}
+				array, ok := values.Values[0].(*ast.CompositeLit)
+				if !ok {
+					t.Fatalf("%s: ControlActions is not a literal array", coreVocabularyPath)
+				}
+				for _, element := range array.Elts {
+					id, ok := element.(*ast.Ident)
+					if !ok {
+						t.Fatalf("%s: ControlActions has a non-constant element", coreVocabularyPath)
+					}
+					verb, ok := constants[id.Name]
+					if !ok {
+						t.Fatalf("%s: action %s has no constant value", coreVocabularyPath, id.Name)
+					}
+					verbs = append(verbs, verb)
+				}
+			}
+		}
+	}
+	if len(verbs) == 0 {
+		t.Fatalf("%s: core vocabulary is empty", coreVocabularyPath)
+	}
+	return verbs
+}
+
+// TestControlVocabularyMatchesCore proves the TUI sends exactly the verbs core
+// accepts. Adding a core action without a TUI action changes the expected list
+// and fails this test.
+func TestControlVocabularyMatchesCore(t *testing.T) {
+	want := coreControlVerbs(t)
+	got := make([]string, 0, len(actions))
+	for _, action := range actions {
+		got = append(got, string(action))
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TUI actions = %v, core.ControlActions = %v", got, want)
+	}
 }
