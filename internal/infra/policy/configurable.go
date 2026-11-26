@@ -11,12 +11,10 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// Config holds the merge criteria that build a Policy. RequiredChecks is the
-// resolved list of check names kept for callers that have no source yet. When
-// RequiredCheckSource is set it takes precedence, so the policy reads names
-// through the port instead of a static slice.
+// Config holds the merge criteria that build a Policy. Required checks reach
+// the policy only through RequiredCheckSource, so the source can change its
+// names without a policy rebuild.
 type Config struct {
-	RequiredChecks      []string
 	RequiredCheckSource core.RequiredCheckSource
 	RequiredApprovals   int
 	Labels              []string
@@ -47,14 +45,12 @@ type Policy struct {
 	criteria []core.Criterion
 }
 
-// New builds a Policy from the criteria enabled in cfg. A source takes
-// precedence over the static list, so swapping sources needs no change here.
+// New builds a Policy from the criteria enabled in cfg. Required checks are
+// read through cfg.RequiredCheckSource when one is supplied.
 func New(cfg Config) *Policy {
 	var rules []core.Criterion
 	if cfg.RequiredCheckSource != nil {
 		rules = append(rules, SourceChecksRule{Source: cfg.RequiredCheckSource})
-	} else if len(cfg.RequiredChecks) > 0 {
-		rules = append(rules, ChecksRule{Names: cfg.RequiredChecks})
 	}
 	if cfg.RequiredApprovals > 0 {
 		rules = append(rules, ApprovalsRule{Needed: cfg.RequiredApprovals})
@@ -82,17 +78,6 @@ func (p *Policy) Evaluate(o core.Observation) core.MergeDecision {
 func (p *Policy) ReviewRequired(mode core.ReviewMode, o core.Observation) bool {
 	verdict, _ := ReviewRule{Mode: mode}.Evaluate(o)
 	return verdict != core.VerdictNoop
-}
-
-// ChecksRule gates a merge on a fixed list of required checks.
-type ChecksRule struct{ Names []string }
-
-// Name returns the required checks criterion name.
-func (r ChecksRule) Name() string { return "required_checks" }
-
-// Evaluate reports which required checks have not passed.
-func (r ChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
-	return evaluateChecks(r.Names, o)
 }
 
 // SourceChecksRule gates a merge on the names reported by a source. Names are
