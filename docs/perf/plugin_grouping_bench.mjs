@@ -7,14 +7,38 @@
 // the report prints median, range, work counts, error counts, the named limiter
 // and the grouping share of a full sidebar render.
 
+// CI runs a bounded smoke pass with BENCH_ITERATIONS=50 and BENCH_WARMUP=0.
+// Full mode uses the defaults below and is the nightly comparison baseline.
+
+import { createHash } from "node:crypto"
 import { queueGroups, queueLineItems } from "../../.opencode/plugins/beacon-project/ui/ui_alerts.js"
 
 const SEED = 20261125
 const EPICS = 24
 const CHILDREN_PER_EPIC = 4
 const BLOCKERS = 8
-const ITERATIONS = 2000
-const WARMUP = 200
+// envInt reads a bounded non-negative integer override. A missing or empty
+// value uses the full-mode default; anything else must parse as an integer at
+// or above min so a typo cannot silently shrink the nightly comparison.
+function envInt(name, fallback, min) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === "") return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < min) {
+    throw new Error(`${name} must be an integer >= ${min}; got ${JSON.stringify(raw)}`)
+  }
+  return value
+}
+
+const ITERATIONS = envInt("BENCH_ITERATIONS", 2000, 1)
+const WARMUP = envInt("BENCH_WARMUP", 200, 0)
+
+// The hash pins the fixture shape. Any edit to the seed, sizes or generated
+// rows changes the hash and fails the run before the harness prints a number.
+const EXPECTED_FIXTURE_HASH = "3122a21ce9316569"
+function hashFixture(fixture) {
+  return createHash("sha256").update(JSON.stringify(fixture)).digest("hex").slice(0, 16)
+}
 
 function rng(seed) {
   let state = seed >>> 0
@@ -102,6 +126,10 @@ function row(name, durations, errors, work, share, limiter) {
 }
 
 const queue = fixture()
+const fixtureHashValue = hashFixture({ seed: SEED, fixture: queue })
+if (fixtureHashValue !== EXPECTED_FIXTURE_HASH) {
+  throw new Error(`fixture hash drift: expected ${EXPECTED_FIXTURE_HASH}, got ${fixtureHashValue}`)
+}
 const grouped = queueGroups(queue)
 const groupWork = queue.length + grouped.groups.size + grouped.parents.size + grouped.blockers.size
 
@@ -125,8 +153,9 @@ const rows = [
 ]
 
 console.log(
-  `plugin grouping: seed=${SEED} epics=${EPICS} children=${CHILDREN_PER_EPIC} blockers=${BLOCKERS} iterations=${ITERATIONS}`,
+  `plugin grouping: seed=${SEED} epics=${EPICS} children=${CHILDREN_PER_EPIC} blockers=${BLOCKERS} iterations=${ITERATIONS} warmup=${WARMUP}`,
 )
+console.log(`fixture hash: ${fixtureHashValue}`)
 console.log("hot path         median(ms)  range(ms)   work   errs  share  limiter")
 for (const r of rows) {
   console.log(

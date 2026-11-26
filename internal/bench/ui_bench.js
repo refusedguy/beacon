@@ -5,7 +5,11 @@
 // the same convention as the Go mirrors in internal/bench/models.go.
 //
 // Run: node internal/bench/ui_bench.js
+//
+// CI runs a bounded smoke pass with BENCH_ITERATIONS=50 and BENCH_WARMUP=0.
+// Full mode uses the defaults below and is the nightly comparison baseline.
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import os from "node:os"
 import { performance } from "node:perf_hooks"
 import {
@@ -25,9 +29,32 @@ import {
 const STATE_BAR_COLOR = Object.freeze({ running: "success", waiting_ci: "info", blocked: "error", merged: "success" })
 const STATE_BAR_LETTER = Object.freeze({ running: "R", waiting_ci: "C", blocked: "B", merged: "M" })
 
+const SEED = 20261125
 const NOW = Date.parse("2026-11-25T10:00:00Z")
 const ROUNDS = 5
-const ITERATIONS = 2000
+
+// envInt reads a bounded non-negative integer override. A missing or empty
+// value uses the full-mode default; anything else must parse as an integer at
+// or above min so a typo cannot silently shrink the nightly comparison.
+function envInt(name, fallback, min) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === "") return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < min) {
+    throw new Error(`${name} must be an integer >= ${min}; got ${JSON.stringify(raw)}`)
+  }
+  return value
+}
+
+const ITERATIONS = envInt("BENCH_ITERATIONS", 2000, 1)
+const WARMUP = envInt("BENCH_WARMUP", 0, 0)
+
+// The hash pins the fixture shape. Any edit to the seed or fixture rows
+// changes the hash and fails the run before the harness prints a number.
+const EXPECTED_FIXTURE_HASH = "8b649f17d1b4b680"
+function hashFixture(fixture) {
+  return createHash("sha256").update(JSON.stringify(fixture)).digest("hex").slice(0, 16)
+}
 
 const wireRun = (id, taskID, state, extra = {}) => ({
   ID: id, TaskID: taskID, State: state, Title: `Task ${taskID}`, PRNumber: 41,
@@ -63,6 +90,11 @@ const FIXTURE = Object.freeze({
   daemon: { State: "alive", PID: 123, HeartbeatAgeSeconds: 2 },
   base_incident: { ID: "INC-1", BaseBranch: "main", FailedChecks: "[1,2]", Attempts: 2 },
 })
+
+const fixtureHashValue = hashFixture({ seed: SEED, fixture: FIXTURE })
+if (fixtureHashValue !== EXPECTED_FIXTURE_HASH) {
+  throw new Error(`fixture hash drift: expected ${EXPECTED_FIXTURE_HASH}, got ${fixtureHashValue}`)
+}
 
 let normalizeCalls = 0
 const countNormalize = (value) => { normalizeCalls += 1; return normalizeSnapshot(value) }
@@ -216,6 +248,14 @@ assert.deepEqual(beforeLines, afterLines, "removing normalizations changed the r
 assert.deepEqual(afterLines, productionLines, "the after mirror differs from production ui_view.js")
 assert.ok(afterLines.length > 0, "the fixture rendered no lines")
 
+// Warm up the mirrored and production renders outside the timed region when
+// the caller asks for it. The Go harness does the same before its timed pass.
+for (let i = 0; i < WARMUP; i += 1) {
+  beforeModel(FIXTURE, NOW)
+  afterModel(FIXTURE, NOW)
+  renderSnapshotLines(FIXTURE, null, NOW)
+}
+
 function measure(fn) {
   normalizeCalls = 0
   const start = performance.now()
@@ -277,9 +317,11 @@ const afterNormalizeMs = after.ms - renderOnly.ms
 const afterNormalizeShare = afterNormalizeMs / after.ms
 
 console.log("sidebar allocation case study")
+console.log(`seed: ${SEED}`)
+console.log(`fixture hash: ${fixtureHashValue}`)
 console.log(`host: ${os.cpus().length} cores, load average ${os.loadavg().map((n) => n.toFixed(2)).join(" ")}`)
 console.log(`fixture: ${FIXTURE.active.length} active, ${FIXTURE.recent.length} recent, ${FIXTURE.queue.length} queue cards`)
-console.log(`${ROUNDS} alternating rounds per side, ${ITERATIONS} renders per round`)
+console.log(`${ROUNDS} alternating rounds per side, ${ITERATIONS} renders per round, ${WARMUP} warmup renders`)
 console.log(`rendered lines: ${beforeLines.length} (before == after == production)`)
 console.log(`work counted in every round: ${before.sink && after.sink ? "yes" : "NO"}`)
 console.log(`before: median ${before.ms.toFixed(2)} ms, range ${before.min.toFixed(2)} to ${before.max.toFixed(2)} ms, ${before.callsPerRender} normalize calls/render`)
