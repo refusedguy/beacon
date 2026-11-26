@@ -248,7 +248,7 @@ test("status source reads snapshot from CLI and keeps RPC for control and dispat
       }
       return { stdout: args[0] === "dispatch" ? '{"started":1}' : '{"ok":true}' }
     },
-    existsSync: () => false,
+    existsSync: (p) => p === "/p/docs/tasks",
   }
   const good = createStatusSource(ctx, { deps })
   assert.equal((await good.snapshot()).active[0].title, "From CLI")
@@ -282,6 +282,7 @@ test("an unverified root keeps every queue card instead of filtering them all", 
 test("a late location verifies the root and drops only missing or done cards", async () => {
   const root = "/work/project"
   const files = {
+    [`${root}/docs/tasks`]: true,
     [`${root}/docs/tasks/T-A.md`]: "---\ntitle: Alpha\nstatus: todo\n---\n",
     [`${root}/docs/tasks/T-B.md`]: "---\ntitle: Beta\nstatus: done\n---\n",
   }
@@ -305,6 +306,7 @@ test("a late location verifies the root and drops only missing or done cards", a
 test("a stale RPC empty queue cannot hide CLI ready cards in the panel", async () => {
   const root = "/work/project"
   const files = {
+    [`${root}/docs/tasks`]: true,
     [`${root}/docs/tasks/T-1.md`]: "---\nid: T-1\ntitle: Alpha\nstatus: todo\n---\n",
     [`${root}/docs/tasks/T-2.md`]: "---\nid: T-2\ntitle: Beta\nstatus: todo\n---\n",
   }
@@ -329,6 +331,47 @@ test("a stale RPC empty queue cannot hide CLI ready cards in the panel", async (
   assert.ok(rendered.includes("▶ Queue 2"), "the queue header counts the ready cards")
   assert.ok(rendered.includes("▶ Dispatch (2 ready)"), "the Dispatch plate shows the ready count")
   assert.equal(rendered.includes("Queue no tasks ready"), false)
+})
+
+test("a worktree location cannot empty a queue of ready cards", async () => {
+  const worktree = "/work/project/.beacon/worktrees/T-1"
+  const ready = Array.from({ length: 18 }, (_, i) => ({ id: `T-${i + 1}`, status: "ready", priority: 1 }))
+  const deps = {
+    command: () => ["/bin/beacon"],
+    execFile: async () => ({ stdout: JSON.stringify({ active: [], recent: [], queue: ready }) }),
+    existsSync: () => false,
+  }
+  const ctx = { location: { directory: worktree, project: { id: "project-1" } } }
+  const source = createStatusSource(ctx, { deps })
+  const snap = await source.snapshot()
+  assert.equal(source.verified(), false, "a worktree root cannot verify the main project's cards")
+  assert.equal(snap.queue.length, 18)
+  const rendered = renderSnapshotLines(snap)
+  assert.ok(rendered.includes("▶ Queue 18"), "the queue header keeps every ready card")
+  assert.ok(rendered.includes("▶ Dispatch (18 ready)"), "the Dispatch plate keeps the ready count")
+})
+
+test("the canonical root, not the worktree directory, decides which cards are pending", async () => {
+  const root = "/work/project"
+  const worktree = `${root}/.beacon/worktrees/T-1`
+  const files = {
+    [`${root}/docs/tasks`]: true,
+    [`${root}/docs/tasks/T-A.md`]: "---\nid: T-A\nstatus: todo\n---\n",
+    [`${root}/docs/tasks/T-B.md`]: "---\nid: T-B\nstatus: done\n---\n",
+    [`${worktree}/docs/tasks/T-A.md`]: "---\nid: T-A\nstatus: done\n---\n",
+    [`${worktree}/docs/tasks/T-B.md`]: "---\nid: T-B\nstatus: done\n---\n",
+  }
+  const deps = {
+    command: () => ["/bin/beacon"],
+    execFile: async () => ({ stdout: JSON.stringify({ active: [], recent: [], queue: [{ id: "T-A" }, { id: "T-B" }] }) }),
+    existsSync: (p) => Object.hasOwn(files, p), readFileSync: (p) => files[p],
+  }
+  const ctx = { location: { directory: worktree, project: { canonical: root } } }
+  const source = createStatusSource(ctx, { deps })
+  const snap = await source.snapshot()
+  assert.equal(source.verified(), true)
+  assert.equal(source.root(), root)
+  assert.deepEqual(snap.queue.map((q) => q.id), ["T-A"], "the canonical root keeps the todo card")
 })
 
 test("RPC definition validates snapshot, control and dispatch shapes", () => {

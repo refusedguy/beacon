@@ -1,7 +1,7 @@
 ---
 id: T-ac47cc54
 title: Fix sidebar queue filter using canonical project root
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_model.js
     - .opencode/plugins/beacon-project/state/location.js
