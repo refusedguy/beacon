@@ -1,7 +1,7 @@
 ---
 id: T-b740cced
 title: Skip config rebuilds that cannot apply
-status: available
+status: done
 scope:
     - cmd/beacon/config_watch.go
     - cmd/beacon/config_watch_test.go

@@ -138,15 +138,33 @@ func (cw *configWatcher) reload() bool {
 		return false
 	}
 	previous := cw.live.Load()
-	if changed := restartFields(previous.cfg, cfg); len(changed) > 0 {
+	restart, modelOnly := configChange(previous.cfg, cfg)
+	if len(restart) > 0 {
 		// The running services were wired with the previous values for these
 		// fields. Storing the new config would make the snapshot disagree with
 		// what the services use, so keep the whole previous config instead.
-		for _, field := range changed {
+		for _, field := range restart {
 			slog.Warn("config watch: change needs restart, kept previous config", "field", field,
 				"action", "restart beacon mcp and reconnect OpenCode")
 		}
 		return false
+	}
+	if modelOnly {
+		// Neither the harness nor the policy depends on the model. Dispatch
+		// resolves it from the live config on every spawn, so store the new
+		// config with the existing services and advance the generation to
+		// invalidate the resolver cache. No new harness, no policy rebuild and
+		// no reload broadcast: the watchers keep watching the same harness.
+		state := &liveState{
+			cfg:        cfg,
+			harness:    previous.harness,
+			policy:     previous.policy,
+			relay:      previous.relay,
+			generation: cw.generations + 1,
+		}
+		cw.live.Store(state)
+		cw.generations++
+		return true
 	}
 	state := cw.build(cfg, root)
 	if state == nil {
@@ -226,6 +244,22 @@ func restartFields(old, next config.Config) []string {
 		}
 	}
 	return out
+}
+
+// configChange classifies a config edit before any service is rebuilt. It
+// returns the restart fields that changed and whether the edit is confined to
+// the model. Restart changes cannot be applied to running services. A
+// model-only change needs no new harness or policy, because dispatch resolves
+// the model from the live config. Any other change rebuilds the harness or
+// policy from the new config.
+func configChange(old, next config.Config) (restart []string, modelOnly bool) {
+	restart = restartFields(old, next)
+	if len(restart) > 0 {
+		return restart, false
+	}
+	probe := old
+	probe.Harness.Model = next.Harness.Model
+	return nil, reflect.DeepEqual(probe, next)
 }
 
 // reloadableHarness delegates to the current harness. Every service holds one

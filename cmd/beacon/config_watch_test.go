@@ -101,7 +101,11 @@ func TestConfigReloadUpdatesHarnessModelWithoutNewProcess(t *testing.T) {
 
 	path := watchConfig(t, srv.URL, "model-a", "worker-token")
 	cw, h := newTestWatcher(t, path)
+	before := cw.live.Load()
 	req := core.SpawnRequest{RunID: "run-1", Workspace: core.Workspace{Path: t.TempDir()}, Prompt: "work"}
+	// Dispatch resolves the model from the live config on every spawn. The
+	// harness-level model is only a startup fallback and stays fixed.
+	req.ModelRef = cw.modelResolver("")
 	if _, err := h.Spawn(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +118,7 @@ func TestConfigReloadUpdatesHarnessModelWithoutNewProcess(t *testing.T) {
 	if !cw.reload() {
 		t.Fatal("reload did not apply the changed config")
 	}
+	req.ModelRef = cw.modelResolver("")
 	if _, err := h.Spawn(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -125,6 +130,91 @@ func TestConfigReloadUpdatesHarnessModelWithoutNewProcess(t *testing.T) {
 	}
 	if len(models) != 2 {
 		t.Fatalf("spawn calls = %d, want 2 (same process)", len(models))
+	}
+	if got := cw.live.Load().harness; got != before.harness {
+		t.Fatal("model-only reload rebuilt the harness")
+	}
+}
+
+// TestConfigReloadModelOnlySkipsHarnessAndBroadcast drives 60 fake ticks that
+// toggle only the model. Each tick reads and hashes the file, but no harness or
+// policy is rebuilt and no reload is broadcast. The harness pointer, policy
+// pointer and relay signal channel stay identical throughout; generation
+// advances once per tick so the model resolver cache invalidates.
+func TestConfigReloadModelOnlySkipsHarnessAndBroadcast(t *testing.T) {
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
+	cw, _ := newTestWatcher(t, path)
+	before := cw.live.Load()
+	signal := before.relay.reloadSignal()
+
+	current := "model-a"
+	for i := 0; i < 60; i++ {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := "model-b"
+		if current == "model-b" {
+			next = "model-a"
+		}
+		writeWatchFile(t, path, strings.Replace(string(body), "model: "+current, "model: "+next, 1))
+		if !cw.reload() {
+			t.Fatalf("tick %d: model-only change was not applied", i)
+		}
+
+		state := cw.live.Load()
+		if state.cfg.Harness.Model != next {
+			t.Fatalf("tick %d: model = %q, want %q", i, state.cfg.Harness.Model, next)
+		}
+		if state.harness != before.harness {
+			t.Fatalf("tick %d: harness was rebuilt", i)
+		}
+		if state.policy != before.policy {
+			t.Fatalf("tick %d: policy was rebuilt", i)
+		}
+		if state.relay != before.relay {
+			t.Fatalf("tick %d: event relay was replaced", i)
+		}
+		if got := before.relay.reloadSignal(); got != signal {
+			t.Fatalf("tick %d: reload was broadcast", i)
+		}
+		if state.generation != uint64(i+1) {
+			t.Fatalf("tick %d: generation = %d, want %d", i, state.generation, i+1)
+		}
+		current = next
+	}
+}
+
+// TestConfigReloadRebuildsOnRealChange confirms a non-model reloadable edit
+// keeps the current behavior: the harness and policy are rebuilt and listeners
+// are signaled to retarget their watchers.
+func TestConfigReloadRebuildsOnRealChange(t *testing.T) {
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
+	cw, _ := newTestWatcher(t, path)
+	before := cw.live.Load()
+	signal := before.relay.reloadSignal()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWatchFile(t, path, string(body)+"merge:\n  required_checks: [build]\n")
+	if !cw.reload() {
+		t.Fatal("reloadable change was not applied")
+	}
+
+	state := cw.live.Load()
+	if state.harness == before.harness {
+		t.Fatal("real change did not rebuild the harness")
+	}
+	if state.policy == before.policy {
+		t.Fatal("real change did not rebuild the policy")
+	}
+	if state.relay != before.relay {
+		t.Fatal("real change replaced the event relay")
+	}
+	if got := before.relay.reloadSignal(); got == signal {
+		t.Fatal("real change did not broadcast a reload")
 	}
 }
 
