@@ -296,3 +296,24 @@ func TestRuleFailReturnsConcreteReason(t *testing.T) {
 		}
 	}
 }
+
+// TestChecksRuleAcceptsResolvedWorkflowNames covers the names config load
+// feeds into RequiredChecks after a workflow rename: a verify job and a
+// matrix-backed test job, with none of the old build/vet/lint jobs present.
+func TestChecksRuleAcceptsResolvedWorkflowNames(t *testing.T) {
+	obs := core.Observation{
+		PRState: "open",
+		Checks: []core.CheckResult{
+			{Name: "verify", State: core.CheckSuccess},
+			{Name: "test", State: core.CheckSuccess},
+		},
+	}
+	resolved := New(Config{RequiredChecks: []string{"test", "verify"}}).Evaluate(obs)
+	if resolved.Verdict != core.VerdictMerge {
+		t.Fatalf("verdict with resolved names = %+v, want merge", resolved)
+	}
+	stale := New(Config{RequiredChecks: []string{"build", "vet", "test", "lint"}}).Evaluate(obs)
+	if stale.Verdict != core.VerdictWait || stale.Criterion != "required_checks" {
+		t.Fatalf("verdict with stale names = %+v, want required_checks wait", stale)
+	}
+}

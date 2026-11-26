@@ -11,7 +11,9 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// Config holds the merge criteria that build a Policy.
+// Config holds the merge criteria that build a Policy. RequiredChecks is the
+// resolved list of check names. The config layer fills it from an explicit
+// list or from workflow job names on load and on every watcher reload.
 type Config struct {
 	RequiredChecks    []string
 	RequiredApprovals int
