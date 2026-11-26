@@ -81,7 +81,7 @@ func TestSpawnSessionAndPromptBodies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	if sess.ID != "ses_42" {
 		t.Fatalf("session id = %q, want ses_42", sess.ID)
 	}
@@ -140,7 +140,7 @@ func TestPerTaskAgentOverridesGlobalAgent(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), req); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	if len(rec.sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
 	}
@@ -153,7 +153,7 @@ func TestPerTaskAgentOverridesGlobalAgent(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), plain); err != nil {
 		t.Fatalf("Spawn without override: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	if len(rec.sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
 	}
@@ -177,7 +177,7 @@ func TestPromptConflictIsAccepted(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn with 409 prompt: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 }
 
 func TestWakeUsesStructuredRedactedPrompt(t *testing.T) {
@@ -259,7 +259,7 @@ func TestWatchIdleEmitsIdleEvent(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.WatchIdle(ctx)
@@ -346,7 +346,7 @@ func TestSpawnThenStopEmptiesRunMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	if _, ok := h.runFor(sess.ID); !ok {
 		t.Fatalf("Spawn did not bind session %q", sess.ID)
 	}
@@ -431,7 +431,7 @@ func TestSpawnUsesDispatchModelRef(t *testing.T) {
 	if err != nil || sess.ID != "ses_worker" {
 		t.Fatalf("Spawn = %q, %v", sess.ID, err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	if len(sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1: %v", len(sessions), sessions)
 	}
@@ -509,7 +509,7 @@ func TestSpawnModelRefOmitsEmptyVariantOnWire(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	if len(rec.sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
 	}
@@ -566,7 +566,7 @@ func TestSpawnCreatesOneSessionWithResolvedModel(t *testing.T) {
 	if err != nil || sess.ID != "ses_worker" {
 		t.Fatalf("Spawn = %q, %v", sess.ID, err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	if len(sessions) != 1 {
 		t.Fatalf("session creates = %d, want 1: %v", len(sessions), sessions)
 	}
@@ -636,7 +636,7 @@ func TestSpawnReusesResolvedModelAcrossWorkers(t *testing.T) {
 			t.Fatalf("Spawn %d: %v", i, err)
 		}
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 
 	mu.Lock()
 	if len(creates) != 4 || len(moves) != 4 || len(models) != 4 || len(prompts) != 4 {
@@ -659,7 +659,7 @@ func TestSpawnReusesResolvedModelAcrossWorkers(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn after model change: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 	mu.Lock()
 	defer mu.Unlock()
 	if len(models) != 5 || !reflect.DeepEqual(models[4]["model"], want) {
@@ -701,7 +701,7 @@ func TestSpawnDispatchModelRefDoesNotReplaceCachedDefault(t *testing.T) {
 	if _, err := h.Spawn(context.Background(), testSpawnRequest()); err != nil {
 		t.Fatalf("Spawn with harness model: %v", err)
 	}
-	h.waitForSetup()
+	h.setupWG.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -798,7 +798,7 @@ func TestSpawnReturnsBeforeDeferredSetup(t *testing.T) {
 	}
 
 	close(release)
-	h.waitForSetup()
+	h.setupWG.Wait()
 
 	// The worker still receives the deferred move and the synchronous model.
 	mu.Lock()
@@ -861,7 +861,7 @@ func TestDeferredSetupOutlivesCallerCancellation(t *testing.T) {
 	}
 	cancel()
 	close(release)
-	h.waitForSetup()
+	h.setupWG.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()

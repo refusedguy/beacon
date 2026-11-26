@@ -557,7 +557,7 @@ func TestMarkdownMalformedFrontmatterReported(t *testing.T) {
 	logs := captureTaskSourceLogs(t)
 	content := "---\nid: [unclosed\ntitle: Broken\n---\n# T-BROKEN. Broken\n"
 
-	if _, ok := parseCard(content, filepath.Join(t.TempDir(), "T-BROKEN.md")); ok {
+	if _, ok, _ := parseCardFields(content, filepath.Join(t.TempDir(), "T-BROKEN.md")); ok {
 		t.Fatal("malformed frontmatter parsed as a card")
 	}
 	if !strings.Contains(logs.String(), "malformed card frontmatter") {
@@ -571,7 +571,7 @@ func TestScopeClassification(t *testing.T) {
 		t.Fatalf("os.MkdirAll(filepath.Join(dir, \"pkg\"), 0o755): %v", err)
 	}
 	card := "# T-3. Scope\nВладелец файлов: internal/**/*.go, pkg/, pkg/core/task.go\n"
-	got, ok := parseCard(card, filepath.Join(dir, "T-3.md"))
+	got, ok, _ := parseCardFields(card, filepath.Join(dir, "T-3.md"))
 	if !ok {
 		t.Fatal("card not parsed")
 	}
