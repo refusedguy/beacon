@@ -37,16 +37,7 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 
 	writer := c.writer()
 	available, existing, results := c.existingBatchCards(ctx, writer, ids)
-	graph := make([]core.Task, 0, len(inputs))
-	groups := make([]batchGroup, len(inputs))
-	for i, in := range resolved {
-		if existing[i] {
-			continue
-		}
-		group := batchGroupTasks(in, ids[i])
-		groups[i] = batchGroup{start: len(graph), end: len(graph) + len(group)}
-		graph = append(graph, group...)
-	}
+	graph, groups := batchGraph(resolved, ids, existing)
 	if len(graph) == 0 {
 		c.Cache.RememberBatch(ids, results)
 		return results, nil
@@ -76,14 +67,35 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 		return nil, err
 	}
 
+	c.fillBatchResults(results, groups, existing, written)
+	c.Cache.RememberBatch(ids, results)
+	return results, nil
+}
+
+// batchGraph builds the cards to write and records which slice of the written
+// graph belongs to each input. Inputs the source already knows contribute no
+// cards and an empty group.
+func batchGraph(resolved []CreateTaskInput, ids []core.TaskID, existing []bool) ([]core.Task, []batchGroup) {
+	graph := make([]core.Task, 0, len(resolved))
+	groups := make([]batchGroup, len(resolved))
+	for i, in := range resolved {
+		if existing[i] {
+			continue
+		}
+		group := batchGroupTasks(in, ids[i])
+		groups[i] = batchGroup{start: len(graph), end: len(graph) + len(group)}
+		graph = append(graph, group...)
+	}
+	return graph, groups
+}
+
+func (c *TaskCreator) fillBatchResults(results []CreatedTask, groups []batchGroup, existing []bool, written []core.Task) {
 	for i, group := range groups {
 		if existing[i] {
 			continue
 		}
 		results[i] = c.result(written[group.start:group.end])
 	}
-	c.Cache.RememberBatch(ids, results)
-	return results, nil
 }
 
 // batchGroup marks the slice of the written graph that belongs to one input.
