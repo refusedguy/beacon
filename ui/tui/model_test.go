@@ -569,3 +569,158 @@ func TestAppliedFalseRendersReason(t *testing.T) {
 		t.Fatalf("view missing refusal reason %q:\n%s", reason, view)
 	}
 }
+
+// truncateRune is the pre-optimization truncator. It stays in the test so the
+// baseline renderer produces the same text the optimized View must produce.
+func truncateRune(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+// viewBaseline is the pre-optimization renderer. It stays in the test so the
+// identity test can pin the rendered bytes and the benchmark can report the
+// allocations the ASCII fast path, cached padding and reused row buffer save.
+func viewBaseline(m model) string {
+	var b strings.Builder
+	title := "Beacon runs"
+	if m.width > 0 {
+		b.WriteString(headerStyle.Render(title + strings.Repeat(" ", maxInt(0, m.width-len(title)))))
+		b.WriteString("\n")
+	} else {
+		b.WriteString(headerStyle.Render(title + "\n"))
+	}
+	if len(m.runs) == 0 {
+		b.WriteString("no runs\n")
+	}
+	start := 0
+	if m.cursor >= visibleRows {
+		start = m.cursor - visibleRows + 1
+	}
+	end := start + visibleRows
+	if end > len(m.runs) {
+		end = len(m.runs)
+	}
+	for i := start; i < end; i++ {
+		run := m.runs[i]
+		line := fmt.Sprintf("%-24s %-16s pr=%-5d %s", run.ID, run.State, run.PR, truncateRune(run.TaskID, 24))
+		if run.Reason != "" {
+			line += " " + truncateRune(run.Reason, 32)
+		}
+		if i == m.cursor {
+			line = cursorStyle.Render("> " + line)
+		} else {
+			line = "  " + line
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("\n")
+	if m.failed {
+		b.WriteString(errorStyle.Render(m.status))
+	} else {
+		b.WriteString(m.status)
+	}
+	b.WriteString("\n")
+	b.WriteString(headerStyle.Render("j/k move  a approve  u unblock  c/x cancel  r retry  q quit"))
+	return b.String()
+}
+
+// viewModel builds a model with a live render cache so repeated View calls
+// exercise the reused padding and row buffer.
+func viewModel(width, cursor int, runs []Run, status string, failed bool) model {
+	m := newModel(&Client{Endpoint: "http://127.0.0.1:7432"})
+	m.width = width
+	m.cursor = cursor
+	m.runs = runs
+	m.status = status
+	m.failed = failed
+	return m
+}
+
+// benchmarkFiveRuns builds a deterministic five-run snapshot for the view
+// identity test and the alternating benchmark.
+func benchmarkFiveRuns(state string) []Run {
+	states := []string{state, "ready", "waiting_ci", "closed", "open"}
+	runs := make([]Run, 5)
+	for i := range runs {
+		runs[i] = Run{
+			ID:     fmt.Sprintf("run-%04d", i),
+			TaskID: fmt.Sprintf("T-%04d", i),
+			State:  states[i],
+			PR:     i + 1,
+			Reason: "review approved",
+		}
+	}
+	return runs
+}
+
+// TestViewMatchesBaseline is the byte-identity check. The optimized View must
+// match the old renderer on every frame, including after its cache warms up.
+func TestViewMatchesBaseline(t *testing.T) {
+	runs := benchmarkFiveRuns("ready")
+	wide := benchmarkFiveRuns("ready")
+	wide[0].TaskID = "日本語テストタスク"
+	wide[0].Reason = "レビュー待ちの理由がとても長い"
+	wide[1].TaskID = "a😀b😀c😀d"
+	wide[1].Reason = "ready to merge"
+
+	cases := []struct {
+		name  string
+		model model
+	}{
+		{"empty no width", viewModel(0, 0, nil, "loading runs", false)},
+		{"empty with width", viewModel(80, 0, nil, "loaded 0 run(s)", false)},
+		{"five runs", viewModel(80, 0, runs, "loaded 5 run(s)", false)},
+		{"cursor last", viewModel(80, 4, runs, "loaded 5 run(s)", false)},
+		{"failed status", viewModel(60, 2, runs, "runs: boom", true)},
+		{"narrow width", viewModel(5, 1, runs, "loaded 5 run(s)", false)},
+		{"multibyte fields", viewModel(80, 0, wide, "loaded 5 run(s)", false)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := viewBaseline(tc.model)
+			for frame := 0; frame < 3; frame++ {
+				if got := tc.model.View(); got != want {
+					t.Fatalf("frame %d: View differs from baseline:\ngot:\n%s\nwant:\n%s", frame, got, want)
+				}
+			}
+		})
+	}
+}
+
+var benchViewOut string
+
+// BenchmarkViewFiveRuns alternates two five-run snapshots. Both sides render
+// the same five rows and report identical text; the reused side shows the lower
+// allocation count.
+func BenchmarkViewFiveRuns(b *testing.B) {
+	fixtures := [2]model{
+		viewModel(80, 0, benchmarkFiveRuns("waiting_ci"), "loaded 5 run(s)", false),
+		viewModel(80, 3, benchmarkFiveRuns("ready"), "loaded 5 run(s)", false),
+	}
+	want := [2]string{viewBaseline(fixtures[0]), viewBaseline(fixtures[1])}
+	for i := range fixtures {
+		if got := fixtures[i].View(); got != want[i] {
+			b.Fatalf("fixture %d view differs from baseline:\ngot:\n%s\nwant:\n%s", i, got, want[i])
+		}
+	}
+	b.Run("baseline", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(5, "rows/op")
+		for i := 0; i < b.N; i++ {
+			benchViewOut = viewBaseline(fixtures[i&1])
+		}
+	})
+	b.Run("reused", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(5, "rows/op")
+		for i := 0; i < b.N; i++ {
+			benchViewOut = fixtures[i&1].View()
+		}
+	})
+}

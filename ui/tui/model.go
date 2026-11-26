@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -26,12 +28,27 @@ const (
 // never schedules a refresh.
 const pingEvent = "ping"
 
+// blankPad supplies the spaces used to right-pad fixed-width row fields. Row
+// padding never exceeds visibleRowWidth, so one literal serves every row.
+const (
+	blankPad        = "                                "
+	visibleRowWidth = 24
+)
+
 // cursorStyle, headerStyle and errorStyle color the run list and status line.
 var (
 	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	headerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("204"))
 )
+
+// renderCache holds scratch state that View reuses across frames. It sits
+// behind a pointer so copies of model share the same buffer.
+type renderCache struct {
+	padWidth int
+	pad      string
+	row      []byte
+}
 
 // model is the Bubble Tea state for the run monitor.
 type model struct {
@@ -43,6 +60,7 @@ type model struct {
 	width      int
 	debounce   time.Duration
 	refreshGen *atomic.Uint64
+	render     *renderCache
 }
 
 // runsMsg carries a fetched run snapshot or its error. gen orders responses
@@ -88,6 +106,7 @@ func newModel(c *Client) model {
 		status:     "loading runs from " + c.Endpoint,
 		debounce:   refreshDebounce,
 		refreshGen: &atomic.Uint64{},
+		render:     &renderCache{},
 	}
 }
 
@@ -248,13 +267,22 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the run list and status line.
+// View renders the run list and status line. The header padding and the row
+// scratch buffer are reused across frames; the rendered text is unchanged.
 func (m model) View() string {
+	cache := m.render
+	if cache == nil {
+		cache = &renderCache{}
+	}
 	var b strings.Builder
 	title := "Beacon runs"
 	if m.width > 0 {
-		b.WriteString(headerStyle.Render(title + strings.Repeat(" ", maxInt(0, m.width-len(title)))))
-		b.WriteString("\n")
+		if cache.padWidth != m.width {
+			cache.padWidth = m.width
+			cache.pad = strings.Repeat(" ", maxInt(0, m.width-len(title)))
+		}
+		b.WriteString(headerStyle.Render(title + cache.pad))
+		b.WriteByte('\n')
 	} else {
 		b.WriteString(headerStyle.Render(title + "\n"))
 	}
@@ -269,18 +297,29 @@ func (m model) View() string {
 	if end > len(m.runs) {
 		end = len(m.runs)
 	}
+	row := cache.row[:0]
 	for i := start; i < end; i++ {
 		run := m.runs[i]
-		line := fmt.Sprintf("%-24s %-16s pr=%-5d %s", run.ID, run.State, run.PR, truncate(run.TaskID, 24))
+		row = row[:0]
+		writeField(&row, run.ID, visibleRowWidth)
+		row = append(row, ' ')
+		writeField(&row, run.State, 16)
+		row = append(row, " pr="...)
+		writeField(&row, strconv.Itoa(run.PR), 5)
+		row = append(row, ' ')
+		row = append(row, truncate(run.TaskID, visibleRowWidth)...)
 		if run.Reason != "" {
-			line += " " + truncate(run.Reason, 32)
+			row = append(row, ' ')
+			row = append(row, truncate(run.Reason, 32)...)
 		}
+		cache.row = row
 		if i == m.cursor {
-			line = cursorStyle.Render("> " + line)
+			b.WriteString(cursorStyle.Render("> " + string(row)))
 		} else {
-			line = "  " + line
+			b.WriteString("  ")
+			b.Write(row)
 		}
-		b.WriteString(line + "\n")
+		b.WriteByte('\n')
 	}
 	b.WriteString("\n")
 	if m.failed {
@@ -293,10 +332,44 @@ func (m model) View() string {
 	return b.String()
 }
 
-// truncate shortens s to limit runes with an ellipsis.
+// asciiOnly reports whether every byte of s is a single-byte UTF-8 code point.
+func asciiOnly(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// writeField appends s to dst and right-pads it with spaces to width runes.
+// It matches the width verb of fmt.Sprintf("%-*s", width, s).
+func writeField(dst *[]byte, s string, width int) {
+	n := len(s)
+	if !asciiOnly(s) {
+		n = utf8.RuneCountInString(s)
+	}
+	*dst = append(*dst, s...)
+	if n < width {
+		pad := width - n
+		if pad > len(blankPad) {
+			pad = len(blankPad)
+		}
+		*dst = append(*dst, blankPad[:pad]...)
+	}
+}
+
+// truncate shortens s to limit runes with an ellipsis. ASCII text skips the
+// rune conversion because a byte is a rune and len(s) is the rune count.
 func truncate(s string, limit int) string {
 	if limit <= 0 {
 		return ""
+	}
+	if asciiOnly(s) {
+		if len(s) <= limit {
+			return s
+		}
+		return s[:limit-1] + "…"
 	}
 	runes := []rune(s)
 	if len(runes) <= limit {
