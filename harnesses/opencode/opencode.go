@@ -306,7 +306,10 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 		return core.Session{}, fmt.Errorf("opencode: missing session id in %s", redact.Redact(string(data)))
 	}
 	h.bind(id, req.RunID)
-	h.deferSessionSetup(ctx, id, req, ref)
+	if err := h.applyModel(ctx, id, ref); err != nil {
+		return core.Session{}, err
+	}
+	h.deferSessionSetup(ctx, id, req)
 	if err := h.prompt(ctx, id, req.Prompt, messageID("spawn")); err != nil {
 		return core.Session{}, err
 	}

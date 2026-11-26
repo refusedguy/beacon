@@ -718,9 +718,10 @@ func TestSpawnDispatchModelRefDoesNotReplaceCachedDefault(t *testing.T) {
 	}
 }
 
-// TestSpawnReturnsBeforeDeferredSetup proves the move and model follow-ups are
-// off the Dispatch critical path. Spawn returns after create and prompt even
-// while the first follow-up is blocked at the server.
+// TestSpawnReturnsBeforeDeferredSetup proves the move follow-up is off the
+// Dispatch critical path. Spawn returns while the move is blocked at the
+// server. The model switch stays synchronous so callers can observe a config
+// reload as soon as Spawn returns.
 func TestSpawnReturnsBeforeDeferredSetup(t *testing.T) {
 	release := make(chan struct{})
 	moveEntered := make(chan struct{}, 1)
@@ -787,10 +788,19 @@ func TestSpawnReturnsBeforeDeferredSetup(t *testing.T) {
 		t.Fatal("Spawn blocked on deferred setup")
 	}
 
+	// The model switch is already observable, so a config reload is visible to
+	// the caller as soon as Spawn returns.
+	mu.Lock()
+	modelCount := len(models)
+	mu.Unlock()
+	if modelCount != 1 {
+		t.Fatalf("model switches after Spawn = %d, want 1", modelCount)
+	}
+
 	close(release)
 	h.waitForSetup()
 
-	// The worker still receives both follow-up settings.
+	// The worker still receives the deferred move and the synchronous model.
 	mu.Lock()
 	defer mu.Unlock()
 	if len(moves) != 1 || moves[0]["directory"] != "/tmp/worktrees/widget" {
@@ -798,7 +808,7 @@ func TestSpawnReturnsBeforeDeferredSetup(t *testing.T) {
 	}
 	wantModel := map[string]any{"id": "model-x", "providerID": "opencode"}
 	if len(models) != 1 || !reflect.DeepEqual(models[0]["model"], wantModel) {
-		t.Fatalf("deferred models = %v, want one with %v", models, wantModel)
+		t.Fatalf("model switches = %v, want one with %v", models, wantModel)
 	}
 }
 
