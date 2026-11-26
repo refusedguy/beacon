@@ -15,6 +15,17 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// bearerClient builds an HTTP client for loopback calls with the given
+// timeout. Callers that probe a slower endpoint pass their own timeout.
+func bearerClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout}
+}
+
+// bearerAuth sets a Bearer Authorization header on req.
+func bearerAuth(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
+}
+
 // subscriberBuffer is the number of PR changes queued for one monitor. A
 // monitor that falls further behind loses the extra changes and sees the run
 // state on a later refresh. The drop keeps one slow connection from blocking

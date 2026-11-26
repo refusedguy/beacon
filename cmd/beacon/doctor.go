@@ -72,7 +72,7 @@ const doctorHTTPTimeout = 5 * time.Second
 
 // doctorHTTPClient builds an HTTP client with the doctor timeout.
 func doctorHTTPClient() *http.Client {
-	return &http.Client{Timeout: doctorHTTPTimeout}
+	return bearerClient(doctorHTTPTimeout)
 }
 
 // exitCoder is implemented by errors that carry a process exit status.
@@ -376,11 +376,6 @@ func doctorNetworkChecks(ctx context.Context, cfg config.Config, client *http.Cl
 	}
 	wg.Wait()
 	return checks
-}
-
-// bearerAuth sets a Bearer Authorization header on req.
-func bearerAuth(req *http.Request, token string) {
-	req.Header.Set("Authorization", "Bearer "+token)
 }
 
 // scmBranchURL builds the branch API URL for the configured SCM provider.
