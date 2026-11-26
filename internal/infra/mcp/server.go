@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"unsafe"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -406,7 +407,13 @@ func jsonResult(v any) *msdk.CallToolResult {
 	if err != nil {
 		return textResult(fmt.Sprintf("{\"error\":%q}", err.Error()))
 	}
-	return textResult(string(b))
+	// The SDK stores tool text as a string, but json.Marshal hands us a byte
+	// slice we own. Expose those bytes as a string view instead of copying them
+	// into a second allocation. b is never mutated, and the returned string
+	// keeps the backing array alive, so the wire bytes stay identical.
+	return &msdk.CallToolResult{
+		Content: []msdk.Content{&msdk.TextContent{Text: unsafe.String(unsafe.SliceData(b), len(b))}},
+	}
 }
 
 // ServeStdio connects the server to a stdio transport and blocks until the session ends.
