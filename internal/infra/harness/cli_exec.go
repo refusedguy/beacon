@@ -10,8 +10,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 // CLIExec spawns an agent by running a shell command.
@@ -56,7 +56,7 @@ func (c *CLIExec) run(ctx context.Context, prompt string, req core.SpawnRequest)
 	if req.Workspace.Path != "" {
 		cmd.Dir = req.Workspace.Path
 	}
-	cmd.Stdin = strings.NewReader(shared.Redact(text))
+	cmd.Stdin = strings.NewReader(redact.Redact(text))
 	cmd.Env = append(cmd.Environ(),
 		"BEACON_RUN_ID="+string(req.RunID),
 		"BEACON_TASK_ID="+string(req.Task.ID),
@@ -65,7 +65,7 @@ func (c *CLIExec) run(ctx context.Context, prompt string, req core.SpawnRequest)
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("agent: %w: %s", err, shared.Redact(string(out)))
+		return "", fmt.Errorf("agent: %w: %s", err, redact.Redact(string(out)))
 	}
 	return string(out), nil
 }
