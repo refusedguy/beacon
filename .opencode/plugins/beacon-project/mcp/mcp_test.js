@@ -105,6 +105,19 @@ function buildCalls(deps) {
   return deps.execCalls.filter((call) => call.cmd === "bash")
 }
 
+// Count filesystem probes so a test can prove the resolver ran once.
+function probeCountingDeps(deps) {
+  const probes = []
+  return {
+    ...deps,
+    probes,
+    existsSync: (path) => {
+      probes.push(path)
+      return deps.existsSync(path)
+    },
+  }
+}
+
 test("a local binary resolves without probing sources or spawning a build", () => {
   const { local } = localPaths()
   const deps = localBinaryDeps()
@@ -363,4 +376,51 @@ test("two registrars resolve the local binary without a build", () => {
 
   assert.equal(deps.execCalls.length, 0)
   assert.equal(deps.statCalls.length, 0)
+})
+
+test("ten sequential CLI calls perform one path resolution", () => {
+  const { local } = localPaths()
+  const deps = probeCountingDeps(localBinaryDeps())
+
+  for (let i = 0; i < 10; i += 1) {
+    assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
+  }
+
+  assert.deepEqual(deps.probes, [local])
+})
+
+test("sequential server config requests reuse one path resolution", () => {
+  const { local } = localPaths()
+  const deps = probeCountingDeps(localBinaryDeps())
+
+  for (let i = 0; i < 10; i += 1) {
+    assert.deepEqual(beaconServerConfig(ROOT, deps).command, [local, "mcp"])
+  }
+
+  assert.deepEqual(deps.probes, [local])
+})
+
+test("a changed BEACON_BIN invalidates the memo", () => {
+  const { local } = localPaths()
+  const explicit = "/custom/beacon"
+  const deps = fakeDeps({
+    files: { [local]: "binary", [explicit]: "binary" },
+    env: {},
+  })
+
+  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
+
+  deps.env.BEACON_BIN = explicit
+
+  assert.deepEqual(beaconCommand(ROOT, deps), [explicit, "mcp"])
+})
+
+test("a new local binary invalidates the memo", () => {
+  const { local } = localPaths()
+  const mainGo = join(ROOT, "cmd", "beacon", "main.go")
+  const before = fakeDeps({ files: { [mainGo]: "package main" } })
+  const after = fakeDeps({ files: { [local]: "binary", [mainGo]: "package main" } })
+
+  assert.deepEqual(beaconCommand(ROOT, before), ["go", "run", "./cmd/beacon", "mcp"])
+  assert.deepEqual(beaconCommand(ROOT, after), [local, "mcp"])
 })

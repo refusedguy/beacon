@@ -1,7 +1,7 @@
 ---
 id: T-6da6c5a7
 title: Resolve beacon command once per root
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/mcp/mcp.js
     - .opencode/plugins/beacon-project/mcp/mcp_test.js
