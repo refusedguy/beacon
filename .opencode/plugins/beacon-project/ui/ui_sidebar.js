@@ -5,6 +5,7 @@ import { createBox, createLineMount, createSegmentBar, createText } from "./ui_n
 import { REASON_WIDTH } from "./ui_model.js"
 import { truncate } from "./ui_alerts.js"
 import { truncateSidebarTitle } from "./ui_view.js"
+import { propSetter } from "./ui_test_helpers.js"
 
 export const SIDEBAR_LINES = 34
 
@@ -44,9 +45,9 @@ export function sidebarPresentation(items = []) {
 }
 
 export function createSidebarMount(ui, deps) {
-  const { insert, setProp } = ui
+  const { insert } = ui
   const { color, BOLD, onItem, onCard, hoverBg } = deps
-  const set = setProp ?? ((node, key, value) => { node.props[key] = value })
+  const set = propSetter(ui)
   // Queue rows carry a card action instead of a run ID. Route them to the
   // card reader and leave every other row with the existing handler.
   const handle = (item) => {

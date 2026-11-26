@@ -1,7 +1,7 @@
 ---
 id: T-4ff3fc70
 title: Centralize prop-write and toast fallbacks
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_card_view.js
     - .opencode/plugins/beacon-project/ui/ui_detail_view.js

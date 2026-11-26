@@ -2,10 +2,11 @@
 // through ctx.ui.toast.show and then refreshes the snapshot. The RPC/CLI
 // transport is injected so the same code path is testable in plain Node.
 import { CONTROL_ACTIONS, errorMessage, str } from "./ui_model.js"
+import { toastShow } from "./ui_test_helpers.js"
 
 // Shared OSC52 copier. The toast reports the clipboard result, never a guess.
 export function clipboardCopier(ctx, toast) {
-  const show = toast ?? ((message, variant = "info") => ctx.ui?.toast?.show?.({ message, variant }))
+  const show = toastShow(ctx, toast)
   return (text, label = text) => {
     if (!text) return false
     const method = ctx.renderer?.copyToClipboardOSC52
@@ -21,7 +22,7 @@ export function clipboardCopier(ctx, toast) {
 }
 
 export function createActionRunner(ctx, source, { refresh = async () => {}, toast, confirm } = {}) {
-  const show = toast ?? ((message, variant = "info") => ctx.ui?.toast?.show?.({ message, variant }))
+  const show = toastShow(ctx, toast)
   const copyText = clipboardCopier(ctx, show)
   const ask = confirm ?? (async (run) => {
     if (typeof ctx.ui?.dialog?.confirm !== "function") return undefined

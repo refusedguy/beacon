@@ -3,6 +3,7 @@
 // a collapse, a refresh or a new selection never allocates a node.
 import { ACTION_NAMES, DETAIL_OPEN } from "./ui_view.js"
 import { createBox, createLineMount, createText } from "./ui_nodes.js"
+import { propSetter } from "./ui_test_helpers.js"
 
 export const DETAIL_LINES = 80
 const ACTION_LABEL = Object.freeze({
@@ -18,8 +19,8 @@ const fieldKey = (text) => text.padEnd(8, " ")
 
 export function createDetailMount(ui, deps) {
   const { insert } = ui
-  const { color, BOLD, onAction, onToggle, onClose, setProp } = deps
-  const set = setProp ?? ((node, key, value) => { node.props[key] = value })
+  const { color, BOLD, onAction, onToggle, onClose } = deps
+  const set = propSetter(deps)
   const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
 
   const header = createBox(ui, {

@@ -51,6 +51,16 @@ export function hostModule(created = []) {
   }
 }
 
+// Host adapters are optional in test doubles. These helpers keep the fallback
+// path identical for every mount and action runner.
+export function propSetter(source) {
+  return source?.setProp ?? ((node, key, value) => { node.props[key] = value })
+}
+
+export function toastShow(ctx, toast) {
+  return toast ?? ((message, variant = "info") => ctx.ui?.toast?.show?.({ message, variant }))
+}
+
 export function themeStub() {
   return {
     text: {
