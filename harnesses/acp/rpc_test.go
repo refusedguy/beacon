@@ -3,8 +3,11 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +59,28 @@ func runFakeAgent() {
 				"result": map[string]any{"sessionId": "sess_wire"},
 			})
 		case "session/prompt":
+			// A gate makes this call hold its watcher slot until the test
+			// creates the file. The marker tells the test the watcher is
+			// already borrowed when the request reaches the agent.
+			var params struct {
+				Gate string `json:"gate"`
+			}
+			if len(msg.Params) != 0 {
+				_ = json.Unmarshal(msg.Params, &params)
+			}
+			if params.Gate != "" {
+				_ = os.WriteFile(params.Gate+".started", nil, 0o600)
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					if _, err := os.Stat(params.Gate); err == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						os.Exit(4)
+					}
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
 			options := []map[string]any{
 				{"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
 			}
@@ -350,5 +375,198 @@ func TestCallRoutesCollidingRequestAndNotification(t *testing.T) {
 	}
 	if len(notes) != 1 || notes[0] != "note-collision" {
 		t.Fatalf("notifications = %v, want [note-collision]", notes)
+	}
+}
+
+// waitForFile blocks until path exists or timeout elapses.
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// promptWithGate runs a prompt call. A non-empty gate makes the fake agent
+// wait for that file before answering, so the call holds a watcher slot until
+// the test opens the gate.
+func promptWithGate(ctx context.Context, p *stdioProcess, gate string) ([]string, error) {
+	params := map[string]any{"sessionId": "sess_wire"}
+	if gate != "" {
+		params["gate"] = gate
+	}
+	var chunks []string
+	err := p.call(ctx, "session/prompt", params, nil, func(raw json.RawMessage) {
+		if text := collectText(raw); text != "" {
+			chunks = append(chunks, text)
+		}
+	})
+	return chunks, err
+}
+
+// TestNinthConcurrentCallPastWatcherPool fills the eight-slot package-global
+// watcher pool with held calls, then starts a ninth. It checks that cancelling
+// a held call frees its slot, that the ninth call still carries the response
+// and progress to its caller, and that no watcher or semaphore token is left
+// behind.
+func TestNinthConcurrentCallPastWatcherPool(t *testing.T) {
+	t.Setenv("ACP_FAKE_AGENT", "1")
+
+	// Start the pool goroutines before measuring the baseline.
+	warm, err := startProcess(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	werr := warm.call(wctx, "initialize", map[string]any{"protocolVersion": 1}, nil, nil)
+	wcancel()
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	_ = warm.close()
+	baseline := runtime.NumGoroutine()
+
+	type result struct {
+		chunks []string
+		err    error
+	}
+	const calls = maxWatchers + 1
+	results := make([]chan result, calls)
+	for i := range results {
+		results[i] = make(chan result, 1)
+	}
+	ctxs := make([]context.Context, calls)
+	cancels := make([]context.CancelFunc, calls)
+	procs := make([]*stdioProcess, calls)
+	gates := make([]string, maxWatchers)
+	root := t.TempDir()
+	for i := range gates {
+		gates[i] = filepath.Join(root, "gate-"+fmt.Sprint(i))
+	}
+
+	for i := 0; i < maxWatchers; i++ {
+		p, err := startProcess(os.Args[0], t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		procs[i] = p
+		ctxs[i], cancels[i] = context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancels[i]()
+		go func(i int, p *stdioProcess, ctx context.Context, gate string) {
+			chunks, err := promptWithGate(ctx, p, gate)
+			results[i] <- result{chunks: chunks, err: err}
+		}(i, p, ctxs[i], gates[i])
+	}
+
+	// Every held agent writes a marker before waiting on its gate. It can only
+	// have received the request after its call borrowed a watcher, so all
+	// eight slots are known to be busy at this point.
+	for _, gate := range gates {
+		waitForFile(t, gate+".started", 5*time.Second)
+	}
+
+	// Start the ninth call only after the pool is full. It has no gate and
+	// would answer at once, so it must be waiting on the pool semaphore.
+	p9, err := startProcess(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	procs[maxWatchers] = p9
+	ctxs[maxWatchers], cancels[maxWatchers] = context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancels[maxWatchers]()
+	go func() {
+		chunks, err := promptWithGate(ctxs[maxWatchers], p9, "")
+		results[maxWatchers] <- result{chunks: chunks, err: err}
+	}()
+
+	select {
+	case got := <-results[maxWatchers]:
+		t.Fatalf("ninth call finished before a slot was freed: %+v", got)
+	default:
+	}
+
+	// Cancelling a held call makes its watcher kill the agent. The call then
+	// returns an error to its caller and releases the slot.
+	cancels[0]()
+	select {
+	case got := <-results[0]:
+		if got.err == nil {
+			t.Fatal("cancelled held call returned no error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled held call did not return")
+	}
+
+	// The ninth call now borrows the freed watcher and reaches its caller with
+	// both the response and the progress chunk.
+	select {
+	case got := <-results[maxWatchers]:
+		if got.err != nil {
+			t.Fatalf("ninth call: %v", got.err)
+		}
+		if len(got.chunks) != 1 || got.chunks[0] != "pull/99" {
+			t.Fatalf("ninth call chunks = %v, want [pull/99]", got.chunks)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ninth call did not finish after a slot was freed")
+	}
+
+	// Open the other gates and check that progress reaches those callers too.
+	for i, gate := range gates {
+		if i == 0 {
+			continue
+		}
+		if err := os.WriteFile(gate, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i < maxWatchers; i++ {
+		select {
+		case got := <-results[i]:
+			if got.err != nil {
+				t.Fatalf("held call %d: %v", i, got.err)
+			}
+			if len(got.chunks) != 1 || got.chunks[0] != "pull/99" {
+				t.Fatalf("held call %d chunks = %v, want [pull/99]", i, got.chunks)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("held call %d did not finish", i)
+		}
+	}
+
+	for _, p := range procs {
+		_ = p.close()
+	}
+
+	// A fresh call must still borrow a watcher after the cancelled call, which
+	// proves no semaphore token was stranded.
+	fresh, err := startProcess(os.Args[0], t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fresh.close() }()
+	fctx, fcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer fcancel()
+	if err := fresh.call(fctx, "initialize", map[string]any{"protocolVersion": 1}, nil, nil); err != nil {
+		t.Fatalf("call after saturation: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		runtime.Gosched()
+		grew := runtime.NumGoroutine() - baseline
+		if grew <= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines grew by %d, want at most 2", grew)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
