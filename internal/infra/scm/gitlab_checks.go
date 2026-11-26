@@ -12,8 +12,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 // gitlabTail keeps the last max runes of s. The byte check avoids a rune slice
@@ -215,10 +215,10 @@ func (g *GitLab) jobFailureOutput(ctx context.Context, job glJob) string {
 	path := fmt.Sprintf("/projects/%s/jobs/%d/trace", g.project(), job.ID)
 	trace, err := g.request(ctx, http.MethodGet, path, nil, nil)
 	if err == nil && len(trace) > 0 {
-		return shared.Redact(gitlabTail(string(trace), 1200))
+		return redact.Redact(gitlabTail(string(trace), 1200))
 	}
 	if job.FailureReason != "" {
-		return shared.Redact(job.FailureReason)
+		return redact.Redact(job.FailureReason)
 	}
 	return ""
 }

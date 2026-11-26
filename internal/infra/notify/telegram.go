@@ -10,8 +10,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 // Telegram sends notifications through the Telegram Bot API.
@@ -34,7 +34,7 @@ func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
 	if !t.Enabled() {
 		return nil
 	}
-	text := shared.Redact(fmt.Sprintf("beacon [%s] %s: %s", n.RunID, n.Subject, n.Body))
+	text := redact.Redact(fmt.Sprintf("beacon [%s] %s: %s", n.RunID, n.Subject, n.Body))
 	payload, _ := json.Marshal(map[string]string{
 		"chat_id": t.ChatID,
 		"text":    text,

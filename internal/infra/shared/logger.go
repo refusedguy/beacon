@@ -32,7 +32,7 @@ func (h redactHandler) Handle(ctx context.Context, r slog.Record) error {
 	if r.NumAttrs() == 0 && !redact.HasCandidate(r.Message) {
 		return h.Handler.Handle(ctx, r)
 	}
-	nr := slog.NewRecord(r.Time, r.Level, Redact(r.Message), r.PC)
+	nr := slog.NewRecord(r.Time, r.Level, redact.Redact(r.Message), r.PC)
 	r.Attrs(func(a slog.Attr) bool {
 		nr.AddAttrs(redactAttr(a))
 		return true
@@ -60,10 +60,10 @@ func redactAttr(a slog.Attr) slog.Attr {
 func redactValue(v slog.Value) slog.Value {
 	switch v.Kind() {
 	case slog.KindString:
-		return slog.StringValue(Redact(v.String()))
+		return slog.StringValue(redact.Redact(v.String()))
 	case slog.KindAny:
 		if err, ok := v.Any().(error); ok {
-			return slog.StringValue(Redact(err.Error()))
+			return slog.StringValue(redact.Redact(err.Error()))
 		}
 	case slog.KindGroup:
 		attrs := v.Group()

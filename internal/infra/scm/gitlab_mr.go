@@ -10,8 +10,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 type glMR struct {
@@ -216,7 +216,7 @@ func (g *GitLab) unresolvedThreads(ctx context.Context, mrIID int) ([]string, er
 			if last == "" {
 				last = "unresolved discussion"
 			}
-			out = append(out, shared.Redact(gitlabTail(last, 1200)))
+			out = append(out, redact.Redact(gitlabTail(last, 1200)))
 		}
 	}
 	return out, nil

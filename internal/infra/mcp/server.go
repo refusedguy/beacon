@@ -14,8 +14,8 @@ import (
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/app"
-	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 // NewServer builds the MCP server and registers every tool in the catalog.
@@ -374,7 +374,7 @@ func registerReconcile(s *msdk.Server, sv Services) {
 		}
 		result := sv.Reconcile.Tick(ctx, a.PR)
 		if result.Error != "" {
-			slog.WarnContext(ctx, "beacon_reconcile", "pr", a.PR, "error", shared.Redact(result.Error))
+			slog.WarnContext(ctx, "beacon_reconcile", "pr", a.PR, "error", redact.Redact(result.Error))
 		}
 		return jsonResult(result), nil, nil
 	})
