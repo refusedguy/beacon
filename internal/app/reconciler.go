@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -167,19 +166,9 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 }
 
 // commitCard publishes the card from the run worktree. A push rejected as
-// non-fast-forward gets one refresh from the remote branch and one retry.
+// non-fast-forward gets one refresh from the run's own branch and one retry.
 func (r *Reconciler) commitCard(ctx context.Context, ws core.Workspace, pathspec, message string) error {
-	publish := func() error { return r.Workspace.CommitPath(ctx, ws, pathspec, message) }
-	err := publish()
-	var nff *NonFastForwardError
-	rebaser, ok := r.Workspace.(BaseRebaser)
-	if !errors.As(err, &nff) || !ok {
-		return err
-	}
-	if err := rebaser.RebaseBase(ctx, ws, ws.Branch); err != nil {
-		return err
-	}
-	return publish()
+	return publishWithNFFRetry(ctx, r.Workspace, ws, ws.Branch, pathspec, message)
 }
 
 func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observation) error {

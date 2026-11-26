@@ -752,11 +752,11 @@ func (c *TaskCreator) result(created []core.Task) CreatedTask {
 	return out
 }
 
-// publishPath rebases, commits pathspec and retries one non-fast-forward push.
-// Creation, update and deletion share it. Cancellation before the commit aborts
-// the publish so the caller can restore the cards. Cancellation after the
-// commit cannot undo it, so the push and its retry finish with a bounded
-// context detached from the caller.
+// publishPath rebases onto the configured base, then commits pathspec. A push
+// rejected as non-fast-forward is retried once on the same base. Cancellation
+// before the commit aborts the publish so the caller can restore the cards.
+// Cancellation after the commit cannot undo it, so the retry finishes with a
+// bounded context detached from the caller.
 func publishPath(ctx context.Context, ws PathCommitter, root core.Workspace, pathspec, message string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -768,6 +768,16 @@ func publishPath(ctx context.Context, ws PathCommitter, root core.Workspace, pat
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return publishWithNFFRetry(ctx, ws, root, base, pathspec, message)
+}
+
+// publishWithNFFRetry commits pathspec and retries the push once when the
+// remote ref advanced. Task creation and the reconciler share it. The caller
+// chooses the rebase base: task creation passes publishBase(root), the
+// reconciler passes the run's own branch. Keeping the base at the call site
+// makes it clear why a retry rebased onto a particular ref. The retry itself
+// runs under the bounded context in retryPublish.
+func publishWithNFFRetry(ctx context.Context, ws PathCommitter, root core.Workspace, base, pathspec, message string) error {
 	if err := ws.CommitPath(ctx, root, pathspec, message); err != nil {
 		var nff *NonFastForwardError
 		if !errors.As(err, &nff) {
