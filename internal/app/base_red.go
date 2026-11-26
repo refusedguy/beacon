@@ -168,11 +168,7 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	run.WorkspacePath = ws.Path
 	run.Branch = ws.Branch
 	run.ParentSessionID = r.ParentSessionID
-	instructions := ""
-	if r.Dispatcher != nil {
-		instructions = r.Dispatcher.WorkerInstructions
-	}
-	prompt := fixerPrompt(base, in, task, instructions)
+	prompt := fixerPrompt(base, in, task, r.WorkerInstructions)
 	session, err := r.Harness.Spawn(ctx, core.SpawnRequest{
 		Task: task, Workspace: ws, RunID: run.ID, Prompt: prompt,
 		ParentSessionID: run.ParentSessionID, IsFixer: true,
@@ -200,11 +196,12 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	return r.Store.UpdateIncident(ctx, in)
 }
 
-// maxAttempts keeps fixers and epics on the dispatcher's retry budget. The
-// default matches the configured merge max_attempts used for normal runs.
+// maxAttempts keeps fixers and epics on the retry budget copied from config
+// at construction. The default matches the configured merge max_attempts used
+// for normal runs.
 func (r *Reconciler) maxAttempts() int {
-	if r.Dispatcher != nil && r.Dispatcher.MaxAttempts > 0 {
-		return r.Dispatcher.MaxAttempts
+	if r.MaxAttempts > 0 {
+		return r.MaxAttempts
 	}
 	return 12
 }

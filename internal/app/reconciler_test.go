@@ -1222,7 +1222,6 @@ func TestHasAgentSlotUsesInjectedPort(t *testing.T) {
 		t.Fatal("port reported two slots but hasAgentSlot returned false")
 	}
 	r.AgentSlots = nil
-	r.Dispatcher = nil
 	if !r.hasAgentSlot(context.Background()) {
 		t.Fatal("missing slot source should fail open")
 	}
@@ -1401,4 +1400,53 @@ func TestRunPrunesStaleRowsOnTicker(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error = %v, want context.Canceled", err)
 	}
+}
+
+// fakePromoter records promotion calls without building a dispatcher.
+type fakePromoter struct {
+	promoted chan struct{}
+	err      error
+}
+
+func (p *fakePromoter) PromotePending(context.Context) ([]*core.Run, error) {
+	if p.promoted != nil {
+		select {
+		case p.promoted <- struct{}{}:
+		default:
+		}
+	}
+	return nil, p.err
+}
+
+func TestRunPromotesPendingThroughPort(t *testing.T) {
+	promoter := &fakePromoter{promoted: make(chan struct{}, 1)}
+	r := &Reconciler{Store: newFakeStore(), Interval: time.Millisecond, Promoter: promoter}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx, make(chan int)) }()
+
+	select {
+	case <-promoter.promoted:
+	case <-time.After(time.Second):
+		t.Fatal("reconciler tick did not call the promoter")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+}
+
+func TestFixerPromptUsesCopiedWorkerInstructions(t *testing.T) {
+	r, _, _, h, _ := redReconciler(t)
+	r.WorkerInstructions = "operator note for fixers"
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
+	}
+	for _, prompt := range h.prompts {
+		if strings.Contains(prompt, "operator note for fixers") {
+			return
+		}
+	}
+	t.Fatalf("fixer prompts = %q, want copied worker instructions", h.prompts)
 }
