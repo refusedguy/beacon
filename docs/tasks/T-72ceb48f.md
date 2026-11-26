@@ -1,7 +1,7 @@
 ---
 id: T-72ceb48f
 title: Reuse a buffer for SSE data lines
-status: available
+status: done
 scope:
     - harnesses/opencode/sse.go
     - harnesses/opencode/sse_test.go

@@ -1,7 +1,7 @@
 ---
 id: T-e32bea1a
 title: Narrow the store port used by control
-status: available
+status: done
 scope:
     - internal/app/control.go
     - cmd/beacon/main_test.go

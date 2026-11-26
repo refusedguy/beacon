@@ -591,3 +591,31 @@ func TestBuildInfraReturnsErrorInFixedOrder(t *testing.T) {
 		t.Fatalf("buildInfra() error = %v, want store error first in fixed order", err)
 	}
 }
+
+// narrowControlStore implements only the methods Control calls. The assertion
+// fails to compile if ControlStore ever carries a method Control does not use.
+type narrowControlStore struct{}
+
+func (narrowControlStore) Save(context.Context, *core.Run) error                 { return nil }
+func (narrowControlStore) Get(context.Context, core.RunID) (*core.Run, error)    { return nil, nil }
+func (narrowControlStore) FindByPR(context.Context, int) (*core.Run, error)      { return nil, nil }
+func (narrowControlStore) SetApproval(context.Context, core.RunID, string) error { return nil }
+
+var (
+	_ app.ControlStore = narrowControlStore{}
+	_ app.ControlStore = (*sqlite.Store)(nil)
+)
+
+func TestWireServicesPassesRealStoreToControl(t *testing.T) {
+	cfg := config.Config{BaseBranch: "main"}
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
+	}
+	defer store.Close()
+	infra := &wiredInfra{store: store, changes: make(chan int, 1)}
+	w := wireServices(cfg, t.TempDir(), "", infra, bareHarness{}, mergePolicy(cfg), nil)
+	if w.control.Store != store {
+		t.Error("control is missing the real store")
+	}
+}

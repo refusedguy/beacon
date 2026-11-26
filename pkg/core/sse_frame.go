@@ -41,9 +41,12 @@ func ParseSSE(r io.Reader, eof SSEEOFPolicy, onFrame func(SSEFrame)) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, sseInitialBuffer), sseMaxToken)
 	var frame SSEFrame
+	var data strings.Builder
 	emit := func() {
-		if frame.ID != "" || frame.Event != "" || frame.Data != "" {
+		if frame.ID != "" || frame.Event != "" || data.Len() != 0 {
+			frame.Data = data.String()
 			onFrame(frame)
+			data.Reset()
 		}
 	}
 	for scanner.Scan() {
@@ -66,10 +69,10 @@ func ParseSSE(r io.Reader, eof SSEEOFPolicy, onFrame func(SSEFrame)) error {
 		case "event":
 			frame.Event = value
 		case "data":
-			if frame.Data != "" {
-				frame.Data += "\n"
+			if data.Len() != 0 {
+				data.WriteByte('\n')
 			}
-			frame.Data += value
+			data.WriteString(value)
 		}
 	}
 	if eof == SSEKeepPartial {
