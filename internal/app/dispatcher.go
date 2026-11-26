@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,13 @@ type Dispatcher struct {
 	ResolveModel       ModelResolver
 	Decisions          DecisionLogger
 
+	// Spans records per-step timing when set. It never changes dispatch output.
+	Spans *DispatchSpans
+
+	// ensured holds the epic base branches already published in this batch.
+	// Every access happens under slotsMu and each batch clears it.
+	ensured map[string]struct{}
+
 	// slotsMu makes slot acquisition atomic across dispatch and promotion. A
 	// caller holds it from the Available check until every agent it starts is
 	// saved as active, so a concurrent path sees the updated store state.
@@ -73,6 +81,43 @@ type DispatchFailure struct {
 	Err    string
 }
 
+// DispatchSpans collects the duration of each named startOne step. Install one
+// on Dispatcher.Spans to profile a dispatch. Every observed step also emits a
+// debug record named "dispatch.span" that carries the cycle ID for correlation.
+// A nil Spans leaves the hot path free of collection.
+type DispatchSpans struct {
+	mu   sync.Mutex
+	durs map[string][]time.Duration
+}
+
+func (s *DispatchSpans) observe(name string, spent time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.durs == nil {
+		s.durs = make(map[string][]time.Duration)
+	}
+	s.durs[name] = append(s.durs[name], spent)
+}
+
+// Durations returns a copy of the recorded durations for name.
+func (s *DispatchSpans) Durations(name string) []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Duration(nil), s.durs[name]...)
+}
+
+// Steps returns the names of all recorded steps in sorted order.
+func (s *DispatchSpans) Steps() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	names := make([]string, 0, len(s.durs))
+	for name := range s.durs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func newRunID() core.RunID {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -87,6 +132,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()
 	d.modelRefs = nil
+	d.ensured = nil
 
 	var out DispatchResult
 	tasks, err := d.Source.ListAvailable(ctx)
@@ -167,6 +213,7 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()
 	d.modelRefs = nil
+	d.ensured = nil
 
 	active, err := d.Store.ListActive(ctx)
 	if err != nil {
@@ -206,30 +253,79 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 	return started, nil
 }
 
+// timed runs one named startOne step and records its duration. A nil Spans
+// skips the clock entirely. The debug record carries the cycle ID so a span
+// can be matched to the dispatch that produced it.
+func (d *Dispatcher) timed(ctx context.Context, name string, fn func() error) error {
+	if d.Spans == nil {
+		return fn()
+	}
+	start := time.Now()
+	err := fn()
+	spent := time.Since(start)
+	d.Spans.observe(name, spent)
+	slog.DebugContext(ctx, "dispatch.span", "step", name,
+		"cycle_id", cycleID(ctx), "elapsed_ms", float64(spent.Microseconds())/1000)
+	return err
+}
+
+// ensureOnce publishes an epic base branch at most once per batch. Children of
+// one epic share the branch, and ensureBranch starts with a remote round trip
+// even when the branch is already present, so repeating it for every child is
+// redundant git work. Only a successful publish is cached: a failure is retried
+// by the next child instead of being remembered for the rest of the batch.
+func (d *Dispatcher) ensureOnce(ctx context.Context, branch string) error {
+	branch = strings.TrimSpace(branch)
+	if !strings.HasPrefix(branch, epicBranchPrefix) {
+		return nil
+	}
+	if _, ok := d.ensured[branch]; ok {
+		return nil
+	}
+	if err := ensureBranch(ctx, d.Workspace, branch, ""); err != nil {
+		return err
+	}
+	if d.ensured == nil {
+		d.ensured = make(map[string]struct{})
+	}
+	d.ensured[branch] = struct{}{}
+	return nil
+}
+
 func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task) error {
 	ctx = WithCycleID(ctx, string(run.ID))
 	// A child card may outlive the epic creation that was supposed to publish
 	// its base branch. Check again here so a missing branch never closes a run.
-	if err := ensureBranch(ctx, d.Workspace, task.BaseBranch, ""); err != nil {
+	if err := d.timed(ctx, "ensureBranch", func() error {
+		return d.ensureOnce(ctx, task.BaseBranch)
+	}); err != nil {
 		return fmt.Errorf("base branch: %w", err)
 	}
-	ws, err := d.Workspace.Create(ctx, task)
-	if err != nil {
+	var ws core.Workspace
+	if err := d.timed(ctx, "Create", func() (err error) {
+		ws, err = d.Workspace.Create(ctx, task)
+		return err
+	}); err != nil {
 		return fmt.Errorf("workspace: %w", err)
 	}
 	run.WorkspacePath = ws.Path
 	run.Branch = ws.Branch
 	run.Scope = task.Scope
-	if err := d.Source.MarkInWorkspace(ctx, task.ID, ws.Path, "in_progress"); err != nil {
+	if err := d.timed(ctx, "MarkInWorkspace", func() error {
+		return d.Source.MarkInWorkspace(ctx, task.ID, ws.Path, "in_progress")
+	}); err != nil {
 		return fmt.Errorf("mark in workspace: %w", err)
 	}
-	session, err := d.Harness.Spawn(ctx, core.SpawnRequest{
-		Task: task, Workspace: ws, RunID: run.ID,
-		ParentSessionID: run.ParentSessionID, IsFixer: run.IsFixer,
-		ModelRef: d.modelRef(run.ParentSessionID),
-		Prompt:   spawnPrompt(task, run.ID, ws.Path, d.WorkerInstructions),
-	})
-	if err != nil {
+	var session core.Session
+	if err := d.timed(ctx, "Spawn", func() (err error) {
+		session, err = d.Harness.Spawn(ctx, core.SpawnRequest{
+			Task: task, Workspace: ws, RunID: run.ID,
+			ParentSessionID: run.ParentSessionID, IsFixer: run.IsFixer,
+			ModelRef: d.modelRef(run.ParentSessionID),
+			Prompt:   spawnPrompt(task, run.ID, ws.Path, d.WorkerInstructions),
+		})
+		return err
+	}); err != nil {
 		return fmt.Errorf("spawn: %w", err)
 	}
 	run.SessionID = session.ID
@@ -240,7 +336,9 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	if err := run.Apply(core.Event{Kind: core.EvStart}); err != nil {
 		return err
 	}
-	if err := d.Store.Save(ctx, run); err != nil {
+	if err := d.timed(ctx, "Save", func() error {
+		return d.Store.Save(ctx, run)
+	}); err != nil {
 		return fmt.Errorf("save: %w", err)
 	}
 	d.Decisions.logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
@@ -248,7 +346,9 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	// FindActiveByTask blocks a second run. Claiming through the root source
 	// would only rewrite the card on the operator's main checkout, leaving it
 	// dirty for the next rebase. SQLite is the authoritative claim here.
-	return d.Store.SetTaskStatus(ctx, task.ID, "claimed")
+	return d.timed(ctx, "SetTaskStatus", func() error {
+		return d.Store.SetTaskStatus(ctx, task.ID, "claimed")
+	})
 }
 
 // handleStartFailure closes a run only after its worker is gone. A worker that
