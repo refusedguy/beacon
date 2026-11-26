@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/google/go-github/v93 v93.0.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/refusedguy/beacon/harnesses/acp v0.0.0
 	github.com/refusedguy/beacon/harnesses/opencode v0.0.0
 	github.com/sony/gobreaker/v2 v2.2.0
 	github.com/spf13/cobra v1.10.2
@@ -33,5 +34,7 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
+
+replace github.com/refusedguy/beacon/harnesses/acp => ./harnesses/acp
 
 replace github.com/refusedguy/beacon/harnesses/opencode => ./harnesses/opencode
