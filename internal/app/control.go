@@ -36,9 +36,21 @@ type sqliteCodedError interface {
 	Code() int
 }
 
+// ControlStore is the store surface Control uses to apply one operator action.
+// Control reads one run, checks a PR owner, persists state and records an
+// approval. The active-run lookup that Retry needs stays an optional capability
+// resolved by activeTaskStates, the same way the reconciler type-asserts the
+// retention sweep it only runs on a daemon tick.
+type ControlStore interface {
+	Save(ctx context.Context, run *core.Run) error
+	Get(ctx context.Context, id core.RunID) (*core.Run, error)
+	FindByPR(ctx context.Context, pr int) (*core.Run, error)
+	SetApproval(ctx context.Context, id core.RunID, sha string) error
+}
+
 // Control applies operator actions to runs and persists the resulting state.
 type Control struct {
-	Store     core.RunStore
+	Store     ControlStore
 	Harness   core.AgentHarness
 	Workspace core.WorkspaceManager
 	OnChange  func(int)
