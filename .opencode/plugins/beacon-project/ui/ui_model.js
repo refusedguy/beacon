@@ -327,27 +327,39 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
   // cwd is a transient fallback, never a verified root; re-resolve per call so
   // a late location replaces it without a reload and can filter the queue.
   const explicit = root ?? deps.root ?? null
-  let current = null, cli = null, verified = false
+  const exists = deps.existsSync ?? fsExistsSync
+  let current = null, cli = null, verified = false, filterRoot = null
   const rootOf = () => {
-    const located = explicit ?? projectRoot(ctx); verified = Boolean(located)
+    const located = explicit ?? projectRoot(ctx)
     const next = located ?? process.cwd()
     if (next !== current || !cli) { current = next; cli = new CliStatusSource({ root: next, deps, limits, sessionID, model }) }
+    // Only a canonical root that can see docs/tasks may judge the queue. A
+    // worktree directory loads the plugin but holds none of the main project's
+    // cards, so filtering against it would drop every ready card. Without a
+    // location, an explicit root is the only root available and is trusted.
+    const info = locationInfo(ctx)
+    if (info) {
+      const canonical = info.canonical
+      filterRoot = canonical && exists(join(canonical, "docs", "tasks")) ? canonical : null
+    } else filterRoot = explicit
+    verified = Boolean(filterRoot)
     return next
   }
   const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx, { limits }) : null
   const snapshotView = (value, project) => {
     const view = normalizeSnapshot(value)
-    if (!verified) return view
+    if (!project) return view
     return { ...view, queue: view.queue.filter((item) => cardIsPending(project, item.id, deps)) }
   }
   const fallback = async (name, input) => {
-    const project = rootOf()
+    rootOf()
+    const project = filterRoot, isVerified = verified
     // A verified root lets the CLI read this project's store on this call. An
     // RPC snapshot can be stale or partially initialised and return an empty
     // queue without throwing, so it must not hide ready cards. An unverified
     // cwd guess stays behind RPC. RPC remains the accelerator for control and
     // dispatch.
-    if (name === "snapshot" && verified) {
+    if (name === "snapshot" && isVerified) {
       try { return snapshotView(await cli.snapshot(input), project) } catch {}
     }
     let value, usedRPC = false
