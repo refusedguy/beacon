@@ -179,6 +179,9 @@ func Load(path string) (Config, error) {
 		}
 		return c, err
 	}
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return defaults(), nil
+	}
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
