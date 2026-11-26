@@ -37,7 +37,7 @@ export function clipboardCopier(ctx, toast) {
   }
 }
 
-export function createActionRunner(ctx, source, { refresh = async () => {}, toast, confirm, log = console.debug } = {}) {
+export function createActionRunner(ctx, source, { refresh = async () => {}, afterDispatch = async () => {}, toast, confirm, log = console.debug } = {}) {
   const show = toastShow(ctx, toast)
   const copyText = clipboardCopier(ctx, show)
   const ask = confirm ?? (async (run) => {
@@ -101,6 +101,10 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
     log(`beacon dispatch click id=${id}`)
     setDispatching(true)
     refreshDispatchingViews()
+    // Start the snapshot read with dispatch so the two CLI lifetimes overlap.
+    // A watcher event may follow up once the run exists; the refresh coalesces
+    // both reads so only the final snapshot renders.
+    const refreshed = refresh()
     const promise = (async () => {
       try {
         const result = await source.dispatch(input)
@@ -114,7 +118,8 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, toas
       } finally {
         setDispatching(false)
         refreshDispatchingViews()
-        await refresh()
+        await refreshed
+        await afterDispatch()
       }
     })()
     lastDispatch = { id, at: now, promise }
