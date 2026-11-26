@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
@@ -213,9 +214,17 @@ type apiServices struct {
 
 type apiServer struct {
 	services apiServices
-	token    string
-	frames   *eventFrames
-	changes  *changeSubscribers
+	// token holds the token bytes, converted once at construction so the auth
+	// check does not allocate a byte slice on every request.
+	token   []byte
+	frames  *eventFrames
+	changes *changeSubscribers
+}
+
+// stringBytes returns a read-only byte view of s without allocating. Callers
+// must not modify the returned slice.
+func stringBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // runHTTP serves handler at addr until ctx ends and reports its exit on errCh.
@@ -244,7 +253,7 @@ func startAPIServer(ctx context.Context, services apiServices, token string, eve
 	go invalidateOnHarness(ctx, views[1], changes.snapshot)
 	frames := newEventFrames(views[0], json.Marshal)
 	go frames.run(ctx)
-	api := &apiServer{services: services, token: token, frames: frames, changes: changes}
+	api := &apiServer{services: services, token: []byte(token), frames: frames, changes: changes}
 	runHTTP(ctx, errCh, addr, api.handler())
 }
 
@@ -281,7 +290,7 @@ func (a *apiServer) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		header := r.Header.Get("Authorization")
 		if len(header) < 8 || header[:7] != "Bearer " ||
-			subtle.ConstantTimeCompare([]byte(header[7:]), []byte(a.token)) != 1 {
+			subtle.ConstantTimeCompare(stringBytes(header[7:]), a.token) != 1 {
 			http.Error(rw, "unauthorized", http.StatusUnauthorized)
 			return
 		}
