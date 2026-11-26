@@ -520,7 +520,8 @@ func TestLoadWorkflowRequiredChecksResolveJobNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(path): %v", err)
 	}
-	want := []string{"build", "lint", "test", "vet"}
+	// The matrix job is excluded; GitHub only emits expanded cell names.
+	want := []string{"build", "lint", "vet"}
 	if !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
 		t.Fatalf("required_checks = %v, want %v", c.Merge.RequiredChecks, want)
 	}
@@ -554,7 +555,7 @@ func TestWorkflowRequiredChecksFollowRenameOnReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload Load(path): %v", err)
 	}
-	wantNew := []string{"test", "verify"}
+	wantNew := []string{"verify"}
 	if !reflect.DeepEqual(reloaded.Merge.RequiredChecks, wantNew) {
 		t.Fatalf("reloaded required_checks = %v, want %v", reloaded.Merge.RequiredChecks, wantNew)
 	}
@@ -636,5 +637,26 @@ func TestLoadRejectsUnknownRequiredChecksMode(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "merge.required_checks_mode") {
 		t.Fatalf("error = %q, want the mode field in the message", err)
+	}
+}
+
+func TestDetectRequiredChecksSkipsMatrixJobs(t *testing.T) {
+	const workflow = "name: CI\njobs:\n" +
+		"  verify:\n    runs-on: ubuntu-latest\n" +
+		"  test-modules:\n    runs-on: ubuntu-latest\n" +
+		"    strategy:\n      matrix:\n        module: [cmd, pkg]\n" +
+		"  test:\n    needs: test-modules\n    runs-on: ubuntu-latest\n"
+	root := t.TempDir()
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := DetectRequiredChecks(root)
+	want := []string{"test", "verify"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DetectRequiredChecks = %v, want %v", got, want)
 	}
 }
