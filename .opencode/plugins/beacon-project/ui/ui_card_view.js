@@ -41,6 +41,7 @@ export function createPanelChrome(ui, deps, options = {}) {
   const set = propSetter(deps)
   const {
     title = "", titleColor = "base", onHint, onClose,
+    hintLabel = "ctrl+g", closeLabel = "✕",
     padding = 8, wrapControls = false, beforeHint = [], afterHint = [], afterControls = [],
   } = options
   const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
@@ -53,10 +54,10 @@ export function createPanelChrome(ui, deps, options = {}) {
     flexDirection: "row", minWidth: 0, flexShrink: 0,
     ...(wrapControls ? { flexWrap: "wrap", rowGap: 1 } : {}),
   })
-  const hint = createText(ui, { content: "ctrl+g", fg: color("action"), onMouseUp: onHint ?? onClose })
+  const hint = createText(ui, { content: hintLabel, fg: color("action"), onMouseUp: onHint ?? onClose })
   set(hint, "paddingLeft", 1); set(hint, "paddingRight", 1)
   const gap = createText(ui, { content: " ", fg: color("muted") })
-  const close = createText(ui, { content: "✕", fg: color("error"), onMouseUp: onClose })
+  const close = createText(ui, { content: closeLabel, fg: color("error"), onMouseUp: onClose })
   set(close, "paddingLeft", 1); set(close, "paddingRight", 1)
   for (const node of beforeHint) insert(controls, node)
   insert(controls, hint)
@@ -239,7 +240,7 @@ export function createCardMount(ui, deps) {
   set(duration, "paddingLeft", 1)
   set(duration, "visible", false)
   const chrome = createPanelChrome(ui, deps, {
-    title: "Task card", titleColor: "action", padding: 10, wrapControls: true,
+    title: "Task card", titleColor: "action", onClose, padding: 10, wrapControls: true,
     beforeHint: [back], afterHint: [readonly], afterControls: [duration],
   })
   const { container, header, title, controls } = chrome

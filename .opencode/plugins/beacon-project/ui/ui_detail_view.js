@@ -16,12 +16,15 @@ const BUTTON_FG = Object.freeze({
   retry: "success", approve: "success", cancel: "error",
   pr: "base", help: "action", copy: "base",
 })
+// The detail panel owns its header labels; the shared builder owns the layout.
+const HEADER_LABEL = Object.freeze({ hint: "ctrl+g", close: "✕" })
 export function createDetailMount(ui, deps) {
   const { insert } = ui
   const { color, BOLD, onAction, onToggle, onClose } = deps
   const set = propSetter(deps)
   const chrome = createPanelChrome(ui, deps, {
     title: "Beacon", onHint: onToggle, onClose, padding: 8,
+    hintLabel: HEADER_LABEL.hint, closeLabel: HEADER_LABEL.close,
   })
   const { container, fieldKey } = chrome
 
