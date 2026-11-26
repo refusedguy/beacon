@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 // Event is the monitor's copy of the daemon's loopback wire event. It is a
@@ -26,7 +26,8 @@ type Event struct {
 // never goes over the wire.
 const reconnectEventType = "reconnected"
 
-// sseFrame is one parsed server-sent event from the daemon.
+// sseFrame is the monitor's view of a shared frame. It keeps the local field
+// names so callers and tests read naturally.
 type sseFrame struct {
 	id    string
 	event string
@@ -135,39 +136,10 @@ func (c *Client) streamOnce(ctx context.Context, onEvent func(Event), lastID *st
 	})
 }
 
-// readSSE parses server-sent event frames from r and calls onFrame for each.
-// A frame left open at EOF is incomplete and is dropped.
+// readSSE parses the loopback stream. A frame left open when the stream ends
+// is incomplete and is dropped, so the next connection resumes with its id.
 func readSSE(r io.Reader, onFrame func(sseFrame)) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), responseLimit)
-	var frame sseFrame
-	for scanner.Scan() {
-		line := strings.TrimSuffix(scanner.Text(), "\r")
-		if line == "" {
-			if frame.event != "" || frame.data != "" || frame.id != "" {
-				onFrame(frame)
-			}
-			frame = sseFrame{}
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		field, value := line, ""
-		if i := strings.IndexByte(line, ':'); i >= 0 {
-			field, value = line[:i], strings.TrimPrefix(line[i+1:], " ")
-		}
-		switch field {
-		case "id":
-			frame.id = value
-		case "event":
-			frame.event = value
-		case "data":
-			if frame.data != "" {
-				frame.data += "\n"
-			}
-			frame.data += value
-		}
-	}
-	return scanner.Err()
+	return core.ParseSSE(r, core.SSEDropPartial, func(f core.SSEFrame) {
+		onFrame(sseFrame{id: f.ID, event: f.Event, data: f.Data})
+	})
 }
