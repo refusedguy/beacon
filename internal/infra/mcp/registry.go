@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 
+	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -11,28 +13,51 @@ import (
 // opencode.json. Running go generate rewrites those permissions from it.
 //go:generate go run ../../../cmd/beacon-gen -out ../../../opencode.json
 
-// ToolSpec describes one MCP tool for consumers such as a permissions generator.
+// ToolSpec describes one MCP tool. Catalog metadata and the register function
+// live in the same value, so adding a tool needs one table entry.
 type ToolSpec struct {
 	Name             string
 	Description      string
 	OrchestratorOnly bool
+	Register         func(*msdk.Server, Services)
 }
 
-// ToolCatalog is the declarative source of the tools this server exposes.
-// Each entry matches the msdk.Tool owned by the matching tool file.
-func ToolCatalog() []ToolSpec {
-	return []ToolSpec{
-		{Name: "beacon_dispatch", Description: "Pick up to N non-overlapping tasks and start agents."},
-		{Name: "beacon_watch_pr", Description: "Bind a pull request to a running task."},
-		{Name: "beacon_status", Description: "List active runs, PRs and blockers."},
-		{Name: "beacon_recent", Description: "List the most recently finished runs."},
-		{Name: "beacon_wait", Description: "Wait for a run to reach an active verdict or a terminal state."},
-		{Name: "beacon_control", Description: controlDescription()},
-		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true},
-		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
-		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
-		{Name: "beacon_reconcile", Description: "Force one reconciler tick for a PR and report its decision. Orchestrator only.", OrchestratorOnly: true},
+// toolSpecs is the one registration table. NewServer walks its derived
+// register list and ToolCatalog projects it for the permissions generator. Each
+// function owns exactly one tool implementation in its own file.
+var toolSpecs []ToolSpec
+
+// toolRegistrations is the register-function view of the one table. It is
+// derived here, never maintained by hand, so NewServer and the tests read the
+// same entries without a second place to add a tool.
+var toolRegistrations []func(*msdk.Server, Services)
+
+// init fills both views in one place. A variable initializer that named the
+// register functions would form an initialization cycle: those functions call
+// catalogTool, which reads the table.
+func init() {
+	toolSpecs = []ToolSpec{
+		{Name: "beacon_dispatch", Description: "Pick up to N non-overlapping tasks and start agents.", Register: registerDispatch},
+		{Name: "beacon_watch_pr", Description: "Bind a pull request to a running task.", Register: registerWatchPR},
+		{Name: "beacon_status", Description: "List active runs, PRs and blockers.", Register: registerStatus},
+		{Name: "beacon_recent", Description: "List the most recently finished runs.", Register: registerRecent},
+		{Name: "beacon_wait", Description: "Wait for a run to reach an active verdict or a terminal state.", Register: registerWait},
+		{Name: "beacon_control", Description: controlDescription(), Register: registerControl},
+		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskCreate},
+		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskDelete},
+		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskUpdate},
+		{Name: "beacon_reconcile", Description: "Force one reconciler tick for a PR and report its decision. Orchestrator only.", OrchestratorOnly: true, Register: registerReconcile},
 	}
+	toolRegistrations = make([]func(*msdk.Server, Services), 0, len(toolSpecs))
+	for _, spec := range toolSpecs {
+		toolRegistrations = append(toolRegistrations, spec.Register)
+	}
+}
+
+// ToolCatalog returns the registration table as catalog entries. The copy keeps
+// callers from editing the table in place.
+func ToolCatalog() []ToolSpec {
+	return append([]ToolSpec(nil), toolSpecs...)
 }
 
 // controlDescription spells out the verbs from core, so the advertised

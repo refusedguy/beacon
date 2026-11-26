@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -95,5 +96,47 @@ func TestMergePermissionsDropsLegacyActionNames(t *testing.T) {
 	}
 	if !foundCustom {
 		t.Error("custom permission was dropped")
+	}
+}
+
+// TestToolSpecTableIsSingleSource proves the one registration table is
+// complete and that its derived views agree. A tool added without a table row,
+// or with a missing register function, fails here.
+func TestToolSpecTableIsSingleSource(t *testing.T) {
+	if len(toolSpecs) == 0 {
+		t.Fatal("toolSpecs is empty")
+	}
+	seen := make(map[string]bool, len(toolSpecs))
+	for i, spec := range toolSpecs {
+		if spec.Name == "" {
+			t.Fatalf("toolSpecs[%d] has no name", i)
+		}
+		if !strings.HasPrefix(spec.Name, "beacon_") {
+			t.Errorf("toolSpecs[%d] name %q lacks the beacon_ prefix", i, spec.Name)
+		}
+		if seen[spec.Name] {
+			t.Errorf("toolSpecs has duplicate name %q", spec.Name)
+		}
+		seen[spec.Name] = true
+		if spec.Register == nil {
+			t.Errorf("toolSpecs[%d] %q has no register function", i, spec.Name)
+		}
+		tool := catalogTool(spec.Name)
+		if tool.Name != spec.Name || tool.Description != spec.Description {
+			t.Errorf("catalogTool(%q) = %+v, want name and description from the table", spec.Name, tool)
+		}
+	}
+	if len(toolRegistrations) != len(toolSpecs) {
+		t.Fatalf("toolRegistrations has %d entries, toolSpecs has %d", len(toolRegistrations), len(toolSpecs))
+	}
+	catalog := ToolCatalog()
+	if len(catalog) != len(toolSpecs) {
+		t.Fatalf("ToolCatalog has %d entries, toolSpecs has %d", len(catalog), len(toolSpecs))
+	}
+	for i, spec := range catalog {
+		want := toolSpecs[i]
+		if spec.Name != want.Name || spec.Description != want.Description || spec.OrchestratorOnly != want.OrchestratorOnly {
+			t.Errorf("ToolCatalog[%d] = %+v, want %+v", i, spec, want)
+		}
 	}
 }
