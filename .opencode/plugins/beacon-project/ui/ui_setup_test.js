@@ -283,14 +283,14 @@ test("a late ctx.location fills the queue without a manual reload", async () => 
   })
   const flush = () => new Promise((resolve) => setImmediate(resolve))
   await flush()
-  const queueCount = () => renderers["sidebar.content"]().children.find((c) => c.item?.sectionKey === "queue")?.item.status
-  assert.equal(queueCount(), "0", "an empty snapshot from a cwd guess is not cached")
+  const queueStatus = () => renderers["sidebar.content"]().children.find((c) => c.item?.name === "Queue")?.item.status
+  assert.equal(queueStatus(), "no tasks ready", "an empty snapshot from a cwd guess is not cached")
   assert.equal(calls.length, 1, "the CLI still runs with the transient cwd root")
 
   ctx.location = { project: { canonical: root } }
   tick()
   await flush()
-  assert.equal(queueCount(), "2", "the queue appears once the canonical root is known")
+  assert.equal(queueStatus(), "2", "the queue appears once the canonical root is known")
   assert.equal(calls[1].cwd, root)
   assert.equal(calls[1].env.BEACON_PROJECT_ROOT, root)
   dispose()

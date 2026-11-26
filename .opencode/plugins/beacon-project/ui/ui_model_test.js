@@ -44,10 +44,10 @@ test("sidebar renders a flat header, state bar legend and two lines per run", ()
   assert.equal(result[2], "▼ Active 1")
   assert.equal(result[3], "▲ T-1 BLK")
   assert.equal(result[4], "#42 3m dirty worktree")
-  assert.equal(result[5], "No tasks ready")
-  assert.equal(result[6], "▶ Queue 0")
-  assert.equal(result[7], "▼ Recent 0")
-  assert.equal(result[8], "No recent runs")
+  assert.equal(result[5], "Queue no tasks ready")
+  assert.equal(result.filter((line) => /queue|ready/i.test(line)).length, 1, "an empty queue renders one line")
+  assert.equal(result[6], "▼ Recent 0")
+  assert.equal(result[7], "No recent runs")
 })
 
 test("a long full title is not cut to a fixed width", () => {
@@ -336,9 +336,9 @@ test("cleanErrorMessage keeps readable text, strips escapes and caps length", ()
   assert.equal(cleanErrorMessage("x".repeat(300)).length, 120)
 })
 
-test("empty snapshot renders both sections with an honest dispatch label", () => {
+test("empty snapshot renders one collapsed queue line", () => {
   assert.deepEqual(renderSnapshotLines(EMPTY_SNAPSHOT), [
-    "Beacon 0 active", "P0 R0 C0 E0 F0 B0 M0 X0", "▼ Active 0", "Idle · no ready tasks",
-    "▶ Queue 0", "▼ Recent 0", "No recent runs",
+    "Beacon 0 active", "P0 R0 C0 E0 F0 B0 M0 X0", "▼ Active 0", "No active runs",
+    "Queue no tasks ready", "▼ Recent 0", "No recent runs",
   ])
 })

@@ -132,20 +132,23 @@ test("state bar uses solid glyphs, never exceeds 30 cells and hides empty segmen
   assert.equal(sidebar.legend.props.marginLeft, undefined)
 })
 
-test("Queue header matches Active and Recent without a duplicate count", () => {
+test("an empty Queue header cannot expand and carries no count", () => {
   const model = sidebarModel(EMPTY_SNAPSHOT, null, NOW)
   const headers = model.listItems.filter((i) => i.sectionKey)
   assert.deepEqual(headers.map((i) => [i.name, i.status, i.statusColor]), [
-    ["Active", "0", "muted"], ["Queue", "0", "muted"], ["Recent", "0", "muted"],
+    ["Active", "0", "muted"], ["Recent", "0", "muted"],
   ])
   for (const header of headers) assert.equal(/\(/.test(header.name), false)
-  assert.equal(model.listItems.find((i) => i.sectionKey === "queue").marker, "▶")
+  const queue = model.listItems.find((i) => i.name === "Queue")
+  assert.deepEqual([queue.status, queue.marker, queue.sectionKey], ["no tasks ready", "", undefined])
 })
 
 test("an idle sidebar shows one muted line and no dispatch plate", () => {
   const idle = sidebarModel(EMPTY_SNAPSHOT, null, NOW).listItems
-  const lines = idle.filter((i) => /Idle|No active runs|No tasks ready/.test(i.name))
-  assert.deepEqual(lines.map((i) => i.name), ["Idle · no ready tasks"])
+  const lines = idle.filter((i) => /No active runs|no tasks ready/i.test(`${i.name} ${i.status}`))
+  assert.deepEqual(lines.map((i) => [i.name, i.status]), [
+    ["No active runs", ""], ["Queue", "no tasks ready"],
+  ])
   assert.equal(lines[0].color, "muted")
   assert.equal(idle.some((i) => i.action === "dispatch"), false)
   const ready = sidebarModel({
