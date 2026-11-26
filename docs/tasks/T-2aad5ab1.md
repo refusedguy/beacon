@@ -1,7 +1,7 @@
 ---
 id: T-2aad5ab1
 title: Collapse decision log wrappers
-status: available
+status: done
 scope:
     - internal/app/decisionlog.go
     - internal/app/decisionlog_test.go
