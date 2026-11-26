@@ -14,7 +14,9 @@ test("elapsed formats seconds, minutes, hours and days", () => {
   assert.equal(elapsed(500), "0s")
   assert.equal(elapsed(90_000), "1m")
   assert.equal(elapsed(3 * 60_000), "3m")
-  assert.equal(elapsed(2 * 60 * 60_000 + 5 * 60_000), "2h")
+  assert.equal(elapsed(5467_000), "1h 31m")
+  assert.equal(elapsed(2 * 60 * 60_000 + 5 * 60_000), "2h 5m")
+  assert.equal(elapsed(2 * 60 * 60_000), "2h")
   assert.equal(elapsed(26 * 60 * 60_000), "1d")
   assert.equal(elapsed(-1), "")
 })
@@ -111,6 +113,10 @@ test("phaseLabel follows the live phase and merged rows drop the reason", () => 
     State: "waiting_ci", Durations: { waiting_ci_seconds: 120, running_seconds: 5, blocked_seconds: 0 },
   }))
   assert.equal(phaseLabel(waiting, NOW), "CI wait 2m")
+  const longWait = normalizeRun(makeRun({
+    State: "waiting_ci", Durations: { waiting_ci_seconds: 5467, running_seconds: 5, blocked_seconds: 0 },
+  }))
+  assert.equal(phaseLabel(longWait, NOW), "CI wait 1h 31m")
   const merged = normalizeRun(makeRun({ State: "merged", Reason: "automatic rebase" }))
   const [, detail] = runLineItems(merged, NOW, true)
   assert.equal(detail.status, "")

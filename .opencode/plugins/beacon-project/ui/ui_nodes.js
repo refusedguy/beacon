@@ -7,14 +7,15 @@ export function createLineMount(ui, {
   color, BOLD = 0, onItem, hoverBg, maxLines, wrap = false, shrinkStatus = false,
 }) {
   const { createElement, insert, setProp } = ui
-  const cell = (grow = false, shrinkable = false) => {
+  const cell = (grow = false, shrinkable = false, right = false) => {
     const node = createElement("text")
     setProp(node, "wrapMode", wrap && grow ? "word" : "none")
     setProp(node, "selectable", false)
     setProp(node, "truncate", !(wrap && grow))
     setProp(node, "flexShrink", grow || shrinkable ? 1 : 0)
-    if (grow || shrinkable) setProp(node, "minWidth", 0)
-    if (grow) setProp(node, "flexGrow", 1)
+    if (grow || shrinkable || right) setProp(node, "minWidth", 0)
+    if (grow || right) setProp(node, "flexGrow", 1)
+    if (right) setProp(node, "textAlign", "right")
     return node
   }
   const lines = []
@@ -26,7 +27,10 @@ export function createLineMount(ui, {
     setProp(box, "minWidth", 0)
     const marker = cell()
     const name = cell(true)
-    const status = cell(false, shrinkStatus)
+    // Fixed rows anchor the status at the panel's right edge: the cell takes
+    // the remaining width and right-aligns its text. Wrapping card rows keep
+    // their natural status width so long values wrap in place instead.
+    const status = cell(false, shrinkStatus, !wrap)
     insert(box, marker); insert(box, name); insert(box, status)
     cellsByLine.push([marker, name, status])
     if (onItem) {
