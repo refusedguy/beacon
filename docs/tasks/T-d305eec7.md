@@ -1,7 +1,7 @@
 ---
 id: T-d305eec7
 title: Split server-safe status RPC out of the TUI entry
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/status_rpc.js
     - .opencode/plugins/beacon-project/index.js
