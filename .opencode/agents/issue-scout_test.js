@@ -59,14 +59,6 @@ test("T3.38: прав для edit, shell и write нет: всё запреще�
   }
 })
 
-test("T3.38: ни одно правило не разрешает запись", () => {
-  for (const item of rules()) {
-    if (["edit", "shell", "write"].includes(item.action)) {
-      assert.notEqual(item.effect, "allow", `${item.action} не должен быть allow`)
-    }
-  }
-})
-
 test("T3.38: профиль описан как read-only исследование issue и PR", () => {
   assert.match(field("description"), /read-only/i)
   const body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "")

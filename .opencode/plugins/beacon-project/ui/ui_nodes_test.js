@@ -22,10 +22,10 @@ test("line mount applies cells when boxes have no children array", () => {
   const cells = created.filter((node) => node.tag === "text")
   const before = created.length
 
-  assert.doesNotThrow(() => mount.apply([
+  mount.apply([
     { marker: "▲", text: "run-1", status: "running", color: "success" },
     { marker: "", text: "Dispatch", status: "", color: "action", bold: true },
-  ]))
+  ])
   assert.equal(created.length, before, "apply must not call createElement or insert")
   assert.equal(cells.length, 6, "two lines of three cells are built once")
   assert.deepEqual(cells.map((cell) => cell.props.content), [
@@ -60,7 +60,7 @@ test("line mount hides empty rows against a host without box.children", () => {
   const mount = createLineMount(hostModule(created), { ...deps, maxLines: 2 })
   const boxes = created.filter((node) => node.tag === "box")
 
-  assert.doesNotThrow(() => mount.apply([{ marker: "", name: "only", color: "base" }]))
+  mount.apply([{ marker: "", name: "only", color: "base" }])
   assert.equal(boxes[0].props.visible, true)
   assert.equal(boxes[1].props.visible, false)
 })
@@ -71,21 +71,19 @@ test("sidebar renders and refreshes against a host without box.children", () => 
   const before = created.length
   const texts = created.filter((node) => node.tag === "text")
 
-  assert.doesNotThrow(() => sidebar.apply(sidebarModel({
+  sidebar.apply(sidebarModel({
     active: [makeRun({ ID: "r-1", State: "running" })], recent: [],
-  }, null, NOW)))
+  }, null, NOW))
   assert.ok(texts.some((node) => node.props.content === "Beacon"), "title cell gets content")
   assert.ok(texts.some((node) => String(node.props.content ?? "").includes("running")), "status cell gets content")
 
-  assert.doesNotThrow(() => sidebar.apply(sidebarModel({
+  sidebar.apply(sidebarModel({
     active: [makeRun({ ID: "r-1", State: "blocked" })], recent: [],
-  }, null, NOW)))
+  }, null, NOW))
   assert.equal(created.length, before, "refresh must not create nodes")
   assert.ok(texts.some((node) => String(node.props.content ?? "").includes("blocked")), "refresh updates the status")
-})
 
-test("sidebar renders an empty snapshot without a children array", () => {
-  const created = []
-  const sidebar = createSidebarMount(hostModule(created), { ...deps, onItem: () => {} })
-  assert.doesNotThrow(() => sidebar.apply(sidebarModel(EMPTY_SNAPSHOT, null, NOW)))
+  sidebar.apply(sidebarModel(EMPTY_SNAPSHOT, null, NOW))
+  assert.ok(texts.some((node) => node.props.content === "No active runs"), "empty snapshot clears the active rows")
+  assert.ok(texts.some((node) => node.props.content === "No recent runs"), "empty snapshot clears the recent rows")
 })

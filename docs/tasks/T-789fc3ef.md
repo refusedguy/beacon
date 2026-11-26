@@ -1,7 +1,7 @@
 ---
 id: T-789fc3ef
 title: Trim tautological JS tests
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_exports_test.js
     - .opencode/agents/issue-scout_test.js

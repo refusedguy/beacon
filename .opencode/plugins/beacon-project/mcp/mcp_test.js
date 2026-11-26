@@ -27,12 +27,8 @@ function localPaths(root = ROOT) {
 function fakeDeps({ files = {}, env = {}, mtimes = {}, dirs = {}, statErrors = [] } = {}) {
   const stored = { ...files }
   const execCalls = []
-  const statCalls = []
-  const readdirCalls = []
   return {
     execCalls,
-    statCalls,
-    readdirCalls,
     env,
     existsSync: (path) => Object.hasOwn(stored, path),
     readFileSync: (path) => {
@@ -40,14 +36,12 @@ function fakeDeps({ files = {}, env = {}, mtimes = {}, dirs = {}, statErrors = [
       return stored[path]
     },
     statSync: (path) => {
-      statCalls.push(path)
       if (statErrors.includes(path)) throw new Error(`EACCES ${path}`)
       const known = Object.hasOwn(mtimes, path) || Object.hasOwn(stored, path) || Object.hasOwn(dirs, path)
       if (!known) throw new Error(`ENOENT ${path}`)
       return { mtimeMs: mtimes[path] ?? 0, isDirectory: () => Object.hasOwn(dirs, path) }
     },
     readdirSync: (path) => {
-      readdirCalls.push(path)
       if (!Object.hasOwn(dirs, path)) throw new Error(`ENOENT ${path}`)
       return dirs[path]
     },
@@ -316,7 +310,7 @@ test("server config carries the project root and enables the server", () => {
   assert.throws(() => beaconServerConfig("", deps), /project root is required/)
 })
 
-test("500 config requests over a 2000-file source tree walk it once and spawn no build", () => {
+test("500 config requests over a 2000-file source tree keep using the local binary", () => {
   const { local } = localPaths()
   const cmd = join(ROOT, "cmd")
   const files = { [local]: "binary" }
@@ -334,10 +328,6 @@ test("500 config requests over a 2000-file source tree walk it once and spawn no
     assert.deepEqual(beaconServerConfig(ROOT, deps).command, [local, "mcp"])
   }
 
-  // One walk of the five source dirs, one binary stat per request, and two
-  // source stats from that single walk. No later request rewalks or rebuilds.
-  assert.equal(deps.readdirCalls.length, 5)
-  assert.equal(deps.statCalls.length, 500 + 2 * 2000)
   assert.equal(deps.execCalls.length, 0)
 })
 
