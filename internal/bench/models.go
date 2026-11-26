@@ -1,36 +1,46 @@
 package bench
 
 import (
+	"container/list"
 	"context"
+	"fmt"
 	"sync"
+
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// The two algorithms below are unexported in their owning packages, so this
-// benchmark harness cannot call them from outside. Each mirror is a line-for-
-// line copy of the production code at the cited location. The only changes are
-// names that would collide inside package bench and, for fanout, returning the
-// writable channels so the harness can pre-fill one view. Do not treat a change
+// The algorithms below are unexported in their owning packages, so this
+// benchmark harness cannot call them from outside. Each mirror copies the
+// production data shape and the work done per operation. The only changes are
+// names that would collide inside package bench, a step-at-a-time entry point
+// so the harness can drain views between events and count deliveries, and a
+// writable channel return on the legacy generic fanout. Do not treat a change
 // here as a change to production behavior; update the mirror when the cited
-// source changes.
+// source changes, apart from returning writable subscriber channels so the
+// harness can pre-fill the slow view.
 
-// journalLimit mirrors operationJournalLimit in internal/infra/mcp/server.go:102.
-const journalLimit = 128
+// operationJournalLimit mirrors operationJournalLimit in
+// internal/infra/mcp/server.go:104.
+const operationJournalLimit = 128
 
 type journalEntry struct{ result any }
 
-// opJournal mirrors internal/infra/mcp/server.go:112-178. A single-flight
-// channel covers concurrent calls with the same id, and order bounds the
-// completed entries so a long-lived daemon does not grow the map without limit.
+// opJournal mirrors internal/infra/mcp/server.go:111-189. A single-flight
+// channel covers concurrent calls with the same id. Recency is an LRU list and
+// index maps an id to its list element, so touch and eviction stay O(1).
 type opJournal struct {
 	mu       sync.Mutex
 	done     map[string]journalEntry
-	order    []string
+	order    *list.List
+	index    map[string]*list.Element
 	inflight map[string]chan struct{}
 }
 
 func newOpJournal() *opJournal {
 	return &opJournal{
 		done:     make(map[string]journalEntry),
+		order:    list.New(),
+		index:    make(map[string]*list.Element),
 		inflight: make(map[string]chan struct{}),
 	}
 }
@@ -50,14 +60,14 @@ func (j *opJournal) claim(id string) (<-chan struct{}, bool) {
 	return wait, true
 }
 
+// touch moves id to the most-recent end of the LRU in constant time. Callers
+// hold mu.
 func (j *opJournal) touch(id string) {
-	for i, key := range j.order {
-		if key == id {
-			j.order = append(j.order[:i], j.order[i+1:]...)
-			break
-		}
+	if elem, ok := j.index[id]; ok {
+		j.order.MoveToBack(elem)
+		return
 	}
-	j.order = append(j.order, id)
+	j.index[id] = j.order.PushBack(id)
 }
 
 func (j *opJournal) finish(id string, result any, err error) {
@@ -67,10 +77,15 @@ func (j *opJournal) finish(id string, result any, err error) {
 	if err == nil {
 		j.done[id] = journalEntry{result: result}
 		j.touch(id)
-		if len(j.order) > journalLimit {
-			oldest := j.order[0]
-			j.order = j.order[1:]
-			delete(j.done, oldest)
+		for len(j.done) > operationJournalLimit {
+			oldest := j.order.Front()
+			if oldest == nil {
+				break
+			}
+			key := oldest.Value.(string)
+			j.order.Remove(oldest)
+			delete(j.index, key)
+			delete(j.done, key)
 		}
 	}
 	j.mu.Unlock()
@@ -87,12 +102,129 @@ func (j *opJournal) cached(id string) (any, bool) {
 	return entry.result, ok
 }
 
-// fanoutBuffer mirrors the 16-slot view in cmd/beacon/serve.go:114.
+// subscriberBuffer mirrors subscriberBuffer in cmd/beacon/http.go:22. A full
+// subscriber drops the value instead of blocking the other monitors.
+const subscriberBuffer = 16
+
+// eventFrames mirrors cmd/beacon/http.go:117-179. One json.Marshal per event
+// produces the SSE frame bytes, and every subscriber gets the same bytes.
+type eventFrames struct {
+	mu      sync.Mutex
+	subs    map[chan []byte]struct{}
+	marshal func(any) ([]byte, error)
+}
+
+func newEventFrames(marshal func(any) ([]byte, error)) *eventFrames {
+	return &eventFrames{
+		subs:    make(map[chan []byte]struct{}),
+		marshal: marshal,
+	}
+}
+
+func (f *eventFrames) subscribe() (chan []byte, func()) {
+	ch := make(chan []byte, subscriberBuffer)
+	f.mu.Lock()
+	f.subs[ch] = struct{}{}
+	f.mu.Unlock()
+	return ch, func() {
+		f.mu.Lock()
+		delete(f.subs, ch)
+		f.mu.Unlock()
+	}
+}
+
+// deliver runs the body of eventFrames.run for one event. The harness drives
+// one event at a time so a full slow view always drops and a drained fast view
+// always receives, which keeps the counts identical between runs. It returns
+// the frame bytes, the number of successful deliveries and the number of drops.
+func (f *eventFrames) deliver(ev core.HarnessEvent) ([]byte, int64, int64) {
+	b, err := f.marshal(core.NewWireEvent(ev))
+	if err != nil {
+		return nil, 0, 0
+	}
+	frame := fmt.Appendf(nil, "event: harness\ndata: %s\n\n", b)
+	var delivered, dropped int64
+	f.mu.Lock()
+	for ch := range f.subs {
+		select {
+		case ch <- frame:
+			delivered++
+		default:
+			dropped++
+		}
+	}
+	f.mu.Unlock()
+	return frame, delivered, dropped
+}
+
+// runsCache mirrors the invalidation side of cmd/beacon/http.go:24-42. The
+// harness does not issue status reads, so it only needs the generation break
+// that changeSubscribers.run performs on every PR change.
+type runsCache struct {
+	mu   sync.Mutex
+	body []byte
+}
+
+func (c *runsCache) invalidate() {
+	c.mu.Lock()
+	c.body = nil
+	c.mu.Unlock()
+}
+
+// changeSubscribers mirrors cmd/beacon/http.go:65-115. Each SSE connection owns
+// one channel, and a full channel is skipped so one slow monitor cannot stall
+// the broadcast.
+type changeSubscribers struct {
+	mu       sync.Mutex
+	subs     map[chan int]struct{}
+	snapshot *runsCache
+}
+
+func newChangeSubscribers() *changeSubscribers {
+	return &changeSubscribers{
+		subs:     make(map[chan int]struct{}),
+		snapshot: &runsCache{},
+	}
+}
+
+func (s *changeSubscribers) subscribe() (chan int, func()) {
+	ch := make(chan int, subscriberBuffer)
+	s.mu.Lock()
+	s.subs[ch] = struct{}{}
+	s.mu.Unlock()
+	return ch, func() {
+		s.mu.Lock()
+		delete(s.subs, ch)
+		s.mu.Unlock()
+	}
+}
+
+// deliver runs the body of changeSubscribers.run for one PR change. It returns
+// the number of successful deliveries and drops.
+func (s *changeSubscribers) deliver(pr int) (int64, int64) {
+	s.snapshot.invalidate()
+	var delivered, dropped int64
+	s.mu.Lock()
+	for ch := range s.subs {
+		select {
+		case ch <- pr:
+			delivered++
+		default:
+			dropped++
+		}
+	}
+	s.mu.Unlock()
+	return delivered, dropped
+}
+
+// fanoutBuffer mirrors the view capacity of the generic fanout in
+// cmd/beacon/serve.go:95-124. That helper still supplies the source views used
+// by newFanoutBench; the measured sse-fanout hotspot uses the broadcasters
+// above, not this generic channel copy.
 const fanoutBuffer = 16
 
-// fanout mirrors cmd/beacon/serve.go:110-133. A slow view loses the value
-// instead of blocking the other views or the source. The harness uses the
-// writable return type to push events and to keep the third view full.
+// fanout is the generic channel copy from cmd/beacon/serve.go:95-124. It copies
+// every value into n buffered views and drops the value for a full view.
 func fanout[T any](ctx context.Context, src <-chan T, n int) []chan T {
 	outs := make([]chan T, n)
 	for i := range outs {
@@ -103,7 +235,10 @@ func fanout[T any](ctx context.Context, src <-chan T, n int) []chan T {
 			select {
 			case <-ctx.Done():
 				return
-			case v := <-src:
+			case v, ok := <-src:
+				if !ok {
+					return
+				}
 				for _, out := range outs {
 					select {
 					case out <- v:
@@ -116,9 +251,8 @@ func fanout[T any](ctx context.Context, src <-chan T, n int) []chan T {
 	return outs
 }
 
-// fanoutBench holds one long-lived fanout so a pass measures delivery, not
-// goroutine startup. views[2] is pre-filled to model a monitor that has stopped
-// reading; its drops are counted in every pass.
+// fanoutBench holds one long-lived generic fanout for the harness helper. The
+// sse-fanout hotspot measures eventFrames and changeSubscribers instead.
 type fanoutBench struct {
 	src    chan int
 	views  []chan int
