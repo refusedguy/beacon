@@ -1,7 +1,7 @@
 ---
 id: T-e941f2ed
 title: Render optimistic Dispatching state on click
-status: available
+status: in_progress
 scope:
     - .opencode/plugins/beacon-project/ui/ui_actions.js
     - .opencode/plugins/beacon-project/ui/ui_alerts.js
