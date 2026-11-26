@@ -1,7 +1,7 @@
 ---
 id: T-c6ec90ca
 title: Debounce pings into one reload
-status: available
+status: done
 scope:
     - ui/tui/model.go
     - ui/tui/model_test.go
