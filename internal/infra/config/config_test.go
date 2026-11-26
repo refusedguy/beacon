@@ -744,3 +744,67 @@ func TestDetectRequiredChecksSkipsMatrixJobs(t *testing.T) {
 		t.Fatalf("DetectRequiredChecks = %v, want %v", got, want)
 	}
 }
+
+func TestDetectRequiredChecksSkipsMatrixJobWhenFailFastComesFirst(t *testing.T) {
+	// fail-fast sits before matrix in the live CI file. A parser that leaves
+	// strategy: on the first sibling key will miss the matrix and advertise a
+	// job name GitHub never emits.
+	const workflow = "name: CI\njobs:\n" +
+		"  build:\n    runs-on: ubuntu-latest\n" +
+		"  test-modules:\n    runs-on: ubuntu-latest\n" +
+		"    strategy:\n      fail-fast: false\n      matrix:\n        module: [cmd, pkg]\n" +
+		"  verify:\n    runs-on: ubuntu-latest\n"
+	root := t.TempDir()
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(dir): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(ci.yml): %v", err)
+	}
+	got := DetectRequiredChecks(root)
+	want := []string{"build", "verify"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DetectRequiredChecks = %v, want %v", got, want)
+	}
+}
+
+func TestResolveRequiredChecksUsesExplicitProjectRoot(t *testing.T) {
+	// A config under <root>/.beacon must resolve workflows from <root>, not
+	// from the config file's own directory or the process working directory.
+	const workflow = "name: CI\njobs:\n  gate:\n    runs-on: ubuntu-latest\n"
+	path := writeWorkflowConfig(t, "merge:\n  required_checks_mode: workflow\n", workflow)
+	root := projectRootFromConfigPath(path)
+	if root == filepath.Dir(path) {
+		t.Fatalf("project root = %q, want the parent of .beacon", root)
+	}
+	want := []string{"gate"}
+	if got := DetectRequiredChecks(root); !reflect.DeepEqual(got, want) {
+		t.Fatalf("DetectRequiredChecks(%q) = %v, want %v", root, got, want)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	if !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
+		t.Fatalf("required_checks = %v, want the workflow from the explicit root %v", c.Merge.RequiredChecks, want)
+	}
+
+	// A standalone config has no .beacon parent and resolves beside itself.
+	standaloneDir := t.TempDir()
+	standalone := filepath.Join(standaloneDir, "config.yaml")
+	if err := os.WriteFile(standalone, []byte("merge:\n  required_checks_mode: workflow\n"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(standalone): %v", err)
+	}
+	writeProjectWorkflow(t, standaloneDir, workflow)
+	if got := projectRootFromConfigPath(standalone); got != standaloneDir {
+		t.Fatalf("standalone root = %q, want %q", got, standaloneDir)
+	}
+	sc, err := Load(standalone)
+	if err != nil {
+		t.Fatalf("Load(standalone): %v", err)
+	}
+	if !reflect.DeepEqual(sc.Merge.RequiredChecks, want) {
+		t.Fatalf("standalone required_checks = %v, want %v", sc.Merge.RequiredChecks, want)
+	}
+}
