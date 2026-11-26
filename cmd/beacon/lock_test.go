@@ -186,3 +186,83 @@ func writeStateFile(t *testing.T, path string, state daemonState) {
 		t.Fatal(err)
 	}
 }
+
+func TestStateFileSaveLoadClear(t *testing.T) {
+	dir := t.TempDir()
+	file := stateFile[daemonState](dir, daemonStateFile)
+	want := daemonState{PID: os.Getpid(), Root: dir, Heartbeat: time.Now().UTC()}
+	if err := file.save(want); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, daemonStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %o, want 600", info.Mode().Perm())
+	}
+	got, err := file.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got != want {
+		t.Fatalf("loaded = %+v, want %+v", *got, want)
+	}
+	file.clear()
+	if _, err := os.Stat(filepath.Join(dir, daemonStateFile)); !os.IsNotExist(err) {
+		t.Fatalf("file still present after clear: %v", err)
+	}
+	file.clear()
+}
+
+func TestStateFileLoadReportsMissingAndInvalid(t *testing.T) {
+	dir := t.TempDir()
+	file := stateFile[connectionInfo](dir, connectionFile)
+	if _, err := file.load(); !os.IsNotExist(err) {
+		t.Fatalf("missing file error = %v, want not-exist", err)
+	}
+	path := filepath.Join(dir, connectionFile)
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.load(); !errors.Is(err, errInvalidState) {
+		t.Fatalf("invalid file error = %v, want errInvalidState", err)
+	}
+}
+
+func TestRemoveIfExists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removeIfExists(path, true)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file still present: %v", err)
+	}
+	removeIfExists(path, true)
+	removeIfExists(path, false)
+}
+
+func TestConnectionRecordLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	token, err := writeConnection(dir, "http://127.0.0.1:7432")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("empty token")
+	}
+	info, err := readConnection(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Addr != "http://127.0.0.1:7432" || info.Token != token || info.PID != os.Getpid() {
+		t.Fatalf("connection = %+v", info)
+	}
+	removeConnection(dir)
+	if _, err := readConnection(dir); !os.IsNotExist(err) {
+		t.Fatalf("connection survived removal: %v", err)
+	}
+	removeConnection(dir)
+}
