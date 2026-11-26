@@ -328,12 +328,23 @@ const NEXT_STEPS = Object.freeze({
 
 export const nextStepLine = (run) => run ? (NEXT_STEPS[str(run.state).toLowerCase()] ?? "") : ""
 
-// Truncation is pure, so cache by the pair that determines the answer. Titles,
-// reasons and section names repeat on every poll; the cache keeps the
-// code-point walk to the first render of each string. Each width gets a bounded
-// FIFO map so a long session cannot grow it without limit.
-const TRUNCATE_CACHE_LIMIT = 2048
-const truncateCache = new Map()
+// Pure formatters see the same titles and reasons on every poll. One bounded
+// FIFO memo serves them both, so a long session cannot grow either cache.
+const MEMO_LIMIT = 2048
+export function boundedMemo(compute, key = (value) => value) {
+  const cache = new Map()
+  return (...args) => {
+    const cacheKey = key(...args)
+    if (cache.has(cacheKey)) return cache.get(cacheKey)
+    const result = compute(...args)
+    if (cache.size >= MEMO_LIMIT) cache.delete(cache.keys().next().value)
+    cache.set(cacheKey, result)
+    return result
+  }
+}
+
+// Truncation depends on both the text and the width, so the memo key carries
+// both. The code-point walk runs once per string and width.
 const clip = (text, width) => {
   // A string shorter than the width in UTF-16 units also fits in code points,
   // so the common short title skips Array.from entirely.
@@ -345,22 +356,12 @@ const clip = (text, width) => {
   return `${chars.slice(0, width - 1).join("")}…`
 }
 
+const truncateMemo = boundedMemo(clip, (text, width) => `${width}\u0000${text}`)
+
 // The host truncates from the middle, so clipped text is cut here from the end.
 // No ellipsis ever appears in the middle of a rendered string.
 export function truncate(value, width) {
-  const text = str(value)
-  let byText = truncateCache.get(width)
-  if (byText) {
-    const hit = byText.get(text)
-    if (hit !== undefined) return hit
-  } else {
-    byText = new Map()
-    truncateCache.set(width, byText)
-  }
-  const out = clip(text, width)
-  if (byText.size >= TRUNCATE_CACHE_LIMIT) byText.delete(byText.keys().next().value)
-  byText.set(text, out)
-  return out
+  return truncateMemo(str(value), width)
 }
 
 const REASON_RULES = [
@@ -376,12 +377,7 @@ const REASON_RULES = [
   [/^spawn:\s*/i, "spawn: "],
   [/^status:\s*/i, ""],
 ]
-const reasonCache = new Map()
-const REASON_CACHE_LIMIT = 2048
-export function compactReason(reason) {
-  const key = str(reason)
-  const hit = reasonCache.get(key)
-  if (hit !== undefined) return hit
+const compactReasonMemo = boundedMemo((key) => {
   let text = key.replace(/\s+/g, " ").trim()
   if (text) {
     for (const [pattern, replacement] of REASON_RULES) {
@@ -389,9 +385,10 @@ export function compactReason(reason) {
     }
     text = truncate(text.replace(/^:\s*/, "").replace(/\s+at\s+\/.*$/i, "").trim(), REASON_WIDTH)
   }
-  if (reasonCache.size >= REASON_CACHE_LIMIT) reasonCache.delete(reasonCache.keys().next().value)
-  reasonCache.set(key, text)
   return text
+})
+export function compactReason(reason) {
+  return compactReasonMemo(str(reason))
 }
 
 function clockDuration(seconds) {
