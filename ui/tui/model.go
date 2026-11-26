@@ -27,7 +27,6 @@ var (
 type model struct {
 	client *Client
 	runs   []Run
-	byID   map[string]int
 	cursor int
 	status string
 	failed bool
@@ -48,16 +47,15 @@ type actionMsg struct {
 	err    error
 }
 
-// refreshMsg requests a refresh after an event. The event travels with the
-// message so a notification about a known run can be applied locally instead
-// of re-reading every run.
+// refreshMsg requests a refresh after an event. The event is a notification:
+// run state always comes from a fresh runs read, not from the event payload.
 type refreshMsg struct {
 	event Event
 }
 
 // newModel builds the initial monitor model for c.
 func newModel(c *Client) model {
-	return model{client: c, byID: make(map[string]int), status: "loading runs from " + c.Endpoint}
+	return model{client: c, status: "loading runs from " + c.Endpoint}
 }
 
 // Init starts the first run fetch.
@@ -75,43 +73,10 @@ func (m model) reload() tea.Cmd {
 	}
 }
 
-// reindex rebuilds the run id index from the ordered run list. A snapshot
-// replaces the list, so the old index is discarded rather than mutated in
-// place. That keeps a previous model generation untouched.
-func (m *model) reindex() {
-	m.byID = make(map[string]int, len(m.runs))
-	for i := range m.runs {
-		m.byID[m.runs[i].ID] = i
-	}
-}
-
-// applyEvent folds a notification into the indexed run map. It reports true
-// when the event names a run the monitor already holds. In that case the
-// change is local and no runs read is needed. UpdatedAt is the only run field
-// the wire event can carry, and it is not rendered, so View keeps its text.
-func (m model) applyEvent(ev Event) (model, bool) {
-	if ev.RunID == "" {
-		return m, false
-	}
-	i, ok := m.byID[ev.RunID]
-	if !ok {
-		return m, false
-	}
-	if ev.At != "" {
-		runs := make([]Run, len(m.runs))
-		copy(runs, m.runs)
-		runs[i].UpdatedAt = ev.At
-		m.runs = runs
-	}
-	return m, true
-}
-
-// onRefresh applies an event when it names a known run and reloads the
-// snapshot otherwise. It is the single refresh path for both message shapes.
-func (m model) onRefresh(ev Event) (tea.Model, tea.Cmd) {
-	if updated, ok := m.applyEvent(ev); ok {
-		return updated, nil
-	}
+// onRefresh treats every event as a notification and schedules a runs read.
+// The event payload cannot carry run state, so a known run is refreshed from
+// the API like any other run.
+func (m model) onRefresh(_ Event) (tea.Model, tea.Cmd) {
 	return m, m.reload()
 }
 
@@ -163,7 +128,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.failed = false
 		m.runs = msg.runs
-		m.reindex()
 		if m.cursor >= len(m.runs) {
 			m.cursor = len(m.runs) - 1
 		}
