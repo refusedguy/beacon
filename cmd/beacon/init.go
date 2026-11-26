@@ -76,12 +76,14 @@ func newInitCommand() *cobra.Command {
 }
 
 // resolveInitOptions turns parsed flags into init options with defaults.
+// The OpenCode endpoint keeps both spellings: OPENCODE_ENDPOINT from OpenCode
+// and BEACON_OPENCODE_ENDPOINT from older Beacon configurations.
 func resolveInitOptions(f *initFlags) initOptions {
 	o := initOptions{
 		taskSource:      firstNonEmpty(f.taskSource, "markdown"),
 		scm:             f.scm,
 		harness:         firstNonEmpty(f.harness, "opencode"),
-		endpoint:        firstNonEmpty(f.harnessEndpoint, os.Getenv("OPENCODE_ENDPOINT"), os.Getenv("BEACON_OPENCODE_ENDPOINT"), "http://127.0.0.1:4096"),
+		endpoint:        firstNonEmpty(f.harnessEndpoint, envString("OPENCODE_ENDPOINT", ""), envString("BEACON_OPENCODE_ENDPOINT", ""), "http://127.0.0.1:4096"),
 		maxInFlight:     f.maxInFlight,
 		maxActiveAgents: f.maxActiveAgents,
 		weakPC:          true,
@@ -491,7 +493,7 @@ func pluginSource(explicit string) string {
 	if explicit != "" {
 		return explicit
 	}
-	if fromEnv := os.Getenv("BEACON_PLUGIN_DIR"); fromEnv != "" {
+	if fromEnv := envString("BEACON_PLUGIN_DIR", ""); fromEnv != "" {
 		return fromEnv
 	}
 	exe, err := os.Executable()

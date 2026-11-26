@@ -195,7 +195,7 @@ func doctorBaseBranch(root string, cfg config.Config) doctorCheck {
 
 // doctorTokenCheck reports whether the SCM token is available.
 func doctorTokenCheck(cfg config.Config) doctorCheck {
-	if cfg.SCM.Token != "" || os.Getenv(cfg.SCM.TokenEnv) != "" {
+	if cfg.SCM.Token != "" || envString(cfg.SCM.TokenEnv, "") != "" {
 		return doctorCheck{"scm token", checkOK, "present via env or config"}
 	}
 	return doctorCheck{"scm token", checkWarn, "not set; export " + cfg.SCM.TokenEnv}
@@ -358,13 +358,13 @@ func doctorNetworkChecks(ctx context.Context, cfg config.Config, client *http.Cl
 		{
 			name:     "opencode endpoint",
 			endpoint: strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/project",
-			token:    firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token),
+			token:    firstNonEmpty(envString(cfg.Harness.TokenEnv, ""), cfg.Harness.Token),
 			auth:     shared.ApplyAuth,
 		},
 		{
 			name:     "scm base branch",
 			endpoint: scmBranchURL(cfg),
-			token:    firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token),
+			token:    firstNonEmpty(envString(cfg.SCM.TokenEnv, ""), cfg.SCM.Token),
 			auth:     bearerAuth,
 		},
 	}

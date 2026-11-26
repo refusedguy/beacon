@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -22,7 +21,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 		Use:   "serve",
 		Short: "Run the reconciler, dispatcher queue, webhook and loopback API",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			parent := os.Getenv("BEACON_PARENT_SESSION")
+			parent := parentSessionFromEnv()
 			w, err := wire(*configPath, parent)
 			if err != nil {
 				return err
@@ -42,7 +41,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer tracker.Close()
-			addr := firstNonEmpty(os.Getenv("BEACON_API_ADDR"), "127.0.0.1:7432")
+			addr := envString("BEACON_API_ADDR", "127.0.0.1:7432")
 			token, err := writeConnection(dir, "http://"+addr)
 			if err != nil {
 				return err

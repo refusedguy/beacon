@@ -21,11 +21,21 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// envString reads an environment variable and returns fallback when it is
+// unset or empty. The variable name stays at the read site so every config key
+// remains visible where it is used.
+func envString(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // parentSessionFromEnv returns the orchestrator session carried by a CLI
 // process. serve and mcp read the same variable, so dispatch and control must
 // read it too or CLI-launched runs lose their merge notifications.
 func parentSessionFromEnv() string {
-	return os.Getenv("BEACON_PARENT_SESSION")
+	return envString("BEACON_PARENT_SESSION", "")
 }
 
 // wireFn builds the wiring for a config path and a parent session. Commands
