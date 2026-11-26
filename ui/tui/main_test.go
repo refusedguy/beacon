@@ -24,10 +24,10 @@ func (s *captureSender) Send(msg tea.Msg) {
 	}
 }
 
-// TestStreamedEventSkipsRunsRead proves the live wiring passes a decoded SSE
-// event into refreshMsg. One event for a known run reaches refreshMsg.event,
-// and the model applies it as a delta without requesting /api/v1/runs.
-func TestStreamedEventSkipsRunsRead(t *testing.T) {
+// TestStreamedEventTriggersRunsRead proves the live wiring passes a decoded
+// SSE event into refreshMsg and that an event for a known run schedules a runs
+// read. The daemon's runs response, not the event body, is the run state.
+func TestStreamedEventTriggersRunsRead(t *testing.T) {
 	const runID = "run-live"
 	const at = "2026-11-26T11:00:00Z"
 	eventJSON := `{"id":9,"type":"idle","run_id":"` + runID + `","at":"` + at + `"}`
@@ -45,7 +45,7 @@ func TestStreamedEventSkipsRunsRead(t *testing.T) {
 		case apiRunsPath:
 			atomic.AddInt64(&runsGets, 1)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"runs":[]}`)
+			_, _ = io.WriteString(w, `{"runs":[{"id":"`+runID+`","state":"idle"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -53,13 +53,7 @@ func TestStreamedEventSkipsRunsRead(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "tok")
-	// The run is already indexed, so the delta path needs no initial runs read.
-	m := model{
-		client: client,
-		runs:   []Run{{ID: runID, State: "waiting_ci"}},
-		byID:   map[string]int{runID: 0},
-		status: "ready",
-	}
+	m := newModel(client)
 
 	sender := &captureSender{msgs: make(chan tea.Msg, 1)}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -84,19 +78,20 @@ func TestStreamedEventSkipsRunsRead(t *testing.T) {
 		t.Fatalf("refreshMsg.event = %+v, want %+v", refresh.event, want)
 	}
 
-	next, cmd := m.Update(refresh)
-	if cmd != nil {
-		t.Fatal("a known-run event produced a reload command")
+	_, cmd := m.Update(refresh)
+	if cmd == nil {
+		t.Fatal("a known-run event must schedule a runs read")
 	}
-	if got := atomic.LoadInt64(&runsGets); got != 0 {
-		t.Fatalf("/api/v1/runs GETs = %d, want 0", got)
+	raw := cmd()
+	msg, ok := raw.(runsMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("reload command = %T %v, want runsMsg with no error", raw, msg.err)
 	}
-	final, ok := next.(model)
-	if !ok {
-		t.Fatalf("Update returned %T, want model", next)
+	if got := atomic.LoadInt64(&runsGets); got != 1 {
+		t.Fatalf("/api/v1/runs GETs = %d, want 1", got)
 	}
-	if i := final.byID[runID]; final.runs[i].UpdatedAt != at {
-		t.Fatalf("event not applied to indexed run: %+v", final.runs[i])
+	if len(msg.runs) != 1 || msg.runs[0].ID != runID {
+		t.Fatalf("reload returned %+v, want run %q", msg.runs, runID)
 	}
 
 	cancel()
