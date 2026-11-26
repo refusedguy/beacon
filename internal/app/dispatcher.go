@@ -31,13 +31,13 @@ func logStep(what string, run *core.Run, err error) {
 type ModelResolver func(parentSession string) core.ModelRef
 
 // DispatchStore is the store surface Dispatcher uses while it selects and
-// starts tasks.
+// starts tasks. The active-run guard reads one list per dispatch, so the port
+// needs no per-task active lookup.
 type DispatchStore interface {
 	SyncTasks(ctx context.Context, tasks []core.Task) error
 	ListReadyTasks(ctx context.Context) ([]core.Task, error)
 	ListActive(ctx context.Context) ([]*core.Run, error)
 	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
-	FindActiveByTask(ctx context.Context, task core.TaskID) (*core.Run, error)
 	Save(ctx context.Context, run *core.Run) error
 	SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error
 }
@@ -194,7 +194,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	if err != nil {
 		return out, err
 	}
-	budget := d.Available(ctx)
+	budget := d.availableFrom(active)
 	d.Decisions.logDispatchCandidates(ctx, len(ready), len(active), sel.Limit, budget)
 	if sel.Limit <= 0 {
 		return out, nil
@@ -203,21 +203,32 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	for _, s := range sel.Skipped {
 		d.Decisions.logDispatchSkip(ctx, s)
 	}
-	if err := d.launch(ctx, sel.Chosen, budget, &out); err != nil {
+	if err := d.launch(ctx, sel.Chosen, budget, activeRunsByTask(active), &out); err != nil {
 		return out, err
 	}
 	return out, nil
 }
 
+// activeRunsByTask indexes the active list by the task that owns each run.
+// launch uses it for the per-task guard instead of one store query per task.
+// ListActive is ordered oldest first, so a later entry overwrites an earlier
+// one and the map holds the newest run for a task.
+func activeRunsByTask(active []*core.Run) map[core.TaskID]*core.Run {
+	byTask := make(map[core.TaskID]*core.Run, len(active))
+	for _, run := range active {
+		byTask[run.TaskID] = run
+	}
+	return byTask
+}
+
 // launch starts a run for each chosen task within the agent budget and adds
-// skipped and failed candidates to out. The caller holds slotsMu from the
-// budget check through this call, so the budget re-read after a failed start
-// stays under the lock and cannot oversubscribe the agent limit.
-func (d *Dispatcher) launch(ctx context.Context, chosen []core.Task, budget int, out *DispatchResult) error {
+// skipped and failed candidates to out. active holds the runs from the single
+// list Dispatch read before selection. The caller holds slotsMu from the
+// budget check through this call, so the re-read after a failed start stays
+// under the lock and cannot oversubscribe the agent limit.
+func (d *Dispatcher) launch(ctx context.Context, chosen []core.Task, budget int, active map[core.TaskID]*core.Run, out *DispatchResult) error {
 	for _, task := range chosen {
-		if existing, err := d.Store.FindActiveByTask(ctx, task.ID); err != nil {
-			return err
-		} else if existing != nil {
+		if existing, ok := active[task.ID]; ok {
 			skip := SkippedTask{
 				TaskID:       task.ID,
 				Code:         SkipActiveRun,
@@ -240,9 +251,9 @@ func (d *Dispatcher) launch(ctx context.Context, chosen []core.Task, budget int,
 				out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
 				d.handleStartFailure(ctx, run, err)
 				// The failed run may still hold a slot when its worker survived.
-				// Re-read under slotsMu instead of spending the slot on the next
-				// task and exceeding the limit.
-				budget = d.Available(ctx)
+				// One re-read under slotsMu refreshes both the budget and the
+				// task guard before the next task starts.
+				budget, active = d.refreshActive(ctx, active)
 				continue
 			}
 			budget--
@@ -394,9 +405,9 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	}
 	d.Decisions.logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
 	// MarkInWorkspace already sets in_progress inside the worker branch, and
-	// FindActiveByTask blocks a second run. Claiming through the root source
-	// would only rewrite the card on the operator's main checkout, leaving it
-	// dirty for the next rebase. SQLite is the authoritative claim here.
+	// the active-run guard blocks a second run. Claiming through the root
+	// source would only rewrite the card on the operator's main checkout,
+	// leaving it dirty for the next rebase. SQLite is the authoritative claim.
 	return d.timed(ctx, "SetTaskStatus", func() error {
 		return d.Store.SetTaskStatus(ctx, task.ID, "claimed")
 	})
@@ -475,6 +486,13 @@ func (d *Dispatcher) Available(ctx context.Context) int {
 	if err != nil {
 		return 0
 	}
+	return d.availableFrom(active)
+}
+
+// availableFrom applies the agent-slot rule to a list the caller already has.
+// Dispatch derives its budget from the first active list instead of calling
+// Available, which would read the same rows a second time.
+func (d *Dispatcher) availableFrom(active []*core.Run) int {
 	limit := d.Concurrency.MaxActiveAgents
 	if limit <= 0 {
 		limit = d.inFlightLimit()
@@ -490,6 +508,17 @@ func (d *Dispatcher) Available(ctx context.Context) int {
 		return 0
 	}
 	return free
+}
+
+// refreshActive re-reads the active list after a failed start and derives the
+// budget and the task guard from that one read. A store error fails closed by
+// zeroing the budget and keeping the last known task guard.
+func (d *Dispatcher) refreshActive(ctx context.Context, active map[core.TaskID]*core.Run) (int, map[core.TaskID]*core.Run) {
+	runs, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return 0, active
+	}
+	return d.availableFrom(runs), activeRunsByTask(runs)
 }
 
 // modelRef resolves the worker model from the run's parent session. The MCP
