@@ -1,7 +1,7 @@
 ---
 id: T-d6da2e78
 title: Avoid token byte conversion per request
-status: in_progress
+status: done
 scope:
     - cmd/beacon/http.go
     - cmd/beacon/http_test.go
