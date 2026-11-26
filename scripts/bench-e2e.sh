@@ -39,8 +39,8 @@ if (( smoke )); then
   exit 0
 fi
 
-# The first benchmark runs five alternating pairs: reconcile first on even
-# pairs, dispatch first on odd pairs. The second is the micro baseline from
+# One invocation compiles the bench package once for both benchmarks. The
+# E2E benchmark runs five alternating pairs: reconcile first on even pairs,
+# dispatch first on odd pairs. HotPaths is the micro baseline from
 # docs/perf/dossier.md, captured here for context.
-run go test -run '^$' -bench '^BenchmarkE2EOperatorPaths$' -benchtime=5x -count=1 ./internal/bench/
-run go test -run '^$' -bench '^BenchmarkHotPaths$' -benchtime=1x -count=1 ./internal/bench/
+run go test -run '^$' -bench 'BenchmarkHotPaths|BenchmarkE2EOperatorPaths' -benchtime=5x -count=1 ./internal/bench/
