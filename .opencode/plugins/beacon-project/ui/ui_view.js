@@ -6,7 +6,7 @@ import {
 } from "./ui_model.js"
 import {
   baseIncidentItem, blockedGroupKeys, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, timelineText, truncate,
+  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
 } from "./ui_alerts.js"
 export { shortTaskID }
 
@@ -211,8 +211,8 @@ export function blockedOpenFrom(epicOpen) {
   return out
 }
 
-export function blockedToggleItem(queue = [], blockedOpen = null) {
-  const keys = blockedGroupKeys(queue)
+export function blockedToggleItem(queue = [], blockedOpen = null, tree = null) {
+  const keys = blockedGroupKeys(queue, tree)
   if (!keys.length) return null
   const expanded = keys.every((key) => blockedOpen?.[key] === true)
   return {
@@ -253,6 +253,9 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
     if (alert) listItems.push(alert)
   }
   const ready = readyCount(view.queue)
+  // The queue header and every queue row read the same index. Build it once
+  // from the normalized snapshot instead of once per consumer.
+  const tree = open.queue === true ? taskTree(view.queue) : null
   listItems.push(sectionItem("Active", active.length, "active", open.active !== false))
   if (open.active !== false) {
     if (!active.length && ready === 0) {
@@ -265,9 +268,9 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   }
   listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
   if (open.queue === true) {
-    const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen) : null
+    const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen, tree) : null
     if (toggle) listItems.push(toggle)
-    listItems.push(...queueRows(view.queue, epicOpen, blockedOpen))
+    listItems.push(...queueRows(view.queue, epicOpen, blockedOpen, tree))
     listItems.push(spacerItem())
   }
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))

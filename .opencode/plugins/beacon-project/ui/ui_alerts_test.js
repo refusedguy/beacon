@@ -4,8 +4,8 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   PANEL_NAME, beaconStatusDefinition, collectTransitionToasts,
-  createDetailMount, createSidebarMount, detailModel, launchSourceText,
-  metricsLine, normalizeRun, queueGroups, shortTaskID, sidebarModel, taskTree,
+  createDetailMount, createLineMount, createSidebarMount, detailModel, launchSourceText,
+  metricsLine, normalizeRun, queueGroups, queueLineItems, queueRows, shortTaskID, sidebarModel, taskTree, truncate,
 } from "./ui.js"
 import { NOW, hostModule, makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
 
@@ -387,4 +387,49 @@ test("queue groups expose parent, child and epic membership for the queue rows",
   const shared = queueGroups(queue, null, tree)
   assert.equal(shared.parentOf("T-EPIC-01"), "T-OTHER", "a supplied tree stays authoritative")
   assert.deepEqual(shared.childrenOf("T-OTHER"), ["T-EPIC-01"])
+})
+
+test("one snapshot queue reuses a tree across the header and the rows", () => {
+  const queue = [
+    { id: "T-EPIC", kind: "epic", title: "Epic", status: "ready", priority: 9, dependsOn: [] },
+    { id: "T-EPIC-01", title: "Child", status: "waiting_deps", priority: 8, dependsOn: [] },
+  ]
+  const tree = taskTree(queue)
+  assert.equal(taskTree(queue), tree, "the same array reuses its index")
+  assert.notEqual(taskTree([...queue]), tree, "a new snapshot builds a new index")
+  assert.deepEqual(queueRows(queue, null, {}, tree), queueRows(queue, null, {}))
+  assert.deepEqual(queueLineItems(queue, null, {}, tree), queueLineItems(queue, null, {}))
+})
+
+test("truncation stays identical for repeated strings across widths", () => {
+  const long = "日本語テスト😀abcdefghijklmnopqrstuvwxyz"
+  for (const width of [4, 10, 29]) {
+    const first = truncate(long, width)
+    assert.equal(truncate(long, width), first)
+    assert.equal(truncate({ toString: () => long }, width), first)
+  }
+  assert.equal(truncate("😀😀😀", 4), "😀😀😀")
+  assert.equal(truncate("abcdefghij", 5), "abcd…")
+})
+
+test("an unchanged refresh does not rewrite pooled cells", () => {
+  let writes = 0
+  const ui = {
+    createElement: (tag) => ({ tag, props: {} }),
+    insert: () => {},
+    setProp: (node, key, value) => { writes++; node.props[key] = value },
+  }
+  const mount = createLineMount(ui, { color: (key) => `theme.${key}`, BOLD: 1, maxLines: 2 })
+  const items = [
+    { marker: "○", name: "Queued", status: "P1", color: "base" },
+    { marker: "", name: "Dispatch (3 ready)", status: "", color: "action", bold: true },
+  ]
+  assert.doesNotThrow(() => mount.apply(items))
+  assert.ok(writes > 0, "the first render writes the cells")
+  writes = 0
+  mount.apply(items.map((item) => ({ ...item })))
+  assert.equal(writes, 0, "an unchanged row set writes nothing")
+  writes = 0
+  mount.apply([{ ...items[0], status: "P2" }])
+  assert.ok(writes > 0, "a changed row still writes its cells")
 })
