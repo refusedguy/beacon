@@ -8,7 +8,9 @@ import {
   baseIncidentItem, blockedGroupKeys, checkRow, checksSummary, compactReason, daemonAlertItem,
   dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
 } from "./ui_alerts.js"
+import { clockTime, elapsed, timeOf } from "./time_format.js"
 export { shortTaskID }
+export { elapsed }
 
 export const STATE_BAR_WIDTH = 30
 // A solid block stays visible in every host font. Every filled segment reads
@@ -59,23 +61,6 @@ export const ACTION_NAMES = Object.freeze(["retry", "approve", "cancel", "pr", "
 // the end with an explicit ellipsis. Detail text keeps its full width.
 export const SIDEBAR_TITLE_WIDTH = 29
 export const truncateSidebarTitle = (value) => truncate(value, SIDEBAR_TITLE_WIDTH)
-export function elapsed(ms) {
-  if (!Number.isFinite(ms) || ms < 0) return ""
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m`
-  const h = Math.floor(m / 60)
-  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`
-}
-function timeOf(v) {
-  if (v == null || v === "") return 0
-  if (typeof v === "number") return Number.isFinite(v) ? v : 0
-  const n = Number(v)
-  if (Number.isFinite(n) && n > 0) return n
-  const t = Date.parse(str(v))
-  return Number.isFinite(t) ? t : 0
-}
 export const ageOf = (run, now) => { const t = Math.max(timeOf(run?.updatedAt), timeOf(run?.createdAt)); return t ? elapsed(now - t) : "" }
 export const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(run?.updatedAt); return a && b ? elapsed(b - a) : "" }
 export function phaseLabel(run, now = Date.now()) {
@@ -306,7 +291,7 @@ export const metricsLine = (snapshot = EMPTY_SNAPSHOT) => {
   return { marker: "", name: `Beacon ${item.summary}`, status: [item.legend, launch].filter(Boolean).join(" · "), color: "muted" }
 }
 
-const stamp = (value) => { const t = str(value); return t.length >= 19 ? t.slice(11, 19) : t || "?" }
+const stamp = (value) => clockTime(value) || "?"
 export function detailActions(run) {
   if (!run) return []
   const state = str(run.state).toLowerCase()
