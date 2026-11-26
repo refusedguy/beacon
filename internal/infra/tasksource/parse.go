@@ -341,7 +341,7 @@ func parseTaskFields(body, dir, depPrefix string) taskFields {
 		if err := yaml.Unmarshal([]byte(block), &yf); err != nil {
 			slog.Warn("tasksource: malformed YAML field block", "error", err)
 		} else {
-			out.ID = firstNonEmpty(yf.TaskID, yf.ID)
+			out.ID = core.FirstNonEmpty(strings.TrimSpace(yf.TaskID), strings.TrimSpace(yf.ID))
 			out.Parent = strings.TrimSpace(yf.Parent)
 			out.Scope = append(out.Scope, yf.combinedScope()...)
 			out.Depends = append(out.Depends, yf.Depends...)
@@ -429,16 +429,6 @@ func unique(values []string) []string {
 		}
 	}
 	return out
-}
-
-// firstNonEmpty returns the first non-empty, trimmed value.
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
 }
 
 // afterColon returns the trimmed text after the first colon.
