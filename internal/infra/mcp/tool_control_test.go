@@ -522,3 +522,39 @@ func TestControlSingleInvalidTransitionReturnsStructuredError(t *testing.T) {
 		t.Fatalf("state = %s, want %s with no partial success", s, core.RunPending)
 	}
 }
+
+// TestControlBatchExampleReturnsJSONResult is the complete request and result
+// pair quoted in docs/research/integration.md. A blocked run unblocks and a
+// pending run keeps its state, so one call shows both outcome codes.
+func TestControlBatchExampleReturnsJSONResult(t *testing.T) {
+	store := newControlStore()
+	store.add(controlRunInState(t, "r1",
+		core.Event{Kind: core.EvStart}, core.Event{Kind: core.EvBlock}))
+	store.add(core.NewRun("r2", "T-2", time.Now()))
+	cs := controlClient(t, newControlServices(store))
+
+	const request = `{"action":"unblock","run_ids":["r1","r2"]}`
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(request), &arguments); err != nil {
+		t.Fatal(err)
+	}
+	res := callControl(t, cs, arguments)
+	got := parseControlBatch(t, res)
+	if got.Action != "unblock" || len(got.Results) != 2 {
+		t.Fatalf("result = %+v", got)
+	}
+	if got.Results[0].ID != "r1" || got.Results[0].Status != "ok" {
+		t.Fatalf("r1 result = %+v, want ok", got.Results[0])
+	}
+	if got.Results[1].ID != "r2" || got.Results[1].Status != "error" ||
+		!strings.Contains(got.Results[1].Error, "invalid_transition") {
+		t.Fatalf("r2 result = %+v, want invalid_transition", got.Results[1])
+	}
+	if store.runs["r1"].State != core.RunWaitingCI || store.runs["r2"].State != core.RunPending {
+		t.Fatalf("states = r1:%s r2:%s, want r1:%s r2:%s",
+			store.runs["r1"].State, store.runs["r2"].State, core.RunWaitingCI, core.RunPending)
+	}
+	t.Logf("request: %s", request)
+	t.Logf("result: %s", controlText(t, res))
+	t.Logf("r1 state=%s r2 state=%s", store.runs["r1"].State, store.runs["r2"].State)
+}
