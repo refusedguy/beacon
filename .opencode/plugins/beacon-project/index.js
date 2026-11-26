@@ -4,7 +4,7 @@ import { createMcpRegistrar, noopMcpRegistration, registerBeaconMcp } from "./mc
 import { installProjectContext } from "./rules/context.js"
 import { resolveAgent, sessionIdentity } from "./state/session_identity.js"
 import {
-  pluginOptions, pollIntervalMs, snapshotLimits,
+  pluginOptions, pollIntervalMs, positiveInt, snapshotLimits,
   statusPanelEnabled, watcherEnabled,
 } from "./state/options.js"
 import {
@@ -22,8 +22,7 @@ import { isWorkerAgent, registerShellGuard } from "./shell_guard.js"
 // Normalize at the handler boundary so a malformed n never reaches the CLI.
 // The RPC schema still rejects it first; this keeps a direct caller safe.
 export function dispatchInput(input) {
-  const n = Number(input?.n)
-  return { ...(input ?? {}), n: Number.isFinite(n) && n > 0 ? Math.floor(n) : 1 }
+  return { ...(input ?? {}), n: positiveInt(input?.n, 1) }
 }
 
 // Log each RPC with one correlation id and its elapsed time. The TUI carries
@@ -151,5 +150,5 @@ export {
   isWorkerAgent, registerShellGuard,
 } from "./shell_guard.js"
 export { createRunChangeWatcher } from "./run_watcher.js"
-export { pluginOptions, pollIntervalMs, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./state/options.js"
+export { pluginOptions, pollIntervalMs, positiveInt, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./state/options.js"
 export default beaconProject

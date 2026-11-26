@@ -7,6 +7,7 @@ import { promisify } from "node:util"
 import { beaconCommand } from "../mcp/mcp.js"
 import { locationInfo, projectRoot } from "../state/location.js"
 import { cliEnv } from "../state/session_identity.js"
+import { positiveInt } from "../state/options.js"
 const execFileAsync = promisify(nodeExecFile)
 export const REFRESH_MS = 5000
 const RPC_TIMEOUT_MS = 10000
@@ -325,7 +326,7 @@ export class CliStatusSource {
     return parseSnapshot((await this.#exec(this.#command(), args, { label: "control" })).stdout)
   }
   async dispatch({ n = 1 } = {}, timing = null) {
-    const count = num(n) > 0 ? Math.floor(num(n)) : 1
+    const count = positiveInt(n, 1)
     return parseSnapshot((await this.#exec(this.#command(), ["dispatch", String(count)], { label: "dispatch", timing })).stdout)
   }
   #base() {

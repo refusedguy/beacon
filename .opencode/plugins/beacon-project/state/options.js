@@ -15,7 +15,7 @@ function boolOption(value, fallback) {
   return typeof value === "boolean" ? value : fallback
 }
 
-function positiveInt(value, fallback) {
+export function positiveInt(value, fallback) {
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
 }
