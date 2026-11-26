@@ -1,7 +1,7 @@
 ---
 id: T-c894c2fa
 title: Add bounded smoke mode for benchmark harness
-status: available
+status: done
 scope:
     - internal/bench/bench_test.go
     - internal/bench/e2e_bench_test.go
