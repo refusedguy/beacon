@@ -51,7 +51,7 @@ const (
 	ActionWatch   Action = "watch"
 )
 
-// actions is the single vocabulary used by both the parser and the validator.
+// actions is the control vocabulary used by the validator.
 var actions = [...]Action{
 	ActionApprove,
 	ActionUnblock,
@@ -59,12 +59,6 @@ var actions = [...]Action{
 	ActionRetry,
 	ActionNudge,
 	ActionWatch,
-}
-
-// ParseAction converts a wire verb into its typed form. Unknown verbs keep
-// their text so the caller can report what it received.
-func ParseAction(raw string) Action {
-	return Action(raw)
 }
 
 // Valid reports whether a belongs to the control vocabulary.
