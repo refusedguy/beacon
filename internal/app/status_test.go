@@ -253,6 +253,24 @@ func TestDeriveDurationsSplitsCIWaitByCycle(t *testing.T) {
 	}
 }
 
+func TestDeriveDurationsFallbackSplitsCIWaitByCycle(t *testing.T) {
+	now := time.Date(2026, 11, 26, 8, 0, 0, 0, time.UTC)
+	run := core.NewRun("run-fallback", "T-FALLBACK", now.Add(-2*time.Minute))
+	run.State = core.RunWaitingCI
+	run.UpdatedAt = now
+
+	got := deriveDurations(run, nil, now)
+	if got.WaitingCI != 120 {
+		t.Fatalf("waiting CI = %d, want 120", got.WaitingCI)
+	}
+	if got.WaitingCIInitial != 120 || got.WaitingCIRebase != 0 || got.WaitingCIFix != 0 {
+		t.Fatalf("cycle split = %+v, want 120/0/0", got)
+	}
+	if got.WaitingCIInitial+got.WaitingCIRebase+got.WaitingCIFix != got.WaitingCI {
+		t.Fatalf("cycle split does not add up: %+v", got)
+	}
+}
+
 func TestSnapshotAggregatesCICycles(t *testing.T) {
 	now := time.Date(2026, 11, 26, 8, 2, 0, 0, time.UTC)
 	run := core.NewRun("run-metrics", "T-METRICS", now.Add(-2*time.Minute))

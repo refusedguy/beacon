@@ -649,28 +649,26 @@ func deriveDurations(run *core.Run, events []RunEvent, now time.Time) Durations 
 		}
 		if end.After(event.At) {
 			seconds := int64(end.Sub(event.At).Seconds())
-			addDuration(&out, state, seconds)
-			if state == core.RunWaitingCI {
-				addCycleDuration(&out, cycle, seconds)
-			}
+			addStateDuration(&out, state, cycle, seconds)
 		}
 	}
 	// Older state databases have no events. Use the run's own window so the
 	// panel still shows an elapsed time.
 	if len(events) == 0 && endOfRun.After(run.CreatedAt) {
 		seconds := int64(endOfRun.Sub(run.CreatedAt).Seconds())
-		addDuration(&out, run.State, seconds)
-		if run.State == core.RunWaitingCI {
-			addCycleDuration(&out, cycleForState(run.State, cycle), seconds)
-		}
+		addStateDuration(&out, run.State, cycleForState(run.State, cycle), seconds)
 	}
 	return out
 }
 
-func addDuration(out *Durations, state core.RunState, seconds int64) {
+// addStateDuration adds one interval to every duration bucket the state owns.
+// Waiting CI feeds both its total and the current cycle split from that same
+// interval, so both call sites share one state-to-bucket mapping.
+func addStateDuration(out *Durations, state core.RunState, cycle ciCycle, seconds int64) {
 	switch state {
 	case core.RunWaitingCI:
 		out.WaitingCI += seconds
+		addCycleDuration(out, cycle, seconds)
 	case core.RunRunning:
 		out.Running += seconds
 	case core.RunBlocked:
