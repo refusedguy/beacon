@@ -20,20 +20,16 @@ const defaultTimeout = 30 * time.Minute
 // Config is the explicit constructor input. Command is the ACP agent to
 // launch, split on whitespace into an executable and arguments.
 type Config struct {
-	Command         string
-	Model           string
-	ParentSessionID string
-	Timeout         time.Duration
+	Command string
+	Timeout time.Duration
 }
 
 // Harness implements core.AgentHarness by hosting one ACP agent process per
 // session. It deliberately implements none of the optional ports: ACP has no
 // parent channel, no worktree registry and no local model lookup.
 type Harness struct {
-	Command         string
-	Model           string
-	ParentSessionID string
-	Timeout         time.Duration
+	Command string
+	Timeout time.Duration
 
 	newProcess func(command, cwd string) (process, error)
 
@@ -53,10 +49,8 @@ type acpSession struct {
 // config fields here instead of passing positional strings.
 func NewFromConfig(cfg Config) *Harness {
 	return &Harness{
-		Command:         cfg.Command,
-		Model:           cfg.Model,
-		ParentSessionID: cfg.ParentSessionID,
-		Timeout:         cfg.Timeout,
+		Command: cfg.Command,
+		Timeout: cfg.Timeout,
 	}
 }
 

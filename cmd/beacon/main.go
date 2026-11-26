@@ -350,9 +350,7 @@ func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarnes
 			return nil, fmt.Errorf("acp harness requires command")
 		}
 		return acp.NewFromConfig(acp.Config{
-			Command:         cfg.Harness.Command,
-			Model:           cfg.Harness.Model,
-			ParentSessionID: parent,
+			Command: cfg.Harness.Command,
 		}), nil
 	default:
 		return harness.New(harness.Config{
