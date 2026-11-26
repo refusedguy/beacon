@@ -6,7 +6,7 @@ import {
 } from "./ui_model.js"
 import {
   baseIncidentItem, blockedGroupKeys, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
+  dispatchItem, isDispatching, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
 } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
 export { shortTaskID }
@@ -227,7 +227,7 @@ export function toggleAllBlockedGroups(epic, queue = []) {
   return keys
 }
 
-export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null, blockedOpen = null) {
+export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null, blockedOpen = null, dispatching = isDispatching()) {
   const view = normalizeSnapshot(snapshot)
   const active = activeFromView(view)
   const recent = recentFromView(view)
@@ -250,7 +250,7 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   if (open.active !== false) {
     if (!active.length) listItems.push({ marker: "", name: "No active runs", status: "", color: "muted" })
     active.forEach((run) => listItems.push(...runLineItems(run, now)))
-    if (ready > 0) listItems.push(dispatchItem(ready))
+    if (dispatching || ready > 0) listItems.push(dispatchItem(ready, dispatching))
   }
   if (queueEmpty) {
     // A counted, expandable "Queue 0" next to a "No tasks ready" row says the

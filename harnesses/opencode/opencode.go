@@ -44,6 +44,7 @@ type Harness struct {
 	events    chan core.HarnessEvent
 	mu        sync.RWMutex
 	runs      map[string]core.RunID
+	setupWG   sync.WaitGroup
 
 	// modelDefault is the harness-level model resolved once on first use. A
 	// model carried by a SpawnRequest still takes precedence per dispatch.
@@ -305,9 +306,10 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 		return core.Session{}, fmt.Errorf("opencode: missing session id in %s", redact.Redact(string(data)))
 	}
 	h.bind(id, req.RunID)
-	if err := h.configureSession(ctx, id, req, ref); err != nil {
+	if err := h.applyModel(ctx, id, ref); err != nil {
 		return core.Session{}, err
 	}
+	h.deferSessionSetup(ctx, id, req)
 	if err := h.prompt(ctx, id, req.Prompt, messageID("spawn")); err != nil {
 		return core.Session{}, err
 	}

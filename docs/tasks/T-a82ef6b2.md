@@ -1,7 +1,7 @@
 ---
 id: T-a82ef6b2
 title: Remove duplicate bench compile in non-smoke mode
-status: available
+status: done
 scope:
     - scripts/bench-e2e.sh
 priority: 70

@@ -13,7 +13,68 @@ import {
 } from "./ui/status_rpc.js"
 import { createRunChangeWatcher } from "./run_watcher.js"
 import { isWorkerAgent, registerShellGuard } from "./shell_guard.js"
-import { cleanupWrapper } from "./ui/ui_test_helpers.js"
+
+// ui_test_helpers.js re-exports ui/ui.js, which imports ui_runtime.js and its
+// @opentui/solid peer. Importing it here makes the server plugin fail to load,
+// so no status RPC is registered and every RPC call answers 400. Keep the
+// teardown wrapper local to the server half.
+export function cleanupWrapper(prefix) {
+  return (label, dispose) => {
+    const failed = (error) => console.debug(`${prefix}${label} cleanup failed: ${error?.message ?? error}`)
+    try {
+      const result = dispose?.()
+      if (result && typeof result.then === "function") return result.catch(failed)
+    } catch (error) {
+      failed(error)
+    }
+  }
+}
+
+// A body hash in the log proves whether two POSTs carried the same payload.
+// FNV-1a over stable JSON keeps this server-safe and free of peer imports.
+export function bodyHash(input) {
+  const text = JSON.stringify(input ?? null)
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0")
+}
+export const requestId = (method, input) => `${method}:${bodyHash(input)}`
+
+// Normalize at the handler boundary so a malformed n never reaches the CLI.
+// The RPC schema still rejects it first; this keeps a direct caller safe.
+export function dispatchInput(input) {
+  const n = Number(input?.n)
+  return { ...(input ?? {}), n: Number.isFinite(n) && n > 0 ? Math.floor(n) : 1 }
+}
+
+// Log each RPC with its body hash and report the rejection body on failure.
+// The TUI swallows RPC errors before falling back to the CLI, so the server is
+// the only place the 400 reason is still visible.
+export function createStatusRpcHandlers(source, { limits = {}, log = console.debug } = {}) {
+  const call = async (method, input, run) => {
+    const id = requestId(method, input)
+    log(`beacon status RPC ${method} id=${id}`)
+    try {
+      const result = await run()
+      log(`beacon status RPC ${method} ok id=${id}`)
+      return result
+    } catch (error) {
+      const body = error && typeof error === "object"
+        ? { type: error.type, status: error.status, message: error.message, data: error.data }
+        : { message: String(error) }
+      log(`beacon status RPC ${method} failed id=${id} body=${JSON.stringify(body)}`)
+      throw error
+    }
+  }
+  return {
+    snapshot: (input) => call("snapshot", input, async () => normalizeSnapshot(await source.snapshot(input ?? limits))),
+    control: (input) => call("control", input, async () => source.control(input ?? {})),
+    dispatch: (input) => call("dispatch", input, async () => source.dispatch(dispatchInput(input))),
+  }
+}
 
 // OpenCode does not hand a session ID to plugin setup. Read the agent from the
 // setup context through the shared adapter, then from the session domain. An
@@ -81,11 +142,7 @@ export const beaconProjectDefinition = {
       const limits = snapshotLimits(options)
       const statusSource = createCliStatusSource({ root, limits, sessionID, model })
       try {
-        statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
-          snapshot: async (input) => normalizeSnapshot(await statusSource.snapshot(input ?? limits)),
-          control: async (input) => statusSource.control(input ?? {}),
-          dispatch: async (input) => statusSource.dispatch(input ?? {}),
-        })
+        statusRpc = await ctx.rpc.register(BeaconStatusRpc, createStatusRpcHandlers(statusSource, { limits }))
       } catch (error) {
         console.warn(`beacon status panel: RPC registration failed: ${error.message}`)
       }

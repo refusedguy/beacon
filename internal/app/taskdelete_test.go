@@ -113,6 +113,25 @@ func TestTaskDeleterReportsNotFound(t *testing.T) {
 	}
 }
 
+func TestTaskDeleterReportsReadFailureWithoutMappingToNotFound(t *testing.T) {
+	dir := t.TempDir()
+	cards := filepath.Join(dir, "docs", "tasks")
+	// A directory at a card path makes os.ReadFile fail with a non-NotExist error.
+	if err := os.MkdirAll(filepath.Join(cards, "T-DIR.md"), 0o755); err != nil {
+		t.Fatalf(`os.MkdirAll(%q): %v`, filepath.Join(cards, "T-DIR.md"), err)
+	}
+	ws := &fakeWorkspace{log: &callLog{}}
+	deleter := newDeleter(dir, newFakeStore(), ws)
+
+	_, err := deleter.Delete(context.Background(), []string{"T-DIR"})
+	if err == nil || !strings.Contains(err.Error(), "read ") {
+		t.Fatalf("error = %v, want a read failure", err)
+	}
+	if len(ws.commits) != 0 {
+		t.Fatal("failed read still committed")
+	}
+}
+
 func TestTaskDeleterRefusesActiveRunBatch(t *testing.T) {
 	dir := t.TempDir()
 	writeCards(t, dir, "T-A", "T-B")

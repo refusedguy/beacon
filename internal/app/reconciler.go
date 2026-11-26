@@ -54,6 +54,7 @@ type Reconciler struct {
 	OrphanTimeout   time.Duration
 	Events          <-chan core.HarnessEvent
 	AutoRebase      bool
+	MaxAutoRebases  int
 	Decisions       DecisionLogger
 }
 

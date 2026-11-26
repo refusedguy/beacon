@@ -382,14 +382,25 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		case pr := <-changes:
 			writeID()
-			writeSSE(rw, "pr_changed", map[string]int{"pr": pr})
+			writeSSE(rw, "pr_changed", wirePRChanged{PR: pr})
 			flusher.Flush()
 		case <-ticker.C:
 			writeID()
-			writeSSE(rw, "ping", map[string]string{"time": time.Now().UTC().Format(time.RFC3339)})
+			writeSSE(rw, "ping", wirePing{Time: time.Now().UTC().Format(time.RFC3339)})
 			flusher.Flush()
 		}
 	}
+}
+
+// wirePRChanged and wirePing are the data payloads of the two non-harness
+// events on the loopback stream. Naming them keeps each emitted key set in one
+// place. The monitor's wire contract fixtures pin the same key sets.
+type wirePRChanged struct {
+	PR int `json:"pr"`
+}
+
+type wirePing struct {
+	Time string `json:"time"`
 }
 
 func writeSSE(rw http.ResponseWriter, event string, payload any) {

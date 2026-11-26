@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -137,8 +136,8 @@ func (u *TaskUpdater) stageUpdates(updates []UpdateInput) (*cardTx, []UpdatedTas
 	for _, in := range updates {
 		path := cardFilePath(u.Root, in.ID)
 		content, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			results = append(results, UpdatedTask{ID: in.ID, Status: "not_found"})
+		if status := notFoundStatus(err); status != "" {
+			results = append(results, UpdatedTask{ID: in.ID, Status: status})
 			continue
 		}
 		if err != nil {

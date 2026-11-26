@@ -143,9 +143,9 @@ func (r *Reconciler) closeOrphan(ctx context.Context, run *core.Run) {
 	}
 	r.notifyParent(ctx, run, run.PRNumber, string(run.State))
 	_ = r.notify(run, "orphan run closed", reason)
-	if err := r.cleanupRun(ctx, run); err != nil {
-		slog.Error("orphan cleanup", "run", run.ID, "error", err)
-	}
+	bestEffort("orphan cleanup", func() error {
+		return r.cleanupRun(ctx, run)
+	}, "run", run.ID)
 }
 
 func (r *Reconciler) orphanTimeout() time.Duration {

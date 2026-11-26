@@ -54,6 +54,15 @@ func WorkspaceConflict(path string) error {
 	return Errorf(CodeConflict, "refusing to remove dirty worktree %s", path)
 }
 
+// JoinWith keeps primary as the main error and appends extra under label. A nil
+// extra leaves primary unchanged. Both errors stay in the chain for errors.Is.
+func JoinWith(primary error, label string, extra error) error {
+	if extra == nil {
+		return primary
+	}
+	return fmt.Errorf("%w; %s: %w", primary, label, extra)
+}
+
 // CodeOf returns the code of an AppError in the error chain.
 func CodeOf(err error) ErrorCode {
 	if err == nil {

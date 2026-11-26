@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -223,6 +224,51 @@ func TestReconcileWaitingCIToAutoRebase(t *testing.T) {
 	got := store.runs["r1"]
 	if got.State != core.RunWaitingCI || got.RebaseAttempts != 1 || scm.rebases != 1 {
 		t.Fatalf("state=%s rebaseAttempts=%d rebases=%d", got.State, got.RebaseAttempts, scm.rebases)
+	}
+}
+
+func TestConfiguredAutoRebaseCapAllowsFiveRebases(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := makeRun("r1", 42, core.RunWaitingCI)
+	// The MaxAttempts budget is separate and must not end the run first.
+	run.MaxAttempts = 12
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
+	}
+	seq := make([]core.Observation, 0, 6)
+	for i := 1; i <= 6; i++ {
+		seq = append(seq, core.Observation{
+			PRNumber: 42, PRState: "open", HeadSHA: "sha" + strconv.Itoa(i),
+			BaseSHA: "base", Behind: true,
+		})
+	}
+	scm := &fakeSCM{observeSeq: seq}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictNeedsRebase, Reason: "branch is behind base"}},
+		Harness: &fakeHarness{}, Source: &fakeSource{}, Workspace: &fakeWorkspace{},
+		AutoRebase: true, MaxAutoRebases: 5,
+	}
+
+	for i := 0; i < 6; i++ {
+		decision, err := r.Reconcile(ctx, 42)
+		if err != nil {
+			t.Fatalf("tick %d: r.Reconcile(ctx, 42): %v", i+1, err)
+		}
+		if decision.Verdict != core.VerdictNeedsRebase {
+			t.Fatalf("tick %d: verdict = %s, want %s", i+1, decision.Verdict, core.VerdictNeedsRebase)
+		}
+	}
+	if scm.rebases != 5 {
+		t.Fatalf("branch updates = %d, want 5", scm.rebases)
+	}
+	got := store.runs["r1"]
+	if got.RebaseAttempts != 5 {
+		t.Fatalf("RebaseAttempts = %d, want 5", got.RebaseAttempts)
+	}
+	if got.State != core.RunBlocked || got.Reason != "rebase budget exhausted" {
+		t.Fatalf("state=%s reason=%q, want blocked with rebase budget exhausted", got.State, got.Reason)
 	}
 }
 

@@ -2,7 +2,10 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { makeRun, solidModule, themeStub } from "./ui_test_helpers.js"
-import { beaconStatusDefinition, createActionRunner, normalizeRun } from "./ui.js"
+import {
+  beaconStatusDefinition, createActionRunner, createSidebarMount, dispatchItem,
+  dispatchRequestId, normalizeRun, setDispatching, sidebarModel,
+} from "./ui.js"
 
 const run = () => normalizeRun(makeRun({ ID: "run-1", State: "blocked" }))
 
@@ -162,6 +165,116 @@ test("Dispatch starts one task, toasts the result and refreshes", async () => {
   assert.deepEqual(h.dispatches, [{ n: 1 }])
   assert.equal(h.toasts[0].message, "Dispatched 1 task")
   assert.equal(h.refreshes, 1)
+})
+
+test("one dispatch gesture makes one call even when both mouse handlers fire", async () => {
+  const logs = []
+  const toasts = []
+  const calls = []
+  let refreshes = 0
+  const source = { dispatch: async (input) => { calls.push(input); return { started: 1 } } }
+  const invoke = createActionRunner(
+    { ui: { toast: { show: (options) => toasts.push(options) } } },
+    source,
+    { refresh: async () => { refreshes++ }, log: (line) => logs.push(line) },
+  )
+
+  await Promise.all([invoke("dispatch"), invoke("dispatch")])
+
+  assert.deepEqual(calls, [{ n: 1 }])
+  assert.deepEqual(toasts.map((t) => t.message), ["Dispatched 1 task"])
+  assert.equal(refreshes, 1)
+  assert.equal(logs.filter((line) => /dispatch click/.test(line)).length, 1)
+  assert.ok(logs.some((line) => line.includes(`id=${dispatchRequestId({ n: 1 })}`)))
+  assert.ok(logs.some((line) => /duplicate suppressed/.test(line)))
+})
+
+test("a dispatch after the dedupe window makes a second call", async () => {
+  const calls = []
+  const invoke = createActionRunner(
+    { ui: { toast: { show: () => {} } } },
+    { dispatch: async (input) => { calls.push(input); return { started: 1 } } },
+    { refresh: async () => {} },
+  )
+  const realNow = Date.now
+  try {
+    await invoke("dispatch")
+    Date.now = () => realNow() + 1000
+    await invoke("dispatch")
+  } finally {
+    Date.now = realNow
+  }
+  assert.deepEqual(calls, [{ n: 1 }, { n: 1 }])
+})
+
+test("the sidebar renders Dispatching from the shared in-flight flag", () => {
+  const ready = { active: [], recent: [], queue: [{ id: "T-2", title: "Queued", status: "ready" }] }
+  assert.equal(dispatchItem(1, true).name, "Dispatching")
+  assert.equal(sidebarModel(ready, null, 0).listItems.some((i) => /^Dispatch \(1 ready\)$/.test(i.name)), true)
+  setDispatching(true)
+  try {
+    const item = sidebarModel(ready, null, 0).listItems.find((i) => i.action === "dispatch")
+    assert.equal(item.name, "Dispatching")
+  } finally {
+    setDispatching(false)
+  }
+})
+
+test("a dispatch click repaints the row before the RPC settles and ignores later clicks", async () => {
+  const created = []
+  const dispatches = []
+  let release
+  const pending = new Promise((resolve) => { release = resolve })
+  const ctx = { ui: { toast: { show: () => {} }, panel: { open: () => {}, close: () => {} } } }
+  const source = { dispatch: (input) => { dispatches.push(input); return pending } }
+  const invoke = createActionRunner(ctx, source, { refresh: async () => {} })
+  const mount = createSidebarMount(solidModule(created), {
+    color: (key) => key, BOLD: 0, hoverBg: "hover",
+    onItem: (item) => { if (item.action === "dispatch") void invoke("dispatch") },
+  })
+  mount.apply(sidebarModel({
+    active: [], recent: [], queue: [{ id: "T-2", title: "Queued", status: "ready" }],
+  }, null, 0))
+  const row = () => mount.node.children.find((box) => box.item?.action === "dispatch")
+  assert.equal(row().item.name, "Dispatch (1 ready)")
+
+  row().props.onMouseDown()
+  assert.equal(row().item.name, "Dispatching", "the click repaints without awaiting dispatch")
+  assert.deepEqual(dispatches, [{ n: 1 }])
+
+  const realNow = Date.now
+  try {
+    Date.now = () => realNow() + 1000
+    row().props.onMouseDown()
+  } finally {
+    Date.now = realNow
+  }
+  assert.deepEqual(dispatches, [{ n: 1 }], "clicks are ignored while in flight")
+
+  release({ started: 1 })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(row().item.name, "Dispatch (1 ready)", "the busy label clears on success")
+})
+
+test("a failed dispatch clears the in-flight state and reports the error", async () => {
+  const toasts = []
+  const source = { dispatch: async () => { throw new Error("rpc down") } }
+  const invoke = createActionRunner(
+    { ui: { toast: { show: (options) => toasts.push(options) } } }, source, { refresh: async () => {} },
+  )
+  const mount = createSidebarMount(solidModule([]), {
+    color: (key) => key, BOLD: 0, hoverBg: "hover",
+    onItem: (item) => { if (item.action === "dispatch") void invoke("dispatch") },
+  })
+  mount.apply(sidebarModel({
+    active: [], recent: [], queue: [{ id: "T-2", title: "Queued", status: "ready" }],
+  }, null, 0))
+  const row = () => mount.node.children.find((box) => box.item?.action === "dispatch")
+  row().props.onMouseDown()
+  assert.equal(row().item.name, "Dispatching")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(row().item.name, "Dispatch (1 ready)", "the busy label clears on failure")
+  assert.match(toasts.at(-1).message, /Dispatch failed: rpc down/)
 })
 
 test("panel buttons and the Dispatch row call the RPC through the real setup", async () => {

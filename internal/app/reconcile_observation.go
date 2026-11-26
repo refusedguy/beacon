@@ -13,10 +13,21 @@ func sameObservation(run *core.Run, obs core.Observation) bool {
 	return run.ObservedSHA == obs.HeadSHA && run.ObservedBaseSHA == obs.BaseSHA
 }
 
-// maxAutoRebases caps automatic branch updates per run. Rebases get their own
-// small budget so a moving base cannot spend the whole fix budget before a real
-// check failure is handled.
+// maxAutoRebases is the fallback automatic branch-update cap for Reconcilers
+// built without a configured value. Rebases get their own small budget so a
+// moving base cannot spend the whole fix budget before a real check failure is
+// handled. Configured Reconcilers use autoRebaseCap instead.
 const maxAutoRebases = 2
+
+// autoRebaseCap returns the configured automatic rebase cap. A Reconciler
+// built directly in a test keeps the fallback, so no caller can accidentally
+// raise the budget by omitting the field.
+func (r *Reconciler) autoRebaseCap() int {
+	if r.MaxAutoRebases > 0 {
+		return r.MaxAutoRebases
+	}
+	return maxAutoRebases
+}
 
 // recordObservation stores the head and base SHA pair the reconciler has just
 // acted on, so the next poll can skip an identical observation.
@@ -79,8 +90,8 @@ func (r *Reconciler) handleNeedsRebase(
 	if sameObservation(run, obs) {
 		return decision, nil
 	}
-	if run.RebaseBudgetExhausted(maxAutoRebases) {
-		if run.State != core.RunBlocked {
+	if run.RebaseBudgetExhausted(r.autoRebaseCap()) {
+		if !run.State.Blocked() {
 			return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase budget exhausted"}, obs)
 		}
 		return decision, nil
@@ -143,7 +154,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 	if err != nil {
 		return decision, err
 	}
-	if fresh != nil && fresh.State == core.RunBlocked {
+	if fresh != nil && fresh.State.Blocked() {
 		return decision, nil
 	}
 	if fresh != nil {
@@ -153,7 +164,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 }
 
 func (r *Reconciler) handleBlocked(ctx context.Context, run *core.Run, decision core.MergeDecision) (core.MergeDecision, error) {
-	if run.State != core.RunBlocked {
+	if !run.State.Blocked() {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
 		}

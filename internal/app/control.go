@@ -11,6 +11,15 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// bestEffort runs a cleanup operation and logs a failure without returning it.
+// Callers use it when the main work is already saved and a later sweep can
+// retry the cleanup, so a failed cleanup must not fail the operation.
+func bestEffort(what string, fn func() error, attrs ...any) {
+	if err := fn(); err != nil {
+		slog.Error(what, append(attrs, "error", err)...)
+	}
+}
+
 const (
 	controlWriteAttempts = 3
 	controlRetryBase     = 10 * time.Millisecond
@@ -164,16 +173,16 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 		return err
 	}
 	if saved.SessionID != "" {
-		if err := c.Harness.Stop(ctx, saved.SessionID); err != nil {
-			slog.Error("cancel session stop", "run", saved.ID, "task", saved.TaskID, "error", err)
-		}
+		bestEffort("cancel session stop", func() error {
+			return c.Harness.Stop(ctx, saved.SessionID)
+		}, "run", saved.ID, "task", saved.TaskID)
 	}
 	if saved.WorkspacePath != "" {
 		// The cancel is already saved. A failed remove leaves a worktree for the
 		// next cleanup sweep, so it must not turn a successful cancel into an error.
-		if err := c.Workspace.Remove(ctx, core.Workspace{Path: saved.WorkspacePath, Branch: saved.Branch}); err != nil {
-			slog.Error("cancel workspace remove", "run", saved.ID, "task", saved.TaskID, "error", err)
-		}
+		bestEffort("cancel workspace remove", func() error {
+			return c.Workspace.Remove(ctx, core.Workspace{Path: saved.WorkspacePath, Branch: saved.Branch})
+		}, "run", saved.ID, "task", saved.TaskID)
 	}
 	return nil
 }
@@ -227,12 +236,12 @@ func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 		if err != nil {
 			return err
 		}
-		switch run.State {
-		case core.RunBlocked:
+		switch {
+		case run.State.Blocked():
 			if err := run.RetryBlocked("retried by operator"); err != nil {
 				return err
 			}
-		case core.RunClosed:
+		case run.State == core.RunClosed:
 			if err := c.retryClosed(ctx, run); err != nil {
 				return err
 			}

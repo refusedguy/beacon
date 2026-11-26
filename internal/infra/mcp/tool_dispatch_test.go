@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -283,8 +282,8 @@ func TestDispatchToolReportsStartedAndFailedRunsInSummary(t *testing.T) {
 	if len(payload.Failures) != 1 || payload.Failures[0].TaskID != "T-BAD" {
 		t.Fatalf("failures = %+v", payload.Failures)
 	}
-	if len(payload.Runs) != 2 {
-		t.Fatalf("runs = %+v, want the started and the failed run", payload.Runs)
+	if len(payload.Runs) != 1 {
+		t.Fatalf("runs = %+v, want only the started run", payload.Runs)
 	}
 	if len(payload.Summary) != 2 {
 		t.Fatalf("summary = %+v, want two outcomes", payload.Summary)
@@ -299,33 +298,35 @@ func TestDispatchToolReportsStartedAndFailedRunsInSummary(t *testing.T) {
 		}
 		byTask[outcome.TaskID] = struct{ id, state, reason string }{outcome.ID, outcome.State, outcome.Reason}
 	}
-	if byTask["T-OK"].state != "running" || byTask["T-BAD"].state != "closed" {
-		t.Fatalf("outcomes = %+v, want running and closed", byTask)
+	if byTask["T-OK"].state != "running" || byTask["T-BAD"].state != "failed" {
+		t.Fatalf("outcomes = %+v, want running and failed", byTask)
 	}
 	if !strings.Contains(byTask["T-BAD"].reason, "dirty worktree") {
 		t.Fatalf("failure reason = %q", byTask["T-BAD"].reason)
 	}
-	if byTask["T-OK"].id == byTask["T-BAD"].id || !strings.HasPrefix(byTask["T-BAD"].id, "run-") {
-		t.Fatalf("run ids = %q and %q", byTask["T-OK"].id, byTask["T-BAD"].id)
+	if byTask["T-BAD"].id != "T-BAD" || !strings.HasPrefix(byTask["T-OK"].id, "run-") {
+		t.Fatalf("outcome ids = %q and %q", byTask["T-OK"].id, byTask["T-BAD"].id)
 	}
 }
 
-// countingDispatchStore serves recent runs and records how often and with
-// which limit they were requested. Only ListRecent matters to failedRuns; the
-// other DispatchStore methods keep the interface satisfied.
+// countingDispatchStore counts ListRecent calls so a test can prove a failed
+// spawn does not trigger a recent-run query. The other DispatchStore methods
+// keep the interface satisfied and return the ready task for dispatch.
 type countingDispatchStore struct {
-	runs     []*core.Run
+	ready    []core.Task
 	calls    int
 	gotLimit int
 }
 
-func (*countingDispatchStore) SyncTasks(context.Context, []core.Task) error        { return nil }
-func (*countingDispatchStore) ListReadyTasks(context.Context) ([]core.Task, error) { return nil, nil }
-func (*countingDispatchStore) ListActive(context.Context) ([]*core.Run, error)     { return nil, nil }
+func (*countingDispatchStore) SyncTasks(context.Context, []core.Task) error { return nil }
+func (s *countingDispatchStore) ListReadyTasks(context.Context) ([]core.Task, error) {
+	return s.ready, nil
+}
+func (*countingDispatchStore) ListActive(context.Context) ([]*core.Run, error) { return nil, nil }
 func (s *countingDispatchStore) ListRecent(_ context.Context, limit int) ([]*core.Run, error) {
 	s.calls++
 	s.gotLimit = limit
-	return s.runs, nil
+	return nil, nil
 }
 func (*countingDispatchStore) FindActiveByTask(context.Context, core.TaskID) (*core.Run, error) {
 	return nil, nil
@@ -333,93 +334,59 @@ func (*countingDispatchStore) FindActiveByTask(context.Context, core.TaskID) (*c
 func (*countingDispatchStore) Save(context.Context, *core.Run) error                    { return nil }
 func (*countingDispatchStore) SetTaskStatus(context.Context, core.TaskID, string) error { return nil }
 
-func TestFailedRunsIndexesRecentOnce(t *testing.T) {
-	const total, failed = 200, 50
-	store := &countingDispatchStore{}
-	failures := make([]app.DispatchFailure, 0, failed)
-
-	// ListRecent returns newest first. The newest 50 tasks failed to start.
-	for i := total - 1; i >= 0; i-- {
-		taskID := core.TaskID(fmt.Sprintf("T-%03d", i))
-		state := core.RunMerged
-		if i >= total-failed {
-			state = core.RunClosed
-		}
-		store.runs = append(store.runs, &core.Run{
-			ID:            core.RunID(fmt.Sprintf("run-%03d", i)),
-			TaskID:        taskID,
-			State:         state,
-			Reason:        string(state),
-			LaunchSource:  core.LaunchMCP,
-			AgentIdentity: "worker",
-		})
-		if i >= total-failed {
-			failures = append(failures, app.DispatchFailure{TaskID: taskID, Err: "workspace: conflict"})
-		}
+func TestDispatchFailureSkipsRecentLookup(t *testing.T) {
+	task := core.Task{ID: "T-BAD", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("bad.go")}}
+	store := &countingDispatchStore{ready: []core.Task{task}}
+	d := &app.Dispatcher{
+		Source:  &dispatchSource{tasks: []core.Task{task}},
+		Planner: planner.New(planner.Options{}), Workspace: failingDispatchWorkspace{},
+		Harness: stubDispatchHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
 	}
-
-	got := failedRuns(context.Background(), &app.Dispatcher{Store: store}, failures)
-	if store.calls != 1 {
-		t.Fatalf("ListRecent calls = %d, want 1 with %d failures", store.calls, failed)
-	}
-	if store.gotLimit != failed+app.DefaultRecentLimit {
-		t.Fatalf("ListRecent limit = %d, want %d", store.gotLimit, failed+app.DefaultRecentLimit)
-	}
-	if len(got) != failed {
-		t.Fatalf("resolved failures = %d, want %d", len(got), failed)
-	}
-
-	// The previous nested scan is the reference for unchanged output.
-	reference := map[core.TaskID]*core.Run{}
-	for _, failure := range failures {
-		for _, run := range store.runs {
-			if run.TaskID == failure.TaskID {
-				reference[failure.TaskID] = run
-				break
-			}
-		}
-	}
-	if !reflect.DeepEqual(got, reference) {
-		t.Fatalf("resolved runs differ from the previous scan")
-	}
-
-	// Build the caller-facing summary the same way registerDispatch does and
-	// compare the wire JSON. Order follows the failure list, not the index.
-	summaryFor := func(byTask map[core.TaskID]*core.Run) []dispatchOutcome {
-		out := make([]dispatchOutcome, 0, len(failures))
-		for _, failure := range failures {
-			if run := byTask[failure.TaskID]; run != nil {
-				out = append(out, outcomeForRun(run))
-				continue
-			}
-			out = append(out, dispatchOutcome{
-				ID: string(failure.TaskID), TaskID: string(failure.TaskID),
-				State: "failed", Reason: failure.Err,
-				Launch: string(core.LaunchMCP), Identity: "worker",
-			})
-		}
-		return out
-	}
-	gotJSON, err := json.Marshal(summaryFor(got))
+	server := NewServer(Services{Dispatcher: d})
+	clientTransport, serverTransport := msdk.NewInMemoryTransports()
+	ss, err := server.Connect(context.Background(), serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantJSON, err := json.Marshal(summaryFor(reference))
+	defer ss.Close()
+	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
+	cs, err := client.Connect(context.Background(), clientTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(gotJSON) != string(wantJSON) {
-		t.Fatalf("summary JSON changed:\n got %s\nwant %s", gotJSON, wantJSON)
-	}
-}
+	defer cs.Close()
 
-func TestFailedRunsKeepsNewestRunForTask(t *testing.T) {
-	older := &core.Run{ID: "run-old", TaskID: "T-DUP", State: core.RunClosed, Reason: "old"}
-	newer := &core.Run{ID: "run-new", TaskID: "T-DUP", State: core.RunClosed, Reason: "new"}
-	store := &countingDispatchStore{runs: []*core.Run{newer, older}}
-	got := failedRuns(context.Background(), &app.Dispatcher{Store: store}, []app.DispatchFailure{{TaskID: "T-DUP"}})
-	if got["T-DUP"] != newer {
-		t.Fatalf("resolved run = %v, want the newest %v", got["T-DUP"], newer)
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_dispatch", Arguments: DispatchArgs{N: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Content) == 0 {
+		t.Fatal("empty dispatch result")
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatal("unexpected tool content")
+	}
+	var payload struct {
+		Summary []struct {
+			ID     string `json:"id"`
+			TaskID string `json:"task_id"`
+			State  string `json:"state"`
+			Reason string `json:"reason"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(text.Text), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if store.calls != 0 {
+		t.Fatalf("ListRecent calls = %d, want 0 after a failed spawn", store.calls)
+	}
+	if len(payload.Summary) != 1 || payload.Summary[0].ID != "T-BAD" ||
+		payload.Summary[0].State != "failed" || !strings.Contains(payload.Summary[0].Reason, "dirty worktree") {
+		t.Fatalf("summary = %+v, want one failed outcome for T-BAD", payload.Summary)
 	}
 }
 
