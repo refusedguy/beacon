@@ -160,6 +160,22 @@ func TestParseTaskFieldsMalformedYAMLReported(t *testing.T) {
 	}
 }
 
+func TestParseTaskFieldsAcceptsCardAliases(t *testing.T) {
+	body := "```yaml\ntask_id: T-YAML-ALIAS\nowner_files: [a.go, b.go]\n```\n"
+
+	got := ParseTaskFields(body, "", "")
+	if got.ID != "T-YAML-ALIAS" {
+		t.Fatalf("ID = %q, want T-YAML-ALIAS", got.ID)
+	}
+	if !reflect.DeepEqual(got.Scope, []string{"a.go", "b.go"}) {
+		t.Fatalf("scope = %v", got.Scope)
+	}
+	want := []core.ScopePath{"f:a.go", "f:b.go"}
+	if resolved := got.Scopes(""); !reflect.DeepEqual(resolved, want) {
+		t.Fatalf("resolved scope = %v, want %v", resolved, want)
+	}
+}
+
 func TestPlanParserChildren(t *testing.T) {
 	epic := core.Task{
 		ID:   "T-EPIC",
