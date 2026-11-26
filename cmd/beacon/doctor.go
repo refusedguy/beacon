@@ -321,7 +321,7 @@ func doctorBinaryCheck(root string) doctorCheck {
 
 // doctorDaemonCheck reports daemon liveness from its status record.
 func doctorDaemonCheck(cfg config.Config) doctorCheck {
-	status := readDaemonStatus(filepath.Dir(cfg.StateDB))
+	status := readDaemonStatus(stateDir(cfg))
 	switch status.State {
 	case "alive":
 		detail := fmt.Sprintf("alive (pid %d, heartbeat %.1fs ago)", status.PID, status.HeartbeatAgeSecond)

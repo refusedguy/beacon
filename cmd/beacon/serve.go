@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -29,7 +28,7 @@ func newServeCommand(configPath *string) *cobra.Command {
 			if w.cfg.Webhook.Enabled && w.cfg.Webhook.Secret == "" {
 				return fmt.Errorf("webhook.enabled requires webhook.secret or webhook.secret_env")
 			}
-			dir := filepath.Dir(w.cfg.StateDB)
+			dir := stateDir(w.cfg)
 			lock, err := acquireLock(dir)
 			if err != nil {
 				return err

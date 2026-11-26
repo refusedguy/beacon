@@ -78,6 +78,22 @@ func daemonSnapshot(status daemonStatus) *app.DaemonSnapshot {
 	return out
 }
 
+// stateDir returns the directory holding the state database, the daemon lock,
+// the daemon status record and the connection file.
+func stateDir(cfg config.Config) string {
+	return filepath.Dir(cfg.StateDB)
+}
+
+// liveDaemon returns the connection record of a daemon that answers on its
+// loopback address. It reports false when no daemon owns the state database.
+func liveDaemon(cfg config.Config) (*connectionInfo, bool) {
+	info, err := readConnection(stateDir(cfg))
+	if err != nil || !daemonAlive(info) {
+		return nil, false
+	}
+	return info, true
+}
+
 func newDispatchCommand(configPath *string, fn wireFn) *cobra.Command {
 	return &cobra.Command{
 		Use:   "dispatch [n]",
@@ -124,7 +140,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				return printJSON(readDaemonStatus(filepath.Dir(cfg.StateDB)))
+				return printJSON(readDaemonStatus(stateDir(cfg)))
 			}
 			cfg, store, _, err := wireReadOnly(*configPath)
 			if err != nil {
@@ -135,7 +151,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				result, err := (app.SnapshotService{
 					Store: store, RecentLimit: f.recentLimit, DecisionsLimit: f.decisionsLimit,
 					Repo:   cfg.RepoSlug(),
-					Daemon: daemonSnapshot(readDaemonStatus(filepath.Dir(cfg.StateDB))),
+					Daemon: daemonSnapshot(readDaemonStatus(stateDir(cfg))),
 				}).Snapshot(cmd.Context())
 				if err != nil {
 					return err
@@ -291,7 +307,7 @@ func dispatchControlWithPR(ctx context.Context, fn wireFn, configPath, action, r
 	if err != nil {
 		return err
 	}
-	if info, err := readConnection(filepath.Dir(cfg.StateDB)); err == nil && daemonAlive(cfg.StateDB) {
+	if info, ok := liveDaemon(cfg); ok {
 		return postControlWithPR(ctx, info, action, runID, sha, pr, message...)
 	}
 	w, err := wireCLI(fn, configPath)
