@@ -28,12 +28,17 @@ test("state bar builds proportional colored segments and a human summary", () =>
     recent: [makeRun({ ID: "e", TaskID: "T-E", State: "merged" })],
     metrics: { merge_count: 51, rebase_count: 2, fix_count: 1 },
   })
-  assert.deepEqual(item.counts, { running: 2, waiting_ci: 1, blocked: 1, merged: 1 })
+  assert.deepEqual(item.counts, {
+    pending: 0, running: 2, waiting_ci: 1, needs_rebase: 0,
+    needs_agent_fix: 0, blocked: 1, merged: 1, closed: 0,
+  })
   assert.equal(item.filled, 5)
   assert.equal(item.bar.length, STATE_BAR_WIDTH)
   assert.equal(item.segments.reduce((n, s) => n + s.text.length, 0), STATE_BAR_WIDTH)
-  assert.deepEqual(item.segments.map((s) => s.color), ["success", "info", "error", "success", "muted"])
-  assert.equal(item.legend, "R2 C1 B1 M51")
+  assert.deepEqual(item.segments.map((s) => s.color), [
+    "muted", "success", "info", "warning", "warning", "error", "success", "muted", "muted",
+  ])
+  assert.equal(item.legend, "P0 R2 C1 E0 F0 B1 M51 X0")
   assert.equal(item.summary, "2 running · 1 in CI · 1 blocked · 1 done")
   assert.equal(item.fg, "error", "a blocked run colors the bar with the error tone")
   const big = stateBarItem({ active: Array.from({ length: STATE_BAR_WIDTH + 2 }, (_, i) => makeRun({ ID: `r-${i}`, State: "running" })), recent: [] })
@@ -43,7 +48,30 @@ test("state bar builds proportional colored segments and a human summary", () =>
   const empty = stateBarItem(EMPTY_SNAPSHOT)
   assert.equal(empty.segments[0].text, "")
   assert.equal(empty.segments.at(-1).text, "─".repeat(STATE_BAR_WIDTH))
-  assert.ok(empty.content.includes("R0 C0 B0 M0"))
+  assert.ok(empty.content.includes("P0 R0 C0 E0 F0 B0 M0 X0"))
+})
+
+test("every run state gets a solid segment and its own legend count", () => {
+  const states = [
+    "pending", "running", "waiting_ci", "needs_rebase",
+    "needs_agent_fix", "blocked", "merged", "closed",
+  ]
+  const item = stateBarItem({
+    active: states.slice(0, 6).map((state, i) => makeRun({ ID: `a-${i}`, TaskID: `T-${i}`, State: state })),
+    recent: states.slice(6).map((state, i) => makeRun({ ID: `r-${i}`, TaskID: `T-R-${i}`, State: state })),
+  })
+  assert.deepEqual(Object.keys(item.counts), states)
+  assert.equal(item.total, 8)
+  assert.equal(item.filled, 8)
+  assert.equal(item.bar.length, STATE_BAR_WIDTH)
+  assert.equal(item.segments.length, 9, "eight states plus the empty remainder")
+  const stateSegments = item.segments.slice(0, 8)
+  assert.ok(stateSegments.every((segment) => segment.text), "each state renders one visible segment")
+  assert.ok(stateSegments.every((segment) => /^█+$/.test(segment.text)), "filled cells use a solid block")
+  assert.equal(item.segments[8].text, "─".repeat(STATE_BAR_WIDTH - 8), "the rest stays empty")
+  assert.equal(item.legend, "P1 R1 C1 E1 F1 B1 M1 X1")
+  assert.equal(new Set(item.legend.split(" ").map((entry) => entry[0])).size, 8, "each state has its own letter")
+  assert.ok(item.legend.length <= STATE_BAR_WIDTH, "the legend fits the sidebar width")
 })
 
 test("compactReason turns noisy failures into readable causes", () => {
@@ -133,7 +161,7 @@ test("a sanitized stale line keeps the prefix and never shows help text", () => 
 test("empty snapshot shows one idle line and counted headers", () => {
   const items = sidebarModel(EMPTY_SNAPSHOT, null, NOW).items
   assert.deepEqual(items.map((i) => i.name), [
-    "Beacon", "R0 C0 B0 M0", "Active", "Idle · no ready tasks",
+    "Beacon", "P0 R0 C0 E0 F0 B0 M0 X0", "Active", "Idle · no ready tasks",
     "Queue", "Recent", "No recent runs",
   ])
   assert.deepEqual(items.filter((i) => i.sectionKey).map((i) => [i.name, i.status]), [
