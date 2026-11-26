@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/infra/shared"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -117,7 +118,7 @@ func (g *GitLab) unresolvedThreads(ctx context.Context, mrIID int) ([]string, er
 			if last == "" {
 				last = "unresolved discussion"
 			}
-			out = append(out, gitlabRedact(gitlabTail(last, 1200)))
+			out = append(out, shared.Redact(gitlabTail(last, 1200)))
 		}
 	}
 	return out, nil
