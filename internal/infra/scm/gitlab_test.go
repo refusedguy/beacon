@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -447,5 +448,86 @@ func TestGitLabBreakerStopsRepeatedFailures(t *testing.T) {
 	}
 	if got := calls.Load(); got != 6 {
 		t.Fatalf("server calls after open = %d, want 6", got)
+	}
+}
+
+func TestGitLabObserveFetchesIndependentSignalsInTwoRounds(t *testing.T) {
+	// With the MR's head pipeline present, threads, approvals, jobs and the
+	// base comparison all run in the first round. Failure traces wait for the
+	// jobs result in the second round.
+	gate := newRoundGate(4)
+	var traceInFlight, maxTraces atomic.Int64
+	g := glTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/merge_requests/7") && r.Method == http.MethodGet:
+			glWriteJSON(t, w, map[string]any{
+				"iid": 7, "state": "opened", "sha": "head1", "target_branch": "main",
+				"head_pipeline": map[string]any{"id": 11, "status": "failed"},
+			})
+			return
+		case strings.HasSuffix(p, "/threads"):
+			gate.first()
+			glWriteJSON(t, w, []any{})
+			return
+		case strings.HasSuffix(p, "/approvals"):
+			gate.first()
+			glWriteJSON(t, w, map[string]any{"approved_by": []map[string]any{
+				{"user": map[string]string{"username": "alice"}},
+			}})
+			return
+		case strings.HasSuffix(p, "/jobs"):
+			gate.first()
+			glWriteJSON(t, w, []map[string]any{
+				{"id": 110, "name": "unit", "status": "failed"},
+				{"id": 111, "name": "lint", "status": "failed"},
+			})
+			return
+		case strings.HasSuffix(p, "/repository/compare"):
+			gate.first()
+			glWriteJSON(t, w, map[string]any{"behind_by": 0})
+			return
+		case strings.Contains(p, "/trace"):
+			gate.later()
+			n := traceInFlight.Add(1)
+			for {
+				m := maxTraces.Load()
+				if n <= m || maxTraces.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			traceInFlight.Add(-1)
+			_, _ = w.Write([]byte("unit failed"))
+			return
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, p)
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	o, err := g.Observe(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gate.count(); got != 2 {
+		t.Fatalf("rounds = %d, want 2 (threads and approvals and jobs and compare, then traces)", got)
+	}
+	if got := gate.peakConcurrency(); got != 4 {
+		t.Fatalf("peak concurrent first-round calls = %d, want 4", got)
+	}
+	if got := maxTraces.Load(); got != 2 {
+		t.Fatalf("peak concurrent traces = %d, want 2", got)
+	}
+	if o.PRNumber != 7 || o.HeadSHA != "head1" || o.PRState != "opened" || o.Approvals != 1 ||
+		o.Incomplete || o.IncompleteReason != "" {
+		t.Fatalf("observation changed: %+v", o)
+	}
+	if len(o.Checks) != 2 || o.Checks[0].Name != "unit" || o.Checks[0].State != core.CheckFailure ||
+		o.Checks[1].Name != "lint" || o.Checks[1].State != core.CheckFailure {
+		t.Fatalf("checks = %+v", o.Checks)
+	}
+	if o.FailureExcerpt != "unit failed" {
+		t.Fatalf("FailureExcerpt = %q, want the first failed job's output", o.FailureExcerpt)
 	}
 }
