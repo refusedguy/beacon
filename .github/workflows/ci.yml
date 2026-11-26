@@ -84,11 +84,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module:
-          - .
-          - harnesses/acp
-          - harnesses/opencode
-          - ui/tui
+        include:
+          - module: root command and infra
+            dir: .
+            packages: ./cmd/... ./internal/...
+          - module: root core
+            dir: .
+            packages: . ./pkg/...
+          - module: acp
+            dir: harnesses/acp
+            packages: ./...
+          - module: opencode
+            dir: harnesses/opencode
+            packages: ./...
+          - module: tui
+            dir: ui/tui
+            packages: ./...
     steps:
       - uses: actions/checkout@v4
 
@@ -101,8 +112,8 @@ jobs:
             ui/tui/go.sum
 
       - name: Test ${{ matrix.module }} module
-        working-directory: ${{ matrix.module }}
-        run: go test -race -shuffle=on ./...
+        working-directory: ${{ matrix.dir }}
+        run: go test -race -shuffle=on ${{ matrix.packages }}
 
   plugin-tui-smoke:
     runs-on: ubuntu-latest
