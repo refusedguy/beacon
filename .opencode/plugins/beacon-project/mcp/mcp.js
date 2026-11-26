@@ -1,9 +1,11 @@
 import { existsSync as fsExistsSync, statSync as fsStatSync, readdirSync as fsReaddirSync } from "node:fs"
 import { execFileSync as defaultExecFileSync } from "node:child_process"
 import { delimiter, join } from "node:path"
+import { sessionIdentity } from "../state/session_identity.js"
 
 export const BEACON_SERVER = "beacon"
 export const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
+export const BEACON_PARENT_SESSION_ENV = "BEACON_PARENT_SESSION"
 export const BEACON_BUILD_SCRIPT = "scripts/build-beacon.sh"
 
 const SOURCE_DIRS = ["cmd", "internal", "pkg", "harnesses", "ui/tui"]
@@ -159,17 +161,24 @@ export function createMcpRegistrar(deps = defaultDeps) {
     throw new Error("beacon MCP: no beacon binary and no cmd/beacon/main.go in project root")
   }
 
-  function beaconServerConfig(root, callDeps = baseDeps) {
+  function beaconServerConfig(root, callDeps = baseDeps, sessionID = "") {
     if (typeof root !== "string" || root.trim() === "") {
       throw new Error("beacon MCP: project root is required")
     }
     const effective = resolveDeps(callDeps)
     const resolveCommand = typeof effective.beaconCommand === "function" ? effective.beaconCommand : beaconCommand
+    const environment = { [BEACON_PROJECT_ROOT_ENV]: root }
+    // The daemon reads this once at startup. A worker that inherits the pooled
+    // connection sends no MCP meta, so the operator session must be in the
+    // server environment to give that dispatch a parent binding.
+    if (typeof sessionID === "string" && sessionID) {
+      environment[BEACON_PARENT_SESSION_ENV] = sessionID
+    }
     return Object.freeze({
       type: "local",
       command: resolveCommand(root, effective),
       cwd: root,
-      environment: Object.freeze({ [BEACON_PROJECT_ROOT_ENV]: root }),
+      environment: Object.freeze(environment),
       disabled: false,
     })
   }
@@ -189,7 +198,11 @@ export function createMcpRegistrar(deps = defaultDeps) {
     const existing = registrations.get(root)
     if (existing) return existing
 
-    const config = beaconServerConfig(root, effective)
+    // Plugin setup does not always receive a session ID directly. The shared
+    // resolver falls back to the newest session, which is the operator session
+    // that owns the pooled MCP daemon.
+    const identity = await sessionIdentity(ctx)
+    const config = beaconServerConfig(root, effective, identity.sessionID)
     const registration = Object.freeze({
       server: BEACON_SERVER,
       config,

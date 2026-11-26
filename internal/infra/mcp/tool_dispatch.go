@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"os"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -140,6 +141,16 @@ func failedRuns(ctx context.Context, d *app.Dispatcher, failures []app.DispatchF
 	return out
 }
 
+// parentSession reads the operator session from call metadata. A worker that
+// inherits the pooled MCP daemon sends no meta, so fall back to the session the
+// plugin placed in the server environment at startup. Per-call meta wins.
 func parentSession(req *msdk.CallToolRequest) string {
-	return metaString(req, "ai.opencode/sessionID", "beacon/sessionID")
+	if meta := metaString(req,
+		"ai.opencode/sessionID", "beacon/sessionID",
+		"ai.opencode/sessionId", "beacon/sessionId",
+		"opencode/sessionID", "sessionID", "sessionId",
+	); meta != "" {
+		return meta
+	}
+	return os.Getenv("BEACON_PARENT_SESSION")
 }
