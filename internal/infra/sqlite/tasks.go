@@ -190,15 +190,25 @@ WHERE status IN (%s)
   AND id NOT IN (SELECT task_id FROM blocked_chain)
 ORDER BY priority DESC, id`, resolvedTaskStatuses, resolvedTaskStatuses, openTaskStatuses)
 
-// SetTaskStatus sets the status of taskID. The write changes a stored card, so
-// the last SyncTasks fingerprint no longer describes the table.
+// SetTaskStatus sets the status of taskID. A write that matched no row leaves
+// the table unchanged, so it keeps the last SyncTasks fingerprint.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
+	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
 	cache := cacheForDB(s.db)
 	cache.mu.Lock()
 	cache.fingerprint = nil
 	cache.mu.Unlock()
-	return err
+	return nil
 }
 
 // ListReadyTasks returns the available tasks whose dependencies are resolved.
