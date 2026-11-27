@@ -193,13 +193,16 @@ export function queueGroups(queue = [], hidden = null, tree = null) {
     if (!groups.has(key)) { groups.set(key, []); order.push(key) }
     groups.get(key).push(item)
   }
+  // The toggle and the rows both need the blocked keys. Derive them here from
+  // the order we already built instead of running a second queueGroups pass.
+  const blockedKeys = order.filter(Boolean)
   return {
-    groups, order, parents: parent, blockers, tree: index, idOf,
+    groups, order, blockedKeys, parents: parent, blockers, tree: index, idOf,
     parentOf, childrenOf, isEpic,
   }
 }
 
-export const blockedGroupKeys = (queue = [], tree = null) => queueGroups(queue, null, tree).order.filter(Boolean)
+export const blockedGroupKeys = (queue = [], tree = null) => queueGroups(queue, null, tree).blockedKeys
 
 // An expanded epic or blocked group shows at most this many member rows. The
 // rest collapse into a "+N more" line so Recent stays inside the sidebar.
@@ -215,12 +218,16 @@ const groupTitle = (id, byID) => str(byID.get(id)?.title) || shortTaskID(id)
 
 // A null blockedOpen keeps the flat legacy rows for pure callers that never
 // drive the toggle. With a map, only groups marked true expand.
-export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tree = null) {
-  const { groups, order, blockers, parentOf, childrenOf, isEpic, idOf, tree: index } = queueGroups(queue, hidden, tree)
+export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tree = null, prepared = null) {
+  const { groups, order, blockers, parentOf, childrenOf, isEpic, idOf, tree: index } = prepared ?? queueGroups(queue, hidden, tree)
   const rows = []
   for (const key of order) {
+    // A prepared index groups the whole queue. Drop hidden members here so a
+    // header and its count match what a fresh hidden-filtered grouping renders.
+    const grouped = groups.get(key) ?? []
+    const members = hidden ? grouped.filter((item) => !hidden.has(str(item?.id))) : grouped
+    if (!members.length) continue
     if (rows.length) rows.push(spacerItem())
-    const members = groups.get(key)
     if (key) {
       const expanded = blockedOpen == null || blockedOpen[key] === true
       const first = members[0]
@@ -254,19 +261,22 @@ export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tr
   return rows
 }
 
-export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree = null) {
+export function queueRowsWithMeta(queue = [], epicOpen = null, blockedOpen = null, tree = null) {
   const list = Array.isArray(queue) ? queue : []
   // One tree per snapshot. The caller passes the index it already built for the
   // queue header; a standalone caller falls back to the cached index for the
   // same array. queueLineItems reads that index through its tree argument.
   const index = tree ?? taskTree(list)
-  // The tree already holds these three maps. Reading them here avoids a second
-  // queueGroups pass over the whole queue; queueLineItems builds the groups it
-  // needs from the same index.
   const parentOf = (id) => index.parent.get(id) || ""
   const childrenOf = (id) => index.children.get(id) ?? []
   const isEpic = (id) => index.epic.has(id)
-  if (!epicOpen) return queueLineItems(list, null, blockedOpen, index)
+  // One grouping serves both the blocked toggle and the rows. blockedKeys comes
+  // from the same pass instead of a second queueGroups scan with a different
+  // membership rule.
+  const prepared = queueGroups(list, null, index)
+  if (!epicOpen) {
+    return { rows: queueLineItems(list, null, blockedOpen, index, prepared), blockedKeys: prepared.blockedKeys }
+  }
   const ids = index.list === list ? index.ids : list.map((item) => str(item?.id))
   // Walk up to the direct child under each ancestor epic. This hides the whole
   // subtree of a collapsed epic and of a child beyond the cap.
@@ -290,7 +300,7 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree 
       parent = parentOf(parent)
     }
   }
-  const rows = queueLineItems(list, hidden, blockedOpen, index)
+  const rows = queueLineItems(list, hidden, blockedOpen, index, prepared)
   const summaries = []
   for (const id of ids) {
     if (!isEpic(id) || epicOpen[id] !== true) continue
@@ -307,11 +317,17 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree 
     } })
   }
   for (const { at, item } of summaries.sort((a, b) => b.at - a.at)) rows.splice(at, 0, item)
-  return rows.map((row) => {
-    if (row.kind !== "queue-title" || !isEpic(row.cardID)) return row
-    const chevron = epicOpen[row.cardID] === true ? "▼" : "▶"
-    return { ...row, marker: chevron, epicKey: row.cardID, action: `epic:${row.cardID}` }
-  })
+  return {
+    rows: rows.map((row) => {
+      if (row.kind !== "queue-title" || !isEpic(row.cardID)) return row
+      const chevron = epicOpen[row.cardID] === true ? "▼" : "▶"
+      return { ...row, marker: chevron, epicKey: row.cardID, action: `epic:${row.cardID}` }
+    }),
+    blockedKeys: prepared.blockedKeys,
+  }
+}
+export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree = null) {
+  return queueRowsWithMeta(queue, epicOpen, blockedOpen, tree).rows
 }
 
 export const readyCount = (queue = []) => (Array.isArray(queue) ? queue : [])
