@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -820,4 +821,127 @@ func TestHTTPControlAcceptsKnownActionAndRejectsUnknownAction(t *testing.T) {
 	}
 	t.Logf("POST /api/v1/control %s with token -> %d %q, service calls still %d",
 		unknown, status, body, len(services.recorded()))
+}
+
+// httpBenchSink keeps benchmark results live so the compiler cannot drop the
+// work inside the timed loop.
+var httpBenchSink []byte
+
+// TestPingFrameWireShape pins the direct payload build against the original
+// json.Marshal plus fmt.Appendf shape, so the optimization cannot change bytes.
+func TestPingFrameWireShape(t *testing.T) {
+	for _, now := range []time.Time{
+		time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 11, 27, 8, 43, 23, 123456789, time.UTC),
+	} {
+		body, err := json.Marshal(wirePing{Time: now.UTC().Format(time.RFC3339)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fmt.Sprintf("event: ping\ndata: %s\n\n", body)
+		if got := string(pingFrame(now)); got != want {
+			t.Fatalf("pingFrame(%v) = %q, want %q", now, got, want)
+		}
+	}
+}
+
+// BenchmarkPingFrame measures the keepalive payload construction per tick.
+func BenchmarkPingFrame(b *testing.B) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		httpBenchSink = pingFrame(now)
+	}
+}
+
+// BenchmarkSnapshotEncode measures one full runs snapshot build. A fresh cache
+// each iteration forces the encode path rather than the cached read.
+func BenchmarkSnapshotEncode(b *testing.B) {
+	runs := []*core.Run{{
+		ID:        "r1",
+		TaskID:    "T-1",
+		State:     core.RunRunning,
+		PRNumber:  7,
+		HeadSHA:   "abc123",
+		Branch:    "beacon/T-1",
+		Reason:    "queued",
+		UpdatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+	}}
+	status := &countingStatus{runs: runs}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cache := &runsCache{}
+		body, err := cache.snapshot(context.Background(), status)
+		if err != nil {
+			b.Fatal(err)
+		}
+		httpBenchSink = body
+	}
+}
+
+// appendSSEIDBench mirrors the handler's id-line builder so the two forms can
+// be compared in one binary. Both emit the same bytes.
+func appendSSEIDBench(dst []byte, id int64) []byte {
+	dst = append(dst, "id: "...)
+	dst = strconv.AppendInt(dst, id, 10)
+	return append(dst, '\n')
+}
+
+// BenchmarkSSEIDWrite compares the per-frame id-line write used by each
+// monitor. The append form reuses a stack buffer and avoids fmt reflection.
+func BenchmarkSSEIDWrite(b *testing.B) {
+	var id int64
+	b.Run("fmt", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			id++
+			_, _ = fmt.Fprintf(io.Discard, "id: %d\n", id)
+		}
+	})
+	b.Run("append", func(b *testing.B) {
+		var buf [24]byte
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			id++
+			_, _ = io.Discard.Write(appendSSEIDBench(buf[:0], id))
+		}
+	})
+}
+
+// BenchmarkEventFramesBroadcast drives a burst through eight monitors and
+// reports delivered and dropped frames. It proves the timed path moves real
+// bytes and shows the lossy-channel drop count.
+func BenchmarkEventFramesBroadcast(b *testing.B) {
+	const monitors = 8
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	src := make(chan core.HarnessEvent)
+	frames := newEventFrames(src, json.Marshal)
+	done := make(chan struct{})
+	go func() { frames.run(ctx); close(done) }()
+	chans := make([]<-chan []byte, monitors)
+	for i := range chans {
+		chans[i], _ = frames.subscribe()
+	}
+	ev := core.HarnessEvent{RunID: "r1", Kind: "progress"}
+	for i := 0; i < b.N; i++ {
+		src <- ev
+	}
+	close(src)
+	<-done
+	var delivered int64
+	for _, ch := range chans {
+		for {
+			select {
+			case <-ch:
+				delivered++
+				continue
+			default:
+			}
+			break
+		}
+	}
+	b.ReportMetric(float64(delivered), "delivered")
+	b.ReportMetric(float64(int64(b.N)*monitors-delivered), "dropped")
 }
