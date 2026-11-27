@@ -198,22 +198,19 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	var entry indexedCard
 	var path, updated string
-	var task core.Task
-	var hasFM bool
 	err := withCardIndex(s.Dir, func(idx *cardIndex) error {
 		p, ok := idx.byID[id]
 		if !ok {
 			return os.ErrNotExist
 		}
-		entry, ok := refreshIndexedCard(idx, p)
+		entry, ok = refreshIndexedCard(idx, p)
 		if !ok {
 			return os.ErrNotExist
 		}
 		path = entry.path
 		updated = rewriteStatus(entry.content, status, entry.hasFM)
-		task = entry.task
-		hasFM = entry.hasFM
 		return nil
 	})
 	if err != nil {
@@ -228,7 +225,7 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 	// rewriteStatus only touches the status line, so the task parsed before
 	// the write stays valid once its status is replaced. This avoids a second
 	// YAML decode of the rewritten text.
-	task.Status = normalizeStatus(status)
-	noteParsedCard(s.Dir, path, updated, task, hasFM)
+	entry.task.Status = normalizeStatus(status)
+	noteParsedCard(s.Dir, path, updated, entry.task, entry.hasFM)
 	return nil
 }
