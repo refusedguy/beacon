@@ -15,16 +15,15 @@ import (
 // env holds the seeded fixtures used by every pass. It is built once outside
 // the timed loop so the numbers measure the hot paths, not fixture setup.
 type env struct {
-	ctx     context.Context
-	store   *sqlite.Store
-	runs    []*core.Run
-	ids     []string
-	cards   []string
-	wire    []*core.Run
-	texts   []secretText
-	journal *opJournal
-	fanout  *fanoutBench
-	cancel  context.CancelFunc
+	ctx    context.Context
+	store  *sqlite.Store
+	runs   []*core.Run
+	ids    []string
+	cards  []string
+	wire   []*core.Run
+	texts  []secretText
+	fanout *fanoutBench
+	cancel context.CancelFunc
 }
 
 // runSQLiteSnapshot issues the seven reads SnapshotService.Snapshot performs.
@@ -133,16 +132,19 @@ func runRedact(e *env) (int64, int64) {
 	return work, errs
 }
 
-// runJournal exercises a mix of fresh operations and duplicate operation ids.
-// Work counts completed calls.
-func runJournal(e *env) (int64, int64) {
+// runJournal exercises a mix of fresh operations and duplicate operation ids
+// against a fresh journal per pass. Reusing one journal would turn every pass
+// after the first into an all-hit LRU walk with the same work count but a
+// different mix. Work counts completed calls.
+func runJournal(*env) (int64, int64) {
 	var work, errs int64
+	journal := newOpJournal()
 	for i := 0; i < 64; i++ {
 		id := "op-" + string(rune('a'+i%26)) + "-" + itoa(i%16)
-		if _, owner := e.journal.claim(id); owner {
-			e.journal.finish(id, nil, nil)
+		if _, owner := journal.claim(id); owner {
+			journal.finish(id, nil, nil)
 		}
-		if _, ok := e.journal.cached(id); !ok {
+		if _, ok := journal.cached(id); !ok {
 			errs++
 		}
 		work++
@@ -216,46 +218,63 @@ func takeFanoutCounts() (int64, int64, int64) {
 	return out[0], out[1], out[2]
 }
 
-// runSSEFanout mirrors one eventFrames plus changeSubscribers broadcast with
-// subs monitors. The first monitor is slow: both of its channels are full, so
-// every send to it drops. The other monitors drain after each event. Work is
-// the number of marshals and successful deliveries; errors are drops.
-func runSSEFanout(e *env, subs int) (int64, int64) {
+// sseSubscriberSet holds one ordered set of broadcasters and monitors. The
+// first monitor is slow and stays full, so every send to it drops. Fast monitors
+// drain after each event. Building the set once keeps subscription order fixed
+// and removes per-pass setup from the timed region.
+type sseSubscriberSet struct {
+	frames      *eventFrames
+	changes     *changeSubscribers
+	fastFrames  []<-chan []byte
+	fastChanges []<-chan int
+}
+
+func newSSESubscriberSet(subs int) *sseSubscriberSet {
 	frames := newEventFrames(json.Marshal)
 	changes := newChangeSubscribers()
-	slowFrames, unsubSlowFrames := frames.subscribe()
-	defer unsubSlowFrames()
-	slowChanges, unsubSlowChanges := changes.subscribe()
-	defer unsubSlowChanges()
+	slowFrames, _ := frames.subscribe()
+	slowChanges, _ := changes.subscribe()
 	for i := 0; i < subscriberBuffer; i++ {
 		slowFrames <- nil
 		slowChanges <- 0
 	}
-	fastFrames := make([]<-chan []byte, 0, subs-1)
-	fastChanges := make([]<-chan int, 0, subs-1)
+	set := &sseSubscriberSet{frames: frames, changes: changes}
 	for i := 1; i < subs; i++ {
-		frameView, unsubFrames := frames.subscribe()
-		defer unsubFrames()
-		fastFrames = append(fastFrames, frameView)
-		changeView, unsubChanges := changes.subscribe()
-		defer unsubChanges()
-		fastChanges = append(fastChanges, changeView)
+		frameView, _ := frames.subscribe()
+		set.fastFrames = append(set.fastFrames, frameView)
+		changeView, _ := changes.subscribe()
+		set.fastChanges = append(set.fastChanges, changeView)
 	}
+	return set
+}
+
+// sseSubscriberSets reuses the same ordered subscribers on every pass. A map
+// lookup by subscriber count keeps both fanout subcases independent.
+var sseSubscriberSets = map[int]*sseSubscriberSet{
+	sseSmallSubs: newSSESubscriberSet(sseSmallSubs),
+	sseLargeSubs: newSSESubscriberSet(sseLargeSubs),
+}
+
+// runSSEFanout mirrors one eventFrames plus changeSubscribers broadcast with
+// subs monitors. Work is the number of marshals and successful deliveries;
+// errors are drops.
+func runSSEFanout(e *env, subs int) (int64, int64) {
+	set := sseSubscriberSets[subs]
 	var work, errs int64
 	for i := 0; i < sseFanoutEvents; i++ {
 		run := e.wire[i%len(e.wire)]
 		ev := core.HarnessEvent{Kind: string(core.EvPRRegistered), RunID: run.ID}
-		_, frameDelivered, frameDropped := frames.deliver(ev)
-		changeDelivered, changeDropped := changes.deliver(run.PRNumber)
+		_, frameDelivered, frameDropped := set.frames.deliver(ev)
+		changeDelivered, changeDropped := set.changes.deliver(run.PRNumber)
 		work += 1 + frameDelivered + changeDelivered
 		errs += frameDropped + changeDropped
 		fanoutCounts.marshal++
 		fanoutCounts.delivered += frameDelivered + changeDelivered
 		fanoutCounts.dropped += frameDropped + changeDropped
-		for _, ch := range fastFrames {
+		for _, ch := range set.fastFrames {
 			<-ch
 		}
-		for _, ch := range fastChanges {
+		for _, ch := range set.fastChanges {
 			<-ch
 		}
 	}

@@ -56,27 +56,35 @@ func newEnv(b *testing.B) *env {
 	fan := newFanoutBench(3)
 	b.Cleanup(fan.close)
 	return &env{
-		ctx:     ctx,
-		store:   store,
-		runs:    runs,
-		ids:     runIDs(runs),
-		cards:   cardFixtures(fixtureCards),
-		wire:    runFixtures(fixtureWireRuns),
-		texts:   secretTexts(),
-		journal: newOpJournal(),
-		fanout:  fan,
+		ctx:    ctx,
+		store:  store,
+		runs:   runs,
+		ids:    runIDs(runs),
+		cards:  cardFixtures(fixtureCards),
+		wire:   runFixtures(fixtureWireRuns),
+		texts:  secretTexts(),
+		fanout: fan,
 	}
 }
 
 // warmup runs every hotspot once outside the timed loop so the first
-// calibration pass does not pay cold page-cache and regexp-init costs.
-func warmup(e *env) {
+// calibration pass does not pay cold page-cache and regexp-init costs. The four
+// newer rows join the three in-memory hotspots here; their counters are reset
+// so the timed report still describes exactly b.N passes.
+func warmup(e *env, scm *scmObserveBench, cards *cardLocalBench, snapshot *httpSnapshotBench, spawn *spawnHarnessBench) {
 	_, _ = runSQLiteSnapshot(e)
 	_, _ = runCardParse(e)
 	_, _ = runWireEncode(e)
 	_, _ = runRedact(e)
 	_, _ = runJournal(e)
 	_, _ = runFanout(e)
+	_, _ = runSCMObserve(scm)
+	_, _ = runCardStoreLocalScan(cards)
+	_, _ = runHTTPSnapshotAssembly(snapshot)
+	_, _ = runHarnessSpawn(spawn)
+	waitSpawnMoves(spawn, spawnCount)
+	snapshot.bytes = 0
+	spawn.moves.Store(0)
 }
 
 func timed(name string, fn func() (int64, int64)) sample {
@@ -239,7 +247,7 @@ func BenchmarkHotPaths(b *testing.B) {
 	snapshot := newHTTPSnapshotBench(b, e)
 	spawn := newSpawnHarnessBench(b)
 	if !smokeMode() {
-		warmup(e)
+		warmup(e, scm, cards, snapshot, spawn)
 	}
 	b.ResetTimer()
 	samples := make([]sample, 0, b.N*len(hotspotOrder))

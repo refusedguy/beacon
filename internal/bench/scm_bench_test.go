@@ -2,8 +2,8 @@ package bench
 
 import (
 	"context"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,7 +17,25 @@ import (
 // approval, compare and changed-file round trip set without a slow fixture.
 const scmObserves = 10
 
-// scmObserveBench holds one GitHub gateway pointed at a loopback server. The
+// stubRoundTripper serves fixed bodies in process so no benchmark pass pays
+// socket setup or scheduler jitter. Both HTTP-backed harnesses share it.
+type stubRoundTripper func(*http.Request) (*http.Response, error)
+
+func (fn stubRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
+// stubJSON builds a response with the same wire bodies the loopback servers
+// used to return. The caller supplies the status so error paths stay covered.
+func stubJSON(req *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		Status:     http.StatusText(status),
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+}
+
+// scmObserveBench holds one GitHub gateway on an in-process transport. The
 // counters are read before and after every observe so each row reports the
 // requests it served, not a cumulative total.
 type scmObserveBench struct {
@@ -28,33 +46,34 @@ type scmObserveBench struct {
 }
 
 // newSCMObserveHarness mirrors the client setup in
-// internal/infra/scm/github_test.go:19. The handler serves the same five
+// internal/infra/scm/github_test.go:19. The transport serves the same five
 // endpoints as ghObserveHandler, with a code file so no observe is skipped.
 func newSCMObserveHarness(b *testing.B) *scmObserveBench {
 	b.Helper()
 	var requests, unexpected atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport := stubRoundTripper(func(req *http.Request) (*http.Response, error) {
 		requests.Add(1)
-		p := r.URL.Path
-		w.Header().Set("Content-Type", "application/json")
+		p := req.URL.Path
 		switch {
 		case strings.HasSuffix(p, "/pulls/42"):
-			_, _ = w.Write([]byte(`{"number":42,"state":"open","head":{"sha":"abc"}}`))
+			return stubJSON(req, http.StatusOK, `{"number":42,"state":"open","head":{"sha":"abc"}}`), nil
 		case strings.Contains(p, "/check-runs"):
-			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+			return stubJSON(req, http.StatusOK, `{"total_count":0,"check_runs":[]}`), nil
 		case strings.HasSuffix(p, "/reviews"):
-			_, _ = w.Write([]byte(`[]`))
+			return stubJSON(req, http.StatusOK, `[]`), nil
 		case strings.HasSuffix(p, "/pulls/42/files"):
-			_, _ = w.Write([]byte(`[{"filename":"internal/app/a.go"}]`))
+			return stubJSON(req, http.StatusOK, `[{"filename":"internal/app/a.go"}]`), nil
 		case strings.Contains(p, "/compare/"):
-			_, _ = w.Write([]byte(`{"behind_by":0,"base_commit":{"sha":"base"}}`))
+			return stubJSON(req, http.StatusOK, `{"behind_by":0,"base_commit":{"sha":"base"}}`), nil
 		default:
 			unexpected.Add(1)
-			http.NotFound(w, r)
+			return stubJSON(req, http.StatusNotFound, `{"message":"not found"}`), nil
 		}
-	}))
-	b.Cleanup(srv.Close)
-	client, err := github.NewClient(github.WithHTTPClient(srv.Client()), github.WithEnterpriseURLs(srv.URL+"/", srv.URL+"/"))
+	})
+	client, err := github.NewClient(
+		github.WithHTTPClient(&http.Client{Transport: transport}),
+		github.WithEnterpriseURLs("https://bench.invalid/", "https://bench.invalid/"),
+	)
 	if err != nil {
 		b.Fatal(err)
 	}
