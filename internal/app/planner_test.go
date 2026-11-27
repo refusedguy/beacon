@@ -613,6 +613,26 @@ func TestPlannerIndexBoundsActiveChecks(t *testing.T) {
 	}
 }
 
+func TestClaimDirKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		scope core.ScopePath
+		want  []core.ScopePath
+	}{
+		{"single file", core.ScopeFile("one.go"), []core.ScopePath{core.ScopeDir("one.go")}},
+		{"nested path", core.ScopeFile("a/b/c.go"), []core.ScopePath{core.ScopeDir("a"), core.ScopeDir("a/b"), core.ScopeDir("a/b/c.go")}},
+		{"leading wildcard", core.ScopePattern("*/b.go"), nil},
+		{"inner wildcard", core.ScopePattern("a/*/c.go"), []core.ScopePath{core.ScopeDir("a")}},
+		{"trailing slash", core.ScopeDir("a/b/"), []core.ScopePath{core.ScopeDir("a"), core.ScopeDir("a/b")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := claimDirKeys(tc.scope); !equalPaths(got, tc.want) {
+				t.Fatalf("claimDirKeys(%q) = %v, want %v", tc.scope, got, tc.want)
+			}
+		})
+	}
+}
+
 func BenchmarkPlannerSelectLargeDispatch(b *testing.B) {
 	tasks, active := largeDispatchFixtures()
 	const limit = 20

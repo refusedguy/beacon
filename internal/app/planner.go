@@ -266,26 +266,26 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 // claimDirKeys returns the directory keys under which a claim is indexed: the
 // claim's own value as a directory, then each literal ancestor directory. A
 // wildcard segment stops the walk because later segments are not fixed paths.
+// Every key is a prefix of the claim value, so slicing the value avoids a
+// strings.Split slice, a builder and its intermediate prefix strings.
 func claimDirKeys(claim core.ScopePath) []core.ScopePath {
 	value := claim.Value()
-	parts := strings.Split(value, "/")
 	var out []core.ScopePath
-	var prefix strings.Builder
-	if !strings.ContainsAny(parts[0], "*?") {
-		out = append(out, core.ScopeDir(parts[0]))
-		prefix.WriteString(parts[0])
-	} else {
-		return out
-	}
-	for _, part := range parts[1:] {
-		if strings.ContainsAny(part, "*?") {
-			break
+	for start := 0; ; {
+		rel := strings.IndexByte(value[start:], '/')
+		end := len(value)
+		if rel >= 0 {
+			end = start + rel
 		}
-		prefix.WriteString("/")
-		prefix.WriteString(part)
-		out = append(out, core.ScopeDir(prefix.String()))
+		if strings.ContainsAny(value[start:end], "*?") {
+			return out
+		}
+		out = append(out, core.ScopeDir(value[:end]))
+		if rel < 0 {
+			return out
+		}
+		start = end + 1
 	}
-	return out
 }
 
 func leadingWildcard(value string) bool {
