@@ -273,7 +273,9 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 	for _, i := range idx.broad {
 		add(i)
 	}
-	slices.Sort(out)
+	if len(out) > 1 {
+		slices.Sort(out)
+	}
 	idx.out = out
 	return out
 }
