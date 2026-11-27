@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -93,6 +94,81 @@ func (p *Policy) Evaluate(o core.Observation) core.MergeDecision {
 func (p *Policy) ReviewRequired(mode core.ReviewMode, o core.Observation) bool {
 	verdict, _ := ReviewRule{Mode: mode}.Evaluate(o)
 	return verdict != core.VerdictNoop
+}
+
+// SideEffectCriterion marks criteria whose Evaluate does work beyond reading
+// the observation. Explain records these rules without running them.
+type SideEffectCriterion interface {
+	HasSideEffects() bool
+}
+
+// Explain walks every invariant and criterion and returns the full trace. It
+// does not call core.Decide, which stops at the first failed check. A
+// side-effect rule is marked and skipped so a dry run never runs shell code.
+func (p *Policy) Explain(o core.Observation) []app.ExplainStep {
+	steps := make([]app.ExplainStep, 0, len(p.criteria)+6)
+	if core.DecideFinalState(o.PRState).Closed {
+		return append(steps, app.ExplainStep{
+			Name: "invariant/closed", Verdict: core.VerdictNoop,
+			Reason: "pull request is " + o.PRState,
+		})
+	}
+	if o.Incomplete {
+		reason := "observation is incomplete"
+		if o.IncompleteReason != "" {
+			reason += ": " + o.IncompleteReason
+		}
+		steps = append(steps, app.ExplainStep{Name: "invariant/incomplete", Verdict: core.VerdictWait, Reason: reason})
+	}
+	if o.Conflict {
+		steps = append(steps, app.ExplainStep{Name: "invariant/conflict", Verdict: core.VerdictNeedsAgentFix, Reason: "merge conflict"})
+	}
+	if len(o.UnresolvedThreads) > 0 {
+		steps = append(steps, app.ExplainStep{
+			Name: "invariant/unresolved_threads", Verdict: core.VerdictNeedsAgentFix,
+			Reason: "unresolved discussion: " + o.UnresolvedThreads[0],
+		})
+	}
+	if c, ok := o.Failure(p.explainRequiredChecks()...); ok {
+		reason := "required check failed: " + c.Name
+		if o.FailureExcerpt != "" {
+			reason += ": " + o.FailureExcerpt
+		}
+		steps = append(steps, app.ExplainStep{Name: "invariant/failed_check", Verdict: core.VerdictNeedsAgentFix, Reason: reason})
+	}
+	if o.Behind {
+		steps = append(steps, app.ExplainStep{Name: "invariant/behind", Verdict: core.VerdictNeedsRebase, Reason: "branch is behind base"})
+	}
+	for _, rule := range p.criteria {
+		if sideEffect, ok := rule.(SideEffectCriterion); ok && sideEffect.HasSideEffects() {
+			steps = append(steps, app.ExplainStep{
+				Name: rule.Name(), Verdict: core.VerdictNoop,
+				Reason: "not run (side effects)", SideEffect: true,
+			})
+			continue
+		}
+		verdict, reason := rule.Evaluate(o)
+		step := app.ExplainStep{Name: rule.Name(), Verdict: verdict, Reason: reason}
+		if checks, ok := rule.(SourceChecksRule); ok {
+			if described, ok := checks.Source.(interface{ NamesDescription() string }); ok {
+				step.Detail = described.NamesDescription()
+			}
+		}
+		steps = append(steps, step)
+	}
+	return steps
+}
+
+// explainRequiredChecks mirrors the invariant scoping in core.Decide, so a
+// failed optional check cannot appear as a blocker in the trace.
+func (p *Policy) explainRequiredChecks() []string {
+	for _, criterion := range p.criteria {
+		if source, ok := criterion.(core.RequiredCheckPolicy); ok {
+			names, _ := source.RequiredChecks()
+			return names
+		}
+	}
+	return nil
 }
 
 // SourceChecksRule gates a merge on the names reported by a source. Names are
@@ -209,6 +285,10 @@ type CommandRule struct {
 
 // Name returns the command gate criterion name.
 func (r CommandRule) Name() string { return "command_gate" }
+
+// HasSideEffects reports that Evaluate runs a shell command. Explain uses it
+// to mark the rule and leave it unrun in a dry-run trace.
+func (r CommandRule) HasSideEffects() bool { return true }
 
 // Evaluate runs the gate command and blocks on a nonzero exit.
 func (r CommandRule) Evaluate(o core.Observation) (core.Verdict, string) {

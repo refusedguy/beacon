@@ -51,6 +51,7 @@ type wiring struct {
 	control     *app.Control
 	status      app.StatusService
 	wait        app.WaitService
+	explain     app.ExplainService
 	taskCreator *app.TaskCreator
 	taskDeleter *app.TaskDeleter
 	taskUpdater *app.TaskUpdater
@@ -331,12 +332,17 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
 	}, infra.store, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
+	explain := app.ExplainService{Store: infra.store, SCM: infra.scm}
+	if traceable, ok := p.(app.ExplainPolicy); ok {
+		explain.Policy = traceable
+	}
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: h,
 		workspace: infra.workspace, scm: infra.scm, policy: p,
 		changes: infra.changes, dispatcher: disp, control: ctrl,
 		status:      app.StatusService{Store: infra.store},
 		wait:        app.WaitService{Store: infra.store, Interval: time.Second},
+		explain:     explain,
 		taskCreator: creator, taskDeleter: deleter, taskUpdater: updater, recon: recon,
 		reconcile: &app.ReconcileService{Reconciler: recon, Store: infra.store},
 	}
@@ -385,6 +391,17 @@ func newReconciler(
 		AutoRebase:         cfg.AutoRebase,
 		MaxAutoRebases:     cfg.MaxAutoRebases,
 	}
+}
+
+// Explain forwards the dry-run trace to the policy in the current snapshot.
+// A policy without Explain yields no steps, which the explain service reports
+// as a merge summary with an empty chain instead of panicking.
+func (p *reloadablePolicy) Explain(obs core.Observation) []app.ExplainStep {
+	traceable, ok := (*p.live).Load().policy.(app.ExplainPolicy)
+	if !ok {
+		return nil
+	}
+	return traceable.Explain(obs)
 }
 
 // ReviewRequired forwards the epic review gate from the live policy snapshot.
@@ -536,6 +553,7 @@ func main() {
 	root.AddCommand(newDoctorCommand(configPath))
 	root.AddCommand(newDispatchCommand(configPath, wire))
 	root.AddCommand(newStatusCommand(configPath))
+	root.AddCommand(newExplainCommand(configPath, wire))
 	root.AddCommand(newControlCommand(configPath, wire))
 	root.AddCommand(newMCPCommand(configPath))
 	root.AddCommand(newServeCommand(configPath))
