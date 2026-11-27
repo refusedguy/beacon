@@ -38,6 +38,11 @@ var (
 	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	headerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("204"))
+
+	// The footer and the zero-width title never change, so render them once
+	// instead of once per frame rebuild.
+	helpLine  = headerStyle.Render("j/k move  a approve  u unblock  c/x cancel  r retry  q quit")
+	titleLine = headerStyle.Render("Beacon runs\n")
 )
 
 // renderCache holds scratch state that View reuses across frames. It sits
@@ -45,9 +50,11 @@ var (
 // hold the last rendered string and the inputs that produced it, so an
 // unchanged render returns the same string without rebuilding it.
 type renderCache struct {
-	padWidth int
-	pad      string
-	row      []byte
+	padWidth     int
+	pad          string
+	styledHeader string
+	row          []byte
+	keyRuns      []runFrame
 
 	frame    string
 	frameKey frameKey
@@ -62,13 +69,29 @@ type runFrame struct {
 }
 
 // frameKey holds every input that can change View's output. A match means the
-// cached frame is still current.
+// cached frame is still current. Only the visible window is keyed: View never
+// renders more than visibleRows runs, so rows outside that window are not
+// inputs. runCount is kept because the window start depends on the list length.
 type frameKey struct {
-	width  int
-	cursor int
-	status string
-	failed bool
-	runs   []runFrame
+	width    int
+	cursor   int
+	status   string
+	failed   bool
+	runCount int
+	visible  []runFrame
+}
+
+// visibleWindow returns the half-open index range of rows View renders.
+func visibleWindow(cursor, count int) (start, end int) {
+	start = 0
+	if cursor >= visibleRows {
+		start = cursor - visibleRows + 1
+	}
+	end = start + visibleRows
+	if end > count {
+		end = count
+	}
+	return
 }
 
 func newRunFrame(run Run) runFrame {
@@ -79,17 +102,25 @@ func newRunFrame(run Run) runFrame {
 }
 
 // frameCurrent reports whether the cached frame matches the current inputs.
-// The runs are compared field by field on the values View actually uses.
+// The visible rows are compared field by field on the values View actually
+// uses; changes to off-screen runs cannot change the frame.
 func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool, runs []Run) bool {
 	if !c.hasFrame || c.frameKey.width != width || c.frameKey.cursor != cursor ||
-		c.frameKey.status != status || c.frameKey.failed != failed {
+		c.frameKey.status != status || c.frameKey.failed != failed ||
+		c.frameKey.runCount != len(runs) {
 		return false
 	}
-	if len(c.frameKey.runs) != len(runs) {
+	start, end := visibleWindow(cursor, len(runs))
+	if len(c.frameKey.visible) != end-start {
 		return false
 	}
-	for i := range runs {
-		if c.frameKey.runs[i] != newRunFrame(runs[i]) {
+	scratch := c.keyRuns[:0]
+	for i := start; i < end; i++ {
+		scratch = append(scratch, newRunFrame(runs[i]))
+	}
+	c.keyRuns = scratch
+	for i := range scratch {
+		if c.frameKey.visible[i] != scratch[i] {
 			return false
 		}
 	}
@@ -97,15 +128,20 @@ func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool
 }
 
 // rememberFrame stores a rendered frame together with the inputs that made it.
+// The new visible window is built in the scratch slice, then swapped with the
+// cached key's slice so the next comparison reuses the old backing array.
 func (c *renderCache) rememberFrame(width, cursor int, status string, failed bool, runs []Run, frame string) {
-	key := frameKey{
+	start, end := visibleWindow(cursor, len(runs))
+	visible := c.keyRuns[:0]
+	for i := start; i < end; i++ {
+		visible = append(visible, newRunFrame(runs[i]))
+	}
+	previous := c.frameKey.visible
+	c.frameKey = frameKey{
 		width: width, cursor: cursor, status: status, failed: failed,
-		runs: make([]runFrame, len(runs)),
+		runCount: len(runs), visible: visible,
 	}
-	for i := range runs {
-		key.runs[i] = newRunFrame(runs[i])
-	}
-	c.frameKey = key
+	c.keyRuns = previous[:0]
 	c.frame = frame
 	c.hasFrame = true
 }
@@ -312,35 +348,29 @@ func (m model) View() string {
 		return cache.frame
 	}
 	var b strings.Builder
-	title := "Beacon runs"
-	header := title + "\n"
-	trailingNewline := false
+	const title = "Beacon runs"
+	headerLines := 1
+	styledHeader := titleLine
 	if m.width > 0 {
 		if cache.padWidth != m.width {
 			cache.padWidth = m.width
 			cache.pad = strings.Repeat(" ", maxInt(0, m.width-len(title)))
+			cache.styledHeader = headerStyle.Render(title + cache.pad)
 		}
-		header = title + cache.pad
-		trailingNewline = true
+		styledHeader = cache.styledHeader
+		headerLines = 2
 	}
-	b.WriteString(headerStyle.Render(header))
-	if trailingNewline {
+	b.WriteString(styledHeader)
+	if headerLines == 2 {
 		b.WriteByte('\n')
 	}
 	if len(m.runs) == 0 {
 		b.WriteString("no runs\n")
 	}
-	start := 0
-	if m.cursor >= visibleRows {
-		start = m.cursor - visibleRows + 1
-	}
-	end := start + visibleRows
-	if end > len(m.runs) {
-		end = len(m.runs)
-	}
+	start, end := visibleWindow(m.cursor, len(m.runs))
 	// Grow once for the header, the visible rows and the footer so the
 	// builder does not reallocate while writing the frame.
-	b.Grow(len(header) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + 80)
+	b.Grow(len(styledHeader) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + 80)
 	row := cache.row[:0]
 	for i := start; i < end; i++ {
 		run := m.runs[i]
@@ -372,7 +402,7 @@ func (m model) View() string {
 		b.WriteString(m.status)
 	}
 	b.WriteString("\n")
-	b.WriteString(headerStyle.Render("j/k move  a approve  u unblock  c/x cancel  r retry  q quit"))
+	b.WriteString(helpLine)
 	frame := b.String()
 	cache.rememberFrame(m.width, m.cursor, m.status, m.failed, m.runs, frame)
 	return frame

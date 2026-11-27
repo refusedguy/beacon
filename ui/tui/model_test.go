@@ -737,14 +737,28 @@ type goTUIViewRow struct {
 // BenchmarkGoTUIView times the five-row monitor view and emits one canonical
 // row. The whole run is one sample, so median, min and max agree.
 func BenchmarkGoTUIView(b *testing.B) {
-	fixture := viewModel(80, 0, benchmarkFiveRuns("ready"), "loaded 5 run(s)", false)
-	want := viewBaseline(fixture)
-	if got := fixture.View(); got != want {
-		b.Fatalf("view differs from baseline:\ngot:\n%s\nwant:\n%s", got, want)
+	// Two snapshots alternate so every measured View call rebuilds the frame.
+	// The hit path was already fast; real traffic misses the cache on each
+	// event, so the miss path is the one worth measuring.
+	snapshots := [2][]Run{
+		benchmarkFiveRuns("waiting_ci"),
+		benchmarkFiveRuns("ready"),
 	}
+	for i, runs := range snapshots {
+		m := viewModel(80, 0, runs, "loaded 5 run(s)", false)
+		if got, want := m.View(), viewBaseline(m); got != want {
+			b.Fatalf("fixture %d view differs from baseline:\ngot:\n%s\nwant:\n%s", i, got, want)
+		}
+	}
+
+	// Identity checks and fixture setup are outside the measured region, so
+	// -benchmem reports only the allocations a forced miss makes.
+	m := viewModel(80, 0, snapshots[0], "loaded 5 run(s)", false)
+	b.ResetTimer()
 	start := time.Now()
 	for i := 0; i < b.N; i++ {
-		benchViewOut = fixture.View()
+		m.runs = snapshots[i&1]
+		benchViewOut = m.View()
 	}
 	ms := float64(time.Since(start)) / float64(time.Millisecond)
 	b.StopTimer()
