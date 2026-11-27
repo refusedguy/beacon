@@ -1,7 +1,7 @@
 ---
 id: T-a7c0efea
 title: '[bench] Core scope glob benchmark'
-status: available
+status: done
 scope:
     - internal/bench/scope_bench_test.go
 priority: 92
