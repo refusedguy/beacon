@@ -1,7 +1,7 @@
 ---
 id: T-546efee1
 title: Always copy UI benchmark harness into base tree
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 priority: 99

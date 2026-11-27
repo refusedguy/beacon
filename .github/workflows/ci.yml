@@ -443,6 +443,12 @@ jobs:
           BASE="$(git merge-base "$BASE_REF" "$HEAD_REF")"
           git worktree add --detach "$RUNNER_TEMP/perf-base" "$BASE"
           git worktree add --detach "$RUNNER_TEMP/perf-head" "$HEAD_REF"
+          # The UI harness must match on both sides even when a PR changes no
+          # harness file. A labeled PR's merge base can predate the fixed
+          # ui_bench.js, which otherwise aborts the base pass and leaves no
+          # comparable rows. Copy it before the changed-file loop.
+          cp "$RUNNER_TEMP/perf-head/internal/bench/ui_bench.js" \
+            "$RUNNER_TEMP/perf-base/internal/bench/ui_bench.js"
           # Harness changes must be identical on both sides. Production code
           # stays at its own tree's revision.
           while IFS= read -r path; do
