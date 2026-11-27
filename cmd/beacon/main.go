@@ -293,7 +293,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		Workspace: infra.workspace, Root: workspaceRoot,
 	}
 	deleter := &app.TaskDeleter{
-		Store: infra.store, Workspace: infra.workspace, Root: workspaceRoot,
+		Store: infra.store, Source: infra.source, Workspace: infra.workspace, Root: workspaceRoot,
 	}
 	updater := &app.TaskUpdater{
 		Store: infra.store, Workspace: infra.workspace, Root: workspaceRoot,

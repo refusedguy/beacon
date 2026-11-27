@@ -89,16 +89,36 @@ type connectionInfo struct {
 
 const connectionFile = "connection.json"
 
-// acquireLock takes an exclusive file lock in dir, failing when another daemon holds it.
+// lockOwner reports whether the daemon record in dir describes a live holder
+// whose heartbeat is fresh. A stale or dead record is not an owner, so its
+// lock file is free for a new daemon to take over.
+func lockOwner(dir string) bool {
+	st := readDaemonStatus(dir)
+	return st.State == "alive"
+}
+
+// acquireLock takes the exclusive file lock in dir. A lock held by a daemon
+// whose heartbeat is stale or whose PID is dead is treated as abandoned: its
+// file is replaced and the lock is reacquired. A live owner still blocks.
 func acquireLock(dir string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "beacon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	path := filepath.Join(dir, "beacon.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if !lockOwner(dir) {
+			// Replace the abandoned lock file so any new holder uses the
+			// same inode. The close releases this process's descriptor.
+			_ = f.Close()
+			if remErr := os.Remove(path); remErr != nil && !errors.Is(remErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("remove stale lock: %w", remErr)
+			}
+			return acquireLock(dir)
+		}
 		// Keep the lock conflict primary and surface a close failure too.
 		return nil, fmt.Errorf("beacon is already running: %w", errors.Join(err, f.Close()))
 	}

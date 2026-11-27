@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -37,24 +39,31 @@ func newMCPCommand(configPath *string) *cobra.Command {
 				client := &remoteClient{info: info, http: bearerClient(5 * time.Second)}
 				services.Remote = client.call
 			} else if lock, err := acquireLock(dir); err != nil {
-				slog.Error("acquire daemon lock", "error", err)
+				// A second daemon with no live owner cannot take the lock. Fail
+				// rather than serve tools without a reconciler, which would
+				// freeze active runs while looking healthy.
 				writeDaemonError(dir, "lock", err)
+				return fmt.Errorf("acquire daemon lock: %w", err)
 			} else {
 				defer lock.Close()
+				slog.Info("daemon acquired reconciler lock", "pid", os.Getpid())
+				defer slog.Info("daemon released reconciler lock", "pid", os.Getpid())
 				tracker, stateErr := startDaemonState(dir)
 				if stateErr != nil {
-					slog.Error("write daemon state", "error", stateErr)
 					writeDaemonError(dir, "state", stateErr)
-				} else {
-					defer tracker.Close()
+					return fmt.Errorf("write daemon state: %w", stateErr)
 				}
+				defer tracker.Close()
 				if watcher, ok := w.harness.(core.IdleWatcher); ok {
 					go watcher.WatchIdle(ctx)
 				}
 				go func() {
-					if err := w.recon.Run(ctx, w.changes); err != nil && !errors.Is(err, context.Canceled) {
+					err := w.recon.Run(ctx, w.changes)
+					if err != nil && !errors.Is(err, context.Canceled) {
 						slog.Error("reconciler loop stopped", "error", err)
 						writeDaemonError(dir, "reconciler", err)
+					} else {
+						slog.Info("reconciler loop exited", "error", err)
 					}
 				}()
 			}

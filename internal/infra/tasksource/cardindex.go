@@ -93,13 +93,15 @@ func buildCardIndex(dir string) (*cardIndex, error) {
 
 // withCardIndex runs fn under the cache lock with the current index for dir. A
 // full scan happens on first use or when the directory gains or loses a file;
-// in-place edits are handled by refreshIndexedCard one card at a time.
+// in-place edits are handled by refreshIndexedCard one card at a time. A
+// removal is detected by statting indexed paths, so a filesystem that does not
+// move the directory mtime on delete still drops the missing card.
 func withCardIndex(dir string, fn func(*cardIndex) error) error {
 	key := cardIndexKey(dir)
 	cardIndexCache.mu.Lock()
 	defer cardIndexCache.mu.Unlock()
 	idx, ok := cardIndexCache.byDir[key]
-	if !ok || !cardModTime(dir).Equal(idx.dirMod) {
+	if !ok || !cardModTime(dir).Equal(idx.dirMod) || hasMissingCard(idx) {
 		var err error
 		idx, err = buildCardIndex(dir)
 		if err != nil {
@@ -108,6 +110,17 @@ func withCardIndex(dir string, fn func(*cardIndex) error) error {
 		cardIndexCache.byDir[key] = idx
 	}
 	return fn(idx)
+}
+
+// hasMissingCard reports whether any indexed card file has been removed. It
+// checks paths only, independent of the directory mtime.
+func hasMissingCard(idx *cardIndex) bool {
+	for path := range idx.byPath {
+		if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
 }
 
 // refreshIndexedCard re-reads path only when its mtime moved since it was

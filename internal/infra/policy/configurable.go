@@ -42,7 +42,22 @@ func (r ReviewRule) Evaluate(o core.Observation) (core.Verdict, string) {
 
 // Policy evaluates an observation against a chain of criteria.
 type Policy struct {
-	criteria []core.Criterion
+	criteria     []core.Criterion
+	checksSource core.RequiredCheckSource
+}
+
+// RequiredChecks returns the names a merge must pass. It lets the failure
+// invariant in core.Decide use the same source as the required-checks criterion,
+// so a cancelled or failed optional check cannot fire the invariant.
+func (p *Policy) RequiredChecks() ([]string, bool) {
+	if p == nil || p.checksSource == nil {
+		return nil, false
+	}
+	names, err := p.checksSource.Names(context.Background())
+	if err != nil {
+		return nil, false
+	}
+	return names, true
 }
 
 // New builds a Policy from the criteria enabled in cfg. Required checks are
@@ -64,7 +79,7 @@ func New(cfg Config) *Policy {
 	if cfg.ReviewMode == core.ReviewModeHuman || cfg.ReviewMode == core.ReviewModeLLM {
 		rules = append(rules, ReviewRule{Mode: cfg.ReviewMode})
 	}
-	return &Policy{criteria: rules}
+	return &Policy{criteria: rules, checksSource: cfg.RequiredCheckSource}
 }
 
 // Evaluate decides whether the observation may merge.
@@ -89,6 +104,19 @@ type SourceChecksRule struct {
 
 // Name returns the required checks criterion name.
 func (r SourceChecksRule) Name() string { return "required_checks" }
+
+// RequiredChecks exposes the rule's source to the failure invariant, so an
+// optional failed check cannot block a merge before policy runs.
+func (r SourceChecksRule) RequiredChecks() ([]string, bool) {
+	if r.Source == nil {
+		return nil, false
+	}
+	names, err := r.Source.Names(context.Background())
+	if err != nil {
+		return nil, false
+	}
+	return names, true
+}
 
 // Evaluate resolves the source's names and applies the same check gate. A
 // source that cannot be read fails closed with a wait verdict.
