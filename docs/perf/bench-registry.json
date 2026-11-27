@@ -1,0 +1,130 @@
+{
+  "specs": [
+    {
+      "key": "sqlite-snapshot",
+      "limiter": "indexed snapshot reads + WAL pages",
+      "unit": "ns",
+      "workMetric": "sqlite-snapshot-work",
+      "errMetric": "sqlite-snapshot-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "card-parse",
+      "limiter": "yaml.Unmarshal + line scan",
+      "unit": "ns",
+      "workMetric": "card-parse-work",
+      "errMetric": "card-parse-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "wire-encode",
+      "limiter": "encoding/json reflection",
+      "unit": "ns",
+      "workMetric": "wire-encode-work",
+      "errMetric": "wire-encode-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "redaction",
+      "limiter": "regexp pass chain",
+      "unit": "ns",
+      "workMetric": "redaction-work",
+      "errMetric": "redaction-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "mcp-journal",
+      "limiter": "mutex + indexed LRU",
+      "unit": "ns",
+      "workMetric": "mcp-journal-work",
+      "errMetric": "mcp-journal-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "sse-fanout",
+      "limiter": "json.Marshal + subscriber maps + slow-view drop",
+      "unit": "ns",
+      "workMetric": "sse-fanout-work",
+      "errMetric": "sse-fanout-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "scm-observe",
+      "limiter": "loopback PR + compare + checks + files round trips",
+      "unit": "ns",
+      "workMetric": "scm-observe-work",
+      "errMetric": "scm-observe-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "card-local-parse",
+      "limiter": "yaml.Unmarshal + per-scope os.Stat",
+      "unit": "ns",
+      "workMetric": "card-local-parse-work",
+      "errMetric": "card-local-parse-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "http-snapshot-assembly",
+      "limiter": "groupHistory + json reflection",
+      "unit": "ns",
+      "workMetric": "http-snapshot-assembly-work",
+      "errMetric": "http-snapshot-assembly-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "harness-spawn",
+      "limiter": "loopback create + model POST + deferred move",
+      "unit": "ns",
+      "workMetric": "harness-spawn-work",
+      "errMetric": "harness-spawn-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "prompt-build",
+      "limiter": "strings.Builder + prompt bytes",
+      "unit": "ns",
+      "workMetric": "prompt-build-work",
+      "errMetric": "prompt-build-errs",
+      "placement": "both",
+      "thresholdPct": 15
+    },
+    {
+      "key": "snapshot-reads",
+      "limiter": "WAL page reads",
+      "unit": "ns",
+      "workMetric": "snapshot-reads-work",
+      "errMetric": "snapshot-errs",
+      "placement": "nightly",
+      "thresholdPct": 15
+    },
+    {
+      "key": "snapshot-assembly",
+      "limiter": "groupHistory + json reflection",
+      "unit": "ns",
+      "workMetric": "snapshot-assembly-work",
+      "errMetric": "snapshot-errs",
+      "placement": "nightly",
+      "thresholdPct": 15
+    },
+    {
+      "key": "snapshot-total",
+      "limiter": "sum of both phases",
+      "unit": "ns",
+      "workMetric": "",
+      "errMetric": "",
+      "placement": "nightly",
+      "thresholdPct": 15
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+package bench
+
+import "encoding/json"
+
+//go:generate go run ../../cmd/bench-gen -out ../../docs/perf/bench-registry.json
+
+// Placement names the pipeline that consumes a benchmark result. "pr" is the
+// advisory two-tree job, "nightly" is the benchstat gate and "both" is every
+// pipeline that reads the registry.
+const (
+	PlacementPR      = "pr"
+	PlacementNightly = "nightly"
+	PlacementBoth    = "both"
+)
+
+// Spec is one typed benchmark registry entry. Key is the canonical benchmark
+// name. The limiter, unit, work and error metric names, placement and
+// regression threshold travel with the key so no consumer hardcodes them.
+type Spec struct {
+	Key          string  `json:"key"`
+	Limiter      string  `json:"limiter"`
+	Unit         string  `json:"unit"`
+	WorkMetric   string  `json:"workMetric"`
+	ErrMetric    string  `json:"errMetric"`
+	Placement    string  `json:"placement"`
+	ThresholdPct float64 `json:"thresholdPct"`
+}
+
+// registryDocument is the on-disk shape of the generated JSON. Keeping the
+// specs under a key lets a consumer add document metadata without changing the
+// array shape.
+type registryDocument struct {
+	Specs []Spec `json:"specs"`
+}
+
+// Registry returns the typed benchmark registry in report order. The name
+// constants and limiter strings stay in report.go, their only owner. This
+// table adds the unit, work and error metric names, placement and threshold
+// for each benchmark that reports a median, so the generated JSON has one
+// authoritative source.
+func Registry() []Spec {
+	specs := make([]Spec, 0, len(hotspotOrder)+1+len(snapshotLimiters))
+	for _, name := range hotspotOrder {
+		specs = append(specs, Spec{
+			Key:          name,
+			Limiter:      limiters[name],
+			Unit:         "ns",
+			WorkMetric:   name + "-work",
+			ErrMetric:    name + "-errs",
+			Placement:    PlacementBoth,
+			ThresholdPct: 15,
+		})
+	}
+	specs = append(specs, Spec{
+		Key:          namePrompt,
+		Limiter:      "strings.Builder + prompt bytes",
+		Unit:         "ns",
+		WorkMetric:   namePrompt + "-work",
+		ErrMetric:    namePrompt + "-errs",
+		Placement:    PlacementBoth,
+		ThresholdPct: 15,
+	})
+	for _, name := range []string{phaseReads, phaseAssembly, phaseTotal} {
+		work, errs := name+"-work", "snapshot-errs"
+		if name == phaseTotal {
+			work, errs = "", ""
+		}
+		specs = append(specs, Spec{
+			Key:          name,
+			Limiter:      snapshotLimiters[name],
+			Unit:         "ns",
+			WorkMetric:   work,
+			ErrMetric:    errs,
+			Placement:    PlacementNightly,
+			ThresholdPct: 15,
+		})
+	}
+	return specs
+}
+
+// EncodeRegistry renders Registry() as the committed JSON document. The
+// generator and the drift test both call it, so the wire format has one owner.
+func EncodeRegistry() ([]byte, error) {
+	data, err := json.MarshalIndent(registryDocument{Specs: Registry()}, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
