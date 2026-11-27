@@ -39,15 +39,16 @@ func DetectWorkflowJobNames(root string) []string {
 // ParseWorkflowJobNames extracts job names from one workflow document. Only
 // the two-space indented keys directly under jobs: are names; nested matrix
 // and step keys sit deeper and are ignored. A job with strategy.matrix is
-// omitted because GitHub reports only the expanded cell names. Keys such as
-// fail-fast that sit beside matrix under strategy: do not hide the matrix.
+// omitted because GitHub reports only the expanded cell names. A job with
+// continue-on-error: true is omitted because it never gates merge. Keys such
+// as fail-fast that sit beside matrix under strategy: do not hide the matrix.
 func ParseWorkflowJobNames(content string) []string {
 	var names []string
 	inJobs := false
 	var current string
 	var body []string
 	flush := func() {
-		if current == "" || hasMatrix(body) {
+		if current == "" || hasMatrix(body) || hasContinueOnError(body) {
 			return
 		}
 		names = append(names, current)
@@ -78,6 +79,19 @@ func ParseWorkflowJobNames(content string) []string {
 	}
 	flush()
 	return names
+}
+
+// hasContinueOnError reports whether a job body declares continue-on-error:
+// true. Such a job is advisory: a failed step cannot produce a failing check
+// run, so the job must not become a required check.
+func hasContinueOnError(lines []string) bool {
+	for _, line := range lines {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && key == "continue-on-error" && strings.EqualFold(strings.TrimSpace(value), "true") {
+			return true
+		}
+	}
+	return false
 }
 
 // hasMatrix reports whether a job body declares strategy.matrix. A sibling
