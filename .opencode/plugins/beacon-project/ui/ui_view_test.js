@@ -196,6 +196,15 @@ test("view helpers with an omitted snapshot use the empty snapshot", () => {
   })
 })
 
+test("one snapshot reuses its normalized view and state bar across entry points", () => {
+  const snapshot = { active: [makeRun({ ID: "a1", State: "running" })], recent: [], queue: [] }
+  const bar = stateBarItem(snapshot)
+  assert.equal(stateBarItem(snapshot), bar, "the footer takes the bar the sidebar built")
+  const model = sidebarModel(snapshot, null, NOW)
+  assert.equal(model.counts, bar.counts, "the sidebar reads the same counts")
+  assert.equal(sidebarModel(snapshot, null, NOW).view, model.view, "the queue array stays stable across renders")
+})
+
 test("empty snapshot shows one queue line and counted headers", () => {
   const items = sidebarModel(EMPTY_SNAPSHOT, null, NOW).items
   assert.deepEqual(items.map((i) => i.name), [

@@ -6,7 +6,7 @@ import {
 } from "./ui_model.js"
 import {
   baseIncidentItem, blockedGroupKeys, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, isDispatching, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
+  dispatchItem, isDispatching, nextStepLine, queueRowsWithMeta, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
 } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
 export { elapsed }
@@ -186,8 +186,41 @@ function stateBarFromView(view, active = activeFromView(view), recent = recentFr
     fg: counts.blocked > 0 ? "error" : "base",
   }
 }
+// One normalized view and state bar per snapshot object. The sidebar pass
+// builds them and the footer pass takes the same bar, so a refresh normalizes
+// and counts the runs once instead of once per slot. The queue array held here
+// is also the stable key that lets the taskTree WeakMap hit across the passes
+// of one refresh and across repeated renders of the same snapshot.
+const viewCache = new WeakMap()
+let lastRaw = null
+let lastEntry = null
+function buildView(snapshot) {
+  const view = normalizeSnapshot(snapshot)
+  const active = activeFromView(view)
+  const recent = recentFromViewWith(view, active)
+  return { view, active, recent, bar: stateBarFromView(view, active, recent) }
+}
+function viewFor(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return buildView(snapshot)
+  const cached = viewCache.get(snapshot)
+  if (cached) return cached
+  // A fresh wrapper around the same payload is common on every poll. Reuse the
+  // prior view when every field the sidebar reads is still the same object.
+  if (lastRaw && lastEntry && lastRaw.queue === snapshot.queue
+    && lastRaw.active === snapshot.active && lastRaw.recent === snapshot.recent
+    && lastRaw.metrics === snapshot.metrics && lastRaw.daemon === snapshot.daemon
+    && lastRaw.baseIncident === snapshot.baseIncident && lastRaw.generatedAt === snapshot.generatedAt) {
+    viewCache.set(snapshot, lastEntry)
+    return lastEntry
+  }
+  const entry = buildView(snapshot)
+  viewCache.set(snapshot, entry)
+  lastRaw = snapshot
+  lastEntry = entry
+  return entry
+}
 export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
-  return stateBarFromView(normalizeSnapshot(snapshot))
+  return viewFor(snapshot).bar
 }
 
 // Two pooled slots per run: identity, then reference and live cause.
@@ -245,10 +278,12 @@ export function blockedOpenFrom(epicOpen) {
   return out
 }
 
-export function blockedToggleItem(queue = [], blockedOpen = null, tree = null) {
-  const keys = blockedGroupKeys(queue, tree)
-  if (!keys.length) return null
-  const expanded = keys.every((key) => blockedOpen?.[key] === true)
+export function blockedToggleItem(queue = [], blockedOpen = null, tree = null, keys = null) {
+  // A caller that already grouped the queue passes the keys from that pass.
+  // A standalone caller falls back to the shared index.
+  const blocked = keys ?? blockedGroupKeys(queue, tree)
+  if (!blocked.length) return null
+  const expanded = blocked.every((key) => blockedOpen?.[key] === true)
   return {
     marker: expanded ? "▼" : "▶",
     name: expanded ? "Collapse all blocked" : "Expand all blocked",
@@ -273,10 +308,7 @@ export function toggleAllBlockedGroups(epic, queue = []) {
 }
 
 export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null, blockedOpen = null, dispatching = isDispatching()) {
-  const view = normalizeSnapshot(snapshot)
-  const active = activeFromView(view)
-  const recent = recentFromView(view)
-  const bar = stateBarFromView(view, active, recent)
+  const { view, active, recent, bar } = viewFor(snapshot)
   const items = [
     { marker: "", name: "Beacon", status: bar.summary, color: "action", bold: true },
     { marker: "", name: bar.legend, status: "", color: "muted" },
@@ -307,9 +339,12 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   } else {
     listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
     if (open.queue === true) {
-      const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen, tree) : null
+      // One grouping serves the rows and the blocked toggle. Passing its keys
+      // into the toggle removes the second queueGroups scan of the queue.
+      const { rows, blockedKeys } = queueRowsWithMeta(view.queue, epicOpen, blockedOpen, tree)
+      const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen, tree, blockedKeys) : null
       if (toggle) listItems.push(toggle)
-      listItems.push(...queueRows(view.queue, epicOpen, blockedOpen, tree))
+      listItems.push(...rows)
       listItems.push(spacerItem())
     }
   }
