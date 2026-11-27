@@ -196,6 +196,24 @@
       "thresholdPct": 15
     },
     {
+      "key": "base-red-check",
+      "limiter": "source ListAvailable + SCM BaseBranchStatus on a red base",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "base-red-block",
+      "limiter": "SCM Observe fanout over active runs on a red base",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
       "key": "planner-select-injected-checker",
       "limiter": "injected overlap checker over active scope index",
       "unit": "ns",

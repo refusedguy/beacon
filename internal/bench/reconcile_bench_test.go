@@ -53,12 +53,18 @@ func (s *countSCM) BaseBranchStatus(_ context.Context, branch string) (core.Base
 
 type countStore struct {
 	*sqlite.Store
-	gets atomic.Int64
+	gets  atomic.Int64
+	saves atomic.Int64
 }
 
 func (s *countStore) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
 	s.gets.Add(1)
 	return s.Store.Get(ctx, id)
+}
+
+func (s *countStore) Save(ctx context.Context, run *core.Run) error {
+	s.saves.Add(1)
+	return s.Store.Save(ctx, run)
 }
 
 type tickEnv struct {
@@ -119,13 +125,14 @@ func (e *tickEnv) tick(b *testing.B) (int64, int64) {
 	return work, errs
 }
 
-// canonicalKey is empty for the two base-check variants; only the reconcile
-// tick plan publishes an advisory row. Its work is one successful tick per PR
-// and its errs stay zero, so a no-change comparison sees equal counts.
-func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bool, canonicalKey string) {
+// Every plan publishes an advisory row with its own canonical key and limiter.
+// The reconcile tick counts keep a green base as the no-red guard; the two
+// base-red keys run on a red base. Work is one successful tick per PR and errs
+// stay zero, so a no-change comparison sees equal counts.
+func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bool, canonicalKey, limiter string) {
 	prevProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(prevProcs)
-	var work, errs, lists, observes, gets int64
+	var work, errs, lists, observes, gets, saves int64
 	var ds []time.Duration
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
@@ -140,6 +147,7 @@ func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bo
 		lists += e.source.lists.Load()
 		observes += e.scm.observes.Load()
 		gets += e.store.gets.Load()
+		saves += e.store.saves.Load()
 		ds = append(ds, d)
 	}
 	if errs != 0 || work == 0 || lists < int64(b.N) || observes < int64(b.N) {
@@ -152,6 +160,7 @@ func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bo
 	b.ReportMetric(float64(lists)/n, prefix+"-lists-per-tick")
 	b.ReportMetric(float64(observes)/n, prefix+"-observes-per-tick")
 	b.ReportMetric(float64(gets)/n, prefix+"-gets-per-tick")
+	b.ReportMetric(float64(saves)/n, prefix+"-saves-per-tick")
 	b.ReportMetric(1, prefix+"-limiter-"+slug)
 	if canonicalKey != "" {
 		var min, max time.Duration
@@ -164,19 +173,21 @@ func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bo
 			}
 		}
 		printPerfRow(os.Stdout, canonicalKey, medianDuration(ds), min, max,
-			int64(prs), errs, reconcileTickLimiter)
+			int64(prs), errs, limiter)
 	}
 }
 
 func BenchmarkReconcileTickCounts(b *testing.B) {
 	runTickBench(b, "reconcile-tick-counts", "source-listavailable-plus-sqlite-get", 20, 0, false,
-		"reconcile-tick-counts")
+		"reconcile-tick-counts", reconcileTickLimiter)
 }
 
 func BenchmarkBaseRedCheck(b *testing.B) {
-	runTickBench(b, "base-red-check", "source-listavailable-io", 1, 0, true, "")
+	runTickBench(b, "base-red-check", "source-listavailable-io", 1, 0, true,
+		"base-red-check", baseRedCheckLimiter)
 }
 
 func BenchmarkBaseRedBlockFanout(b *testing.B) {
-	runTickBench(b, "base-red-block", "scm-observe-roundtrips", 1, 24, true, "")
+	runTickBench(b, "base-red-block", "scm-observe-roundtrips", 1, 24, true,
+		"base-red-block", baseRedBlockLimiter)
 }
