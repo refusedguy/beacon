@@ -1,6 +1,6 @@
 ---
 id: T-5d11af6c
-title: [perf] Planner allocation cut after dispatch merge
+title: '[perf] Planner allocation cut after dispatch merge'
 status: available
 scope:
     - internal/app/planner.go

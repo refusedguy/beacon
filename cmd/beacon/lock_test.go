@@ -85,6 +85,10 @@ func TestDaemonStatusWithoutState(t *testing.T) {
 
 func TestLockFailureLeavesVisibleError(t *testing.T) {
 	dir := t.TempDir()
+	// A live owner keeps the lock held. Without a fresh daemon record the
+	// lock is treated as abandoned and reacquired.
+	state := daemonState{PID: os.Getpid(), StartedAt: time.Now().UTC(), Heartbeat: time.Now().UTC()}
+	writeStateFile(t, filepath.Join(dir, daemonStateFile), state)
 	first, err := acquireLock(dir)
 	if err != nil {
 		t.Fatal(err)

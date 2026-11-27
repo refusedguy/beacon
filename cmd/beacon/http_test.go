@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -846,6 +847,29 @@ func TestPingFrameWireShape(t *testing.T) {
 	}
 }
 
+// TestAppendHarnessFrameMatchesWriteSSE pins the direct frame build against
+// writeSSE, the documented SSE writer, so the allocation cut cannot change the
+// bytes a monitor receives. Escaping cases are included because json.Marshal
+// escapes those characters inside the data line.
+func TestAppendHarnessFrameMatchesWriteSSE(t *testing.T) {
+	for _, we := range []core.WireEvent{
+		{},
+		{ID: 7, Type: "progress", RunID: "r1", At: "2026-01-02T03:04:05Z"},
+		{ID: 9, Type: "quoted \"kind\"", RunID: "run\nid", At: "<at>"},
+	} {
+		body, err := json.Marshal(we)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorder := httptest.NewRecorder()
+		writeSSE(recorder, "harness", we)
+		want := recorder.Body.String()
+		if got := string(appendHarnessFrame(nil, body)); got != want {
+			t.Fatalf("appendHarnessFrame(%+v) = %q, want %q", we, got, want)
+		}
+	}
+}
+
 // BenchmarkPingFrame measures the keepalive payload construction per tick.
 func BenchmarkPingFrame(b *testing.B) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
@@ -944,4 +968,122 @@ func BenchmarkEventFramesBroadcast(b *testing.B) {
 	}
 	b.ReportMetric(float64(delivered), "delivered")
 	b.ReportMetric(float64(int64(b.N)*monitors-delivered), "dropped")
+}
+
+// The HTTP frame emission harness is copied from the PR head into the base
+// tree by the advisory job, so both sides measure identical harness code.
+// Work and errs are constants, so a no-change comparison sees equal counts
+// and zero errors on both sides.
+const (
+	httpFrameLimiter  = "json.Marshal + eight-subscriber lossy fanout"
+	httpFrameEvents   = 64
+	httpFrameMonitors = 8
+	httpFrameWork     = int64(httpFrameEvents * httpFrameMonitors)
+	httpFrameErrs     = int64(0)
+)
+
+// httpFrameRow is the canonical payload, declared locally so the HTTP harness
+// owns its wire shape like the pure control does.
+type httpFrameRow struct {
+	Key      string  `json:"key"`
+	MedianMS float64 `json:"median_ms"`
+	MinMS    float64 `json:"min_ms"`
+	MaxMS    float64 `json:"max_ms"`
+	Work     int64   `json:"work"`
+	Errs     int64   `json:"errs"`
+	Limiter  string  `json:"limiter"`
+	Cache    string  `json:"cache"`
+}
+
+// drainHTTPFrames empties one subscriber channel so the next burst starts from
+// a clean buffer.
+func drainHTTPFrames(ch <-chan []byte) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// BenchmarkHTTPFramesEmission drives a fixed burst of pre-encoded frames
+// through eight monitors and emits one canonical row. The whole run is one
+// sample, so median, min and max agree as they do for the control.
+func BenchmarkHTTPFramesEmission(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	for i := 0; i < b.N; i++ {
+		src := make(chan core.HarnessEvent)
+		frames := newEventFrames(src, json.Marshal)
+		done := make(chan struct{})
+		go func() { frames.run(ctx); close(done) }()
+		chans := make([]<-chan []byte, httpFrameMonitors)
+		for j := range chans {
+			chans[j], _ = frames.subscribe()
+		}
+		ev := core.HarnessEvent{RunID: "r1", Kind: "progress"}
+		for j := 0; j < httpFrameEvents; j++ {
+			src <- ev
+		}
+		close(src)
+		<-done
+		for _, ch := range chans {
+			drainHTTPFrames(ch)
+		}
+	}
+	ms := float64(time.Since(start)) / float64(time.Millisecond)
+	b.StopTimer()
+
+	cache := os.Getenv("BEACON_BENCH_CACHE")
+	if cache == "" {
+		cache = "unset"
+	}
+	row := httpFrameRow{
+		Key:      "http-frame-emission",
+		MedianMS: ms,
+		MinMS:    ms,
+		MaxMS:    ms,
+		Work:     httpFrameWork,
+		Errs:     httpFrameErrs,
+		Limiter:  httpFrameLimiter,
+		Cache:    cache,
+	}
+	data, err := json.Marshal(row)
+	if err != nil {
+		b.Fatal(err)
+	}
+	fmt.Printf("beacon-perf: %s\n", data)
+}
+
+// TestHTTPFramesCanonicalRow checks the exact field set the advisory parser
+// accepts, so a harness edit cannot silently change the wire shape.
+func TestHTTPFramesCanonicalRow(t *testing.T) {
+	data, err := json.Marshal(httpFrameRow{
+		Key:      "http-frame-emission",
+		MedianMS: 1,
+		MinMS:    1,
+		MaxMS:    1,
+		Work:     httpFrameWork,
+		Errs:     httpFrameErrs,
+		Limiter:  httpFrameLimiter,
+		Cache:    "unset",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"key", "median_ms", "min_ms", "max_ms", "work", "errs", "limiter", "cache"}
+	if len(fields) != len(want) {
+		t.Fatalf("HTTP frame row has %d fields, want %d: %s", len(fields), len(want), data)
+	}
+	for _, name := range want {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("HTTP frame row is missing %q: %s", name, data)
+		}
+	}
 }

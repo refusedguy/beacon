@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -127,6 +126,24 @@ func (s *changeSubscribers) run(ctx context.Context, src <-chan int) {
 	}
 }
 
+// The fixed envelope around a harness event's JSON payload. The prefix and
+// suffix are appended directly into the frame buffer instead of going through
+// fmt, which boxes the payload into an interface and grows a nil buffer.
+const (
+	harnessFramePrefix = "event: harness\ndata: "
+	harnessFrameSuffix = "\n\n"
+)
+
+// appendHarnessFrame appends one complete SSE frame onto dst and returns it. The
+// caller supplies a buffer with capacity for the whole frame so the result is
+// allocated once. The returned slice is immutable and is shared with every
+// subscriber, so the caller must not append to it after broadcasting.
+func appendHarnessFrame(dst, body []byte) []byte {
+	dst = append(dst, harnessFramePrefix...)
+	dst = append(dst, body...)
+	return append(dst, harnessFrameSuffix...)
+}
+
 // eventFrames encodes each harness event once and broadcasts the finished SSE
 // frame to one channel per monitor. Encoding at the source keeps one
 // json.Marshal per event no matter how many monitors are connected. Every
@@ -178,7 +195,8 @@ func (f *eventFrames) run(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			frame := fmt.Appendf(nil, "event: harness\ndata: %s\n\n", b)
+			size := len(harnessFramePrefix) + len(b) + len(harnessFrameSuffix)
+			frame := appendHarnessFrame(make([]byte, 0, size), b)
 			f.mu.Lock()
 			for ch := range f.subs {
 				select {

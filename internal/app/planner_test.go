@@ -619,18 +619,96 @@ func TestClaimDirKeys(t *testing.T) {
 		scope core.ScopePath
 		want  []core.ScopePath
 	}{
-		{"single file", core.ScopeFile("one.go"), []core.ScopePath{core.ScopeDir("one.go")}},
-		{"nested path", core.ScopeFile("a/b/c.go"), []core.ScopePath{core.ScopeDir("a"), core.ScopeDir("a/b"), core.ScopeDir("a/b/c.go")}},
+		{"single file", core.ScopeFile("one.go"), []core.ScopePath{"one.go"}},
+		{"nested path", core.ScopeFile("a/b/c.go"), []core.ScopePath{"a", "a/b", "a/b/c.go"}},
 		{"leading wildcard", core.ScopePattern("*/b.go"), nil},
-		{"inner wildcard", core.ScopePattern("a/*/c.go"), []core.ScopePath{core.ScopeDir("a")}},
-		{"trailing slash", core.ScopeDir("a/b/"), []core.ScopePath{core.ScopeDir("a"), core.ScopeDir("a/b")}},
+		{"inner wildcard", core.ScopePattern("a/*/c.go"), []core.ScopePath{"a"}},
+		{"trailing slash", core.ScopeDir("a/b/"), []core.ScopePath{"a", "a/b"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := claimDirKeys(tc.scope); !equalPaths(got, tc.want) {
+			if got := claimDirKeys(nil, tc.scope); !equalPaths(got, tc.want) {
 				t.Fatalf("claimDirKeys(%q) = %v, want %v", tc.scope, got, tc.want)
 			}
 		})
 	}
+}
+
+func TestClaimDirKeysReusesBufferWithoutChangingKeys(t *testing.T) {
+	scopes := []core.ScopePath{
+		core.ScopeFile("a/b/c.go"),
+		core.ScopePattern("*/b.go"),
+		core.ScopePattern("a/*/c.go"),
+		core.ScopeDir("x/y/"),
+		core.ScopeFile("one.go"),
+	}
+	var buf []core.ScopePath
+	for _, scope := range scopes {
+		got := claimDirKeys(buf, scope)
+		buf = got
+		want := claimDirKeys(nil, scope)
+		if !equalPaths(got, want) {
+			t.Fatalf("claimDirKeys with reused buffer for %q = %v, want %v", scope, got, want)
+		}
+	}
+}
+
+func TestLeadingWildcard(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"*.go", true},
+		{"?*.go", true},
+		{"*/*.go", true},
+		{"src/*.go", false},
+		{"src/a/*/c.go", false},
+		{"src/*.go/lead", false},
+		{"plain.go", false},
+		{"", false},
+		{"a/b?/c", false},
+		{"a/*", false},
+	} {
+		if got := leadingWildcard(tc.value); got != tc.want {
+			t.Errorf("leadingWildcard(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestActiveScopeIndexMatchingStableAcrossCalls(t *testing.T) {
+	active := []*core.Run{
+		{ID: "r1", TaskID: "A1", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("src/a.go")}},
+		{ID: "r2", TaskID: "A2", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("src/b.go")}},
+		{ID: "r3", TaskID: "A3", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("docs/readme.md")}},
+	}
+	idx := newActiveScopeIndex(active)
+	tasks := []core.Task{
+		{ID: "t1", Scope: []core.ScopePath{core.ScopeFile("src/a.go")}},
+		{ID: "t2", Scope: []core.ScopePath{core.ScopeFile("src/a.go"), core.ScopeFile("src/b.go")}},
+		{ID: "t3", Scope: []core.ScopePath{core.ScopeDir("src")}},
+		{ID: "t4", Scope: []core.ScopePath{core.ScopeAll()}},
+		{ID: "t5", Scope: []core.ScopePath{core.ScopePattern("*.go")}},
+	}
+	for pass := 0; pass < 3; pass++ {
+		for _, task := range tasks {
+			got := idx.matching(task)
+			want := newActiveScopeIndex(active).matching(task)
+			if !equalInts(got, want) {
+				t.Fatalf("pass %d task %s matching = %v, want %v", pass, task.ID, got, want)
+			}
+		}
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func BenchmarkPlannerSelectLargeDispatch(b *testing.B) {

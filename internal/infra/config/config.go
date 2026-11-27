@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,22 @@ const DefaultMaxAutoRebases = app.DefaultMaxAutoRebases
 // never passed through Load.
 const defaultPollInterval = 30 * time.Second
 
+// Concurrency defaults shared by ApplyDefaults and defaults. Both paths must
+// raise the same number of in-flight runs and active agents when a config
+// leaves the values unset.
+const (
+	DefaultMaxInFlight     = 20
+	DefaultMaxActiveAgents = 4
+)
+
+// DefaultOrphanTimeout is the fallback for an unset orphan timeout. It comes
+// from the reconciler so a configured timeout and the built-in one agree.
+const DefaultOrphanTimeout = app.DefaultOrphanTimeout
+
+// DefaultModelTimeout bounds the parent-session model lookup. A lookup that
+// runs longer leaves workers on the server default without a visible cause.
+const DefaultModelTimeout = 3 * time.Second
+
 // DefaultWorkerInstructions is prepended to worker spawn prompts when the
 // operator does not configure harness.worker_instructions. It combines the
 // shared weak-machine verification rule with the MCP-only tool rule, and stays
@@ -38,19 +55,21 @@ const DefaultWorkerInstructions = core.WeakMachineVerificationRule + " Use the b
 
 // Config holds every setting loaded from .beacon/config.yaml.
 type Config struct {
-	StateDB      string      `yaml:"state_db"`
-	WorkspaceDir string      `yaml:"workspace_dir"`
-	BaseBranch   string      `yaml:"base_branch"`
-	PollInterval string      `yaml:"poll_interval"`
-	StrictScope  bool        `yaml:"strict_scope"`
-	Concurrency  Concurrency `yaml:"concurrency"`
-	TaskSource   TaskSource  `yaml:"task_source"`
-	SCM          SCM         `yaml:"scm"`
-	Harness      Harness     `yaml:"harness"`
-	Merge        Merge       `yaml:"merge"`
-	OnBaseRed    OnBaseRed   `yaml:"on_base_red"`
-	Webhook      Webhook     `yaml:"webhook"`
-	Notify       Notify      `yaml:"notify"`
+	StateDB       string      `yaml:"state_db"`
+	WorkspaceDir  string      `yaml:"workspace_dir"`
+	BaseBranch    string      `yaml:"base_branch"`
+	PollInterval  string      `yaml:"poll_interval"`
+	OrphanTimeout string      `yaml:"orphan_timeout"`
+	ModelTimeout  string      `yaml:"model_timeout"`
+	StrictScope   bool        `yaml:"strict_scope"`
+	Concurrency   Concurrency `yaml:"concurrency"`
+	TaskSource    TaskSource  `yaml:"task_source"`
+	SCM           SCM         `yaml:"scm"`
+	Harness       Harness     `yaml:"harness"`
+	Merge         Merge       `yaml:"merge"`
+	OnBaseRed     OnBaseRed   `yaml:"on_base_red"`
+	Webhook       Webhook     `yaml:"webhook"`
+	Notify        Notify      `yaml:"notify"`
 
 	// interval is the parsed PollInterval. Load sets it once so readers of a
 	// loaded config never parse the same value again. Code-built configs leave
@@ -151,18 +170,43 @@ func (c Config) Complete() bool {
 	return err == nil
 }
 
-// parseInterval resolves the poll interval and returns the ParseDuration error
-// for a malformed value. Load rejects a bad value at the boundary so the
-// daemon never runs with a silently substituted interval.
-func parseInterval(value string) (time.Duration, error) {
+// parseDuration resolves a configured duration and returns the ParseDuration
+// error for a malformed value. Load rejects a bad value at the boundary so the
+// daemon never runs with a silently substituted duration.
+func parseDuration(value string, fallback time.Duration) (time.Duration, error) {
 	if value == "" {
-		return defaultPollInterval, nil
+		return fallback, nil
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
 		return 0, err
 	}
 	return d, nil
+}
+
+// parseInterval resolves the poll interval with its dedicated fallback.
+func parseInterval(value string) (time.Duration, error) {
+	return parseDuration(value, defaultPollInterval)
+}
+
+// OrphanTimeoutDuration parses the configured orphan timeout. A malformed
+// value falls back because Load rejects it before the daemon starts.
+func (c Config) OrphanTimeoutDuration() time.Duration {
+	d, err := parseDuration(c.OrphanTimeout, DefaultOrphanTimeout)
+	if err != nil {
+		return DefaultOrphanTimeout
+	}
+	return d
+}
+
+// ModelTimeoutDuration parses the configured model resolution timeout. A
+// malformed value falls back because Load rejects it before the daemon starts.
+func (c Config) ModelTimeoutDuration() time.Duration {
+	d, err := parseDuration(c.ModelTimeout, DefaultModelTimeout)
+	if err != nil {
+		return DefaultModelTimeout
+	}
+	return d
 }
 
 // Interval returns the configured poll interval. Load parses PollInterval once
@@ -212,6 +256,12 @@ func (c *Config) validate(interval time.Duration, intervalErr error) error {
 	if intervalErr != nil {
 		return fmt.Errorf("invalid poll_interval %q: %w", c.PollInterval, intervalErr)
 	}
+	if _, err := parseDuration(c.OrphanTimeout, DefaultOrphanTimeout); err != nil {
+		return fmt.Errorf("invalid orphan_timeout %q: %w", c.OrphanTimeout, err)
+	}
+	if _, err := parseDuration(c.ModelTimeout, DefaultModelTimeout); err != nil {
+		return fmt.Errorf("invalid model_timeout %q: %w", c.ModelTimeout, err)
+	}
 	switch c.Merge.RequiredChecksMode {
 	case "", RequiredChecksManual, RequiredChecksWorkflow:
 	default:
@@ -252,8 +302,33 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
 	ApplyDefaults(&c)
+	warnModelOverride(c)
+	if err := validateRequiredCheckFallback(&c, path); err != nil {
+		return c, fmt.Errorf("config %s: %w", path, err)
+	}
 	resolveRequiredChecks(&c, path)
 	return c, nil
+}
+
+// validateRequiredCheckFallback rejects manual check names that GitHub never
+// reports as a standalone check. A stale fallback that names a matrix parent
+// or a reusable workflow's inner job would wait forever for a check that no
+// workflow emits. The check is skipped when the project has no workflows, so
+// a standalone config keeps its explicit list.
+func validateRequiredCheckFallback(c *Config, path string) error {
+	if len(c.Merge.RequiredChecks) == 0 {
+		return nil
+	}
+	unreportable := make(map[string]bool)
+	for _, name := range shared.DetectUnreportableJobNames(projectRootFromConfigPath(path)) {
+		unreportable[name] = true
+	}
+	for _, name := range c.Merge.RequiredChecks {
+		if unreportable[name] {
+			return fmt.Errorf("merge.required_checks contains %q, a name GitHub never reports", name)
+		}
+	}
+	return nil
 }
 
 // ApplyDefaults fills unset scalar settings. Load and beacon init both call
@@ -276,10 +351,10 @@ func ApplyDefaults(c *Config) {
 		c.Merge.MaxAutoRebases = DefaultMaxAutoRebases
 	}
 	if c.Concurrency.MaxInFlight <= 0 {
-		c.Concurrency.MaxInFlight = 20
+		c.Concurrency.MaxInFlight = DefaultMaxInFlight
 	}
-	if c.Concurrency.MaxActiveAgents < 0 {
-		c.Concurrency.MaxActiveAgents = 0
+	if c.Concurrency.MaxActiveAgents <= 0 {
+		c.Concurrency.MaxActiveAgents = DefaultMaxActiveAgents
 	}
 	if c.OnBaseRed.Mode == "" {
 		c.OnBaseRed.Mode = "spawn_fixer"
@@ -290,6 +365,23 @@ func ApplyDefaults(c *Config) {
 	if c.Harness.WorkerInstructions == "" {
 		c.Harness.WorkerInstructions = DefaultWorkerInstructions
 	}
+	if c.OrphanTimeout == "" {
+		c.OrphanTimeout = DefaultOrphanTimeout.String()
+	}
+	if c.ModelTimeout == "" {
+		c.ModelTimeout = DefaultModelTimeout.String()
+	}
+}
+
+// warnModelOverride makes an environment model override visible. BEACON_MODEL
+// wins over harness.model, so an operator who reads only the config would
+// otherwise see a model that the daemon never uses.
+func warnModelOverride(c Config) {
+	override := EnvOr("BEACON_MODEL", "")
+	if override == "" || c.Harness.Model == "" {
+		return
+	}
+	slog.Warn("BEACON_MODEL overrides harness.model", "beacon_model", override, "harness_model", c.Harness.Model)
 }
 
 // resolveRequiredChecks replaces the configured names with the job names in
@@ -348,17 +440,19 @@ func LiteralOrEnv(literal, envName string) string {
 // defaults returns the config used when no config file exists.
 func defaults() Config {
 	return Config{
-		StateDB:      ".beacon/state.db",
-		WorkspaceDir: ".beacon/worktrees",
-		BaseBranch:   "main",
-		PollInterval: "30s",
-		interval:     defaultPollInterval,
-		Concurrency:  Concurrency{MaxInFlight: 20, MaxActiveAgents: 4},
-		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
-		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
-		Harness:      Harness{WorkerInstructions: DefaultWorkerInstructions},
-		Merge:        Merge{MaxAttempts: 12, MaxAutoRebases: DefaultMaxAutoRebases, AutoRebase: true},
-		OnBaseRed:    OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
+		StateDB:       ".beacon/state.db",
+		WorkspaceDir:  ".beacon/worktrees",
+		BaseBranch:    "main",
+		PollInterval:  "30s",
+		OrphanTimeout: DefaultOrphanTimeout.String(),
+		ModelTimeout:  DefaultModelTimeout.String(),
+		interval:      defaultPollInterval,
+		Concurrency:   Concurrency{MaxInFlight: DefaultMaxInFlight, MaxActiveAgents: DefaultMaxActiveAgents},
+		TaskSource:    TaskSource{Provider: "markdown", Dir: "docs/tasks"},
+		SCM:           SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
+		Harness:       Harness{WorkerInstructions: DefaultWorkerInstructions},
+		Merge:         Merge{MaxAttempts: 12, MaxAutoRebases: DefaultMaxAutoRebases, AutoRebase: true},
+		OnBaseRed:     OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
 }
 
@@ -373,6 +467,8 @@ func expandNonSecrets(c *Config) {
 	c.WorkspaceDir = expandEnv(c.WorkspaceDir)
 	c.BaseBranch = expandEnv(c.BaseBranch)
 	c.PollInterval = expandEnv(c.PollInterval)
+	c.OrphanTimeout = expandEnv(c.OrphanTimeout)
+	c.ModelTimeout = expandEnv(c.ModelTimeout)
 	c.TaskSource.Provider = expandEnv(c.TaskSource.Provider)
 	c.TaskSource.Dir = expandEnv(c.TaskSource.Dir)
 	c.TaskSource.Owner = expandEnv(c.TaskSource.Owner)

@@ -1,7 +1,7 @@
 package app
 
 import (
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -144,8 +144,8 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 // newActiveRunIndex builds the per-cycle view of active runs: busy task IDs and
 // an index of live scope claims. Terminal and nil runs are ignored.
 func newActiveRunIndex(active []*core.Run) (map[core.TaskID]*core.Run, *activeScopeIndex) {
-	busyIDs := make(map[core.TaskID]*core.Run)
-	var live []*core.Run
+	busyIDs := make(map[core.TaskID]*core.Run, len(active))
+	live := make([]*core.Run, 0, len(active))
 	for _, r := range active {
 		if r == nil || r.State.Terminal() {
 			continue
@@ -167,19 +167,28 @@ type activeScopeIndex struct {
 	globs  []int
 	unpath []int
 	broad  []int
+	epoch  int
+	seen   []int
+	out    []int
+	keys   []core.ScopePath
 }
 
 func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 	idx := &activeScopeIndex{
 		runs:  runs,
-		exact: make(map[core.ScopePath][]int),
-		cover: make(map[core.ScopePath][]int),
-		under: make(map[core.ScopePath][]int),
+		exact: make(map[core.ScopePath][]int, len(runs)),
+		cover: make(map[core.ScopePath][]int, len(runs)),
+		under: make(map[core.ScopePath][]int, len(runs)),
+		seen:  make([]int, len(runs)),
+		out:   make([]int, 0, len(runs)),
 	}
+	var keysBuf []core.ScopePath
 	for i, r := range runs {
 		for _, claim := range r.Scope {
-			idx.exact[claim] = appendUnique(idx.exact[claim], i)
-			keys := claimDirKeys(claim)
+			exactKey := core.ScopePath(claim.Value())
+			idx.exact[exactKey] = appendUnique(idx.exact[exactKey], i)
+			keys := claimDirKeys(keysBuf, claim)
+			keysBuf = keys
 			for _, key := range keys {
 				idx.under[key] = appendUnique(idx.under[key], i)
 			}
@@ -204,15 +213,20 @@ func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 
 // matching returns the live runs whose claims could overlap t, in live order.
 // The result is a superset: every overlapping run is included, and the caller
-// confirms each one with the injected checker.
+// confirms each one with the injected checker. The index owns the returned
+// slice and reuses it on the next call, so callers must consume it before
+// calling matching again. Deduplication uses an epoch buffer instead of a map
+// so a candidate costs no per-candidate heap allocations. The seen slice is
+// sized to the live run count, which bounds every index below.
 func (idx *activeScopeIndex) matching(t core.Task) []int {
-	seen := make(map[int]bool)
-	var out []int
+	idx.epoch++
+	out := idx.out[:0]
 	add := func(i int) {
-		if !seen[i] {
-			seen[i] = true
-			out = append(out, i)
+		if idx.seen[i] == idx.epoch {
+			return
 		}
+		idx.seen[i] = idx.epoch
+		out = append(out, i)
 	}
 	allRuns := func() {
 		for i := range idx.runs {
@@ -220,17 +234,19 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 		}
 	}
 	for _, claim := range t.Scope {
-		if claim.Kind() == 'a' || (claim.Kind() == 'g' && leadingWildcard(claim.Value())) {
+		kind, value := claim.Kind(), claim.Value()
+		if kind == 'a' || (kind == 'g' && leadingWildcard(value)) {
 			// A broad claim can cover any active path, so no prefix key is
 			// selective enough. Fall back to a full scan for this candidate.
 			allRuns()
 			continue
 		}
-		for _, i := range idx.exact[claim] {
+		for _, i := range idx.exact[core.ScopePath(value)] {
 			add(i)
 		}
-		keys := claimDirKeys(claim)
-		switch claim.Kind() {
+		keys := claimDirKeys(idx.keys, claim)
+		idx.keys = keys
+		switch kind {
 		case 'f':
 			for _, key := range keys {
 				for _, i := range idx.cover[key] {
@@ -238,15 +254,16 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 				}
 			}
 		default:
+			// cover is only filled for d and g claims, and it uses the same
+			// claimDirKeys prefixes that fill under for every claim. So
+			// cover[key] is always a subset of under[key], and walking cover
+			// here adds nothing the under walk has not already added.
 			for _, key := range keys {
 				for _, i := range idx.under[key] {
 					add(i)
 				}
-				for _, i := range idx.cover[key] {
-					add(i)
-				}
 			}
-			if claim.Kind() == 'g' {
+			if kind == 'g' {
 				for _, i := range idx.globs {
 					add(i)
 				}
@@ -259,18 +276,23 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 	for _, i := range idx.broad {
 		add(i)
 	}
-	sort.Ints(out)
+	if len(out) > 1 {
+		slices.Sort(out)
+	}
+	idx.out = out
 	return out
 }
 
 // claimDirKeys returns the directory keys under which a claim is indexed: the
 // claim's own value as a directory, then each literal ancestor directory. A
 // wildcard segment stops the walk because later segments are not fixed paths.
-// Every key is a prefix of the claim value, so slicing the value avoids a
-// strings.Split slice, a builder and its intermediate prefix strings.
-func claimDirKeys(claim core.ScopePath) []core.ScopePath {
+// Every key is a bare prefix of the claim value with no kind tag, so slicing
+// the value avoids a strings.Split slice, a builder, its intermediate prefix
+// strings and the per-key "d:" concatenation. The caller passes a reusable
+// dst, so a claim costs no key-slice and no key-string allocation.
+func claimDirKeys(dst []core.ScopePath, claim core.ScopePath) []core.ScopePath {
+	out := dst[:0]
 	value := claim.Value()
-	var out []core.ScopePath
 	for start := 0; ; {
 		rel := strings.IndexByte(value[start:], '/')
 		end := len(value)
@@ -280,7 +302,7 @@ func claimDirKeys(claim core.ScopePath) []core.ScopePath {
 		if strings.ContainsAny(value[start:end], "*?") {
 			return out
 		}
-		out = append(out, core.ScopeDir(value[:end]))
+		out = append(out, core.ScopePath(value[:end]))
 		if rel < 0 {
 			return out
 		}
@@ -289,14 +311,19 @@ func claimDirKeys(claim core.ScopePath) []core.ScopePath {
 }
 
 func leadingWildcard(value string) bool {
-	return strings.ContainsAny(strings.Split(value, "/")[0], "*?")
+	end := strings.IndexByte(value, '/')
+	if end < 0 {
+		end = len(value)
+	}
+	return strings.ContainsAny(value[:end], "*?")
 }
 
+// appendUnique adds i to indices when it is not already present. The caller
+// walks runs in ascending order, so a repeated i is always the last element.
+// Checking only that element deduplicates in constant time without a scan.
 func appendUnique(indices []int, i int) []int {
-	for _, existing := range indices {
-		if existing == i {
-			return indices
-		}
+	if n := len(indices); n > 0 && indices[n-1] == i {
+		return indices
 	}
 	return append(indices, i)
 }

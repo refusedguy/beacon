@@ -1,7 +1,7 @@
 // Data model, CLI transport and RPC schema for the Beacon panels. Sources load
 // TUI peers lazily in setup so `node --test` can import this module alone.
 import { execFile as nodeExecFile } from "node:child_process"
-import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
+import { existsSync as fsExistsSync, readFileSync as fsReadFileSync, statSync as fsStatSync } from "node:fs"
 import { join, relative, resolve } from "node:path"
 import { promisify } from "node:util"
 import { beaconCommand } from "../mcp/mcp.js"
@@ -107,12 +107,16 @@ const DECISION_SPEC = [
 ]
 const DURATION_SPEC = [
   ["waitingCI", ["waiting_ci_seconds", "waitingCISeconds", "waitingCI"], num],
+  ["waitingCIInitial", ["waiting_ci_initial_seconds", "waitingCIInitialSeconds", "waitingCIInitial"], num],
+  ["waitingCIRebase", ["waiting_ci_rebase_seconds", "waitingCIRebaseSeconds", "waitingCIRebase"], num],
+  ["waitingCIFix", ["waiting_ci_fix_seconds", "waitingCIFixSeconds", "waitingCIFix"], num],
   ["running", ["running_seconds", "runningSeconds", "running"], num],
   ["blocked", ["blocked_seconds", "blockedSeconds", "blocked"], num],
 ]
 const CHECK_SPEC = [
   ["name", ["Name", "name"]], ["state", ["State", "state"]],
   ["durationSeconds", ["duration_seconds", "durationSeconds"], num],
+  ["headSHA", ["head_sha", "headSHA", "headSha"]],
 ]
 const QUEUE_SPEC = [
   ["id", ["ID", "id"]], ["title", ["Title", "title"]], ["kind", ["Kind", "kind"]],
@@ -170,7 +174,44 @@ function normalizeMetrics(v) {
   for (const [key, name] of Object.entries(METRIC_KEYS)) out[key] = num(pick(s, [name, key]))
   return out
 }
-export const normalizeRun = (v) => normalize(v, RUN_SPEC)
+// An attempt starts at the first timeline event and restarts at each rebase or
+// agent-fix transition. The transition's decision carries the result and the
+// head it produced, so the view can tell a finished attempt from a running one.
+const ATTEMPT_STATES = Object.freeze({ needs_rebase: "rebase", needs_agent_fix: "fix" })
+const ATTEMPT_KINDS = Object.freeze({ behind: "rebase", checks_failed: "fix", rebase: "rebase", fix: "fix" })
+const RETRY_DECISIONS = Object.freeze({ "transition.rebase": "rebase", "transition.wake": "fix" })
+const byTime = (a, b) => str(a?.at).localeCompare(str(b?.at))
+const eventKind = (event) => str(event?.kind).toLowerCase()
+const lastOfKind = (list, kinds) => [...list].reverse().find((item) => kinds(item)) ?? null
+
+export function normalizeAttempt(run) {
+  const timeline = [...(run?.timeline ?? [])].sort(byTime)
+  const decisions = [...(run?.decisions ?? [])].sort(byTime)
+  const firstAt = str(timeline[0]?.at)
+  const event = lastOfKind(timeline, (e) =>
+    Boolean(ATTEMPT_STATES[str(e?.state).toLowerCase()] || ATTEMPT_KINDS[eventKind(e)]))
+  const since = event && (!firstAt || str(event.at) >= firstAt) ? str(event.at) : ""
+  const kind = event
+    ? ATTEMPT_STATES[str(event.state).toLowerCase()] ?? ATTEMPT_KINDS[eventKind(event)] ?? "initial"
+    : "initial"
+  const decision = lastOfKind(decisions, (d) =>
+    RETRY_DECISIONS[str(d?.kind)] === kind && (!since || str(d.at) >= since))
+  const fields = decision?.fields && typeof decision.fields === "object" ? decision.fields : {}
+  const outcome = str(decision?.action)
+  const pendingHead = lastOfKind(timeline, (e) => eventKind(e) === "checks_pending")?.sha
+  const headSHA = str(pick(fields, ["new_sha", "newSHA"]) ?? pendingHead) || str(run?.sha)
+  const rebaseStatus = kind !== "rebase" ? "none"
+    : outcome === "rebased" ? "passed"
+      : outcome === "failed" ? "failed" : "running"
+  const number = kind === "initial" ? 1 : num(fields.attempt) || num(run?.rebaseAttempts) + num(run?.fixAttempts) || 1
+  return { number, kind, startedAt: since, headSHA, outcome, rebaseStatus }
+}
+
+export function normalizeRun(v) {
+  const run = normalize(v, RUN_SPEC)
+  run.attempt = normalizeAttempt(run)
+  return run
+}
 export function normalizeSnapshot(v) {
   const s = v && typeof v === "object" ? v : {}
   const out = { active: list(s.active, normalizeRun), recent: list(s.recent, normalizeRun), queue: [] }
@@ -233,12 +274,46 @@ const CARD_META_FIELD_RE = /^([A-Za-z_][\w-]*):\s*(.*?)\s*$/
 const CARD_BODY_FIELD_RE = /^([A-Za-z_][\w-]*):\s*(.+?)\s*$/gim
 const BEACON_BRANCH_RE = /^beacon\/(.+)$/
 
+// Parsed cards are cached by path and validated with a cheap stat, so a poll
+// that re-reads an unchanged card does no file read and no regex work. The
+// stamp folds size and a short hash of the inode metadata. ctime changes on a
+// rewrite even when mtime and size stay inside one tick, so a same-size edit
+// cannot leave a stale card in the cache. The cache is bounded: a session can
+// visit many cards but never all task files.
+const CARD_CACHE_LIMIT = 512
+const cardCache = new Map()
+const cardStamp = (info) => `${info?.size ?? 0}:${fnv1a([info?.mtimeMs ?? info?.mtime ?? 0, info?.ctimeMs ?? 0, info?.ino ?? 0])}`
+// Hand out a fresh card on every read. A caller that edits a title or a meta
+// field must not be able to change what later readers see from the cache.
+const copyCard = (card) => ({ ...card, meta: Object.assign(Object.create(null), card.meta) })
 // Read a card from docs/tasks. A missing or unreadable file returns null so
 // the caller fails closed instead of showing a stale SQLite queue row.
 export function readCard(root, id, deps = {}) {
   const cardID = str(id)
   if (!CARD_ID_RE.test(cardID)) return null
   const path = join(root, "docs", "tasks", `${cardID}.md`)
+  // An injected readFileSync with no statSync is a test double on a fake path
+  // that cannot be stat'ed. Bypass the cache so its reads stay observable. With
+  // no injection the real fs statSync validates the cache in production.
+  const stat = deps.readFileSync === undefined ? (deps.statSync ?? fsStatSync) : deps.statSync
+  let stamp = null
+  if (typeof stat === "function") {
+    try {
+      stamp = cardStamp(stat(path))
+    } catch {}
+  }
+  // An injected readFileSync on a fake path can be read but not stat'ed. Read
+  // it directly instead of failing closed, so a test double keeps working.
+  if (stamp !== null) {
+    const hit = cardCache.get(path)
+    if (hit && hit.stamp === stamp) {
+      // Reinsert the hit so Map order tracks use. Eviction drops the oldest
+      // entry, which is now the least recently read card.
+      cardCache.delete(path)
+      cardCache.set(path, hit)
+      return copyCard(hit.card)
+    }
+  }
   let body
   try {
     if (!(deps.existsSync ?? fsExistsSync)(path)) return null
@@ -261,12 +336,17 @@ export function readCard(root, id, deps = {}) {
     if (bodyFields[name] === undefined) bodyFields[name] = found[2]
   }
   const field = (name) => text(name) || bodyFields[name.toLowerCase()] || ""
-  return {
+  const card = {
     id: cardID, title: text("title") || cardID, priority: text("priority"), status: text("status"),
     kind: text("kind") || "task", scope: field("scope"), depends: field("depends") || field("depends_on"), meta,
     parent: (field("epic") || (BEACON_BRANCH_RE.exec(field("base_branch"))?.[1] ?? "")).trim(),
     path, relativePath: relative(root, path), body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
   }
+  if (stamp !== null) {
+    if (cardCache.size >= CARD_CACHE_LIMIT) cardCache.delete(cardCache.keys().next().value)
+    cardCache.set(path, { stamp, card: copyCard(card) })
+  }
+  return card
 }
 export const readTitle = (root, taskID, deps = {}) => readCard(root, taskID, deps)?.title || str(taskID)
 const cardIsPending = (root, id, deps = {}) => {
@@ -280,7 +360,7 @@ function enrichRuns(root, runs, deps = {}) {
 export class CliStatusSource {
   constructor({ root, deps = {}, limits = {}, sessionID, model, log = console.debug }) {
     Object.assign(this, { root, limits, sessionID, model, log })
-    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, now: () => Date.now(), normalizeSnapshot, ...deps }
+    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, statSync: fsStatSync, now: () => Date.now(), normalizeSnapshot, ...deps }
   }
   #exec(base, args, { label = "cli", timing = null } = {}) {
     const [program, ...rest] = base
@@ -389,9 +469,21 @@ class RpcStatusSource {
   }
   #rpc() { return this.ctx.client.rpc(BeaconStatusRpc) }
   async snapshot(limits = this.limits) {
-    return normalizeSnapshot(await this.#rpc().snapshot(limits ?? {}, {
+    const value = await this.#rpc().snapshot(limits ?? {}, {
       location: tuiLocation(this.ctx), signal: AbortSignal.timeout(this.timeout),
-    }))
+    })
+    // The RPC server reads through CliStatusSource, which already normalizes
+    // every run and marks it with an attempt. Skip that work on a normal wire
+    // result and normalize only a raw payload from a test double or older peer.
+    const hasRawRun = (group) => {
+      if (!Array.isArray(group)) return false
+      for (const run of group) if (run && !Object.hasOwn(run, "attempt")) return true
+      return false
+    }
+    const raw = hasRawRun(value?.active) || hasRawRun(value?.recent)
+    // A payload without a queue still needs normalization: snapshotView and
+    // mergeDispatch read value.queue directly and must never see undefined.
+    return raw || !Array.isArray(value?.queue) ? normalizeSnapshot(value) : value
   }
   async control(input) {
     return this.#rpc().control(input, { signal: AbortSignal.timeout(this.timeout) })

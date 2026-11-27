@@ -29,7 +29,30 @@ const (
 	deepActive    = 1000
 	deepRecent    = 20
 	deepSeed      = 20261126
+
+	// Smoke sizes keep the same seed and modulo distributions as the deep
+	// fixture, so one bounded PR pass reads a fixed amount of work in seconds.
+	smokeRuns      = 2000
+	smokeDecisions = 10000
+	smokeEvents    = 40000
+	smokeActive    = 200
+	smokeRecent    = 20
 )
+
+// deepDBFlags pins the SQLite settings that change page-cache and WAL work.
+// cache_size is negative, so its magnitude is a fixed KiB limit. Autocheckpoint
+// stays off until seeding finishes and the explicit checkpoint below runs.
+const deepDBFlags = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-65536)&_pragma=wal_autocheckpoint(0)&_pragma=temp_store(MEMORY)"
+
+// deepTmpDir keeps the seeded database on tmpfs when the machine has it. A
+// fixed filesystem removes dentry and page-cache variance between base and
+// head. Machines without tmpfs fall back to the OS temp directory.
+func deepTmpDir() string {
+	if info, err := os.Stat("/dev/shm"); err == nil && info.IsDir() {
+		return "/dev/shm"
+	}
+	return os.TempDir()
+}
 
 // snapshotEnv holds one seeded state database and the ids a snapshot reads.
 type snapshotEnv struct {
@@ -57,11 +80,19 @@ func deepSize(name string, fallback int) int {
 // measures seconds, not minutes, on the benchmark machine.
 func newSnapshotEnv(b *testing.B) *snapshotEnv {
 	b.Helper()
-	runs := deepSize("BEACON_DEEP_RUNS", deepRuns)
-	decisions := deepSize("BEACON_DEEP_DECISIONS", deepDecisions)
-	events := deepSize("BEACON_DEEP_EVENTS", deepEvents)
-	active := deepSize("BEACON_DEEP_ACTIVE", deepActive)
-	recent := deepSize("BEACON_DEEP_RECENT", deepRecent)
+	fallbackRuns, fallbackDecisions, fallbackEvents := deepRuns, deepDecisions, deepEvents
+	fallbackActive, fallbackRecent := deepActive, deepRecent
+	if smokeMode() {
+		fallbackRuns, fallbackDecisions, fallbackEvents = smokeRuns, smokeDecisions, smokeEvents
+		fallbackActive, fallbackRecent = smokeActive, smokeRecent
+	}
+	// deepSize reads the environment first, so explicit BEACON_DEEP_* values
+	// still win over the smoke fallback.
+	runs := deepSize("BEACON_DEEP_RUNS", fallbackRuns)
+	decisions := deepSize("BEACON_DEEP_DECISIONS", fallbackDecisions)
+	events := deepSize("BEACON_DEEP_EVENTS", fallbackEvents)
+	active := deepSize("BEACON_DEEP_ACTIVE", fallbackActive)
+	recent := deepSize("BEACON_DEEP_RECENT", fallbackRecent)
 	if active > runs {
 		active = runs
 	}
@@ -69,7 +100,7 @@ func newSnapshotEnv(b *testing.B) *snapshotEnv {
 		recent = runs - active
 	}
 
-	dir, err := os.MkdirTemp("", "beacon-deep-snapshot-")
+	dir, err := os.MkdirTemp(deepTmpDir(), "beacon-deep-snapshot-")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -81,7 +112,7 @@ func newSnapshotEnv(b *testing.B) *snapshotEnv {
 	}
 	b.Cleanup(func() { _ = store.Close() })
 
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?"+deepDBFlags)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -159,6 +190,16 @@ FROM seq`)
 	if err := tx.Commit(); err != nil {
 		b.Fatal(err)
 	}
+	// Move every seeded page out of the WAL before the first timed read. A
+	// checkpoint at a fixed point keeps the warm pass and the timed passes
+	// reading the same file state.
+	var busy, log, checkpointed int
+	if err := db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &log, &checkpointed); err != nil {
+		b.Fatal(err)
+	}
+	if busy != 0 {
+		b.Fatalf("wal_checkpoint(TRUNCATE) reported %d busy pages", busy)
+	}
 }
 
 // runSnapshotQueries issues the store reads a status snapshot performs. Work
@@ -221,35 +262,49 @@ type snapshotSample struct {
 // BenchmarkSQLiteSnapshot is the repeatable deep-snapshot command. It reports
 // the median and range of a full snapshot read at 500k decisions, 100k runs
 // and 2M run events, with work and error counts from the final pass.
+//
+// CI runs a bounded smoke pass with BEACON_BENCH_SMOKE=1 and -benchtime=1x:
+//
+//	BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' -bench '^BenchmarkSQLiteSnapshot$' -benchtime=1x -count=1 -benchmem ./internal/bench/
+//
+// Smoke mode uses smaller fixture sizes, skips the warm pass and both
+// profiles, and still prints the sizes actually used so base and head can be
+// checked for identical work. The seed, modulo distributions, report and
+// counts stay the same.
 func BenchmarkSQLiteSnapshot(b *testing.B) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	e := newSnapshotEnv(b)
-	_, _ = runSnapshotQueries(e) // warm page cache and prepared plans
+	if !smokeMode() {
+		_, _ = runSnapshotQueries(e) // warm page cache and prepared plans
+	}
 
 	// Profiles start after the fixture and warmup so they describe the timed
-	// snapshot loop rather than millions of fixture inserts.
+	// snapshot loop rather than millions of fixture inserts. Smoke mode skips
+	// them so one bounded pass stays well under the CI limit.
 	var cpuFile, heapFile *os.File
-	var err error
-	if path := os.Getenv("BEACON_DEEP_CPUPROFILE"); path != "" {
-		cpuFile, err = os.Create(path)
-		if err != nil {
-			b.Fatal(err)
+	if !smokeMode() {
+		var err error
+		if path := os.Getenv("BEACON_DEEP_CPUPROFILE"); path != "" {
+			cpuFile, err = os.Create(path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := pprof.StartCPUProfile(cpuFile); err != nil {
+				b.Fatal(err)
+			}
+			defer func() {
+				pprof.StopCPUProfile()
+				_ = cpuFile.Close()
+			}()
 		}
-		if err := pprof.StartCPUProfile(cpuFile); err != nil {
-			b.Fatal(err)
+		if path := os.Getenv("BEACON_DEEP_MEMPROFILE"); path != "" {
+			heapFile, err = os.Create(path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = heapFile.Close() }()
 		}
-		defer func() {
-			pprof.StopCPUProfile()
-			_ = cpuFile.Close()
-		}()
-	}
-	if path := os.Getenv("BEACON_DEEP_MEMPROFILE"); path != "" {
-		heapFile, err = os.Create(path)
-		if err != nil {
-			b.Fatal(err)
-		}
-		defer func() { _ = heapFile.Close() }()
 	}
 
 	b.ResetTimer()
@@ -288,7 +343,13 @@ func BenchmarkSQLiteSnapshot(b *testing.B) {
 	fmt.Printf("sqlite snapshot deep: runs=%d decisions=%d events=%d active_ids=%d iterations=%d\n", e.runs, e.decisions, e.events, len(e.ids), b.N)
 	fmt.Printf("sqlite snapshot deep: median=%s mean=%s min=%s max=%s range=%s work=%d errs=%d\n",
 		median, avg, min, max, max-min, work, errs)
+	// The canonical row exposes min and max directly instead of only the
+	// range, so a consumer never has to infer the sample spread.
+	printPerfRow(os.Stdout, "snapshot", median, min, max, work, errs,
+		"SQLite VM, ListRunEvents sort and JSON reflection")
 	b.ReportMetric(float64(median.Nanoseconds()), "snapshot-median-ns")
+	b.ReportMetric(float64(min.Nanoseconds()), "snapshot-min-ns")
+	b.ReportMetric(float64(max.Nanoseconds()), "snapshot-max-ns")
 	b.ReportMetric(float64((max - min).Nanoseconds()), "snapshot-range-ns")
 	b.ReportMetric(float64(work), "snapshot-work")
 	b.ReportMetric(float64(errs), "snapshot-errs")

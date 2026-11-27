@@ -6,7 +6,7 @@ import {
 } from "./ui_model.js"
 import {
   baseIncidentItem, blockedGroupKeys, checkRow, checksSummary, compactReason, daemonAlertItem,
-  dispatchItem, isDispatching, nextStepLine, queueRows, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
+  dispatchItem, isDispatching, nextStepLine, queueRowsWithMeta, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
 } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
 export { elapsed }
@@ -62,8 +62,44 @@ export const SIDEBAR_TITLE_WIDTH = 29
 export const truncateSidebarTitle = (value) => truncate(value, SIDEBAR_TITLE_WIDTH)
 const ageOf = (run, now) => { const t = Math.max(timeOf(run?.updatedAt), timeOf(run?.createdAt)); return t ? elapsed(now - t) : "" }
 const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(run?.updatedAt); return a && b ? elapsed(b - a) : "" }
-export function phaseLabel(run, now = Date.now()) {
+const numberOrZero = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : 0 }
+export const shortSHA = (value) => { const sha = str(value); return sha ? sha.slice(0, 7) : "-" }
+const lastChecksPending = (timeline) => [...timeline].reverse().find((e) => str(e?.kind).toLowerCase() === "checks_pending")
+
+// A rebase or fix transition starts a new attempt. The cumulative buckets keep
+// counting from the first start, so the live phase uses the cycle buckets that
+// measure only the current round.
+export function phaseDurations(run, now = Date.now()) {
   const d = run.durations ?? {}
+  const cumulative = {
+    waitingCI: numberOrZero(d.waitingCI), running: numberOrZero(d.running), blocked: numberOrZero(d.blocked),
+  }
+  const attempt = run.attempt ?? {}
+  if (attempt.kind !== "rebase" && attempt.kind !== "fix") return { ...cumulative, scoped: false }
+  const waitingCI = attempt.kind === "rebase" ? numberOrZero(d.waitingCIRebase) : numberOrZero(d.waitingCIFix)
+  const running = attempt.startedAt && str(run?.state).toLowerCase() === "running"
+    ? Math.max(0, now - timeOf(attempt.startedAt)) / 1000 : cumulative.running
+  return { waitingCI, running, blocked: cumulative.blocked, scoped: true, cumulative }
+}
+
+// Checks can outlive the head they measured. After a rebase the run carries a
+// new head before the next observation replaces the old green checks.
+export function checksForRun(run) {
+  const all = run.checks ?? []
+  const head = str(run?.sha)
+  if (!head) return { checks: all, stale: [] }
+  const observed = str(lastChecksPending(run.timeline ?? [])?.sha)
+  const checks = [], stale = []
+  for (const check of all) {
+    const checkHead = str(check?.headSHA)
+    const current = checkHead ? checkHead === head : !observed || observed === head
+    ;(current ? checks : stale).push(check)
+  }
+  return { checks, stale }
+}
+
+export function phaseLabel(run, now = Date.now()) {
+  const d = phaseDurations(run, now)
   const state = str(run.state).toLowerCase()
   const phase = state === "waiting_ci" ? ["CI wait", d.waitingCI]
     : state === "blocked" ? ["block", d.blocked]
@@ -109,8 +145,18 @@ function recentFromViewWith(view, active) {
 }
 function recentFromView(view) { return recentFromViewWith(view, activeFromView(view)) }
 function stateBarFromView(view, active = activeFromView(view), recent = recentFromView(view)) {
-  const counts = Object.fromEntries(STATE_BAR_KEYS.map((key) => [key, 0]))
-  for (const run of [...active, ...recent]) {
+  // A prepared literal with the same keys as STATE_BAR_KEYS avoids building an
+  // entries array and a combined run array on every refresh. Walk the two
+  // views in place instead of spreading them into a third array.
+  const counts = {
+    pending: 0, running: 0, waiting_ci: 0, needs_rebase: 0,
+    needs_agent_fix: 0, blocked: 0, merged: 0, closed: 0,
+  }
+  for (const run of active) {
+    const state = str(run.state).toLowerCase()
+    if (Object.hasOwn(counts, state)) counts[state] += 1
+  }
+  for (const run of recent) {
     const state = str(run.state).toLowerCase()
     if (Object.hasOwn(counts, state)) counts[state] += 1
   }
@@ -140,8 +186,41 @@ function stateBarFromView(view, active = activeFromView(view), recent = recentFr
     fg: counts.blocked > 0 ? "error" : "base",
   }
 }
+// One normalized view and state bar per snapshot object. The sidebar pass
+// builds them and the footer pass takes the same bar, so a refresh normalizes
+// and counts the runs once instead of once per slot. The queue array held here
+// is also the stable key that lets the taskTree WeakMap hit across the passes
+// of one refresh and across repeated renders of the same snapshot.
+const viewCache = new WeakMap()
+let lastRaw = null
+let lastEntry = null
+function buildView(snapshot) {
+  const view = normalizeSnapshot(snapshot)
+  const active = activeFromView(view)
+  const recent = recentFromViewWith(view, active)
+  return { view, active, recent, bar: stateBarFromView(view, active, recent) }
+}
+function viewFor(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return buildView(snapshot)
+  const cached = viewCache.get(snapshot)
+  if (cached) return cached
+  // A fresh wrapper around the same payload is common on every poll. Reuse the
+  // prior view when every field the sidebar reads is still the same object.
+  if (lastRaw && lastEntry && lastRaw.queue === snapshot.queue
+    && lastRaw.active === snapshot.active && lastRaw.recent === snapshot.recent
+    && lastRaw.metrics === snapshot.metrics && lastRaw.daemon === snapshot.daemon
+    && lastRaw.baseIncident === snapshot.baseIncident && lastRaw.generatedAt === snapshot.generatedAt) {
+    viewCache.set(snapshot, lastEntry)
+    return lastEntry
+  }
+  const entry = buildView(snapshot)
+  viewCache.set(snapshot, entry)
+  lastRaw = snapshot
+  lastEntry = entry
+  return entry
+}
 export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
-  return stateBarFromView(normalizeSnapshot(snapshot))
+  return viewFor(snapshot).bar
 }
 
 // Two pooled slots per run: identity, then reference and live cause.
@@ -199,10 +278,12 @@ export function blockedOpenFrom(epicOpen) {
   return out
 }
 
-export function blockedToggleItem(queue = [], blockedOpen = null, tree = null) {
-  const keys = blockedGroupKeys(queue, tree)
-  if (!keys.length) return null
-  const expanded = keys.every((key) => blockedOpen?.[key] === true)
+export function blockedToggleItem(queue = [], blockedOpen = null, tree = null, keys = null) {
+  // A caller that already grouped the queue passes the keys from that pass.
+  // A standalone caller falls back to the shared index.
+  const blocked = keys ?? blockedGroupKeys(queue, tree)
+  if (!blocked.length) return null
+  const expanded = blocked.every((key) => blockedOpen?.[key] === true)
   return {
     marker: expanded ? "▼" : "▶",
     name: expanded ? "Collapse all blocked" : "Expand all blocked",
@@ -227,10 +308,7 @@ export function toggleAllBlockedGroups(epic, queue = []) {
 }
 
 export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date.now(), open = SIDEBAR_OPEN, epicOpen = null, blockedOpen = null, dispatching = isDispatching()) {
-  const view = normalizeSnapshot(snapshot)
-  const active = activeFromView(view)
-  const recent = recentFromView(view)
-  const bar = stateBarFromView(view, active, recent)
+  const { view, active, recent, bar } = viewFor(snapshot)
   const items = [
     { marker: "", name: "Beacon", status: bar.summary, color: "action", bold: true },
     { marker: "", name: bar.legend, status: "", color: "muted" },
@@ -261,9 +339,12 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   } else {
     listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
     if (open.queue === true) {
-      const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen, tree) : null
+      // One grouping serves the rows and the blocked toggle. Passing its keys
+      // into the toggle removes the second queueGroups scan of the queue.
+      const { rows, blockedKeys } = queueRowsWithMeta(view.queue, epicOpen, blockedOpen, tree)
+      const toggle = blockedOpen != null ? blockedToggleItem(view.queue, blockedOpen, tree, blockedKeys) : null
       if (toggle) listItems.push(toggle)
-      listItems.push(...queueRows(view.queue, epicOpen, blockedOpen, tree))
+      listItems.push(...rows)
       listItems.push(spacerItem())
     }
   }
@@ -304,9 +385,9 @@ export function detailActions(run) {
   actions.push("copy")
   return actions
 }
-function phaseSummary(run) {
-  const d = run.durations ?? {}
-  return `Run ${shortTaskID(run.id)} · Coding ${elapsed((d.running ?? 0) * 1000)} · CI wait ${elapsed((d.waitingCI ?? 0) * 1000)} · Blocked ${elapsed((d.blocked ?? 0) * 1000)}`
+function phaseSummary(run, now) {
+  const d = phaseDurations(run, now)
+  return `Run ${shortTaskID(run.id)} · Coding ${elapsed(d.running * 1000)} · CI wait ${elapsed(d.waitingCI * 1000)} · Blocked ${elapsed(d.blocked * 1000)}`
 }
 export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_OPEN) {
   if (!run) return {
@@ -331,10 +412,11 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     row({ marker: "", name: reason || "No reason recorded", status: "", kind: "reason",
       color: problem ? "error" : "base" })
   }
-  const checks = run.checks ?? []
-  header("CI Checks", "checks", checksSummary(checks))
+  const { checks, stale } = checksForRun(run)
+  header("CI Checks", "checks", stale.length ? `pending for ${shortSHA(run.sha)}` : checksSummary(checks, run.checks?.ciWallSeconds))
   if (isOpen("checks")) {
-    if (!checks.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "check" })
+    if (stale.length) row({ marker: "", name: `Checks pending for head ${shortSHA(run.sha)}`, status: "", color: "warning", kind: "check" })
+    if (!checks.length && !stale.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "check" })
     else checks.forEach((c) => row(checkRow(c)))
   }
   header("Timeline", "timeline")
@@ -353,8 +435,16 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     const launch = launchOf(run)
     if (launch) row({ marker: key("Launch"), name: [launch, str(run.agentIdentity ?? run.agent_identity)].filter(Boolean).join(" · "), status: "", color: "base", kind: "tech" })
     row({ marker: key("Head SHA"), name: run.sha || "-", status: "", color: "base", kind: "tech" })
-    const attempts = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
-    row({ marker: key("Attempts"), name: attempts, status: "", color: "base", kind: "tech" })
+    const attempt = run.attempt ?? {}
+    const head = shortSHA(attempt.headSHA || run.sha)
+    const attemptName = `#${attempt.number || 1}${attempt.kind && attempt.kind !== "initial" ? ` ${attempt.kind}` : ""}`
+      + `${attempt.outcome ? ` · ${attempt.outcome}` : ""} · head ${head}`
+    row({ marker: key("Attempts"), name: attemptName, status: "", color: "base", kind: "tech" })
+    row({ marker: key("Rebase"), name: attempt.rebaseStatus || "none", status: "", color: "base", kind: "tech" })
+    const counters = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
+    row({ marker: key("Counters"), name: counters, status: "", color: "muted", kind: "tech" })
+    const totals = phaseDurations(run, now)
+    if (totals.scoped) row({ marker: key("Total time"), name: `Coding ${elapsed(totals.cumulative.running * 1000)} · CI wait ${elapsed(totals.cumulative.waitingCI * 1000)} · Blocked ${elapsed(totals.cumulative.blocked * 1000)}`, status: "", color: "muted", kind: "tech" })
     const all = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
     const decisions = all.slice(-DECISION_LIMIT)
     if (all.length > decisions.length) row({ marker: "", name: `... ${all.length - decisions.length} earlier decisions`, status: "", color: "muted", kind: "decision" })
@@ -371,7 +461,7 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     branch: run.branch || "-",
     title: str(run.title) || str(run.taskID) || "-",
     task: run.taskID || "-",
-    phase: phaseSummary(run),
+    phase: phaseSummary(run, now),
     nextStep: nextStepLine(run),
     fixer: run.isFixer ? "FIXER" : "",
     actions: detailActions(run),

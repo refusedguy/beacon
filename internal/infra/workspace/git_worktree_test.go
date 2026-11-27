@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -154,6 +155,59 @@ func TestGitWorktreeCreateUsesTaskBaseBranch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(mainWS.Path, "base-only.txt")); !os.IsNotExist(err) {
 		t.Fatalf("default worktree used release branch: %v", err)
+	}
+}
+
+func TestGitWorktreeCreateRejectsCollidingTaskIDs(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	first := core.Task{ID: "T-a-b"}
+	ws, err := wt.Create(ctx, first)
+	if err != nil {
+		t.Fatalf("Create(first) error = %v", err)
+	}
+
+	// The slash is sanitized to a dash, so this id targets the same branch
+	// and worktree path as the first task.
+	second := core.Task{ID: "T-a/b"}
+	_, err = wt.Create(ctx, second)
+	if core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("Create(second) error = %v, want CodeConflict", err)
+	}
+	for _, id := range []string{"T-a-b", "T-a/b"} {
+		if !strings.Contains(err.Error(), id) {
+			t.Fatalf("Create(second) error = %q, want it to name task %s", err, id)
+		}
+	}
+	if clean, err := wt.Clean(ctx, ws); err != nil || !clean {
+		t.Fatalf("Create(second) disturbed the first worktree: clean=%v err=%v", clean, err)
+	}
+}
+
+func TestGitWorktreeForceRemoveDeletesBranchWhenWorktreeIsGone(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-GONE-BRANCH"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	branch := ws.Branch
+
+	// Drop the directory and git's administrative entry. Git then refuses
+	// `worktree remove`, while the branch ref is still present locally.
+	if err := os.RemoveAll(ws.Path); err != nil {
+		t.Fatalf("os.RemoveAll(ws.Path): %v", err)
+	}
+	admin := filepath.Join(wt.Root, ".git", "worktrees", filepath.Base(ws.Path))
+	if err := os.RemoveAll(admin); err != nil {
+		t.Fatalf("os.RemoveAll(admin): %v", err)
+	}
+	if err := wt.ForceRemove(ctx, ws); err != nil {
+		t.Fatalf("ForceRemove() with a missing worktree error = %v", err)
+	}
+	cmd := exec.Command("git", "-C", wt.Repo, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("stale branch %s survived ForceRemove: %s", branch, out)
 	}
 }
 
@@ -1001,5 +1055,135 @@ func TestGitWorktreeForceRemoveReportsBranchDeleteFailure(t *testing.T) {
 	err = wt.ForceRemove(ctx, ws)
 	if !errors.Is(err, branchErr) {
 		t.Fatalf("ForceRemove() error = %v, want the branch delete failure", err)
+	}
+}
+
+func TestGitWorktreeRemoveCleanPathLimitsGitCalls(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-RM-COUNT"})
+	if err != nil {
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-RM-COUNT\"}): %v", err)
+	}
+	var calls [][]string
+	wt.commandHook = func(_ string, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	if err := wt.Remove(ctx, ws); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("Remove() ran %d git commands, want 2: %v", len(calls), calls)
+	}
+	for _, call := range calls {
+		if len(call) > 0 && call[0] == "status" {
+			t.Fatalf("Remove() ran a separate status check on a clean path: %v", calls)
+		}
+	}
+}
+
+func TestGitWorktreeRemoveDirtyPathClassifiesWithOneProbe(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-RM-DIRTY"})
+	if err != nil {
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-RM-DIRTY\"}): %v", err)
+	}
+	dirty := filepath.Join(ws.Path, "agent.txt")
+	if err := os.WriteFile(dirty, []byte("agent work\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(dirty, ...): %v", err)
+	}
+	var calls [][]string
+	wt.commandHook = func(_ string, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	err = wt.Remove(ctx, ws)
+	if core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("Remove() error = %v, want CodeConflict for a dirty worktree", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("Remove() ran %d git commands on a dirty path, want 2: %v", len(calls), calls)
+	}
+	if calls[0][0] != "worktree" || calls[1][0] != "status" {
+		t.Fatalf("Remove() probe order = %v, want worktree remove then status", calls)
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Fatalf("agent file removed by a rejected Remove(): %v", err)
+	}
+}
+
+func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock measurement")
+	}
+	ctx := context.Background()
+	const passes = 5
+	walls := make([]float64, 0, passes)
+	works := make([]int, 0, passes)
+	statuses := make([]int, 0, passes)
+	errs := 0
+	for i := 1; i <= passes; i++ {
+		wt, _ := newTestGitWorktree(t)
+		ws, err := wt.Create(ctx, core.Task{ID: core.TaskID(fmt.Sprintf("T-RM-LAT-%d", i))})
+		if err != nil {
+			t.Fatalf("Create() pass %d: %v", i, err)
+		}
+		calls, statusCalls := 0, 0
+		wt.commandHook = func(_ string, args []string) error {
+			calls++
+			if len(args) > 0 && args[0] == "status" {
+				statusCalls++
+			}
+			return nil
+		}
+		start := time.Now()
+		err = wt.Remove(ctx, ws)
+		wall := time.Since(start).Seconds()
+		walls = append(walls, wall)
+		works = append(works, calls)
+		statuses = append(statuses, statusCalls)
+		runErrs := 0
+		if err != nil {
+			runErrs = 1
+			errs++
+		}
+		t.Logf("run %d: wall=%.3fs work=%d status=%d errs=%d", i, wall, calls, statusCalls, runErrs)
+	}
+	sort.Float64s(walls)
+	sort.Ints(works)
+	sort.Ints(statuses)
+	fmt.Printf("worktree-remove: median=%.3fs range=%.3fs-%.3fs work=%d status=%d errs=%d limiter=git subprocess spawn and worktree metadata\n",
+		walls[len(walls)/2], walls[0], walls[len(walls)-1],
+		works[len(works)/2], statuses[len(statuses)/2], errs)
+	// Keep the test as the harness and print the canonical row alongside the
+	// human line. The status count stays in the human line only: the canonical
+	// payload has a fixed field set shared by every harness.
+	cache := os.Getenv("BEACON_BENCH_CACHE")
+	if cache == "" {
+		cache = "unset"
+	}
+	row := struct {
+		Key      string  `json:"key"`
+		MedianMS float64 `json:"median_ms"`
+		MinMS    float64 `json:"min_ms"`
+		MaxMS    float64 `json:"max_ms"`
+		Work     int64   `json:"work"`
+		Errs     int64   `json:"errs"`
+		Limiter  string  `json:"limiter"`
+		Cache    string  `json:"cache"`
+	}{
+		Key:      "worktree-remove",
+		MedianMS: walls[len(walls)/2] * 1000,
+		MinMS:    walls[0] * 1000,
+		MaxMS:    walls[len(walls)-1] * 1000,
+		Work:     int64(works[len(works)/2]),
+		Errs:     int64(errs),
+		Limiter:  "git subprocess spawn and worktree metadata",
+		Cache:    cache,
+	}
+	if data, err := json.Marshal(row); err == nil {
+		fmt.Printf("beacon-perf: %s\n", data)
 	}
 }

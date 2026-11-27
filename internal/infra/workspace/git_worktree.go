@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app"
@@ -30,6 +31,13 @@ type GitWorktree struct {
 	// commandHook is a test seam. Production leaves it nil. A non-nil hook
 	// fails a chosen git subcommand by returning an error before it runs.
 	commandHook func(dir string, args []string) error
+
+	// owners records which task holds each live worktree target. Create claims
+	// the target before touching git so two ids that sanitize to the same ref
+	// cannot both open a worktree. The first run's worktree stays intact when
+	// a second task tries to claim it.
+	mu     sync.Mutex
+	owners map[core.TaskID]createTarget
 }
 
 // New builds a worktree manager for repo with worktrees under dir.
@@ -160,6 +168,50 @@ func (g *GitWorktree) targetFor(task core.Task) createTarget {
 	}
 }
 
+// reserveTarget claims t for id. Two ids that sanitize to the same branch or
+// path cannot both own a worktree: the second caller gets a conflict that
+// names both tasks instead of silently replacing the first run's worktree.
+func (g *GitWorktree) reserveTarget(id core.TaskID, t createTarget) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.owners == nil {
+		g.owners = make(map[core.TaskID]createTarget)
+	}
+	for other, owned := range g.owners {
+		if other == id {
+			continue
+		}
+		if owned.branch == t.branch || owned.path == t.path {
+			return core.Errorf(core.CodeConflict,
+				"task %s cannot create worktree: branch %s and path %s collide with task %s",
+				id, t.branch, t.path, other)
+		}
+	}
+	g.owners[id] = t
+	return nil
+}
+
+// releaseOwner drops the claim held by id. Create calls it when a claim did
+// not produce a worktree, so a retry can claim the target again.
+func (g *GitWorktree) releaseOwner(id core.TaskID) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.owners, id)
+}
+
+// releaseWorkspace drops the claim for the task that owns ws, matched by path
+// or branch. Removal only calls it once the worktree is gone; a refused
+// removal keeps the claim because the worktree still lives.
+func (g *GitWorktree) releaseWorkspace(ws core.Workspace) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id, owned := range g.owners {
+		if (ws.Path != "" && owned.path == ws.Path) || (ws.Branch != "" && owned.branch == ws.Branch) {
+			delete(g.owners, id)
+		}
+	}
+}
+
 // clearStalePath removes a leftover worktree at path. A failed spawn can leave
 // only the card status marker behind, which belongs to Beacon and must not
 // block the next dispatch. Real agent code still stops the create with a
@@ -213,6 +265,15 @@ func (g *GitWorktree) worktreeBase(ctx context.Context, t createTarget) (string,
 // Create checks out a fresh worktree for task.
 func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspace, error) {
 	t := g.targetFor(task)
+	if err := g.reserveTarget(task.ID, t); err != nil {
+		return core.Workspace{}, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			g.releaseOwner(task.ID)
+		}
+	}()
 	if err := os.MkdirAll(g.Dir, 0o755); err != nil {
 		return core.Workspace{}, err
 	}
@@ -229,6 +290,7 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	if err != nil {
 		return core.Workspace{}, err
 	}
+	ok = true
 	return core.Workspace{Path: t.path, Branch: t.branch, Base: base}, nil
 }
 
@@ -409,7 +471,10 @@ func (g *GitWorktree) refresh(ctx context.Context) {
 	if g.Refresher == nil {
 		return
 	}
-	if err := g.Refresher.RefreshWorktrees(ctx); err != nil {
+	// The removal or cleanup is already decided when the refresh runs. A
+	// cancelled caller must not skip the editor cleanup, so detach from its
+	// cancellation while keeping its values.
+	if err := g.Refresher.RefreshWorktrees(context.WithoutCancel(ctx)); err != nil {
 		slog.Warn("worktree refresh failed", "error", err)
 	}
 }
@@ -422,30 +487,35 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	// The editor can hold a stale row even when git refuses to remove the
 	// worktree. Defer the refresh so a failed removal still cleans it up.
 	defer g.refresh(ctx)
-	// A directory removed outside this method is not dirty. It still needs the
-	// editor registration refreshed, so skip the clean check but keep going.
-	clean := true
-	if _, err := os.Stat(ws.Path); err == nil {
-		var checkErr error
-		clean, checkErr = g.Clean(ctx, ws)
-		if checkErr != nil {
-			return checkErr
+	// Git checks cleanliness inside worktree remove and leaves a dirty worktree
+	// untouched. Trying the removal first avoids a separate status call on the
+	// common clean path.
+	_, removeErr := g.run(ctx, "worktree", "remove", ws.Path)
+	if removeErr == nil {
+		g.releaseWorkspace(ws)
+		if ws.Branch != "" {
+			return g.deleteBranch(ctx, ws.Branch, false)
 		}
-	} else if !os.IsNotExist(err) {
+		return nil
+	}
+	// A directory removed outside this method needs no clean check. Keep the
+	// git error as the result and let the deferred refresh clear the editor.
+	if _, err := os.Stat(ws.Path); os.IsNotExist(err) {
+		return removeErr
+	} else if err != nil {
 		return err
+	}
+	// A failed removal may mean dirt or a broken git registration. Ask git once
+	// to tell the cases apart so a dirty worktree keeps its old conflict error
+	// and every other failure keeps the original git error.
+	clean, cleanErr := g.Clean(ctx, ws)
+	if cleanErr != nil {
+		return core.JoinWith(removeErr, "check worktree before removal", cleanErr)
 	}
 	if !clean {
 		return core.WorkspaceConflict(ws.Path)
 	}
-	if _, err := g.run(ctx, "worktree", "remove", ws.Path); err != nil {
-		return err
-	}
-	if ws.Branch != "" {
-		if err := g.deleteBranch(ctx, ws.Branch, false); err != nil {
-			return err
-		}
-	}
-	return nil
+	return removeErr
 }
 
 // deleteBranch deletes the local branch with -d for a safe delete or -D for a
@@ -465,15 +535,31 @@ func (g *GitWorktree) deleteBranch(ctx context.Context, branch string, force boo
 // removal is the point where the editor's worktree registry must be refreshed.
 func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error {
 	defer g.refresh(ctx)
-	return g.removeForce(ctx, ws)
+	err := g.removeForce(ctx, ws)
+	if err == nil {
+		g.releaseWorkspace(ws)
+	}
+	return err
 }
 
 // removeForce deletes a worktree and its branch without a clean check or an
 // editor refresh. Create uses it for a stale path it re-adds in the same call.
 func (g *GitWorktree) removeForce(ctx context.Context, ws core.Workspace) error {
-	_, err := g.run(ctx, "worktree", "remove", "--force", ws.Path)
-	if err == nil && ws.Branch != "" {
-		err = g.deleteBranch(ctx, ws.Branch, true)
+	_, removeErr := g.run(ctx, "worktree", "remove", "--force", ws.Path)
+	if removeErr != nil {
+		// A directory removed outside this process needs no worktree removal.
+		// Git still refuses the remove when its administrative entry is gone,
+		// so the branch would survive here without an explicit delete.
+		if _, statErr := os.Stat(ws.Path); !os.IsNotExist(statErr) {
+			return removeErr
+		}
+		if ws.Branch == "" {
+			return removeErr
+		}
+		return g.deleteBranch(ctx, ws.Branch, true)
 	}
-	return err
+	if ws.Branch != "" {
+		return g.deleteBranch(ctx, ws.Branch, true)
+	}
+	return nil
 }

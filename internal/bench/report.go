@@ -1,37 +1,113 @@
 package bench
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"time"
 )
 
+// perfPrefix marks one canonical row in a benchmark log. The payload is JSON
+// so limiter strings may contain spaces.
+const perfPrefix = "beacon-perf: "
+
+// perfRow is the fixed payload of every canonical row. Consumers validate the
+// field set, so no harness may add another field or rename one. Cache names the
+// cache policy the measurement ran under, so two rows from different policies
+// can never be read as the same sample.
+type perfRow struct {
+	Key      string  `json:"key"`
+	MedianMS float64 `json:"median_ms"`
+	MinMS    float64 `json:"min_ms"`
+	MaxMS    float64 `json:"max_ms"`
+	Work     int64   `json:"work"`
+	Errs     int64   `json:"errs"`
+	Limiter  string  `json:"limiter"`
+	Cache    string  `json:"cache"`
+}
+
+// benchCache returns the cache state stamped on every canonical row. CI sets
+// BEACON_BENCH_CACHE when it runs a harness under a named policy; without an
+// override the row reports "unset" instead of omitting the field.
+func benchCache() string {
+	if value := os.Getenv("BEACON_BENCH_CACHE"); value != "" {
+		return value
+	}
+	return "unset"
+}
+
+// perfLine renders one canonical row. Benchmarks time in nanoseconds and the
+// advisory report reads in milliseconds, so the published values are ms.
+func perfLine(key string, median, min, max time.Duration, work, errs int64, limiter string) string {
+	data, err := json.Marshal(perfRow{
+		Key:      key,
+		MedianMS: float64(median) / float64(time.Millisecond),
+		MinMS:    float64(min) / float64(time.Millisecond),
+		MaxMS:    float64(max) / float64(time.Millisecond),
+		Work:     work,
+		Errs:     errs,
+		Limiter:  limiter,
+		Cache:    benchCache(),
+	})
+	if err != nil {
+		return ""
+	}
+	return perfPrefix + string(data)
+}
+
+// printPerfRow writes one canonical row after the human-readable line. Every
+// harness prints both so a reader and a parser see the same measurement.
+func printPerfRow(w io.Writer, key string, median, min, max time.Duration, work, errs int64, limiter string) {
+	fmt.Fprintln(w, perfLine(key, median, min, max, work, errs, limiter))
+}
+
 // Hotspot names are fixed so every report has the same row order.
 const (
-	nameSQLite  = "sqlite-snapshot"
-	nameCard    = "card-parse"
-	nameWire    = "wire-encode"
-	nameRedact  = "redaction"
-	nameJournal = "mcp-journal"
-	nameFanout  = "sse-fanout"
+	nameSQLite       = "sqlite-snapshot"
+	nameCard         = "card-parse"
+	nameWire         = "wire-encode"
+	nameRedact       = "redaction"
+	nameJournal      = "mcp-journal"
+	nameFanout       = "sse-fanout"
+	nameSCM          = "scm-observe"
+	nameCardLocal    = "card-local-parse"
+	nameHTTPSnapshot = "http-snapshot-assembly"
+	nameSpawn        = "harness-spawn"
 )
 
-var hotspotOrder = []string{nameSQLite, nameCard, nameWire, nameRedact, nameJournal, nameFanout}
+var hotspotOrder = []string{
+	nameSQLite, nameCard, nameWire, nameRedact, nameJournal, nameFanout,
+	nameSCM, nameCardLocal, nameHTTPSnapshot, nameSpawn,
+}
 
 // namePrompt names the standalone prompt benchmark. Prompt construction is not
-// one of the six alternating hotspots, so it gets its own report line.
+// one of the ten alternating hotspots, so it gets its own report line.
 const namePrompt = "prompt-build"
+
+// nameAssembly names the in-memory snapshot assembly benchmark. It exercises
+// status.go and metrics.go without SQLite reads or HTTP encoding, so a change
+// in either production file has its own deciding advisory row.
+const nameAssembly = "snapshot-assembly-in-memory"
+
+// limiterAssembly names the resource that bounds in-memory assembly. It lives
+// here beside the key so the registry and the benchmark cannot drift apart.
+const limiterAssembly = "groupHistory map growth + makeRunSnapshot field copy"
 
 // limiters name the resource that bounds each hotspot. The dossier explains
 // why each one is the limiter and points at the annotated production code.
 var limiters = map[string]string{
-	nameSQLite:  "indexed snapshot reads + WAL pages",
-	nameCard:    "yaml.Unmarshal + line scan",
-	nameWire:    "encoding/json reflection",
-	nameRedact:  "regexp pass chain",
-	nameJournal: "mutex + indexed LRU",
-	nameFanout:  "json.Marshal + subscriber maps + slow-view drop",
+	nameSQLite:       "indexed snapshot reads + WAL pages",
+	nameCard:         "yaml.Unmarshal + line scan",
+	nameWire:         "encoding/json reflection",
+	nameRedact:       "regexp pass chain",
+	nameJournal:      "mutex + indexed LRU",
+	nameFanout:       "json.Marshal + subscriber maps + slow-view drop",
+	nameSCM:          "loopback PR + compare + checks + files round trips",
+	nameCardLocal:    "yaml.Unmarshal + per-scope os.Stat",
+	nameHTTPSnapshot: "groupHistory + json reflection",
+	nameSpawn:        "loopback create + model POST + deferred move",
 }
 
 type sample struct {
@@ -103,6 +179,7 @@ func printReport(w io.Writer, sums []summary, total time.Duration, iterations in
 	for _, s := range sums {
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %5.1f%%  %s\n",
 			s.Name, s.Median, s.Max-s.Min, s.Work, s.Errors, s.Share, s.Limiter)
+		printPerfRow(w, s.Name, s.Median, s.Min, s.Max, s.Work, s.Errors, s.Limiter)
 	}
 	marshal, delivered, dropped := takeFanoutCounts()
 	fmt.Fprintf(w, "sse-fanout (8 and 64 subscribers): marshal=%d delivery=%d drop=%d\n", marshal, delivered, dropped)
@@ -216,6 +293,7 @@ func printSnapshotReport(w io.Writer, phases []snapshotPhase, fixture string, pa
 	for _, p := range phases {
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %7d %7.1f %5.1f%%  %s\n",
 			p.Name, p.Median, p.Max-p.Min, p.Work, p.Errs, p.Bytes, p.Allocs, p.Share, snapshotLimiters[p.Name])
+		printPerfRow(w, p.Name, p.Median, p.Min, p.Max, p.Work, p.Errs, snapshotLimiters[p.Name])
 	}
 	fmt.Fprintln(w, "shares are of one full snapshot CPU: reads plus assembly, not the hot-path micro benchmark")
 }

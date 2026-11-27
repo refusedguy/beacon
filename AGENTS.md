@@ -13,11 +13,11 @@ Dependencies point one way:
 
 An inner package never imports an outer one. The 350-line production-file limit is advisory: `arch_test.go` logs an `ADVISORY` line instead of failing. Treat it as a prompt to decompose the file. `arch_test.go` enforces cyclomatic complexity of at most 20 per function, with two functions grandfathered pending decomposition.
 
-Two modules sit outside the root module in `go.work`: `harnesses/opencode` is the agent harness adapter, and `ui/tui` is the operator monitor. `ui/tui` imports no Beacon package. It reaches the daemon through loopback HTTP and SSE only.
+Three modules sit outside the root module in `go.work`: `harnesses/opencode` and `harnesses/acp` are agent harness adapters, and `ui/tui` is the operator monitor (`go.work:3-8`). `ui/tui` imports no Beacon package. It reaches the daemon through loopback HTTP and SSE only.
 
 ## Vocabulary
 
-`GLOSSARY.md` defines the names used in cards, code and reports. Use those exact names in prose. A `Criterion` is one merge check, not a "merge rule". A `DecisionKind` names a decision record; a `Verdict` names a merge outcome. A `DecisionAction` ties a verdict or kind to its `ActionDispatch` and `ActionCounter`. `Run.NoteObservation` is the one place that stamps a run's head, base and update time from an observation.
+`GLOSSARY.md` defines the names used in cards, code and reports, including the state-to-action table for the eight run states in `pkg/core/run.go:15-32` and their transitions in `pkg/core/run.go:117-124`. Use those exact names in prose. A `Criterion` is one merge check, not a "merge rule". A `DecisionKind` names a decision record; a `Verdict` names a merge outcome. A `DecisionAction` ties a verdict or kind to its `ActionDispatch` and `ActionCounter`. `Run.NoteObservation` is the one place that stamps a run's head, base and update time from an observation.
 
 ## Loopback API
 
@@ -27,11 +27,11 @@ The monitor uses three routes:
 | --- | --- |
 | `GET /api/v1/runs` | `{"runs":[Run]}` or a bare `[Run]` array |
 | `GET /api/v1/events` | `text/event-stream` frames with a JSON `Event` payload |
-| `POST /api/v1/control` | `{"action":"approve\|unblock\|cancel\|retry","run_id":"...","sha":"..."}` |
+| `POST /api/v1/control` | `{"action":"approve\|unblock\|cancel\|retry\|nudge\|watch","run_id":"...","sha":"..."}` |
 
 `Run` carries `id`, `task_id`, `state`, `pr`, `head_sha`, `branch`, `reason` and `updated_at`. `Event` carries `id`, `type`, `run_id` and `at`. Events are notifications. After any event the client re-reads `/api/v1/runs` instead of treating event payloads as state.
 
-The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. The token comes from `--token` or `BEACON_API_TOKEN` and is sent as `Authorization: Bearer <token>`. Only loopback endpoints are accepted.
+The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. The token comes from `--token` or `BEACON_API_TOKEN` and is sent as `Authorization: Bearer <token>` (`ui/tui/main.go:18`). Only loopback endpoints are accepted. `beacon serve` generates a fresh token on every start and writes the address, token and PID to `.beacon/connection.json` (`cmd/beacon/lock.go:108-120`, `cmd/beacon/serve.go:39-44`). Read the current value after each restart. The six control verbs come from `pkg/core/control.go:8-26` and the handler rejects any other value (`cmd/beacon/http.go:411-424`).
 
 ## MCP tools
 
@@ -44,7 +44,7 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 | `beacon_status` | List active runs, pull requests and blockers. | worker |
 | `beacon_recent` | List the most recently finished runs. | worker |
 | `beacon_wait` | Wait for a run to reach a verdict or a terminal state. | worker |
-| `beacon_control` | Approve, unblock, cancel or retry a run. | worker |
+| `beacon_control` | Approve, unblock, cancel, retry, nudge or watch a run. Pass `run_ids` instead of `run_id` to apply one verb to several runs and get one result per id. The vocabulary is `pkg/core/control.go:8-26`; the batch form is `internal/infra/mcp/tool_control.go:12-32` and `internal/infra/mcp/tool_control.go:67-86`. | worker |
 | `beacon_task_create` | `{"title": "...", ...}` creates one card; `{"tasks": [{"title": "...", "depends": ["@1"], ...}, ...]}` creates several and returns `{"created": [{"id", "path"}], "pushed": true}`. `@N` in `depends` means the Nth card in the batch (1-based) and must name an earlier card. | orchestrator only |
 | `beacon_task_delete` | `{"ids": ["T-...", ...]}` deletes several task cards in one commit and push. | orchestrator only |
 | `beacon_task_update` | `{"updates": [{"id": "T-...", "title": "...", ...}]}` edits several task cards in one commit and push. Omitted fields stay unchanged and `status` is ignored. | orchestrator only |
@@ -52,7 +52,7 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 
 `opencode.json` tool permissions are generated, not hand-edited. `ToolCatalog()` in `internal/infra/mcp/registry.go` lists every tool and marks the orchestrator-only ones. Run `go generate ./...` after changing the catalog. `cmd/beacon-gen` rewrites only the permission entries it owns and keeps every other config key, agent description, mode and custom permission as they were. Generation happens at development time, never at binary startup. `TestPermissionsUpToDate` in `internal/infra/mcp/permissions_test.go` regenerates the file into a temp copy and fails when the committed `opencode.json` differs, so CI catches a stale permission list.
 
-No other `beacon_*` MCP tool exists. The MCP server runs as one pooled `beacon mcp` process started from the project `opencode.json`. The local plugin resolves `.opencode/bin/beacon` when it exists and rebuilds a stale binary with `scripts/build-beacon.sh` when the build inputs are newer. There is no HEAD watcher and no automatic `ctx.mcp.reload()`. After Go code lands on `main`, run `bash scripts/build-beacon.sh` explicitly, then restart the MCP daemon and the OpenCode TUI. When no local binary exists, the plugin falls back to `bin/beacon`, a binary on `PATH`, or `go run ./cmd/beacon mcp`. `beacon status --snapshot` bounds its decision history; `--recent-limit` and `--decisions-limit` tighten it further without a rebuild. `opencode.json` denies `beacon_task_create`, `beacon_task_delete`, `beacon_task_update` and `beacon_reconcile` globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows.
+No other `beacon_*` MCP tool exists. The MCP server runs as one pooled `beacon mcp` process started from the project `opencode.json`. The local plugin only resolves a command path: `BEACON_BIN` when it exists, then `.opencode/bin/beacon`, `bin/beacon`, a binary on `PATH`, and finally `go run ./cmd/beacon mcp` when `cmd/beacon/main.go` exists (`.opencode/plugins/beacon-project/mcp/mcp.js:86-107`). It never reads build inputs, never starts a build and never rebuilds a stale binary. There is no HEAD watcher and no automatic `ctx.mcp.reload()`. After Go code lands on `main`, run `bash scripts/build-beacon.sh` explicitly, then restart the MCP daemon and the OpenCode TUI; the plugin emits that reminder from `.opencode/plugins/beacon-project/rules/context.js:8`. A stale local binary keeps serving until that explicit rebuild. `beacon status --snapshot` bounds its decision history; `--recent-limit` and `--decisions-limit` tighten it further without a rebuild. `opencode.json` denies `beacon_task_create`, `beacon_task_delete`, `beacon_task_update` and `beacon_reconcile` globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows.
 
 Spawn workers with `harness.command: worker` in `.beacon/config.yaml`. The OpenCode harness passes that value as the session agent, so each worker inherits the global deny rules for `beacon_task_create`, `beacon_task_delete`, `beacon_task_update` and `beacon_reconcile`. A worker must never create, delete or update task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
 
@@ -98,7 +98,7 @@ Edit only files in `Scope:`. Do not edit files owned by another card. Do not edi
 
 The operator works in the default `build` agent. That agent gets orchestrator rules from the plugin. Keep the main checkout clean and let workers own their worktrees.
 
-- Do not dispatch a task again after `workspace conflict` or `dirty worktree` until you find the cause. A repeated dispatch does not clear a stale worktree.
+- Do not dispatch a task again after `workspace conflict` or `dirty worktree` until you find the cause. A repeated dispatch does not clear a stale worktree. Diagnose in this order: `beacon status --snapshot` for the run's `state` and `reason`, `beacon status --daemon` for a missing reconciler (`cmd/beacon/lock.go:250-282`), `git status --short` inside `.beacon/worktrees/<id>` for uncommitted files (`pkg/core/errors.go:51-54`, `internal/infra/workspace/git_worktree.go:468-482`). Clear or preserve that work explicitly, then re-arm the blocked or closed run with `beacon_control {"action":"retry","run_id":"..."}` (`internal/app/control.go:288-315`).
 - Before `beacon_task_create`, check `git log -n 10 --oneline`, `beacon_status` and `beacon_recent`. Do not recreate a card for work that is in flight or already merged.
 - Give each card a narrow, disjoint `Scope`. Never run two cards that touch `ui.js`, `ui_view.js` or `reconciler.go` at the same time.
 - After Go code lands on `main`, run `bash scripts/build-beacon.sh`, then tell the operator to restart the MCP daemon and the OpenCode TUI once. Go code is not hot-reloaded.

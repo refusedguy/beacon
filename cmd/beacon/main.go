@@ -51,6 +51,7 @@ type wiring struct {
 	control     *app.Control
 	status      app.StatusService
 	wait        app.WaitService
+	explain     app.ExplainService
 	taskCreator *app.TaskCreator
 	taskDeleter *app.TaskDeleter
 	taskUpdater *app.TaskUpdater
@@ -293,7 +294,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		Workspace: infra.workspace, Root: workspaceRoot,
 	}
 	deleter := &app.TaskDeleter{
-		Store: infra.store, Workspace: infra.workspace, Root: workspaceRoot,
+		Store: infra.store, Source: infra.source, Workspace: infra.workspace, Root: workspaceRoot,
 	}
 	updater := &app.TaskUpdater{
 		Store: infra.store, Workspace: infra.workspace, Root: workspaceRoot,
@@ -326,16 +327,22 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		MaxFixTries:        cfg.OnBaseRed.MaxFixAttempts,
 		MaxAttempts:        cfg.Merge.MaxAttempts,
 		Interval:           cfg.Interval(),
+		OrphanTimeout:      cfg.OrphanTimeoutDuration(),
 		AutoRebase:         cfg.Merge.AutoRebase,
 		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
 	}, infra.store, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
+	explain := app.ExplainService{Store: infra.store, SCM: infra.scm}
+	if traceable, ok := p.(app.ExplainPolicy); ok {
+		explain.Policy = traceable
+	}
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: h,
 		workspace: infra.workspace, scm: infra.scm, policy: p,
 		changes: infra.changes, dispatcher: disp, control: ctrl,
 		status:      app.StatusService{Store: infra.store},
 		wait:        app.WaitService{Store: infra.store, Interval: time.Second},
+		explain:     explain,
 		taskCreator: creator, taskDeleter: deleter, taskUpdater: updater, recon: recon,
 		reconcile: &app.ReconcileService{Reconciler: recon, Store: infra.store},
 	}
@@ -380,9 +387,21 @@ func newReconciler(
 		MaxAttempts:        cfg.MaxAttempts,
 		ParentSessionID:    cfg.ParentSession,
 		Interval:           cfg.Interval,
+		OrphanTimeout:      cfg.OrphanTimeout,
 		AutoRebase:         cfg.AutoRebase,
 		MaxAutoRebases:     cfg.MaxAutoRebases,
 	}
+}
+
+// Explain forwards the dry-run trace to the policy in the current snapshot.
+// A policy without Explain yields no steps, which the explain service reports
+// as a merge summary with an empty chain instead of panicking.
+func (p *reloadablePolicy) Explain(obs core.Observation) []app.ExplainStep {
+	traceable, ok := (*p.live).Load().policy.(app.ExplainPolicy)
+	if !ok {
+		return nil
+	}
+	return traceable.Explain(obs)
 }
 
 // ReviewRequired forwards the epic review gate from the live policy snapshot.
@@ -431,20 +450,32 @@ func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarnes
 	}
 }
 
+// modelProvider is the provider recorded on a model taken from the config or
+// the environment. An empty harness provider builds the default harness, so
+// the same default applies to the model reference.
+func modelProvider(cfg config.Config) string {
+	if p := strings.TrimSpace(cfg.Harness.Provider); p != "" {
+		return p
+	}
+	return "opencode"
+}
+
 // resolveModel uses the configured model, then BEACON_MODEL, then the model
 // of the orchestrator session so workers run with the user's current choice.
 func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
+	provider := modelProvider(cfg)
 	if v := envOr("BEACON_MODEL", ""); v != "" {
-		return core.ModelRef{ProviderID: "opencode", ID: v}
+		return core.ModelRef{ProviderID: provider, ID: v}
 	}
 	if cfg.Harness.Model != "" {
-		return core.ModelRef{ProviderID: "opencode", ID: cfg.Harness.Model}
+		return core.ModelRef{ProviderID: provider, ID: cfg.Harness.Model}
 	}
 	if parent == "" || token == "" || cfg.Harness.Endpoint == "" {
 		return core.ModelRef{}
 	}
 	endpoint := strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	timeout := cfg.ModelTimeoutDuration()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -458,6 +489,9 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			slog.Warn("model resolution timed out", "provider", provider, "timeout", timeout, "parent", parent)
+		}
 		return core.ModelRef{}
 	}
 	defer resp.Body.Close()
@@ -519,6 +553,7 @@ func main() {
 	root.AddCommand(newDoctorCommand(configPath))
 	root.AddCommand(newDispatchCommand(configPath, wire))
 	root.AddCommand(newStatusCommand(configPath))
+	root.AddCommand(newExplainCommand(configPath, wire))
 	root.AddCommand(newControlCommand(configPath, wire))
 	root.AddCommand(newMCPCommand(configPath))
 	root.AddCommand(newServeCommand(configPath))

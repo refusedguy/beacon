@@ -1113,6 +1113,58 @@ func TestReconcilePersistsObservedChecks(t *testing.T) {
 	}
 }
 
+// saveCountingStore records writes a reconcile tick performs through the store
+// port. A caller sees a write as a row update, so the count is observable.
+type saveCountingStore struct {
+	*fakeStore
+	saves int
+}
+
+func (s *saveCountingStore) Save(ctx context.Context, run *core.Run) error {
+	s.saves++
+	return s.fakeStore.Save(ctx, run)
+}
+
+func TestUnchangedReconcileTickWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	obs := core.Observation{
+		PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base", PRState: "open",
+		Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+	}
+	r, base, _, _, _ := newReconciler(t, core.VerdictWait, obs)
+	run := base.runs["r1"]
+	run.ObservedSHA = obs.HeadSHA
+	run.ObservedBaseSHA = obs.BaseSHA
+	if err := base.Save(ctx, run); err != nil {
+		t.Fatalf(`base.Save(ctx, run): %v`, err)
+	}
+	store := &saveCountingStore{fakeStore: base}
+	r.Store = store
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
+	}
+	if store.saves != 0 {
+		t.Fatalf("saves = %d, want zero for an unchanged observation", store.saves)
+	}
+}
+
+func TestChangedReconcileTickStillWritesObservation(t *testing.T) {
+	ctx := context.Background()
+	obs := core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"}
+	r, base, _, _, _ := newReconciler(t, core.VerdictWait, obs)
+	store := &saveCountingStore{fakeStore: base}
+	r.Store = store
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
+	}
+	if store.saves != 1 {
+		t.Fatalf("saves = %d, want one for a changed observation", store.saves)
+	}
+	if got := store.runs["r1"]; got.ObservedSHA != obs.HeadSHA {
+		t.Fatalf("ObservedSHA = %q, want %q", got.ObservedSHA, obs.HeadSHA)
+	}
+}
+
 func TestApplyAndSaveRecordsBothSHAsFromExplicitObservation(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {

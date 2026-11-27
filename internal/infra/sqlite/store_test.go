@@ -1370,19 +1370,10 @@ func TestActiveTaskIDsProjectsOnlyTaskAndState(t *testing.T) {
 	}
 }
 
-func taskUpdatedAt(t *testing.T, store *Store, id string) int64 {
-	t.Helper()
-	var stamp int64
-	if err := store.db.QueryRow(`SELECT updated_at FROM tasks WHERE id=?`, id).Scan(&stamp); err != nil {
-		t.Fatalf("read updated_at for %s: %v", id, err)
-	}
-	return stamp
-}
-
-// TestSyncTasksFingerprintSkipsUnchangedRewrite checks that a repeated sync of
-// the same source cards leaves stored rows alone, and that a local status write
-// clears the cache so the next sync rebuilds from source.
-func TestSyncTasksFingerprintSkipsUnchangedRewrite(t *testing.T) {
+// TestCountedReadsKeepExactRows pins the count passes that size the result
+// slices for ListRunEvents and ListDecisions. A wrong count would show up as a
+// wrong length, a missing row or an out-of-order timeline.
+func TestCountedReadsKeepExactRows(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -1390,81 +1381,82 @@ func TestSyncTasksFingerprintSkipsUnchangedRewrite(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	tasks := []core.Task{{ID: "T-1", Title: "one", Status: core.TaskAvailable}}
-	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatalf("first SyncTasks: %v", err)
+	const perRun = 150
+	base := time.Now().UTC().Add(-time.Hour)
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
 	}
-	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM tasks`); got != 1 {
-		t.Fatalf("fresh sync rows = %d, want 1", got)
+	for _, runID := range []string{"r1", "r2"} {
+		for i := 0; i < perRun; i++ {
+			at := base.Add(time.Duration(i) * time.Second).UnixNano()
+			if _, err := tx.ExecContext(ctx, `INSERT INTO run_events (run_id, kind, state, at) VALUES (?,?,?,?)`, runID, "state", "running", at); err != nil {
+				_ = tx.Rollback()
+				t.Fatalf("insert event: %v", err)
+			}
+		}
+	}
+	for i := 0; i < perRun; i++ {
+		at := base.Add(time.Duration(i) * time.Second).UnixNano()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO decisions (at, kind, run_id, fields_json) VALUES (?,?,?,?)`, at, "transition.spawn", "r1", "{}"); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("insert decision: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 
-	// A zero stamp makes any rewrite visible without sleeping for a clock tick.
-	if _, err := store.db.ExecContext(ctx, `UPDATE tasks SET updated_at=0`); err != nil {
-		t.Fatalf("zero stamps: %v", err)
+	events, err := store.ListRunEvents(ctx, []string{"r1", "r2"})
+	if err != nil {
+		t.Fatalf("ListRunEvents: %v", err)
 	}
-	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatalf("unchanged SyncTasks: %v", err)
+	if len(events) != 2*perRun {
+		t.Fatalf("events = %d, want %d", len(events), 2*perRun)
 	}
-	if stamp := taskUpdatedAt(t, store, "T-1"); stamp != 0 {
-		t.Fatalf("unchanged sync rewrote the row, updated_at=%d", stamp)
+	for i := 1; i < len(events); i++ {
+		if events[i].At.Before(events[i-1].At) {
+			t.Fatalf("event[%d] at %s precedes event[%d] at %s", i, events[i].At, i-1, events[i-1].At)
+		}
 	}
 
-	if err := store.SetTaskStatus(ctx, "T-1", "claimed"); err != nil {
-		t.Fatalf("SetTaskStatus: %v", err)
+	decisions, err := store.ListDecisions(ctx, []string{"r1"}, 10, 10)
+	if err != nil {
+		t.Fatalf("ListDecisions: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, `UPDATE tasks SET updated_at=0`); err != nil {
-		t.Fatalf("zero stamps after status: %v", err)
-	}
-	if err := store.SyncTasks(ctx, tasks); err != nil {
-		t.Fatalf("SyncTasks after status: %v", err)
-	}
-	if stamp := taskUpdatedAt(t, store, "T-1"); stamp == 0 {
-		t.Fatal("status change did not invalidate the sync cache")
-	}
-	var status string
-	if err := store.db.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id='T-1'`).Scan(&status); err != nil {
-		t.Fatalf("read status: %v", err)
-	}
-	if status != "available" {
-		t.Fatalf("status after resync = %q, want available", status)
+	if len(decisions) != 10 {
+		t.Fatalf("decisions = %d, want 10", len(decisions))
 	}
 }
 
-// TestSyncTasksFingerprintRewritesChangedCards checks that changed source
-// cards survive a cached fingerprint, including their dependencies.
-func TestSyncTasksFingerprintRewritesChangedCards(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+func TestInQueryExpandsListsInOrder(t *testing.T) {
+	query, args := inQuery(`a IN (%s) AND b IN (%s)`, []string{"x", "y"}, []string{"z"})
+	if want := `a IN (?,?) AND b IN (?)`; query != want {
+		t.Fatalf("query = %q, want %q", query, want)
 	}
-	defer store.Close()
-	ctx := context.Background()
-
-	if err := store.SyncTasks(ctx, []core.Task{{ID: "T-1", Title: "one", Status: core.TaskAvailable}}); err != nil {
-		t.Fatalf("first SyncTasks: %v", err)
-	}
-	if _, err := store.db.ExecContext(ctx, `UPDATE tasks SET updated_at=0`); err != nil {
-		t.Fatalf("zero stamps: %v", err)
+	if want := []any{"x", "y", "z"}; !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %+v, want %+v", args, want)
 	}
 
-	changed := []core.Task{{
-		ID: "T-1", Title: "two", Status: core.TaskAvailable,
-		DependsOn: []core.TaskID{"T-0"},
-	}}
-	if err := store.SyncTasks(ctx, changed); err != nil {
-		t.Fatalf("changed SyncTasks: %v", err)
+	query, args = inQuery(`a IN (%s)`, nil)
+	if want := `a IN ()`; query != want || len(args) != 0 {
+		t.Fatalf("empty list: query = %q args = %+v, want %q and no args", query, args, want)
 	}
-	var title string
-	if err := store.db.QueryRowContext(ctx, `SELECT title FROM tasks WHERE id='T-1'`).Scan(&title); err != nil {
-		t.Fatalf("read title: %v", err)
-	}
-	if title != "two" {
-		t.Fatalf("title = %q, want two", title)
-	}
-	if stamp := taskUpdatedAt(t, store, "T-1"); stamp == 0 {
-		t.Fatal("changed cards did not rewrite the row")
-	}
-	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM task_deps`); got != 1 {
-		t.Fatalf("task_deps rows = %d, want 1", got)
+}
+
+func TestDecisionCountQueryBindsEveryPlaceholder(t *testing.T) {
+	for _, tc := range []struct {
+		runIDs []string
+		limit  int
+		orphan int
+	}{
+		{nil, 20, 100},
+		{[]string{"r1"}, 20, 100},
+		{[]string{"r1", "r2"}, 2, 3},
+	} {
+		query, args := decisionCountQuery(tc.runIDs, tc.limit, tc.orphan)
+		if n := strings.Count(query, "?"); n != len(args) {
+			t.Fatalf("runIDs=%v: %d placeholders but %d args: %q", tc.runIDs, n, len(args), query)
+		}
 	}
 }

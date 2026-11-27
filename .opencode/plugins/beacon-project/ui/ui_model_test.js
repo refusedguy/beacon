@@ -1,12 +1,15 @@
 // Run: node --test .opencode/plugins/beacon-project/ui_model_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { mkdirSync, mkdtempSync, readFileSync as fsReadFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { NOW, lines, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
   BeaconStatusRpc, CHECK_BUCKETS, CliStatusSource, EMPTY_SNAPSHOT, RECENT_LIMIT,
   checkRow, checksSummary, cleanErrorMessage, createCliStatusSource, createStatusSource,
-  defineBeaconStatus, errorMessage, eventKey, joinKey, normalizeRun, normalizeSnapshot,
+  defineBeaconStatus, errorMessage, eventKey, joinKey, normalizeAttempt, normalizeRun, normalizeSnapshot,
   parseSnapshot, renderSnapshotLines, runChangedPayload, runSignature,
   default: beaconStatus, beaconStatusDefinition,
 } = ui
@@ -30,7 +33,7 @@ test("normalizeRun keeps a missing title empty and reads CI checks", () => {
   assert.equal(run.title, "")
   assert.equal(run.state, "running")
   assert.equal(run.durations.waitingCI, 60)
-  assert.deepEqual(run.checks, [{ name: "ci", state: "success", durationSeconds: 28 }])
+  assert.deepEqual(run.checks, [{ name: "ci", state: "success", durationSeconds: 28, headSHA: "" }])
   assert.equal(normalizeRun({ State: "" }).state, "unknown")
 })
 
@@ -121,6 +124,80 @@ test("readCard keeps body titles and scopes stable across repeated reads", () =>
     assert.equal(ui.readCard("/p", "T-1", deps).scope, first.scope)
     assert.equal(ui.readCard("/p", "T-2", deps).scope, "pkg/b.go")
     assert.equal(ui.readTitle("/p", "T-1", deps), first.title)
+  }
+})
+
+test("readCard caches a parsed card until its file stamp changes", () => {
+  const path = "/cache/docs/tasks/T-100.md"
+  const body = "---\nid: T-100\ntitle: Cached\nstatus: ready\n---\nScope: pkg/a.go\nGoal: work.\n"
+  let reads = 0
+  let info = { mtimeMs: 1000, size: body.length }
+  const deps = {
+    existsSync: (p) => p === path,
+    readFileSync: () => { reads++; return body },
+    statSync: () => info,
+  }
+  const first = ui.readCard("/cache", "T-100", deps)
+  assert.equal(first.title, "Cached")
+  assert.equal(first.scope, "pkg/a.go")
+  assert.equal(reads, 1)
+  assert.equal(ui.readCard("/cache", "T-100", deps).title, "Cached")
+  assert.equal(reads, 1, "an unchanged stat reuses the parsed card without a file read")
+
+  info = { mtimeMs: 2000, size: body.length }
+  assert.equal(ui.readCard("/cache", "T-100", deps).scope, "pkg/a.go")
+  assert.equal(reads, 2, "a new mtime forces exactly one fresh read")
+
+  const injected = { existsSync: deps.existsSync, readFileSync: deps.readFileSync }
+  ui.readCard("/cache", "T-100", injected)
+  ui.readCard("/cache", "T-100", injected)
+  assert.equal(reads, 4, "an injected readFileSync without statSync bypasses the cache")
+})
+
+test("readCard invalidates a same-size rewrite that keeps its mtime", () => {
+  const path = "/cache/docs/tasks/T-200.md"
+  const bodyOf = (title) => `---\nid: T-200\ntitle: ${title}\nstatus: ready\n---\nGoal: work.\n`
+  let body = bodyOf("AAAAA")
+  let info = { mtimeMs: 1000, ctimeMs: 1, size: body.length }
+  const deps = {
+    existsSync: (p) => p === path,
+    readFileSync: () => body,
+    statSync: () => info,
+  }
+  assert.equal(ui.readCard("/cache", "T-200", deps).title, "AAAAA")
+  body = bodyOf("BBBBB")
+  info = { mtimeMs: 1000, ctimeMs: 2, size: body.length }
+  assert.equal(ui.readCard("/cache", "T-200", deps).title, "BBBBB", "a same-size rewrite with the same mtime invalidates the card")
+})
+
+test("CLI source keeps title-less card reads at R across snapshots without an injected statSync", async () => {
+  const root = mkdtempSync(join(tmpdir(), "beacon-card-counter-"))
+  try {
+    const tasks = join(root, "docs", "tasks")
+    mkdirSync(tasks, { recursive: true })
+    const R = 12
+    for (let i = 1; i <= R; i++) {
+      writeFileSync(join(tasks, `T-${i}.md`), `---\nid: T-${i}\ntitle: Card ${i}\nstatus: running\n---\n`)
+    }
+    let reads = 0
+    const deps = {
+      command: () => ["/bin/beacon"],
+      execFile: async () => ({ stdout: JSON.stringify({
+        active: Array.from({ length: R }, (_, i) => makeRun({ ID: `run-${i}`, TaskID: `T-${i + 1}`, title: "" })),
+        recent: [],
+      }) }),
+      readFileSync: (path, ...args) => { reads++; return fsReadFileSync(path, ...args) },
+    }
+    const source = new CliStatusSource({ root, deps })
+    const first = await source.snapshot()
+    assert.equal(first.active.length, R)
+    assert.equal(first.active[0].title, "Card 1")
+    assert.equal(reads, R, "the first snapshot reads each title-less card once")
+    const second = await source.snapshot()
+    assert.equal(second.active.length, R)
+    assert.equal(reads, R, "the second snapshot reuses the cached cards without another read")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 
@@ -588,4 +665,99 @@ test("a dispatch without run data still reads the snapshot on refresh", async ()
     ["/bin/beacon", "status", "--snapshot"],
   ])
   assert.deepEqual(next.active, [])
+})
+
+test("normalizeRun reads cycle durations and a per-check head SHA", () => {
+  const run = normalizeRun({
+    id: "r-1",
+    durations: {
+      waiting_ci_seconds: 180, waiting_ci_initial_seconds: 120,
+      waiting_ci_rebase_seconds: 60, waiting_ci_fix_seconds: 30,
+      running_seconds: 420, blocked_seconds: 0,
+    },
+    checks: [{ name: "ci", state: "success", head_sha: "abcdef0" }],
+  })
+  assert.deepEqual(run.checks[0].headSHA, "abcdef0")
+  assert.equal(run.durations.waitingCI, 180)
+  assert.equal(run.durations.waitingCIInitial, 120)
+  assert.equal(run.durations.waitingCIRebase, 60)
+  assert.equal(run.durations.waitingCIFix, 30)
+})
+
+test("normalizeAttempt reports no transition as the initial attempt", () => {
+  const run = normalizeRun(makeRun({
+    Durations: { waiting_ci_seconds: 120, running_seconds: 5, blocked_seconds: 0 },
+  }))
+  assert.equal(run.attempt.kind, "initial")
+  assert.equal(run.attempt.number, 1)
+  assert.equal(run.attempt.rebaseStatus, "none")
+  assert.equal(run.attempt.outcome, "")
+  assert.equal(run.attempt.headSHA, "abcdef1234567890")
+})
+
+test("normalizeAttempt names a finished rebase and the head it produced", () => {
+  const run = normalizeRun({
+    id: "r-2", head_sha: "newsha111",
+    rebase_attempts: 1, max_attempts: 12,
+    timeline: [
+      { at: "2026-11-23T10:00:00Z", kind: "start", state: "running", head_sha: "oldsha000" },
+      { at: "2026-11-23T10:02:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "oldsha000" },
+      { at: "2026-11-23T10:10:00Z", kind: "behind", state: "needs_rebase", head_sha: "oldsha000" },
+      { at: "2026-11-23T10:14:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "newsha111" },
+    ],
+    decisions: [
+      { at: "2026-11-23T10:12:00Z", kind: "transition.rebase", action: "rebased", fields: { attempt: 1, new_sha: "newsha111" } },
+    ],
+  })
+  assert.deepEqual(
+    { kind: run.attempt.kind, number: run.attempt.number, outcome: run.attempt.outcome, status: run.attempt.rebaseStatus, head: run.attempt.headSHA },
+    { kind: "rebase", number: 1, outcome: "rebased", status: "passed", head: "newsha111" },
+  )
+  assert.equal(run.attempt.startedAt, "2026-11-23T10:10:00Z")
+})
+
+test("normalizeAttempt tells a failed rebase from one still running", () => {
+  const failed = normalizeAttempt({
+    rebaseAttempts: 2,
+    timeline: [
+      { at: "2026-11-23T10:00:00Z", kind: "start", state: "running" },
+      { at: "2026-11-23T10:10:00Z", kind: "behind", state: "needs_rebase" },
+    ],
+    decisions: [
+      { at: "2026-11-23T10:11:00Z", kind: "transition.rebase", action: "failed", fields: { attempt: 2, new_sha: "" } },
+    ],
+  })
+  assert.equal(failed.rebaseStatus, "failed")
+  assert.equal(failed.outcome, "failed")
+  const running = normalizeAttempt({
+    timeline: [
+      { at: "2026-11-23T10:00:00Z", kind: "start", state: "running" },
+      { at: "2026-11-23T10:10:00Z", kind: "behind", state: "needs_rebase" },
+    ],
+    decisions: [],
+  })
+  assert.equal(running.rebaseStatus, "running")
+})
+
+test("readCard returns a defensive copy and keeps recently read cards on eviction", () => {
+  const files = new Map()
+  const info = { mtimeMs: 1000, ctimeMs: 1, size: 80 }
+  const deps = { existsSync: (p) => files.has(p), readFileSync: (p) => files.get(p), statSync: () => info }
+  const kept = "/cache/docs/tasks/T-300.md"
+  files.set(kept, "---\nid: T-300\ntitle: Original\nstatus: ready\n---\nGoal: work.\n")
+  const card = ui.readCard("/cache", "T-300", deps)
+  card.title = "Mutated"
+  card.meta.title = "Mutated meta"
+  assert.equal(ui.readCard("/cache", "T-300", deps).title, "Original", "a caller cannot mutate the cached card")
+  assert.equal(ui.readCard("/cache", "T-300", deps).meta.title, "Original", "meta is copied too")
+
+  // The cache holds 512 entries. Reading the kept card after each insert marks
+  // it as most recent, so it survives even after more than 512 other cards.
+  for (let i = 0; i < 520; i++) {
+    const id = `T-${400 + i}`
+    files.set(`/cache/docs/tasks/${id}.md`, `---\nid: ${id}\ntitle: ${id}\nstatus: ready\n---\nGoal: work.\n`)
+    ui.readCard("/cache", id, deps)
+    ui.readCard("/cache", "T-300", deps)
+  }
+  assert.equal(ui.readCard("/cache", "T-300", deps).title, "Original", "frequent access keeps the card in the LRU")
 })

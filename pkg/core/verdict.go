@@ -60,41 +60,19 @@ func CIWallSeconds(checks []CheckResult) int64 {
 	return int64(end.Sub(start).Seconds())
 }
 
-// PRState is the state a provider reports for a pull request. GitHub and
-// GitLab use different tokens for an open request, so callers classify state
-// through IsClosed and IsMerged instead of comparing raw strings.
+// PRState is a provider-neutral pull request state. Each SCM adapter maps its
+// provider's raw tokens onto these outcomes before building an Observation, so
+// no provider vocabulary lives in core.
 type PRState string
 
-const (
-	// PROpen is GitHub's open pull request state.
-	PROpen PRState = "open"
-	// PROpened is GitLab's open merge request state.
-	PROpened PRState = "opened"
-	// PRClosed is a pull request closed without a merge.
-	PRClosed PRState = "closed"
-	// PRMerged is a pull request closed by a merge.
-	PRMerged PRState = "merged"
-	// PRLocked is a closed and locked pull request.
-	PRLocked PRState = "locked"
-)
-
-// IsClosed reports whether s is a final state. Closed, merged and locked pull
+// IsClosed reports whether s is a final state. Closed, merged and locked
 // requests are final; an open or unknown state is not.
-func (s PRState) IsClosed() bool {
-	switch strings.ToLower(string(s)) {
-	case string(PRClosed), string(PRMerged), string(PRLocked):
-		return true
-	default:
-		return false
-	}
-}
+func (s PRState) IsClosed() bool { return DecideFinalState(string(s)).Closed }
 
 // IsMerged reports whether s is a merged pull request.
-func (s PRState) IsMerged() bool {
-	return strings.ToLower(string(s)) == string(PRMerged)
-}
+func (s PRState) IsMerged() bool { return DecideFinalState(string(s)).Merged }
 
-// FinalState is the shared classification of a provider's pull request state.
+// FinalState is the shared, provider-neutral classification of a pull request.
 type FinalState struct {
 	// Closed reports whether the request is closed, merged or locked.
 	Closed bool
@@ -102,12 +80,19 @@ type FinalState struct {
 	Merged bool
 }
 
-// DecideFinalState classifies a raw provider state once for every final-state
+// DecideFinalState classifies a normalized state once for every final-state
 // handler. Open, unknown and empty states are not final, so no handler can
-// finalize a pull request Beacon still treats as open.
+// finalize a pull request Beacon still treats as open. SCM adapters own the
+// mapping from a provider's raw tokens to these outcomes.
 func DecideFinalState(raw string) FinalState {
-	state := PRState(raw)
-	return FinalState{Closed: state.IsClosed(), Merged: state.IsMerged()}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "merged":
+		return FinalState{Closed: true, Merged: true}
+	case "closed", "locked":
+		return FinalState{Closed: true}
+	default:
+		return FinalState{}
+	}
 }
 
 // Observation is a provider snapshot of a pull request at one point in time.
@@ -136,14 +121,31 @@ type Observation struct {
 	IncompleteReason string
 }
 
-// Failure returns the first failed check.
-func (o Observation) Failure() (CheckResult, bool) {
+// Failure returns the first failed required check. When names is empty it
+// considers every reported check. An optional check that fails cannot block a
+// merge, so it is skipped even when the failure invariant runs before policy.
+func (o Observation) Failure(names ...string) (CheckResult, bool) {
 	for _, c := range o.Checks {
-		if c.State == CheckFailure {
-			return c, true
+		if c.State != CheckFailure || !checkRequired(c.Name, names) {
+			continue
 		}
+		return c, true
 	}
 	return CheckResult{}, false
+}
+
+// checkRequired reports whether name belongs to the required set. An empty set
+// means every check is in scope, matching the old caller behavior.
+func checkRequired(name string, names []string) bool {
+	if len(names) == 0 {
+		return true
+	}
+	for _, want := range names {
+		if strings.EqualFold(name, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasPending reports whether any check is still running. A behind pull request
@@ -289,6 +291,8 @@ type MergeDecision struct {
 
 // Decide applies invariants, then the configured criteria in order.
 // It returns VerdictMerge only when every invariant and every rule passed.
+// A policy that can name its required checks is consulted so an optional
+// failed check never fires the failure invariant.
 func Decide(o Observation, criteria []Criterion) MergeDecision {
 	if DecideFinalState(o.PRState).Closed {
 		return MergeDecision{Verdict: VerdictNoop, Reason: "pull request is " + o.PRState}
@@ -310,7 +314,16 @@ func Decide(o Observation, criteria []Criterion) MergeDecision {
 			Criterion: "invariant",
 		}
 	}
-	if c, ok := o.Failure(); ok {
+	var required []string
+	for _, criterion := range criteria {
+		if p, ok := criterion.(RequiredCheckPolicy); ok {
+			if names, known := p.RequiredChecks(); known {
+				required = names
+			}
+			break
+		}
+	}
+	if c, ok := o.Failure(required...); ok {
 		reason := "required check failed: " + c.Name
 		if o.FailureExcerpt != "" {
 			reason += ": " + o.FailureExcerpt

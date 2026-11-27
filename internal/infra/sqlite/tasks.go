@@ -1,81 +1,16 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
-
-// taskSyncCache holds the fingerprint of the last successful SyncTasks for a
-// database. Dispatch re-reads and rewrites the same cards on every cycle, so a
-// hit skips two DELETEs and one INSERT per card. The handle is the key because
-// two state databases must never share a fingerprint.
-var taskSyncCache sync.Map // map[*sql.DB]string
-
-// taskSyncRow is the canonical form hashed by taskFingerprint. updated_at is
-// stamped at write time and is deliberately excluded.
-type taskSyncRow struct {
-	ID            string
-	Title         string
-	Body          string
-	Status        string
-	Priority      int
-	Scope         string
-	SourceRef     string
-	Kind          string
-	Parent        string
-	BaseBranch    string
-	RequireReview string
-	Plan          string
-	WorkerAgent   string
-	WorkerPrompt  string
-	Depends       []string
-}
-
-// taskFingerprint hashes every field SyncTasks writes. Callers skip a rewrite
-// only when this value matches the last successful sync for the same database.
-func taskFingerprint(tasks []core.Task) (string, error) {
-	h := sha256.New()
-	enc := json.NewEncoder(h)
-	for _, t := range tasks {
-		scope, err := json.Marshal(t.Scope)
-		if err != nil {
-			return "", err
-		}
-		plan, err := json.Marshal(t.Plan)
-		if err != nil {
-			return "", err
-		}
-		status := string(t.Status)
-		if status == "" {
-			status = statusAvailable
-		}
-		kind := string(t.Kind)
-		if kind == "" {
-			kind = "task"
-		}
-		depends := make([]string, len(t.DependsOn))
-		for i, dep := range t.DependsOn {
-			depends[i] = string(dep)
-		}
-		row := taskSyncRow{
-			ID: string(t.ID), Title: t.Title, Body: t.Body, Status: status,
-			Priority: t.Priority, Scope: string(scope), SourceRef: t.SourceRef,
-			Kind: kind, Parent: string(t.Parent), BaseBranch: t.BaseBranch,
-			RequireReview: string(t.RequireReview), Plan: string(plan),
-			WorkerAgent: t.WorkerAgent, WorkerPrompt: t.WorkerPrompt, Depends: depends,
-		}
-		if err := enc.Encode(row); err != nil {
-			return "", err
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
 
 // taskColumns are the epic fields added after the initial tasks table. The
 // schema file stays unchanged so existing state databases keep their data.
@@ -105,77 +40,140 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 	return nil
 }
 
-// SyncTasks replaces the stored cards and dependencies with tasks. An
-// unchanged source snapshot skips the rewrite; SetTaskStatus and any failed
-// transaction clear the cached fingerprint so the next sync starts fresh.
-func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
-	if err := s.ensureTaskColumns(ctx); err != nil {
-		taskSyncCache.Delete(s.db)
-		return err
-	}
-	fp, err := taskFingerprint(tasks)
-	if err != nil {
-		taskSyncCache.Delete(s.db)
-		return err
-	}
-	if got, ok := taskSyncCache.Load(s.db); ok && got == fp {
-		return nil
-	}
-	taskSyncCache.Delete(s.db)
-	return s.writeTasks(ctx, tasks, fp)
+// syncCache holds the fingerprint of the last successful SyncTasks for one
+// database file. Two handles on the same file share the entry, so a sync seen
+// by the daemon is also seen by a CLI process in the same process.
+type syncCache struct {
+	mu          sync.Mutex
+	fingerprint []byte
 }
 
-// writeTasks commits one full replacement of the task and dependency tables.
-func (s *Store) writeTasks(ctx context.Context, tasks []core.Task, fp string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+var syncCaches sync.Map // map[string]*syncCache
+
+// dbPaths resolves the main file behind each handle once. Store is defined
+// outside this card's scope, so it cannot record the path it was opened with;
+// PRAGMA database_list is the only way to read it from an open handle.
+var dbPaths sync.Map // map[*sql.DB]string
+
+func pathForDB(ctx context.Context, db *sql.DB) (string, error) {
+	if v, ok := dbPaths.Load(db); ok {
+		return v.(string), nil
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA database_list`)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks`); err != nil {
-		return err
-	}
-	taskInsert, depInsert, err := prepareTaskInserts(ctx, tx)
-	if err != nil {
-		return err
-	}
-	defer taskInsert.Close()
-	defer depInsert.Close()
-	for _, t := range tasks {
-		if err := insertTask(ctx, taskInsert, depInsert, t); err != nil {
-			return err
+	defer rows.Close()
+	path := ""
+	for rows.Next() {
+		var seq int
+		var name, file string
+		if err := rows.Scan(&seq, &name, &file); err != nil {
+			return "", err
+		}
+		if name == "main" {
+			path = file
+			break
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return err
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
-	taskSyncCache.Store(s.db, fp)
-	return nil
+	if path == "" {
+		path = fmt.Sprintf("handle:%p", db)
+	}
+	actual, _ := dbPaths.LoadOrStore(db, path)
+	return actual.(string), nil
 }
 
-// prepareTaskInserts prepares the two INSERT statements once for the whole
-// replacement. The caller owns both statements and closes them after the loop.
-func prepareTaskInserts(ctx context.Context, tx *sql.Tx) (*sql.Stmt, *sql.Stmt, error) {
-	taskInsert, err := tx.PrepareContext(ctx, `
+func cacheForDB(ctx context.Context, db *sql.DB) (*syncCache, error) {
+	path, err := pathForDB(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	v, _ := syncCaches.LoadOrStore(path, &syncCache{})
+	return v.(*syncCache), nil
+}
+
+// syncFingerprint encodes every field SyncTasks persists. core.Task exports
+// all of those fields, so the encoding changes whenever a task write would.
+// The bytes are held as is, so a warm sync pays no string copy.
+func syncFingerprint(tasks []core.Task) ([]byte, error) {
+	return json.Marshal(tasks)
+}
+
+// syncStatements are the two inserts reused for every card in one sync.
+type syncStatements struct {
+	task *sql.Stmt
+	deps *sql.Stmt
+}
+
+func prepareSyncStatements(ctx context.Context, tx *sql.Tx) (*syncStatements, error) {
+	task, err := tx.PrepareContext(ctx, `
 INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET
+ title=excluded.title, body=excluded.body, status=excluded.status,
+ scope_json=excluded.scope_json, priority=excluded.priority,
+ source_ref=excluded.source_ref, updated_at=excluded.updated_at,
+ kind=excluded.kind, parent=excluded.parent, base_branch=excluded.base_branch,
+ require_review=excluded.require_review, plan_json=excluded.plan_json,
+ worker_agent=excluded.worker_agent, worker_prompt=excluded.worker_prompt`)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	depInsert, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO task_deps(task_id, depends_on) VALUES (?,?)`)
+	deps, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO task_deps(task_id, depends_on) VALUES (?,?)`)
 	if err != nil {
-		_ = taskInsert.Close()
-		return nil, nil, err
+		_ = task.Close()
+		return nil, err
 	}
-	return taskInsert, depInsert, nil
+	return &syncStatements{task: task, deps: deps}, nil
 }
 
-// insertTask writes one card and its dependencies through the prepared
-// statements, applying the same defaults SyncTasks has always applied.
-func insertTask(ctx context.Context, taskInsert, depInsert *sql.Stmt, t core.Task) error {
+func (st *syncStatements) close() {
+	_ = st.task.Close()
+	_ = st.deps.Close()
+}
+
+// beaconDoneTasks returns the ids of stored cards Beacon marked done. A card
+// whose status is done in SQLite is authoritative over a stale working tree.
+func beaconDoneTasks(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id FROM tasks WHERE status=?`, statusDone)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// writeSyncRows merges the current cards into the stored graph. Beacon controls
+// status through SetTaskStatus, so a merge keeps the stored status when it is
+// Beacon-authoritative: a task with a live or finished run stays done even if
+// a stale working tree still reports it available. Other fields always follow
+// the file. Rows and dependencies absent from tasks are removed, so deletions
+// still take effect. The statements are prepared once by the caller.
+func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []core.Task, done map[string]bool) error {
+	ids := make([]string, 0, len(tasks))
+	for _, t := range tasks {
+		if err := writeSyncTask(ctx, st, t, done); err != nil {
+			return err
+		}
+		ids = append(ids, string(t.ID))
+	}
+	return pruneSyncRows(ctx, tx, ids)
+}
+
+// writeSyncTask upserts one card and its dependency edges. A stale working
+// tree cannot revert a card Beacon already marked done.
+func writeSyncTask(ctx context.Context, st *syncStatements, t core.Task, done map[string]bool) error {
 	scope, err := json.Marshal(t.Scope)
 	if err != nil {
 		return err
@@ -188,19 +186,95 @@ func insertTask(ctx context.Context, taskInsert, depInsert *sql.Stmt, t core.Tas
 	if status == "" {
 		status = statusAvailable
 	}
+	if done[string(t.ID)] && status != statusDone && status != statusDropped {
+		status = statusDone
+	}
 	kind := string(t.Kind)
 	if kind == "" {
 		kind = "task"
 	}
-	if _, err := taskInsert.ExecContext(ctx, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
-		kind, string(t.Parent), t.BaseBranch, string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
+	if _, err := st.task.ExecContext(ctx, string(t.ID), t.Title, t.Body, status, t.Priority,
+		string(scope), t.SourceRef, nowUnix(), kind, string(t.Parent), t.BaseBranch,
+		string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
 		return err
 	}
 	for _, dep := range t.DependsOn {
-		if _, err := depInsert.ExecContext(ctx, string(t.ID), string(dep)); err != nil {
+		if _, err := st.deps.ExecContext(ctx, string(t.ID), string(dep)); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// pruneSyncRows removes every stored row and edge not named by ids.
+func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string) error {
+	if len(ids) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM tasks`)
+		return err
+	}
+	marks := make([]string, len(ids))
+	args := make([]any, 0, 2*len(ids))
+	for i, id := range ids {
+		marks[i] = "?"
+		args = append(args, id)
+	}
+	depsArgs := append(append([]any(nil), args...), args...)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps WHERE task_id NOT IN (`+strings.Join(marks, ",")+`) OR depends_on NOT IN (`+strings.Join(marks, ",")+`)`, depsArgs...); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE id NOT IN (`+strings.Join(marks, ",")+`)`, args...)
+	return err
+}
+
+// SyncTasks replaces the stored cards and dependencies with tasks. An
+// unchanged fingerprint skips the DELETE and INSERT pairs: the tables already
+// hold exactly these cards. SetTaskStatus clears the fingerprint because it
+// changes a stored status outside this function.
+func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
+	fp, err := syncFingerprint(tasks)
+	if err != nil {
+		return err
+	}
+	cache, err := cacheForDB(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if bytes.Equal(cache.fingerprint, fp) {
+		return nil
+	}
+	// A failed transaction leaves the cache cold so the next call rewrites the
+	// tables instead of trusting a half-applied sync.
+	cache.fingerprint = nil
+
+	if err := s.ensureTaskColumns(ctx); err != nil {
+		return err
+	}
+	done, err := beaconDoneTasks(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmts, err := prepareSyncStatements(ctx, tx)
+	if err != nil {
+		return err
+	}
+	defer stmts.close()
+	if err := writeSyncRows(ctx, tx, stmts, tasks, done); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	cache.fingerprint = fp
 	return nil
 }
 
@@ -226,13 +300,31 @@ WHERE status IN (%s)
   AND id NOT IN (SELECT task_id FROM blocked_chain)
 ORDER BY priority DESC, id`, resolvedTaskStatuses, resolvedTaskStatuses, openTaskStatuses)
 
-// SetTaskStatus sets the status of taskID. A local claim is not reflected in
-// the source cards, so the next SyncTasks must rewrite from source instead of
-// trusting the cached fingerprint.
+// SetTaskStatus sets the status of taskID. A write that matched no row leaves
+// the table unchanged, so it keeps the last SyncTasks fingerprint.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
-	taskSyncCache.Delete(s.db)
-	return err
+	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	path, err := pathForDB(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	if v, ok := syncCaches.Load(path); ok {
+		cache := v.(*syncCache)
+		cache.mu.Lock()
+		cache.fingerprint = nil
+		cache.mu.Unlock()
+	}
+	return nil
 }
 
 // ListReadyTasks returns the available tasks whose dependencies are resolved.

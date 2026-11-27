@@ -35,12 +35,12 @@ type WorkspaceManager interface {
 }
 
 // ModelRef names the model a harness session should use. The zero value means
-// no model was resolved, so the harness keeps its own default. The JSON tags
-// keep the OpenCode wire shape unchanged.
+// no model was resolved, so the harness keeps its own default. The fields are
+// transport neutral; each harness adapter maps them onto its own wire shape.
 type ModelRef struct {
-	ProviderID string `json:"providerID"`
-	ID         string `json:"id"`
-	Variant    string `json:"variant,omitempty"`
+	ProviderID string
+	ID         string
+	Variant    string
 }
 
 // IsZero reports whether no model is set.
@@ -124,6 +124,14 @@ type ScmGateway interface {
 // MergePolicy evaluates an observation into a merge decision.
 type MergePolicy interface {
 	Evaluate(Observation) MergeDecision
+}
+
+// RequiredCheckPolicy is the optional capability a policy may expose to name
+// the checks a merge must pass. Decide uses it to scope the failure invariant:
+// a failed optional check must not block a merge. A policy without the
+// capability keeps the conservative all-checks behavior.
+type RequiredCheckPolicy interface {
+	RequiredChecks() ([]string, bool)
 }
 
 // RequiredCheckSource supplies the names of checks a merge must pass. Policy

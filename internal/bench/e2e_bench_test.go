@@ -400,6 +400,7 @@ func printE2EReport(w io.Writer, sums []e2eSummary, total time.Duration, pairs i
 	for _, s := range sums {
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %5.1f%%  %s\n",
 			s.Name, s.Median, s.Max-s.Min, s.Work, s.Errors, s.Share, s.Limiter)
+		printPerfRow(w, s.Name, s.Median, s.Min, s.Max, s.Work, s.Errors, s.Limiter)
 	}
 	fmt.Fprintf(w, "e2e cycle median: %s (sum of path medians; share is each path's micro share)\n", total)
 	fmt.Fprintf(w, "reconcile substeps (median ms): observe=%.3f save=%.3f approved=%.3f decision=%.3f\n",
@@ -464,6 +465,8 @@ func BenchmarkE2EOperatorPaths(b *testing.B) {
 	}
 	for _, s := range sums {
 		b.ReportMetric(float64(s.Median.Nanoseconds()), s.Name+"-median-ns")
+		b.ReportMetric(float64(s.Min.Nanoseconds()), s.Name+"-min-ns")
+		b.ReportMetric(float64(s.Max.Nanoseconds()), s.Name+"-max-ns")
 		b.ReportMetric(s.Share, s.Name+"-micro-share-pct")
 		b.ReportMetric(float64(s.Work), s.Name+"-work")
 		b.ReportMetric(float64(s.Errors), s.Name+"-errs")

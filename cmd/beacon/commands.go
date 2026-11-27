@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -183,6 +184,40 @@ func newStatusCommand(configPath *string) *cobra.Command {
 	cmd.Flags().IntVar(&f.recentLimit, "recent-limit", 0, "cap finished runs in a snapshot (0 uses the default)")
 	cmd.Flags().IntVar(&f.decisionsLimit, "decisions-limit", 0, "cap decisions per run and run-less decisions in a snapshot (0 uses the default)")
 	cmd.Flags().BoolVar(&f.daemon, "daemon", false, "print daemon liveness and heartbeat age instead of runs")
+	return cmd
+}
+
+// newExplainCommand traces the merge policy for a pull request. It reads a
+// fresh observation and the stored approval, then prints every check. It has
+// no write path: runs, cards and the provider stay untouched.
+func newExplainCommand(configPath *string, fn wireFn) *cobra.Command {
+	jsonOutput := false
+	cmd := &cobra.Command{
+		Use:   "explain <pr>",
+		Short: "Trace a dry-run verdict for a pull request",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pr, err := strconv.Atoi(args[0])
+			if err != nil || pr <= 0 {
+				return fmt.Errorf("invalid PR number %q", args[0])
+			}
+			w, err := wireCLI(fn, *configPath)
+			if err != nil {
+				return err
+			}
+			defer w.close()
+			result, err := w.explain.Explain(cmd.Context(), pr)
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				return printJSON(result)
+			}
+			fmt.Fprint(cmd.OutOrStdout(), app.FormatExplain(result))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "print a machine readable trace")
 	return cmd
 }
 

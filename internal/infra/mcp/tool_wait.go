@@ -15,10 +15,17 @@ type WaitArgs struct {
 	TimeoutMS int    `json:"timeout_ms"`
 }
 
+// maxWaitMS bounds a wait so a caller cannot hold an agent open indefinitely.
+const maxWaitMS = 600000
+
 func registerWait(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, catalogTool("beacon_wait"), func(ctx context.Context, _ *msdk.CallToolRequest, a WaitArgs) (*msdk.CallToolResult, any, error) {
-		if a.TimeoutMS <= 0 || a.TimeoutMS > 600000 {
-			a.TimeoutMS = 60000
+		if a.TimeoutMS <= 0 || a.TimeoutMS > maxWaitMS {
+			return nil, nil, core.Errorf(core.CodeInvalidInput,
+				"timeout_ms must be between 1 and %d", maxWaitMS)
+		}
+		if err := requireService("wait service", sv.Wait); err != nil {
+			return nil, nil, err
 		}
 		cctx, cancel := context.WithTimeout(ctx, time.Duration(a.TimeoutMS)*time.Millisecond)
 		defer cancel()

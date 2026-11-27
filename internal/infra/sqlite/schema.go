@@ -138,6 +138,38 @@ func dsn(path string) string {
 	}).String()
 }
 
+// schemaPrepared reports whether a database already carries every table,
+// index, trigger and backfill this file defines. SQLite leaves user_version at
+// zero on a new file and bumps schema_version on each DDL statement. openDB
+// stamps the final schema_version into user_version only after preparation
+// finishes, so a legacy file, or one whose table was dropped since the last
+// open, fails the comparison and takes the migration path again.
+func schemaPrepared(db *sql.DB) (bool, error) {
+	var marked, current int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&marked); err != nil {
+		return false, err
+	}
+	if marked == 0 {
+		return false, nil
+	}
+	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&current); err != nil {
+		return false, err
+	}
+	return marked == current, nil
+}
+
+// markSchemaPrepared records the current schema_version in user_version. It
+// runs only after all DDL and backfills are in place, and changing
+// user_version does not itself change schema_version.
+func markSchemaPrepared(db *sql.DB) error {
+	var current int
+	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&current); err != nil {
+		return err
+	}
+	_, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, current))
+	return err
+}
+
 func openDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -147,6 +179,14 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(4)
+	prepared, err := schemaPrepared(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("schema version: %w", err)
+	}
+	if prepared {
+		return db, nil
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
@@ -159,6 +199,25 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("run events migration: %w", err)
 	}
+	// Apply the read-side objects here as well as in Store.Open so one open of
+	// a legacy file leaves it fully prepared. Store.Open calls them again, but
+	// the version marker below makes those calls return without work.
+	if err := dropRedundantRunIndexes(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("runs indexes: %w", err)
+	}
+	if err := ensureSnapshotIndexes(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("snapshot indexes: %w", err)
+	}
+	if err := ensureDecisionSummary(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("decision summary: %w", err)
+	}
+	if err := markSchemaPrepared(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("schema version: %w", err)
+	}
 	return db, nil
 }
 
@@ -167,7 +226,14 @@ func openDB(path string) (*sql.DB, error) {
 // so keeping it only adds write cost. Databases created before the composite
 // index existed still carry it, hence the idempotent drop on open.
 func dropRedundantRunIndexes(db *sql.DB) error {
-	_, err := db.Exec(`DROP INDEX IF EXISTS runs_state_idx`)
+	prepared, err := schemaPrepared(db)
+	if err != nil {
+		return err
+	}
+	if prepared {
+		return nil
+	}
+	_, err = db.Exec(`DROP INDEX IF EXISTS runs_state_idx`)
 	return err
 }
 
@@ -175,6 +241,13 @@ func dropRedundantRunIndexes(db *sql.DB) error {
 // They live on the read side, next to the queries they serve, so an older
 // state database gains them on the next open without a schema version bump.
 func ensureSnapshotIndexes(db *sql.DB) error {
+	prepared, err := schemaPrepared(db)
+	if err != nil {
+		return err
+	}
+	if prepared {
+		return nil
+	}
 	for _, ddl := range []string{
 		`CREATE INDEX IF NOT EXISTS runs_state_updated_idx ON runs(state, updated_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS decisions_run_kind_verdict_action_idx ON decisions(run_id, kind, verdict, action)`,
@@ -192,6 +265,13 @@ func ensureSnapshotIndexes(db *sql.DB) error {
 // maintains the aggregate on every insert; the backfill makes an older state
 // database correct on the next open.
 func ensureDecisionSummary(db *sql.DB) error {
+	prepared, err := schemaPrepared(db)
+	if err != nil {
+		return err
+	}
+	if prepared {
+		return nil
+	}
 	const table = `CREATE TABLE IF NOT EXISTS decision_summary (
 run_id TEXT NOT NULL, kind TEXT NOT NULL, verdict TEXT NOT NULL, action TEXT NOT NULL,
 n INTEGER NOT NULL, PRIMARY KEY (run_id, kind, verdict, action))`
@@ -231,7 +311,7 @@ END`
 	if rows > 0 {
 		return nil
 	}
-	_, err := db.Exec(`INSERT INTO decision_summary (run_id, kind, verdict, action, n)
+	_, err = db.Exec(`INSERT INTO decision_summary (run_id, kind, verdict, action, n)
 SELECT run_id, kind, verdict, action, COUNT(*) FROM decisions
 GROUP BY run_id, kind, verdict, action
 ON CONFLICT (run_id, kind, verdict, action) DO UPDATE SET n = excluded.n`)

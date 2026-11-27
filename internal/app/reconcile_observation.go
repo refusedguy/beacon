@@ -118,7 +118,10 @@ func (r *Reconciler) greenButBehind(
 		}
 		return decision, r.applyAndSave(ctx, run, core.Event{Kind: kind, HeadSHA: obs.HeadSHA, Reason: "base green"}, obs)
 	}
-	return decision, nil
+	// A green-but-behind PR that policy will not merge leaves the run in its
+	// current state on this tick. Stamp the observation anyway so the next tick
+	// does not report the same stale head as a new signal and loop needs_rebase.
+	return decision, r.applyAndSave(ctx, run, core.Event{}, obs)
 }
 
 func (r *Reconciler) handleNeedsAgentFix(
@@ -171,6 +174,14 @@ func (r *Reconciler) handlePending(
 	}
 	if err := run.Apply(core.Event{Kind: core.EvChecksPending, HeadSHA: obs.HeadSHA}); err != nil {
 		return decision, err
+	}
+	// A check-pending observation carries no failure. Keep the reason from a
+	// prior fix request from sticking to a run whose checks are simply running.
+	if run.Reason != "" {
+		run.Reason = ""
+		if err := r.Store.Save(ctx, run); err != nil {
+			return decision, err
+		}
 	}
 	if run.ObserveSHA(obs.HeadSHA, obs.BaseSHA) {
 		return decision, r.Store.Save(ctx, run)

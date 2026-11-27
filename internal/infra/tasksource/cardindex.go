@@ -93,13 +93,15 @@ func buildCardIndex(dir string) (*cardIndex, error) {
 
 // withCardIndex runs fn under the cache lock with the current index for dir. A
 // full scan happens on first use or when the directory gains or loses a file;
-// in-place edits are handled by refreshIndexedCard one card at a time.
+// in-place edits are handled by refreshIndexedCard one card at a time. A
+// removal is detected by statting indexed paths, so a filesystem that does not
+// move the directory mtime on delete still drops the missing card.
 func withCardIndex(dir string, fn func(*cardIndex) error) error {
 	key := cardIndexKey(dir)
 	cardIndexCache.mu.Lock()
 	defer cardIndexCache.mu.Unlock()
 	idx, ok := cardIndexCache.byDir[key]
-	if !ok || !cardModTime(dir).Equal(idx.dirMod) {
+	if !ok || !cardModTime(dir).Equal(idx.dirMod) || hasMissingCard(idx) {
 		var err error
 		idx, err = buildCardIndex(dir)
 		if err != nil {
@@ -108,6 +110,17 @@ func withCardIndex(dir string, fn func(*cardIndex) error) error {
 		cardIndexCache.byDir[key] = idx
 	}
 	return fn(idx)
+}
+
+// hasMissingCard reports whether any indexed card file has been removed. It
+// checks paths only, independent of the directory mtime.
+func hasMissingCard(idx *cardIndex) bool {
+	for path := range idx.byPath {
+		if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
 }
 
 // refreshIndexedCard re-reads path only when its mtime moved since it was
@@ -143,14 +156,23 @@ func refreshIndexedCard(idx *cardIndex, path string) (indexedCard, bool) {
 // noteIndexedCard folds a write made through this package back into the index
 // so the writer never has to rescan its own change.
 func noteIndexedCard(dir, path, content string) {
+	t, parsed, hasFM := parseCardFields(content, path)
+	if !parsed {
+		return
+	}
+	noteParsedCard(dir, path, content, t, hasFM)
+}
+
+// noteParsedCard folds a write back into the index using a task the caller has
+// already parsed. Status patches use it: the text before the write was decoded
+// once, and a status-only rewrite cannot change any other field, so decoding
+// the rewritten text again would repeat the same YAML work. The caller passes
+// that task with its status set to the value written to disk.
+func noteParsedCard(dir, path, content string, t core.Task, hasFM bool) {
 	cardIndexCache.mu.Lock()
 	defer cardIndexCache.mu.Unlock()
 	idx, ok := cardIndexCache.byDir[cardIndexKey(dir)]
 	if !ok {
-		return
-	}
-	t, parsed, hasFM := parseCardFields(content, path)
-	if !parsed {
 		return
 	}
 	if old := idx.byPath[path]; old.task.ID != "" && old.task.ID != t.ID && idx.byID[old.task.ID] == path {
@@ -189,13 +211,14 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	var entry indexedCard
 	var path, updated string
 	err := withCardIndex(s.Dir, func(idx *cardIndex) error {
 		p, ok := idx.byID[id]
 		if !ok {
 			return os.ErrNotExist
 		}
-		entry, ok := refreshIndexedCard(idx, p)
+		entry, ok = refreshIndexedCard(idx, p)
 		if !ok {
 			return os.ErrNotExist
 		}
@@ -212,6 +235,10 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		return err
 	}
-	noteIndexedCard(s.Dir, path, updated)
+	// rewriteStatus only touches the status line, so the task parsed before
+	// the write stays valid once its status is replaced. This avoids a second
+	// YAML decode of the rewritten text.
+	entry.task.Status = normalizeStatus(status)
+	noteParsedCard(s.Dir, path, updated, entry.task, entry.hasFM)
 	return nil
 }
