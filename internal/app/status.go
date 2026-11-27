@@ -241,10 +241,7 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 		return nil, err
 	}
 	timeline, histories := groupHistory(events, decisions)
-	now := time.Now().UTC()
-	if s.Now != nil {
-		now = s.Now().UTC()
-	}
+	now := snapshotNow(s)
 	daemon := s.Daemon
 	if daemon == nil {
 		daemon = &DaemonSnapshot{State: "absent"}
@@ -267,6 +264,15 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 		Metrics:      makeMetrics(activeSnapshots, recentSnapshots, timeline, histories, counts),
 	}
 	return out, nil
+}
+
+// snapshotNow applies the injected clock when one is set. Keeping the choice
+// out of Snapshot holds that method at its prior statement count.
+func snapshotNow(s SnapshotService) time.Time {
+	if s.Now != nil {
+		return s.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func snapshotDecisionLimits(s SnapshotService) (int, int) {
