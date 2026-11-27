@@ -13,6 +13,10 @@ import (
 // before its worker session is checked for liveness.
 const defaultOrphanTimeout = 90 * time.Second
 
+// DefaultOrphanTimeout exposes the built-in fallback to the composition root.
+// A configured timeout and the reconciler's own default then share one value.
+const DefaultOrphanTimeout = defaultOrphanTimeout
+
 // ReconcilerStore is the store surface Reconciler and its helpers use, from
 // reconciliation through incident repair and idle-session wakeups.
 type ReconcilerStore interface {
@@ -68,6 +72,7 @@ type ReconcilerConfig struct {
 	MaxFixTries        int
 	MaxAttempts        int
 	Interval           time.Duration
+	OrphanTimeout      time.Duration
 	AutoRebase         bool
 	MaxAutoRebases     int
 }

@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/refusedguy/beacon/internal/infra/config"
 )
 
 // initFlags holds the values parsed from the init command flags.
@@ -51,8 +53,8 @@ func newInitCommand() *cobra.Command {
 			return runInit(f)
 		},
 	}
-	cmd.Flags().IntVar(&f.maxInFlight, "max-in-flight", 10, "maximum unfinished runs")
-	cmd.Flags().IntVar(&f.maxActiveAgents, "max-active-agents", 2, "maximum active agent sessions")
+	cmd.Flags().IntVar(&f.maxInFlight, "max-in-flight", config.DefaultMaxInFlight, "maximum unfinished runs")
+	cmd.Flags().IntVar(&f.maxActiveAgents, "max-active-agents", config.DefaultMaxActiveAgents, "maximum active agent sessions")
 	cmd.Flags().StringVar(&f.taskSource, "task-source", "markdown", "markdown, github_issues or gitlab_issues")
 	cmd.Flags().StringVar(&f.scm, "scm", "", "github or gitlab")
 	cmd.Flags().StringVar(&f.harness, "harness", "opencode", "opencode or cli")
