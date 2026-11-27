@@ -170,6 +170,7 @@ type activeScopeIndex struct {
 	epoch  int
 	seen   []int
 	out    []int
+	keys   []core.ScopePath
 }
 
 func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
@@ -181,10 +182,12 @@ func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 		seen:  make([]int, len(runs)),
 		out:   make([]int, 0, len(runs)),
 	}
+	var keysBuf []core.ScopePath
 	for i, r := range runs {
 		for _, claim := range r.Scope {
 			idx.exact[claim] = appendUnique(idx.exact[claim], i)
-			keys := claimDirKeys(claim)
+			keys := claimDirKeys(keysBuf, claim)
+			keysBuf = keys
 			for _, key := range keys {
 				idx.under[key] = appendUnique(idx.under[key], i)
 			}
@@ -239,7 +242,8 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 		for _, i := range idx.exact[claim] {
 			add(i)
 		}
-		keys := claimDirKeys(claim)
+		keys := claimDirKeys(idx.keys, claim)
+		idx.keys = keys
 		switch claim.Kind() {
 		case 'f':
 			for _, key := range keys {
@@ -278,10 +282,11 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 // claim's own value as a directory, then each literal ancestor directory. A
 // wildcard segment stops the walk because later segments are not fixed paths.
 // Every key is a prefix of the claim value, so slicing the value avoids a
-// strings.Split slice, a builder and its intermediate prefix strings.
-func claimDirKeys(claim core.ScopePath) []core.ScopePath {
+// strings.Split slice, a builder and its intermediate prefix strings. The
+// caller passes a reusable dst, so a claim costs no key-slice allocation.
+func claimDirKeys(dst []core.ScopePath, claim core.ScopePath) []core.ScopePath {
+	out := dst[:0]
 	value := claim.Value()
-	var out []core.ScopePath
 	for start := 0; ; {
 		rel := strings.IndexByte(value[start:], '/')
 		end := len(value)
