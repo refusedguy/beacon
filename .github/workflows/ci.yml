@@ -603,7 +603,6 @@ jobs:
           const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
           const controlKey = 'json-control';
           const notes = [];
-          const maxFloorPct = 25;
           const allocDropPct = 5;
 
           const readLines = path => {
@@ -611,13 +610,15 @@ jobs:
             catch (e) { notes.push(`cannot read ${path}: ${e.message}`); return []; }
           };
 
-          // benchstat writes one CSV table per metric. A config row and a
-          // header row come first; the header puts the unit in column B and
-          // "CI" in column C. With two inputs a data row is name, base center,
-          // base CI, head center, head CI, delta, P.
+          // benchstat writes one CSV table per config, not one merged
+          // comparison table. Each table opens with a config row whose column B
+          // is the input file path, then a unit row with the unit in column B
+          // and "CI" in column C. Data rows are name, center and CI. The same
+          // benchmark appears in the base and head tables, so the file path
+          // tells which center is old and which is next.
           function readCompareCSV(path) {
-            const metrics = new Map();
-            let unit = '';
+            const samples = new Map();
+            let unit = '', side = '';
             for (const line of readLines(path)) {
               if (!line.trim()) continue;
               const cells = [];
@@ -633,15 +634,33 @@ jobs:
               }
               cells.push(field);
               if (cells[0] === '') {
-                unit = cells[2] === 'CI' ? cells[1] : '';
+                if (cells[2] === 'CI') {
+                  unit = cells[1];
+                } else {
+                  unit = '';
+                  side = /perf-base\.txt$/.test(cells[1]) ? 'old'
+                    : /perf-head\.txt$/.test(cells[1]) ? 'next' : '';
+                }
                 continue;
               }
-              if (!unit || cells[0] === 'geomean') continue;
-              const old = Number.parseFloat(cells[1]);
-              const next = Number.parseFloat(cells[3]);
-              if (!Number.isFinite(old) || !Number.isFinite(next)) continue;
-              if (!metrics.has(unit)) metrics.set(unit, new Map());
-              metrics.get(unit).set(cells[0], { old, next });
+              if (!unit || !side || cells[0] === 'geomean') continue;
+              const value = Number.parseFloat(cells[1]);
+              if (!Number.isFinite(value)) continue;
+              if (!samples.has(unit)) samples.set(unit, new Map());
+              const byBench = samples.get(unit);
+              if (!byBench.has(cells[0])) byBench.set(cells[0], { old: [], next: [] });
+              byBench.get(cells[0])[side].push(value);
+            }
+            const metrics = new Map();
+            for (const [u, byBench] of samples) {
+              const table = new Map();
+              for (const [bench, sides] of byBench) {
+                table.set(bench, {
+                  old: sides.old.length ? median(sides.old) : NaN,
+                  next: sides.next.length ? median(sides.next) : NaN,
+                });
+              }
+              metrics.set(u, table);
             }
             return metrics;
           }
@@ -726,15 +745,14 @@ jobs:
           try {
             const doc = JSON.parse(fs.readFileSync(`${temp}/bench-noise-floor/noise-floor.json`, 'utf8'));
             if (Number.isFinite(doc.floorPct) && doc.floorPct > 0) {
-              const published = Math.max(defaultFloor, doc.floorPct);
-              floorPct = Math.min(maxFloorPct, published);
+              floorPct = Math.max(defaultFloor, doc.floorPct);
               calibrated = true;
-              if (published > maxFloorPct) {
-                notes.push(`calibrated floor ${published}% clamped to ${maxFloorPct}% for verdicts`);
+              if (floorPct > 25) {
+                notes.push(`calibrated floor ${floorPct}% exceeds 25%; using the raw value for verdicts`);
               }
             }
-            if (Number.isFinite(doc.rawFloorPct) && doc.rawFloorPct > maxFloorPct) {
-              notes.push(`raw observed floor ${doc.rawFloorPct}% clamped to ${maxFloorPct}% for verdicts`);
+            if (Number.isFinite(doc.rawFloorPct) && doc.rawFloorPct > 25) {
+              notes.push(`raw observed floor ${doc.rawFloorPct}% exceeds 25%; using the raw value for verdicts`);
             }
             if (typeof doc.floorNote === 'string' && doc.floorNote) notes.push(doc.floorNote);
             if (doc.floors && typeof doc.floors === 'object' && !Array.isArray(doc.floors)) {
@@ -923,18 +941,18 @@ jobs:
             const relation = overlap ? 'overlap' : 'separate';
             const delta = am === 0 ? 0 : 100 * (bm - am) / am;
             const maxSpread = Math.max(spread(a), spread(b));
-            // A calibrated per-key floor wins for this row. Both the global
-            // and per-key floors are capped so one outlier no-change run
-            // cannot raise the verdict threshold above maxFloorPct.
+            // A calibrated per-key floor wins for this row. Publish the raw
+            // observed floor: a single large no-change run is still the best
+            // noise estimate, so no cap is applied to the verdict threshold.
             const rawPerKey = floors && Number.isFinite(floors[key]) && floors[key] > 0
               ? floors[key] : NaN;
-            const unbounded = Number.isFinite(rawPerKey) && rawPerKey > 0
+            const rowFloor = Number.isFinite(rawPerKey) && rawPerKey > 0
               ? rawPerKey
               : (Number.isFinite(floorPct) && floorPct > 0 ? floorPct : defaultFloor);
-            const rowFloor = Math.min(maxFloorPct, unbounded);
-            if (unbounded > maxFloorPct || (rawFloors && Number.isFinite(rawFloors[key]) &&
-                rawFloors[key] > maxFloorPct)) {
-              notes.push(`${key}: floor clamped to ${maxFloorPct}% for the verdict`);
+            const rawKeyFloor = rawFloors && Number.isFinite(rawFloors[key])
+              ? rawFloors[key] : NaN;
+            if (rowFloor > 25 || rawKeyFloor > 25) {
+              notes.push(`${key}: floor ${rowFloor}% exceeds 25%; using the raw value for the verdict`);
             } else if (!Number.isFinite(rawPerKey)) {
               notes.push(`${key}: using uncalibrated floor ${rowFloor}%`);
             }
@@ -991,7 +1009,7 @@ jobs:
             'Five alternating passes per side (B A A B B A A B B A) on two detached worktrees at the merge base and the real head SHA.',
             'One uncounted compile-only warmup per tree compiles the bench and workspace packages before the passes; measurement runs on one CPU from Cpus_allowed_list via taskset.',
             'Canonical rows come from the harness output; names, limiter text and the noise floor come from the registry on the base ref.',
-            `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}. Verdict floors are capped at ${maxFloorPct}%.`,
+            `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}. Verdict floors use the raw observed floor, including any value above 25%.`,
             'Times are in ms. Work and errs are counts. Ratios divide each plan by the pure json-control row in the same pass.',
             'Allocation and counter columns come from perf-results/compare.csv. Go benchmarks report them at benchmark granularity, so the ten HotPaths plans share the HotPaths row.',
             'Advisory data only: it adds no required check and does not gate merge.',
@@ -1167,7 +1185,6 @@ jobs:
           const temp = process.env.RUNNER_TEMP;
           const prefix = 'beacon-perf: ';
           const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
-          const maxFloorPct = 25;
           // Every published floor is at least the registry default.
           let defaultFloor = 2;
           try {
@@ -1208,11 +1225,11 @@ jobs:
           const index = Math.min(deltas.length - 1, Math.ceil(0.95 * deltas.length) - 1);
           const observed = deltas.length ? deltas[Math.max(0, index)] : 0;
           const rawFloorPct = Math.max(defaultFloor, Math.ceil(observed * 10) / 10);
-          // A single noisy run must not raise the verdict floor above the cap.
-          // The raw value stays in the artifact for diagnosis.
-          const floorPct = Math.min(maxFloorPct, rawFloorPct);
-          const floorNote = rawFloorPct > maxFloorPct
-            ? `raw floor ${rawFloorPct}% clamped to ${maxFloorPct}% for verdicts`
+          // Publish the raw observed floor. A large no-change run is still the
+          // best noise estimate, so no cap is applied to the verdict floor.
+          const floorPct = rawFloorPct;
+          const floorNote = rawFloorPct > 25
+            ? `raw floor ${rawFloorPct}% exceeds 25%; using the raw value for verdicts`
             : '';
 
           // Per-key floors come from the same no-change passes. Pair the
@@ -1252,7 +1269,7 @@ jobs:
             }
             const raw = Math.max(defaultFloor, Math.ceil(quantile95(perPass) * 10) / 10);
             rawFloors[key] = raw;
-            floors[key] = Math.min(maxFloorPct, raw);
+            floors[key] = raw;
           }
           const doc = {
             floorPct,
