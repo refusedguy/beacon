@@ -289,13 +289,16 @@ export function readCard(root, id, deps = {}) {
   // that cannot be stat'ed. Bypass the cache so its reads stay observable. With
   // no injection the real fs statSync validates the cache in production.
   const stat = deps.readFileSync === undefined ? (deps.statSync ?? fsStatSync) : deps.statSync
-  const cacheable = typeof stat === "function"
   let stamp = null
-  if (cacheable) {
+  if (typeof stat === "function") {
     try {
       const info = stat(path) ?? {}
       stamp = `${info.mtimeMs ?? info.mtime ?? 0}:${info.size ?? 0}`
-    } catch { return null }
+    } catch {}
+  }
+  // An injected readFileSync on a fake path can be read but not stat'ed. Read
+  // it directly instead of failing closed, so a test double keeps working.
+  if (stamp !== null) {
     const hit = cardCache.get(path)
     if (hit && hit.stamp === stamp) return hit.card
   }
@@ -327,7 +330,7 @@ export function readCard(root, id, deps = {}) {
     parent: (field("epic") || (BEACON_BRANCH_RE.exec(field("base_branch"))?.[1] ?? "")).trim(),
     path, relativePath: relative(root, path), body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
   }
-  if (cacheable) {
+  if (stamp !== null) {
     if (cardCache.size >= CARD_CACHE_LIMIT) cardCache.delete(cardCache.keys().next().value)
     cardCache.set(path, { stamp, card })
   }
@@ -345,7 +348,7 @@ function enrichRuns(root, runs, deps = {}) {
 export class CliStatusSource {
   constructor({ root, deps = {}, limits = {}, sessionID, model, log = console.debug }) {
     Object.assign(this, { root, limits, sessionID, model, log })
-    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, now: () => Date.now(), normalizeSnapshot, ...deps }
+    this.deps = { execFile: execFileAsync, existsSync: fsExistsSync, readFileSync: fsReadFileSync, statSync: fsStatSync, now: () => Date.now(), normalizeSnapshot, ...deps }
   }
   #exec(base, args, { label = "cli", timing = null } = {}) {
     const [program, ...rest] = base

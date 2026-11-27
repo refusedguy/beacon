@@ -1,6 +1,9 @@
 // Run: node --test .opencode/plugins/beacon-project/ui_model_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { mkdirSync, mkdtempSync, readFileSync as fsReadFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { NOW, lines, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
@@ -149,6 +152,37 @@ test("readCard caches a parsed card until its file stamp changes", () => {
   ui.readCard("/cache", "T-100", injected)
   ui.readCard("/cache", "T-100", injected)
   assert.equal(reads, 4, "an injected readFileSync without statSync bypasses the cache")
+})
+
+test("CLI source keeps title-less card reads at R across snapshots without an injected statSync", async () => {
+  const root = mkdtempSync(join(tmpdir(), "beacon-card-counter-"))
+  try {
+    const tasks = join(root, "docs", "tasks")
+    mkdirSync(tasks, { recursive: true })
+    const R = 12
+    for (let i = 1; i <= R; i++) {
+      writeFileSync(join(tasks, `T-${i}.md`), `---\nid: T-${i}\ntitle: Card ${i}\nstatus: running\n---\n`)
+    }
+    let reads = 0
+    const deps = {
+      command: () => ["/bin/beacon"],
+      execFile: async () => ({ stdout: JSON.stringify({
+        active: Array.from({ length: R }, (_, i) => makeRun({ ID: `run-${i}`, TaskID: `T-${i + 1}`, title: "" })),
+        recent: [],
+      }) }),
+      readFileSync: (path, ...args) => { reads++; return fsReadFileSync(path, ...args) },
+    }
+    const source = new CliStatusSource({ root, deps })
+    const first = await source.snapshot()
+    assert.equal(first.active.length, R)
+    assert.equal(first.active[0].title, "Card 1")
+    assert.equal(reads, R, "the first snapshot reads each title-less card once")
+    const second = await source.snapshot()
+    assert.equal(second.active.length, R)
+    assert.equal(reads, R, "the second snapshot reuses the cached cards without another read")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test("parseSnapshot tolerates null, empty and malformed output", () => {
