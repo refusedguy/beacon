@@ -69,13 +69,29 @@ type runFrame struct {
 }
 
 // frameKey holds every input that can change View's output. A match means the
-// cached frame is still current.
+// cached frame is still current. Only the visible window is keyed: View never
+// renders more than visibleRows runs, so rows outside that window are not
+// inputs. runCount is kept because the window start depends on the list length.
 type frameKey struct {
-	width  int
-	cursor int
-	status string
-	failed bool
-	runs   []runFrame
+	width    int
+	cursor   int
+	status   string
+	failed   bool
+	runCount int
+	visible  []runFrame
+}
+
+// visibleWindow returns the half-open index range of rows View renders.
+func visibleWindow(cursor, count int) (start, end int) {
+	start = 0
+	if cursor >= visibleRows {
+		start = cursor - visibleRows + 1
+	}
+	end = start + visibleRows
+	if end > count {
+		end = count
+	}
+	return
 }
 
 func newRunFrame(run Run) runFrame {
@@ -86,17 +102,25 @@ func newRunFrame(run Run) runFrame {
 }
 
 // frameCurrent reports whether the cached frame matches the current inputs.
-// The runs are compared field by field on the values View actually uses.
+// The visible rows are compared field by field on the values View actually
+// uses; changes to off-screen runs cannot change the frame.
 func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool, runs []Run) bool {
 	if !c.hasFrame || c.frameKey.width != width || c.frameKey.cursor != cursor ||
-		c.frameKey.status != status || c.frameKey.failed != failed {
+		c.frameKey.status != status || c.frameKey.failed != failed ||
+		c.frameKey.runCount != len(runs) {
 		return false
 	}
-	if len(c.frameKey.runs) != len(runs) {
+	start, end := visibleWindow(cursor, len(runs))
+	if len(c.frameKey.visible) != end-start {
 		return false
 	}
-	for i := range runs {
-		if c.frameKey.runs[i] != newRunFrame(runs[i]) {
+	scratch := c.keyRuns[:0]
+	for i := start; i < end; i++ {
+		scratch = append(scratch, newRunFrame(runs[i]))
+	}
+	c.keyRuns = scratch
+	for i := range scratch {
+		if c.frameKey.visible[i] != scratch[i] {
 			return false
 		}
 	}
@@ -104,20 +128,20 @@ func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool
 }
 
 // rememberFrame stores a rendered frame together with the inputs that made it.
-// The key slice is scratch space on the cache: after frameCurrent has compared
-// the old key, the same backing array is refilled for the new one, so a rebuild
-// does not allocate a fresh []runFrame on every miss.
+// The new visible window is built in the scratch slice, then swapped with the
+// cached key's slice so the next comparison reuses the old backing array.
 func (c *renderCache) rememberFrame(width, cursor int, status string, failed bool, runs []Run, frame string) {
-	keyRuns := c.keyRuns[:0]
-	for i := range runs {
-		keyRuns = append(keyRuns, newRunFrame(runs[i]))
+	start, end := visibleWindow(cursor, len(runs))
+	visible := c.keyRuns[:0]
+	for i := start; i < end; i++ {
+		visible = append(visible, newRunFrame(runs[i]))
 	}
-	c.keyRuns = keyRuns
-	key := frameKey{
+	previous := c.frameKey.visible
+	c.frameKey = frameKey{
 		width: width, cursor: cursor, status: status, failed: failed,
-		runs: keyRuns,
+		runCount: len(runs), visible: visible,
 	}
-	c.frameKey = key
+	c.keyRuns = previous[:0]
 	c.frame = frame
 	c.hasFrame = true
 }
@@ -343,14 +367,7 @@ func (m model) View() string {
 	if len(m.runs) == 0 {
 		b.WriteString("no runs\n")
 	}
-	start := 0
-	if m.cursor >= visibleRows {
-		start = m.cursor - visibleRows + 1
-	}
-	end := start + visibleRows
-	if end > len(m.runs) {
-		end = len(m.runs)
-	}
+	start, end := visibleWindow(m.cursor, len(m.runs))
 	// Grow once for the header, the visible rows and the footer so the
 	// builder does not reallocate while writing the frame.
 	b.Grow(len(styledHeader) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + 80)
