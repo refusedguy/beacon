@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
@@ -139,6 +140,7 @@ func BenchmarkPlannerSelectInjectedChecker(b *testing.B) {
 	}
 
 	var totalChecks, totalSelected, totalActiveSkip, totalSelectedSkip int64
+	start := time.Now()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		checks = 0
@@ -153,6 +155,7 @@ func BenchmarkPlannerSelectInjectedChecker(b *testing.B) {
 		totalSelectedSkip += int64(counts.selected)
 	}
 	b.StopTimer()
+	elapsed := time.Since(start)
 
 	runs := int64(b.N)
 	if totalChecks == 0 {
@@ -179,4 +182,9 @@ func BenchmarkPlannerSelectInjectedChecker(b *testing.B) {
 	b.ReportMetric(activeSkipPerOp, "active-skipped-per-select")
 	b.ReportMetric(selectedSkipPerOp, "selected-skipped-per-select")
 	printPlannerReport(os.Stdout, checksPerOp, selectedPerOp, activeSkipPerOp, selectedSkipPerOp)
+	// One row for the whole run. The fixture fixes the selected count per
+	// Select and the benchmark above rejects any error, so a no-change
+	// comparison sees equal work and zero errs on both sides.
+	printPerfRow(os.Stdout, "planner-select-injected-checker", elapsed, elapsed, elapsed,
+		int64(plannerAllowed+plannerClean), 0, plannerSelectLimiter)
 }

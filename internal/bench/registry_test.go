@@ -69,6 +69,39 @@ func TestRegistryReusesReportLimiterStrings(t *testing.T) {
 	}
 }
 
+// TestRegistryPRBenchSpecs ties the advisory-only keys to the limiter
+// constants the benchmarks print. A key that loses its registry entry, moves
+// out of the pr placement or drifts in limiter text fails here.
+func TestRegistryPRBenchSpecs(t *testing.T) {
+	byKey := make(map[string]Spec, len(Registry()))
+	for _, spec := range Registry() {
+		byKey[spec.Key] = spec
+	}
+	for _, tc := range []struct{ key, limiter string }{
+		{"reconcile-tick-counts", reconcileTickLimiter},
+		{"planner-select-injected-checker", plannerSelectLimiter},
+		{"dispatch-prompt", dispatchPromptLimiter},
+	} {
+		spec, ok := byKey[tc.key]
+		if !ok {
+			t.Errorf("registry has no spec for advisory key %q", tc.key)
+			continue
+		}
+		if spec.Limiter != tc.limiter {
+			t.Errorf("%s limiter = %q, want benchmark value %q", tc.key, spec.Limiter, tc.limiter)
+		}
+		if spec.Placement != PlacementPR {
+			t.Errorf("%s placement = %q, want %q", tc.key, spec.Placement, PlacementPR)
+		}
+		if spec.Unit != "ns" || spec.WorkMetric != "work" || spec.ErrMetric != "errs" {
+			t.Errorf("%s metrics = %q, %q, %q; want ns, work, errs", tc.key, spec.Unit, spec.WorkMetric, spec.ErrMetric)
+		}
+		if spec.ThresholdPct <= 0 {
+			t.Errorf("%s threshold = %v, want positive", tc.key, spec.ThresholdPct)
+		}
+	}
+}
+
 // harnessSources are the files that print canonical perf rows. Go benchmarks
 // print through printPerfRow; the Node harnesses, the workspace latency test,
 // the HTTP frame harness and the Go TUI view harness print the payload
@@ -81,6 +114,15 @@ var harnessSources = []string{
 	"../infra/workspace/git_worktree_test.go",
 	"../../cmd/beacon/http_test.go",
 	"../../ui/tui/model_test.go",
+}
+
+// prBenchSources are the in-package benchmarks that publish advisory rows.
+// benchSource already covers their names and metrics; this list lets the
+// printed-key cross-check see their printPerfRow calls as well.
+var prBenchSources = []string{
+	"reconcile_bench_test.go",
+	"planner_bench_test.go",
+	"prompt_bench_test.go",
 }
 
 // canonicalKeyRe finds the key a harness publishes for a canonical row. It
@@ -98,7 +140,8 @@ func TestHarnessKeysAreRegistered(t *testing.T) {
 	for _, spec := range Registry() {
 		registered[spec.Key] = true
 	}
-	for _, path := range harnessSources {
+	checkKeys := func(path string) {
+		t.Helper()
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
@@ -109,6 +152,12 @@ func TestHarnessKeysAreRegistered(t *testing.T) {
 				t.Errorf("%s prints canonical key %q with no registry entry", path, key)
 			}
 		}
+	}
+	for _, path := range harnessSources {
+		checkKeys(path)
+	}
+	for _, path := range prBenchSources {
+		checkKeys(path)
 	}
 }
 

@@ -3,6 +3,7 @@ package bench
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync/atomic"
@@ -118,7 +119,10 @@ func (e *tickEnv) tick(b *testing.B) (int64, int64) {
 	return work, errs
 }
 
-func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bool) {
+// canonicalKey is empty for the two base-check variants; only the reconcile
+// tick plan publishes an advisory row. Its work is one successful tick per PR
+// and its errs stay zero, so a no-change comparison sees equal counts.
+func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bool, canonicalKey string) {
 	prevProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(prevProcs)
 	var work, errs, lists, observes, gets int64
@@ -149,16 +153,30 @@ func runTickBench(b *testing.B, prefix, slug string, prs, candidates int, red bo
 	b.ReportMetric(float64(observes)/n, prefix+"-observes-per-tick")
 	b.ReportMetric(float64(gets)/n, prefix+"-gets-per-tick")
 	b.ReportMetric(1, prefix+"-limiter-"+slug)
+	if canonicalKey != "" {
+		var min, max time.Duration
+		for i, d := range ds {
+			if i == 0 || d < min {
+				min = d
+			}
+			if d > max {
+				max = d
+			}
+		}
+		printPerfRow(os.Stdout, canonicalKey, medianDuration(ds), min, max,
+			int64(prs), errs, reconcileTickLimiter)
+	}
 }
 
 func BenchmarkReconcileTickCounts(b *testing.B) {
-	runTickBench(b, "reconcile-tick-counts", "source-listavailable-plus-sqlite-get", 20, 0, false)
+	runTickBench(b, "reconcile-tick-counts", "source-listavailable-plus-sqlite-get", 20, 0, false,
+		"reconcile-tick-counts")
 }
 
 func BenchmarkBaseRedCheck(b *testing.B) {
-	runTickBench(b, "base-red-check", "source-listavailable-io", 1, 0, true)
+	runTickBench(b, "base-red-check", "source-listavailable-io", 1, 0, true, "")
 }
 
 func BenchmarkBaseRedBlockFanout(b *testing.B) {
-	runTickBench(b, "base-red-block", "scm-observe-roundtrips", 1, 24, true)
+	runTickBench(b, "base-red-block", "scm-observe-roundtrips", 1, 24, true, "")
 }

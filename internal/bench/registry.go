@@ -38,6 +38,24 @@ var prHarnessLimiters = []struct{ key, limiter string }{
 	{"go-tui-view", "truncate + padding cache + reused row buffer"},
 }
 
+// The in-package benchmarks the advisory job runs print these limiter strings.
+// The registry owns them; the benchmarks print the constants so a limiter edit
+// cannot put two competing names on the wire.
+const (
+	reconcileTickLimiter  = "source ListAvailable + SQLite Get per PR"
+	plannerSelectLimiter  = "injected overlap checker over active scope index"
+	dispatchPromptLimiter = "strings.Builder + prompt bytes"
+)
+
+// prBenchLimiters are the canonical keys and limiter strings published by the
+// reconcile, planner and prompt benchmarks. They run only in the advisory
+// two-tree job, so their registry placement is pr.
+var prBenchLimiters = []struct{ key, limiter string }{
+	{"reconcile-tick-counts", reconcileTickLimiter},
+	{"planner-select-injected-checker", plannerSelectLimiter},
+	{"dispatch-prompt", dispatchPromptLimiter},
+}
+
 // The pure control benchmark owns no Beacon code, so its canonical name and
 // limiter string are declared here. The registry is their single owner; the
 // drift test cross-checks them against the control's local constants.
@@ -82,7 +100,7 @@ type registryDocument struct {
 // for each benchmark that reports a median, so the generated JSON has one
 // authoritative source.
 func Registry() []Spec {
-	specs := make([]Spec, 0, len(hotspotOrder)+2+len(snapshotLimiters)+len(prHarnessLimiters))
+	specs := make([]Spec, 0, len(hotspotOrder)+2+len(snapshotLimiters)+len(prHarnessLimiters)+len(prBenchLimiters))
 	for _, name := range hotspotOrder {
 		specs = append(specs, Spec{
 			Key:          name,
@@ -122,6 +140,20 @@ func Registry() []Spec {
 	// error counts arrive in the canonical row fields, not as named Go
 	// metrics, so the field names are the work and err metrics here.
 	for _, h := range prHarnessLimiters {
+		specs = append(specs, Spec{
+			Key:          h.key,
+			Limiter:      h.limiter,
+			Unit:         "ns",
+			WorkMetric:   "work",
+			ErrMetric:    "errs",
+			Placement:    PlacementPR,
+			ThresholdPct: 15,
+		})
+	}
+	// The reconcile, planner and prompt benchmarks emit fixed work and zero
+	// errs in the canonical row fields. They run only in the advisory job, so
+	// their keys are pr-only like the external harnesses above.
+	for _, h := range prBenchLimiters {
 		specs = append(specs, Spec{
 			Key:          h.key,
 			Limiter:      h.limiter,

@@ -187,6 +187,33 @@
       "thresholdPct": 15
     },
     {
+      "key": "reconcile-tick-counts",
+      "limiter": "source ListAvailable + SQLite Get per PR",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "planner-select-injected-checker",
+      "limiter": "injected overlap checker over active scope index",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "dispatch-prompt",
+      "limiter": "strings.Builder + prompt bytes",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
       "key": "json-control",
       "limiter": "encoding/json reflection over a fixed struct",
       "unit": "ns",

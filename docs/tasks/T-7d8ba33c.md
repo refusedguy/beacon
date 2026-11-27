@@ -1,7 +1,7 @@
 ---
 id: T-7d8ba33c
 title: 'W1R-3: wire reconcile and dispatch benchmarks into advisory'
-status: available
+status: in_progress
 scope:
     - internal/bench/reconcile_bench_test.go
     - internal/bench/prompt_bench_test.go
