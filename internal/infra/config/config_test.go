@@ -587,6 +587,15 @@ func writeProjectWorkflow(t *testing.T, root, workflow string) {
 	}
 }
 
+func TestWorkflowFilePathsFollowsConfigRoot(t *testing.T) {
+	path := writeWorkflowConfig(t, "merge:\n  required_checks_mode: workflow\n",
+		"name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n")
+	want := []string{filepath.Join(projectRootFromConfigPath(path), ".github", "workflows", "ci.yml")}
+	if got := WorkflowFilePaths(path); !reflect.DeepEqual(got, want) {
+		t.Fatalf("WorkflowFilePaths = %v, want %v", got, want)
+	}
+}
+
 func TestLoadManualRequiredChecksKeepExplicitList(t *testing.T) {
 	const workflow = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n"
 	for _, mode := range []string{"", RequiredChecksManual} {
