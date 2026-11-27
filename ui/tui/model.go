@@ -48,6 +48,7 @@ type renderCache struct {
 	padWidth int
 	pad      string
 	row      []byte
+	keyRuns  []runFrame
 
 	frame    string
 	frameKey frameKey
@@ -97,13 +98,18 @@ func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool
 }
 
 // rememberFrame stores a rendered frame together with the inputs that made it.
+// The key slice is scratch space on the cache: after frameCurrent has compared
+// the old key, the same backing array is refilled for the new one, so a rebuild
+// does not allocate a fresh []runFrame on every miss.
 func (c *renderCache) rememberFrame(width, cursor int, status string, failed bool, runs []Run, frame string) {
+	keyRuns := c.keyRuns[:0]
+	for i := range runs {
+		keyRuns = append(keyRuns, newRunFrame(runs[i]))
+	}
+	c.keyRuns = keyRuns
 	key := frameKey{
 		width: width, cursor: cursor, status: status, failed: failed,
-		runs: make([]runFrame, len(runs)),
-	}
-	for i := range runs {
-		key.runs[i] = newRunFrame(runs[i])
+		runs: keyRuns,
 	}
 	c.frameKey = key
 	c.frame = frame
