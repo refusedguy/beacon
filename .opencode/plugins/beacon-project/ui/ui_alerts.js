@@ -71,8 +71,6 @@ export function shortTaskID(value) {
 // lets the queue header, the rows and the card panel share a single tree
 // instead of rebuilding it for every consumer in a render.
 const treeCache = new WeakMap()
-const depsOf = (item) => (Array.isArray(item?.dependsOn) ? item.dependsOn
-  : Array.isArray(item?.depends_on) ? item.depends_on : []).map(str).filter(Boolean)
 
 // TaskTree is the single index of parent-child relations for the queue and
 // card panels. An explicit parent field is authoritative. Snapshots that still
@@ -132,7 +130,14 @@ const countLabel = (n, one, many) => `${n} ${n === 1 ? one : many}`
 
 // The snapshot carries only unresolved deps. Children of an epic already have
 // their own rows, so they never become blocker headers.
-const queueBlockers = (item, parent) => depsOf(item).filter((dep) => dep && !parent.get(dep))
+// Most cards carry no dependency array. Skip the map and filter entirely for
+// them instead of allocating two temporary arrays per card per render.
+const queueBlockers = (item, parent) => {
+  const deps = Array.isArray(item?.dependsOn) ? item.dependsOn
+    : Array.isArray(item?.depends_on) ? item.depends_on : null
+  if (!deps || !deps.length) return []
+  return deps.map(str).filter((dep) => dep && !parent.get(dep))
+}
 
 function taskRows(item, { id, epic, parent, blockers, children }) {
   const blocked = str(item?.status).toLowerCase() === "waiting_deps"
@@ -255,7 +260,12 @@ export function queueRows(queue = [], epicOpen = null, blockedOpen = null, tree 
   // queue header; a standalone caller falls back to the cached index for the
   // same array. queueLineItems reads that index through its tree argument.
   const index = tree ?? taskTree(list)
-  const { parentOf, childrenOf, isEpic } = queueGroups(list, null, index)
+  // The tree already holds these three maps. Reading them here avoids a second
+  // queueGroups pass over the whole queue; queueLineItems builds the groups it
+  // needs from the same index.
+  const parentOf = (id) => index.parent.get(id) || ""
+  const childrenOf = (id) => index.children.get(id) ?? []
+  const isEpic = (id) => index.epic.has(id)
   if (!epicOpen) return queueLineItems(list, null, blockedOpen, index)
   const ids = index.list === list ? index.ids : list.map((item) => str(item?.id))
   // Walk up to the direct child under each ancestor epic. This hides the whole
