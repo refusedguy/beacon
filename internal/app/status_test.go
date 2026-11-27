@@ -305,7 +305,7 @@ func TestRunSnapshotCarriesSessionIncidentAndPRURL(t *testing.T) {
 	run.IsFixer = true
 	run.BlockedIncidentID = "inc-7"
 
-	got := makeRunSnapshot(run, nil, nil, now, "owner/repo")
+	got := makeRunSnapshot(run, nil, nil, now, prBase("owner/repo"))
 	if got.SessionID != "sess-fields" || !got.IsFixer || got.BlockedIncidentID != "inc-7" {
 		t.Fatalf("run fields = %+v", got)
 	}

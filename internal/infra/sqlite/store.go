@@ -313,7 +313,7 @@ func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64,
 func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
 	// Keep the state list literal: the partial index predicate must match it
 	// exactly, and bound parameters there would force a full scan and sort.
-	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN (`+activeStatesSQL+`) ORDER BY updated_at`)
+	return s.queryAllCap(ctx, activeRunsCap, `SELECT `+runColumns+` FROM runs WHERE state NOT IN (`+activeStatesSQL+`) ORDER BY updated_at`)
 }
 
 // ListRecent returns at most limit finished runs, newest first.
@@ -347,11 +347,16 @@ func (s *Store) ListByIncident(ctx context.Context, incidentID string) ([]*core.
 
 // queryAll runs query and scans every returned row into a run.
 func (s *Store) queryAll(ctx context.Context, query string, args ...any) ([]*core.Run, error) {
+	return s.queryAllCap(ctx, 0, query, args...)
+}
+
+// queryAllCap is queryAll with a capacity hint for the returned slice.
+func (s *Store) queryAllCap(ctx context.Context, capacity int, query string, args ...any) ([]*core.Run, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	return collectRows(rows, scanRun)
+	return collectRowsCap(rows, capacity, scanRun)
 }
 
 // queryOne runs query and scans at most one row into a run.
@@ -370,8 +375,15 @@ type scanner interface{ Scan(...any) error }
 // close and the iteration error live here. Each caller supplies its own column
 // list through the scan function.
 func collectRows[T any](rows *sql.Rows, scan func(scanner) (T, error)) ([]T, error) {
+	return collectRowsCap(rows, 0, scan)
+}
+
+// collectRowsCap is collectRows with a capacity hint. Hot snapshot reads know
+// roughly how many rows they expect, so a single allocation replaces the
+// repeated growth of an empty slice.
+func collectRowsCap[T any](rows *sql.Rows, capacity int, scan func(scanner) (T, error)) ([]T, error) {
 	defer rows.Close()
-	out := make([]T, 0)
+	out := make([]T, 0, capacity)
 	for rows.Next() {
 		v, err := scan(rows)
 		if err != nil {
@@ -382,10 +394,45 @@ func collectRows[T any](rows *sql.Rows, scan func(scanner) (T, error)) ([]T, err
 	return out, rows.Err()
 }
 
-// decodeJSON decodes one JSON text column into dst. Every scanner calls this
-// so the byte conversion lives in one place. Callers keep the error prefix
-// that names the column.
+// Trivial JSON column values. Most rows store one of these, so decoding them
+// through json.Unmarshal buys nothing and pays for reflection on every scan.
+const (
+	jsonEmpty       = ""
+	jsonEmptyObject = "{}"
+	jsonEmptyArray  = "[]"
+	jsonNull        = "null"
+)
+
+// activeRunsCap and decisionRowsCap bound the preallocation of the two snapshot
+// reads whose row count has no cheap upper bound. A modest hint still removes
+// the first several slice growths without reserving large blocks for an empty
+// database.
+const (
+	activeRunsCap   = 16
+	decisionRowsCap = 64
+)
+
+// decodeJSON decodes one JSON text column into dst. Empty and trivial values
+// reset dst directly, which skips json.Unmarshal on the common case. Every
+// scanner calls this so the byte conversion lives in one place. Callers keep
+// the error prefix that names the column.
 func decodeJSON(text string, dst any) error {
+	if text == jsonEmpty || text == jsonEmptyObject || text == jsonEmptyArray || text == jsonNull {
+		switch d := dst.(type) {
+		case *[]core.ScopePath:
+			*d = nil
+			return nil
+		case *[]core.CheckResult:
+			*d = nil
+			return nil
+		case *[]core.ChildSpec:
+			*d = nil
+			return nil
+		case *map[string]any:
+			*d = nil
+			return nil
+		}
+	}
 	return json.Unmarshal([]byte(text), dst)
 }
 
@@ -479,7 +526,7 @@ FROM run_events WHERE run_id IN (%s) ORDER BY at, id`, runIDs)
 	if err != nil {
 		return nil, err
 	}
-	return collectRows(rows, scanRunEvent)
+	return collectRowsCap(rows, len(runIDs), scanRunEvent)
 }
 
 // scanRunEvent decodes one run event row into an app.RunEvent.
@@ -531,7 +578,7 @@ ORDER BY at, id`
 	if err != nil {
 		return nil, err
 	}
-	return collectRows(rows, func(row scanner) (app.Decision, error) {
+	return collectRowsCap(rows, decisionRowsCap, func(row scanner) (app.Decision, error) {
 		d, err := scanDecision(row)
 		if err != nil {
 			return app.Decision{}, err

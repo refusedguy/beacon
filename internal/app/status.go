@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -242,13 +243,14 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if daemon == nil {
 		daemon = &DaemonSnapshot{State: "absent"}
 	}
+	prBaseURL := prBase(s.Repo)
 	activeSnapshots := make([]RunSnapshot, 0, len(active))
 	for _, run := range active {
-		activeSnapshots = append(activeSnapshots, makeRunSnapshot(run, timeline, histories, now, s.Repo))
+		activeSnapshots = append(activeSnapshots, makeRunSnapshot(run, timeline, histories, now, prBaseURL))
 	}
 	recentSnapshots := make([]RunSnapshot, 0, len(recent))
 	for _, run := range recent {
-		recentSnapshots = append(recentSnapshots, makeRunSnapshot(run, timeline, histories, now, s.Repo))
+		recentSnapshots = append(recentSnapshots, makeRunSnapshot(run, timeline, histories, now, prBaseURL))
 	}
 	out := &Snapshot{
 		GeneratedAt:  now,
@@ -351,8 +353,12 @@ func nonNullStrings(values []string) []string {
 }
 
 func collectRunIDs(groups ...[]*core.Run) []string {
-	seen := make(map[string]bool)
-	var ids []string
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	seen := make(map[string]bool, total)
+	ids := make([]string, 0, total)
 	for _, group := range groups {
 		for _, run := range group {
 			id := string(run.ID)
@@ -366,8 +372,8 @@ func collectRunIDs(groups ...[]*core.Run) []string {
 }
 
 func groupHistory(events []RunEvent, decisions []Decision) (map[string][]RunEvent, map[string][]Decision) {
-	timeline := make(map[string][]RunEvent)
-	histories := make(map[string][]Decision)
+	timeline := make(map[string][]RunEvent, len(events))
+	histories := make(map[string][]Decision, len(decisions))
 	for _, event := range events {
 		timeline[event.RunID] = append(timeline[event.RunID], event)
 	}
@@ -377,7 +383,9 @@ func groupHistory(events []RunEvent, decisions []Decision) (map[string][]RunEven
 	return timeline, histories
 }
 
-func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time, repo ...string) RunSnapshot {
+// makeRunSnapshot builds one run's wire view. prBaseURL is the PR URL prefix
+// computed once per snapshot, so a run only appends its number to it.
+func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time, prBaseURL ...string) RunSnapshot {
 	events := timeline[string(run.ID)]
 	if events == nil {
 		events = []RunEvent{}
@@ -387,8 +395,8 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		decisions = []Decision{}
 	}
 	link := ""
-	if len(repo) > 0 {
-		link = prLink(repo[0], run.PRNumber)
+	if len(prBaseURL) > 0 && run.PRNumber > 0 {
+		link = prBaseURL[0] + strconv.Itoa(run.PRNumber)
 	}
 	return RunSnapshot{
 		ID: string(run.ID), TaskID: string(run.TaskID), State: string(run.State),
@@ -404,17 +412,25 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 	}
 }
 
-// prLink builds the GitHub PR URL. A repo that is not owner/repo has no URL,
-// which keeps other SCM providers from showing a broken link.
-func prLink(repo string, pr int) string {
-	if pr <= 0 {
-		return ""
-	}
+// prBase builds the GitHub PR URL prefix. A repo that is not owner/repo has no
+// prefix, which keeps other SCM providers from showing a broken link. Snapshot
+// calls this once and reuses the prefix for every run.
+func prBase(repo string) string {
 	owner, name, ok := strings.Cut(repo, "/")
 	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
 		return ""
 	}
-	return "https://github.com/" + owner + "/" + name + "/pull/" + fmt.Sprint(pr)
+	return "https://github.com/" + owner + "/" + name + "/pull/"
+}
+
+// prLink builds the full PR URL from a repo string. Callers that already hold a
+// prefix from prBase append strconv.Itoa(pr) directly instead.
+func prLink(repo string, pr int) string {
+	base := prBase(repo)
+	if base == "" || pr <= 0 {
+		return ""
+	}
+	return base + strconv.Itoa(pr)
 }
 
 // checkSnapshots maps stored checks to the UI contract without any SCM call.
