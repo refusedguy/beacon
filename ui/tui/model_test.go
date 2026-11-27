@@ -444,6 +444,47 @@ func TestNewerSnapshotWins(t *testing.T) {
 	}
 }
 
+// TestReloadRepliesAreOrdered proves two reloads cannot both land. Each reload
+// claims a generation, so delivering the older reply after the newer one leaves
+// the newer snapshot on screen instead of flipping back to the pre-action state.
+func TestReloadRepliesAreOrdered(t *testing.T) {
+	const runID = "run-reload-gen"
+	f := newDeltaFixture(t, runID)
+	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
+
+	// Start both reloads before delivering either reply. Before the fix both
+	// read the same generation and both replies were accepted.
+	olderCmd := m.reload()
+	newerCmd := m.reload()
+
+	f.setBody(runsBody(runID, "older-state"))
+	older := olderCmd().(runsMsg)
+	f.setBody(runsBody(runID, "newer-state"))
+	newer := newerCmd().(runsMsg)
+
+	// Deliver the newer reply first, then the older one last.
+	afterNewer, followUp := m.Update(newer)
+	if followUp != nil {
+		t.Fatalf("newer runsMsg returned an unexpected command: %v", followUp)
+	}
+	want := afterNewer.(model).View()
+	if !strings.Contains(want, "newer-state") {
+		t.Fatalf("view missing newer snapshot:\n%s", want)
+	}
+
+	afterOlder, followUp := afterNewer.Update(older)
+	if followUp != nil {
+		t.Fatalf("older runsMsg returned an unexpected command: %v", followUp)
+	}
+	got := afterOlder.(model).View()
+	if got != want {
+		t.Fatalf("older reload reply overwrote newer snapshot:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "older-state") {
+		t.Fatalf("view shows pre-action state older-state:\n%s", got)
+	}
+}
+
 // controlFixture serves a run list and one control response, counting every
 // control POST. It drives apply() from a selected run to the rendered status.
 // A non-zero status makes the control response a refusal on the wire.
