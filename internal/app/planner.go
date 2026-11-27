@@ -234,18 +234,19 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 		}
 	}
 	for _, claim := range t.Scope {
-		if claim.Kind() == 'a' || (claim.Kind() == 'g' && leadingWildcard(claim.Value())) {
+		kind, value := claim.Kind(), claim.Value()
+		if kind == 'a' || (kind == 'g' && leadingWildcard(value)) {
 			// A broad claim can cover any active path, so no prefix key is
 			// selective enough. Fall back to a full scan for this candidate.
 			allRuns()
 			continue
 		}
-		for _, i := range idx.exact[core.ScopePath(claim.Value())] {
+		for _, i := range idx.exact[core.ScopePath(value)] {
 			add(i)
 		}
 		keys := claimDirKeys(idx.keys, claim)
 		idx.keys = keys
-		switch claim.Kind() {
+		switch kind {
 		case 'f':
 			for _, key := range keys {
 				for _, i := range idx.cover[key] {
@@ -253,15 +254,16 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 				}
 			}
 		default:
+			// cover is only filled for d and g claims, and it uses the same
+			// claimDirKeys prefixes that fill under for every claim. So
+			// cover[key] is always a subset of under[key], and walking cover
+			// here adds nothing the under walk has not already added.
 			for _, key := range keys {
 				for _, i := range idx.under[key] {
 					add(i)
 				}
-				for _, i := range idx.cover[key] {
-					add(i)
-				}
 			}
-			if claim.Kind() == 'g' {
+			if kind == 'g' {
 				for _, i := range idx.globs {
 					add(i)
 				}
