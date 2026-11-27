@@ -1,7 +1,7 @@
 ---
 id: T-8b2fdcd3
 title: 'W2-1: cut HTTP event frames and Go TUI view allocations'
-status: available
+status: done
 scope:
     - cmd/beacon/http.go
     - cmd/beacon/http_test.go

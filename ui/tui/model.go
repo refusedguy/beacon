@@ -41,11 +41,73 @@ var (
 )
 
 // renderCache holds scratch state that View reuses across frames. It sits
-// behind a pointer so copies of model share the same buffer.
+// behind a pointer so copies of model share the same buffer. The frame fields
+// hold the last rendered string and the inputs that produced it, so an
+// unchanged render returns the same string without rebuilding it.
 type renderCache struct {
 	padWidth int
 	pad      string
 	row      []byte
+
+	frame    string
+	frameKey frameKey
+	hasFrame bool
+}
+
+// runFrame is the part of a Run that View renders. It is the identity of one
+// row in the full-frame cache key.
+type runFrame struct {
+	id, state, taskID, reason string
+	pr                        int
+}
+
+// frameKey holds every input that can change View's output. A match means the
+// cached frame is still current.
+type frameKey struct {
+	width  int
+	cursor int
+	status string
+	failed bool
+	runs   []runFrame
+}
+
+func newRunFrame(run Run) runFrame {
+	return runFrame{
+		id: run.ID, state: run.State, pr: run.PR,
+		taskID: run.TaskID, reason: run.Reason,
+	}
+}
+
+// frameCurrent reports whether the cached frame matches the current inputs.
+// The runs are compared field by field on the values View actually uses.
+func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool, runs []Run) bool {
+	if !c.hasFrame || c.frameKey.width != width || c.frameKey.cursor != cursor ||
+		c.frameKey.status != status || c.frameKey.failed != failed {
+		return false
+	}
+	if len(c.frameKey.runs) != len(runs) {
+		return false
+	}
+	for i := range runs {
+		if c.frameKey.runs[i] != newRunFrame(runs[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// rememberFrame stores a rendered frame together with the inputs that made it.
+func (c *renderCache) rememberFrame(width, cursor int, status string, failed bool, runs []Run, frame string) {
+	key := frameKey{
+		width: width, cursor: cursor, status: status, failed: failed,
+		runs: make([]runFrame, len(runs)),
+	}
+	for i := range runs {
+		key.runs[i] = newRunFrame(runs[i])
+	}
+	c.frameKey = key
+	c.frame = frame
+	c.hasFrame = true
 }
 
 // model is the Bubble Tea state for the run monitor.
@@ -239,11 +301,15 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // View renders the run list and status line. The header padding and the row
-// scratch buffer are reused across frames; the rendered text is unchanged.
+// scratch buffer are reused across frames. A frame whose inputs have not
+// changed returns the cached string; the rendered text is unchanged.
 func (m model) View() string {
 	cache := m.render
 	if cache == nil {
 		cache = &renderCache{}
+	}
+	if cache.frameCurrent(m.width, m.cursor, m.status, m.failed, m.runs) {
+		return cache.frame
 	}
 	var b strings.Builder
 	title := "Beacon runs"
@@ -272,6 +338,9 @@ func (m model) View() string {
 	if end > len(m.runs) {
 		end = len(m.runs)
 	}
+	// Grow once for the header, the visible rows and the footer so the
+	// builder does not reallocate while writing the frame.
+	b.Grow(len(header) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + 80)
 	row := cache.row[:0]
 	for i := start; i < end; i++ {
 		run := m.runs[i]
@@ -304,7 +373,9 @@ func (m model) View() string {
 	}
 	b.WriteString("\n")
 	b.WriteString(headerStyle.Render("j/k move  a approve  u unblock  c/x cancel  r retry  q quit"))
-	return b.String()
+	frame := b.String()
+	cache.rememberFrame(m.width, m.cursor, m.status, m.failed, m.runs, frame)
+	return frame
 }
 
 // asciiOnly reports whether every byte of s is a single-byte UTF-8 code point.
