@@ -466,6 +466,10 @@ jobs:
           git fetch origin "$BASE_REF" || true
           git fetch origin "$BASE_BRANCH" || true
           BASE="$(git merge-base "$BASE_REF" "$HEAD_REF")"
+          # The comment parser takes its names and limiter text from the base
+          # ref. A PR cannot rewrite those inputs, including on a fork.
+          git show "$BASE_REF:docs/perf/bench-registry.json" \
+            > "$RUNNER_TEMP/bench-registry.json"
           git worktree add --detach "$RUNNER_TEMP/perf-base" "$BASE"
           git worktree add --detach "$RUNNER_TEMP/perf-head" "$HEAD_REF"
           # Both trees must run the same known-good UI mirror. Take it from the
@@ -490,6 +494,38 @@ jobs:
             esac
           done < <(git diff --name-only "$BASE" "$HEAD_REF")
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      # Both trees must measure the same harness. Hash every file that can
+      # move a number: benchmark sources, fixtures, the registry, module pins,
+      # the Node harnesses and the workspace latency test. Production code
+      # stays at each tree's own revision, so it is deliberately not hashed.
+      - name: Hash measurement files
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          hash_tree() {
+            local dir="$1"
+            (
+              cd "$dir"
+              {
+                find internal/bench docs/perf -type f -print 2>/dev/null
+                printf '%s\n' internal/infra/workspace/git_worktree_test.go \
+                  go.mod go.sum go.work go.work.sum
+                find . -type d -name testdata -prune -print 2>/dev/null \
+                  | while IFS= read -r d; do find "$d" -type f -print; done
+              } | LC_ALL=C sort -u | while IFS= read -r path; do
+                  [[ -f "$path" ]] || continue
+                  printf '%s ' "$path"
+                  sha256sum "$path" | cut -d' ' -f1
+                done | LC_ALL=C sort | sha256sum | cut -d' ' -f1
+            )
+          }
+          base_hash="$(hash_tree "$RUNNER_TEMP/perf-base")"
+          head_hash="$(hash_tree "$RUNNER_TEMP/perf-head")"
+          printf 'base %s\nhead %s\n' "$base_hash" "$head_hash" > "$RUNNER_TEMP/perf-hash"
+          if [[ "$base_hash" != "$head_hash" ]]; then
+            echo "measurement trees differ" >> "$RUNNER_TEMP/perf-status"
+          fi
 
       - name: Run A B B A B A passes
         continue-on-error: true
@@ -551,217 +587,188 @@ jobs:
           node - <<'NODE'
           const fs = require('fs');
           const temp = process.env.RUNNER_TEMP;
-          const sides = {
-            base: fs.readFileSync(`${temp}/perf-base.txt`, 'utf8'),
-            head: fs.readFileSync(`${temp}/perf-head.txt`, 'utf8'),
+          const prefix = 'beacon-perf: ';
+          const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter'];
+          const notes = [];
+
+          const readLines = path => {
+            try { return fs.readFileSync(path, 'utf8').split(/\r?\n/); }
+            catch (e) { notes.push(`cannot read ${path}: ${e.message}`); return []; }
           };
-          const statusPath = `${temp}/perf-status`;
-          const status = fs.existsSync(statusPath)
-            ? fs.readFileSync(statusPath, 'utf8').trim() : '';
-          // go test prints custom metrics as "<value> <name>". Only wired
-          // benchmark rows are parsed from that tail.
-          const metricNames = ['mcp-journal', 'redaction', 'wire-encode', 'prompt-build',
-            'snapshot', 'reconcile-tick-counts', 'base-red-check', 'base-red-block',
-            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
-          const wanted = ['planner-select', 'prompt-build', 'mcp-journal',
-            'redaction', 'wire-encode', 'tui-view',
-            'reconcile-tick-counts', 'base-red-check', 'base-red-block',
-            'snapshot', 'worktree-remove', 'run-watcher-fp', 'run-watcher-fp-chars',
-            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
-          const limiters = {
-            'mcp-journal': 'mutex + indexed LRU',
-            'redaction': 'regexp pass chain',
-            'wire-encode': 'encoding/json reflection',
-            'tui-view': 'normalizeSnapshot + render',
-            'planner-select': 'injected overlap checker',
-            'prompt-build': 'strings.Builder + prompt bytes',
-            'reconcile-tick-counts': 'Source.ListAvailable + SQLite Get',
-            'base-red-check': 'Source.ListAvailable I/O',
-            'base-red-block': 'SCM.Observe round trips',
-            'snapshot': 'SQLite VM, ListRunEvents sort and JSON reflection',
-            'worktree-remove': 'git subprocess spawn and worktree metadata',
-            'run-watcher-fp': 'JSON.stringify character volume',
-            'scm-observe': 'loopback PR + compare + checks + files round trips',
-            'card-local-parse': 'yaml.Unmarshal + per-scope os.Stat',
-            'http-snapshot-assembly': 'groupHistory + json reflection',
-            'harness-spawn': 'loopback create + model POST + deferred move',
-          };
-          const workPlans = ['planner-select', 'prompt-build', 'mcp-journal',
-            'redaction', 'wire-encode', 'tui-view', 'snapshot', 'worktree-remove',
-            'run-watcher-fp', 'reconcile-tick-counts', 'base-red-check', 'base-red-block',
-            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
-          const errPlans = ['prompt-build', 'mcp-journal', 'redaction', 'wire-encode',
-            'snapshot', 'worktree-remove', 'run-watcher-fp',
-            'reconcile-tick-counts', 'base-red-check', 'base-red-block',
-            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
-          const durationMS = raw => {
-            const n = Number.parseFloat(raw);
-            if (raw.endsWith('ns')) return n / 1e6;
-            if (raw.endsWith('µs') || raw.endsWith('us')) return n / 1e3;
-            if (raw.endsWith('ms')) return n;
-            return n * 1e3;
-          };
-          const values = { base: {}, head: {} };
-          const ranges = { base: {}, head: {} };
-          for (const side of ['base', 'head']) {
-            for (const line of sides[side].split(/\r?\n/)) {
-              const bench = line.match(/^Benchmark(\S+?)(?:-\d+)?\s+(\d+)\s+([\d.]+) ns\/op(.*)$/);
-              if (bench) {
-                const key = bench[1] === 'PlannerSelectInjectedChecker' ? 'planner-select'
-                  : bench[1] === 'SpawnPrompt' ? 'prompt-build' : null;
-                if (key) {
-                  (values[side][key] ||= []).push(Number(bench[3]) / 1e6);
-                  const allocs = bench[4].match(/([\d.]+)\s+B\/op/);
-                  if (allocs) (values[side][`${key}-bytes`] ||= []).push(Number(allocs[1]));
-                  const count = bench[4].match(/([\d.]+)\s+allocs\/op/);
-                  if (count) (values[side][`${key}-allocs`] ||= []).push(Number(count[1]));
-                  if (key === 'planner-select') {
-                    const checks = bench[4].match(/([\d.]+)\s+checks-per-select/);
-                    if (checks) (values[side]['planner-select-work'] ||= []).push(Number(checks[1]));
-                  }
-                }
-                for (const metric of ['median-ns', 'work', 'errs']) {
-                  // go test prints a custom metric as "<value> <name>".
-                  const re = new RegExp(`([\\d.]+)\\s+(\\S+?)-${metric}(?=\\s|$)`, 'g');
-                  let found;
-                  while ((found = re.exec(bench[4])) !== null) {
-                    const name = found[2];
-                    if (!metricNames.includes(name)) continue;
-                    const metricKey = metric === 'median-ns' ? name : `${name}-${metric}`;
-                    const value = metric === 'median-ns' ? Number(found[1]) / 1e6 : Number(found[1]);
-                    (values[side][metricKey] ||= []).push(value);
-                  }
-                }
-                for (const metric of ['lists-per-tick', 'observes-per-tick', 'gets-per-tick']) {
-                  const re = new RegExp(`([\\d.]+)\\s+(\\S+?)-${metric}(?=\\s|$)`, 'g');
-                  let found;
-                  while ((found = re.exec(bench[4])) !== null) {
-                    if (!['reconcile-tick-counts', 'base-red-check', 'base-red-block'].includes(found[2])) continue;
-                    (values[side][`${found[2]}-${metric}`] ||= []).push(Number(found[1]));
-                  }
-                }
-                continue;
-              }
-              // The deep snapshot prints its own summary with a real min and
-              // max, so its range is not inferred from the sampled medians.
-              const snap = line.match(/^sqlite snapshot deep: median=(\S+) .* min=(\S+) max=(\S+) range=(\S+) work=(\d+) errs=(\d+)/);
-              if (snap) ranges[side]['snapshot'] = [durationMS(snap[2]), durationMS(snap[3])];
-              const wt = line.match(/^worktree-remove: median=([\d.]+)s range=([\d.]+)s-([\d.]+)s work=(\d+) status=(\d+) errs=(\d+)/);
-              if (wt) {
-                (values[side]['worktree-remove'] ||= []).push(Number(wt[1]));
-                (values[side]['worktree-remove-work'] ||= []).push(Number(wt[4]));
-                (values[side]['worktree-remove-status'] ||= []).push(Number(wt[5]));
-                (values[side]['worktree-remove-errs'] ||= []).push(Number(wt[6]));
-                ranges[side]['worktree-remove'] = [Number(wt[2]), Number(wt[3])];
-              }
-              const fp = line.match(/^run-watcher-fp: median ([\d.]+) ms, range ([\d.]+) to ([\d.]+) ms/);
-              if (fp) {
-                (values[side]['run-watcher-fp'] ||= []).push(Number(fp[1]));
-                ranges[side]['run-watcher-fp'] = [Number(fp[2]), Number(fp[3])];
-              }
-              const fpChars = line.match(/^run-watcher-fp-chars: (\d+) characters, range (\d+) to (\d+)/);
-              if (fpChars) {
-                (values[side]['run-watcher-fp-chars'] ||= []).push(Number(fpChars[1]));
-                ranges[side]['run-watcher-fp-chars'] = [Number(fpChars[2]), Number(fpChars[3])];
-              }
-              const fpWork = line.match(/^run-watcher-fp-work: snapshots=(\d+) normalizations=(\d+) emissions=(\d+)/);
-              if (fpWork) {
-                const snapshots = Number(fpWork[1]);
-                const norms = Number(fpWork[2]);
-                const emissions = Number(fpWork[3]);
-                (values[side]['run-watcher-fp-work'] ||= []).push(snapshots + norms + emissions);
-                (values[side]['run-watcher-fp-snapshots'] ||= []).push(snapshots);
-                (values[side]['run-watcher-fp-normalizations'] ||= []).push(norms);
-                (values[side]['run-watcher-fp-emissions'] ||= []).push(emissions);
-              }
-              const fpErrs = line.match(/^run-watcher-fp-errs: (\d+) errors/);
-              if (fpErrs) (values[side]['run-watcher-fp-errs'] ||= []).push(Number(fpErrs[1]));
-              const tui = line.match(/^production: median ([\d.]+) ms, range ([\d.]+) to ([\d.]+) ms/);
-              if (tui) {
-                (values[side]['tui-view'] ||= []).push(Number(tui[1]));
-              }
-              const counted = line.match(/^work counted in every round: (yes|NO)/);
-              if (counted) (values[side]['tui-view-work'] ||= []).push(counted[1] === 'yes' ? 1 : 0);
-            }
+
+          // Names and limiter text come from the registry on the base ref. A
+          // fork PR cannot rewrite this file, and no printed string is trusted
+          // for the limiter column.
+          const registryPath = process.env.BENCH_REGISTRY || `${temp}/bench-registry.json`;
+          let specs = [];
+          try {
+            const doc = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+            if (!Array.isArray(doc.specs)) throw new Error('missing specs array');
+            specs = doc.specs;
+          } catch (e) {
+            notes.push(`cannot read registry: ${e.message}`);
           }
+          const registry = new Map();
+          for (const s of specs) {
+            if (!s || typeof s.key !== 'string' || !s.key) continue;
+            if (registry.has(s.key)) { notes.push(`duplicate registry key ${s.key}`); continue; }
+            registry.set(s.key, s);
+          }
+
+          // One canonical row per named plan per pass. Every failure is reported
+          // in the comment; this advisory step still exits zero.
+          function parseSide(path, side) {
+            const passes = [];
+            let pass = null;
+            for (const line of readLines(path)) {
+              const mark = line.match(/^== pass \S+ ==$/);
+              if (mark) { pass = { rows: [], bad: [] }; passes.push(pass); continue; }
+              if (!line.startsWith(prefix)) continue;
+              let row;
+              try { row = JSON.parse(line.slice(prefix.length)); }
+              catch (e) { notes.push(`${side}: invalid canonical JSON: ${e.message}`); continue; }
+              if (!row || typeof row !== 'object' || Array.isArray(row)) {
+                notes.push(`${side}: canonical row is not an object`); continue;
+              }
+              const keys = Object.keys(row);
+              if (keys.length !== fields.length || fields.some(f => !keys.includes(f))) {
+                notes.push(`${side}: canonical row fields ${keys.join(',')}`); continue;
+              }
+              if (typeof row.key !== 'string' || !row.key ||
+                  typeof row.limiter !== 'string' || !row.limiter) {
+                notes.push(`${side}: canonical row has no key or limiter`); continue;
+              }
+              if (['median_ms', 'min_ms', 'max_ms', 'work', 'errs'].some(f =>
+                    typeof row[f] !== 'number' || !Number.isFinite(row[f]))) {
+                notes.push(`${side}: non-finite number in ${row.key}`); continue;
+              }
+              if (row.min_ms <= 0 || row.max_ms < row.min_ms ||
+                  row.median_ms < row.min_ms || row.median_ms > row.max_ms ||
+                  row.work < 0 || row.errs < 0) {
+                notes.push(`${side}: invalid values in ${row.key}`); continue;
+              }
+              if (!pass) { pass = { rows: [], bad: [] }; passes.push(pass); }
+              if (pass.rows.some(r => r.key === row.key)) {
+                pass.bad.push(`duplicate ${row.key}`); continue;
+              }
+              pass.rows.push(row);
+            }
+            return passes;
+          }
+
+          const basePasses = parseSide(`${temp}/perf-base.txt`, 'base');
+          const headPasses = parseSide(`${temp}/perf-head.txt`, 'head');
+          const status = readLines(`${temp}/perf-status`).map(s => s.trim()).filter(Boolean);
+          const hashes = readLines(`${temp}/perf-hash`);
+          const sameHarness = hashes.length >= 2 &&
+            hashes[0].split(/\s+/)[1] === hashes[1].split(/\s+/)[1];
+
+          if (!basePasses.length || !headPasses.length) notes.push('missing pass markers');
+
+          // The trusted base pass names the expected rows. Nightly-only keys
+          // do not belong in a PR pass, and a head-only key has no counterpart.
+          const expected = new Set();
+          for (const p of basePasses) for (const r of p.rows) {
+            const spec = registry.get(r.key);
+            if (spec && spec.placement === 'nightly') continue;
+            expected.add(r.key);
+          }
+          const extra = [];
+          for (const p of headPasses) for (const r of p.rows) {
+            if (!expected.has(r.key)) extra.push(r.key);
+          }
+          if (extra.length) notes.push(`rejected head-only keys: ${[...new Set(extra)].join(', ')}`);
+
+          const unregistered = [...expected].filter(k => !registry.has(k));
+          if (unregistered.length) {
+            notes.push(`keys without a registry entry: ${unregistered.join(', ')}`);
+          }
+
+          let badShape = false;
+          const missing = [];
+          for (const [side, passes] of [['base', basePasses], ['head', headPasses]]) {
+            if (passes.length !== 3) {
+              notes.push(`${side} ran ${passes.length} passes, want 3`); badShape = true;
+            }
+            passes.forEach((p, i) => {
+              if (p.rows.length !== expected.size) {
+                notes.push(`${side} pass ${i + 1} has ${p.rows.length} rows, want ${expected.size}`);
+                badShape = true;
+              }
+              for (const key of expected) {
+                if (!p.rows.some(r => r.key === key)) missing.push(`${side} pass ${i + 1}: ${key}`);
+              }
+              if (p.bad.length) {
+                notes.push(`${side} pass ${i + 1}: ${p.bad.join(', ')}`); badShape = true;
+              }
+            });
+          }
+          if (missing.length) notes.push(`missing rows: ${[...new Set(missing)].join(', ')}`);
+
+          const inconclusiveAll = status.length > 0 || !sameHarness || badShape ||
+            registry.size === 0 || extra.length > 0;
+
           const median = xs => {
-            const sorted = [...xs].sort((a, b) => a - b);
-            const mid = Math.floor(sorted.length / 2);
-            return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+            const s = [...xs].sort((a, b) => a - b);
+            const mid = Math.floor(s.length / 2);
+            return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
           };
+          const values = (passes, key, field) => passes
+            .map(p => p.rows.find(r => r.key === key))
+            .filter(Boolean).map(r => r[field]);
+          const extreme = (passes, key, field, fn) => {
+            const xs = values(passes, key, field);
+            return xs.length ? fn(...xs) : NaN;
+          };
+
           const rows = [];
-          for (const plan of wanted) {
-            const keys = [plan];
-            if (plan === 'planner-select' || plan === 'prompt-build') keys.push(`${plan}-bytes`, `${plan}-allocs`);
-            if (workPlans.includes(plan)) keys.push(`${plan}-work`);
-            if (errPlans.includes(plan)) keys.push(`${plan}-errs`);
-            if (['reconcile-tick-counts', 'base-red-check', 'base-red-block'].includes(plan)) {
-              keys.push(`${plan}-lists-per-tick`, `${plan}-observes-per-tick`, `${plan}-gets-per-tick`);
+          for (const key of [...expected]) {
+            const spec = registry.get(key);
+            const baseRow = basePasses[0].rows.find(r => r.key === key);
+            const limiter = (spec && spec.limiter) || (baseRow && baseRow.limiter) || '-';
+            const a = values(basePasses, key, 'median_ms');
+            const b = values(headPasses, key, 'median_ms');
+            if (!a.length || !b.length) {
+              rows.push(`| ${key} | - | - | - | - | - | ${limiter} | inconclusive |`);
+              continue;
             }
-            if (plan === 'worktree-remove') keys.push(`${plan}-status`);
-            if (plan === 'run-watcher-fp') {
-              keys.push(`${plan}-snapshots`, `${plan}-normalizations`, `${plan}-emissions`);
-            }
-            const wa = values.base[`${plan}-work`] || [];
-            const wb = values.head[`${plan}-work`] || [];
-            let workMismatch = !wa.length || !wb.length || median(wa) !== median(wb);
-            // Worktree removal is expected to drop a git status call, so base
-            // and head work counts differ by design.
-            if (plan === 'worktree-remove') workMismatch = false;
-            // The plugin fingerprint counts three work actions and errors;
-            // all four must agree before a timing change is trusted.
-            if (plan === 'run-watcher-fp') {
-              workMismatch = ['snapshots', 'normalizations', 'emissions', 'errs'].some(counter => {
-                const a = values.base[`${plan}-${counter}`] || [];
-                const b = values.head[`${plan}-${counter}`] || [];
-                return !a.length || !b.length || median(a) !== median(b);
-              });
-            }
-            for (const key of keys) {
-              const a = values.base[key] || [];
-              const b = values.head[key] || [];
-              if (!a.length || !b.length) continue;
-              const am = median(a), bm = median(b);
-              const amin = ranges.base[key] ? ranges.base[key][0] : Math.min(...a);
-              const amax = ranges.base[key] ? ranges.base[key][1] : Math.max(...a);
-              const bmin = ranges.head[key] ? ranges.head[key][0] : Math.min(...b);
-              const bmax = ranges.head[key] ? ranges.head[key][1] : Math.max(...b);
-              const delta = am === 0 ? 0 : 100 * (bm - am) / am;
-              const overlap = amax >= bmin && bmax >= amin;
-              let verdict = (overlap || workMismatch) ? 'inconclusive'
-                : delta <= -2 ? 'gain' : delta >= 2 ? 'regression' : 'flat';
-              // The worktree call row is judged by counts, not wall time.
-              if (plan === 'worktree-remove' && key === 'worktree-remove-work') {
-                const ba = values.base['worktree-remove-work'] || [];
-                const bb = values.head['worktree-remove-work'] || [];
-                const sa = values.base['worktree-remove-status'] || [];
-                const sb = values.head['worktree-remove-status'] || [];
-                const ea = values.base['worktree-remove-errs'] || [];
-                const eb = values.head['worktree-remove-errs'] || [];
-                if (median(ba) === 3 && median(sa) === 1 && median(bb) === 2 && median(sb) === 0
-                  && median(ea) === 0 && median(eb) === 0) verdict = 'calls reduced';
-              }
-              const limiterKey = Object.keys(limiters)
-                .filter(k => key.startsWith(k))
-                .sort((a, b) => b.length - a.length)[0];
-              rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}% | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${limiterKey ? limiters[limiterKey] : '-'} | ${verdict} |`);
-            }
+            const am = median(a), bm = median(b);
+            const amin = extreme(basePasses, key, 'min_ms', Math.min);
+            const amax = extreme(basePasses, key, 'max_ms', Math.max);
+            const bmin = extreme(headPasses, key, 'min_ms', Math.min);
+            const bmax = extreme(headPasses, key, 'max_ms', Math.max);
+            const wa = values(basePasses, key, 'work');
+            const wb = values(headPasses, key, 'work');
+            const ea = values(basePasses, key, 'errs');
+            const eb = values(headPasses, key, 'errs');
+            let workMismatch = !wa.length || !wb.length || median(wa) !== median(wb) ||
+              !ea.length || !eb.length || median(ea) !== median(eb);
+            // Worktree removal drops a git status call by design.
+            if (key === 'worktree-remove') workMismatch = false;
+            const overlap = amax >= bmin && bmax >= amin;
+            const delta = am === 0 ? 0 : 100 * (bm - am) / am;
+            const verdict = (overlap || workMismatch || inconclusiveAll || !registry.has(key))
+              ? 'inconclusive'
+              : delta <= -2 ? 'gain' : delta >= 2 ? 'regression' : 'flat';
+            rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}% | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${limiter} | ${verdict} |`);
           }
+
           const marker = '<!-- beacon-pr-perf -->';
           const body = [
             marker,
             '### Advisory perf comparison, base vs head',
             '',
             'A B B A B A passes on two detached worktrees at the merge base and the real head SHA.',
-            'Times are in ms; worktree-remove is in seconds and run-watcher-fp-chars counts characters.',
-            'Work and errs are counts. Advisory data only: it adds no required check and does not gate merge.',
+            'Canonical rows come from the harness output; names and limiter text come from the registry on the base ref.',
+            'Times are in ms. Work and errs are counts. Advisory data only: it adds no required check and does not gate merge.',
             '',
             '| plan / metric | base | head | delta | base range | head range | limiter | verdict |',
             '| --- | --- | --- | --- | --- | --- | --- | --- |',
             ...(rows.length ? rows : ['| no comparable rows | - | - | - | - | - | - | inconclusive |']),
             '',
+            ...(notes.length ? ['Parser notes:', '', ...notes.map(n => `- ${n}`), ''] : []),
             'Overlapping ranges or different work counts are inconclusive, not a gain.',
-            status ? `Aborted passes: ${status.split(/\r?\n/).filter(Boolean).join(', ')}.` : 'No aborted passes.',
+            status.length ? `Aborted passes: ${status.join(', ')}.` : 'No aborted passes.',
             'Raw logs and per-side CSVs are in the artifact.',
           ].join('\n');
           fs.mkdirSync('perf-results', { recursive: true });
