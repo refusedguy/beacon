@@ -43,15 +43,21 @@ var prHarnessLimiters = []struct{ key, limiter string }{
 // cannot put two competing names on the wire.
 const (
 	reconcileTickLimiter  = "source ListAvailable + SQLite Get per PR"
+	baseRedCheckLimiter   = "source ListAvailable + SCM BaseBranchStatus on a red base"
+	baseRedBlockLimiter   = "SCM Observe fanout over active runs on a red base"
 	plannerSelectLimiter  = "injected overlap checker over active scope index"
 	dispatchPromptLimiter = "strings.Builder + prompt bytes"
 )
 
 // prBenchLimiters are the canonical keys and limiter strings published by the
 // reconcile, planner and prompt benchmarks. They run only in the advisory
-// two-tree job, so their registry placement is pr.
+// two-tree job, so their registry placement is pr. reconcile-tick-counts keeps
+// a green base as the no-red regression guard; the two base-red keys run on a
+// red base so their own counters can earn a calls-reduced verdict.
 var prBenchLimiters = []struct{ key, limiter string }{
 	{"reconcile-tick-counts", reconcileTickLimiter},
+	{"base-red-check", baseRedCheckLimiter},
+	{"base-red-block", baseRedBlockLimiter},
 	{"planner-select-injected-checker", plannerSelectLimiter},
 	{"dispatch-prompt", dispatchPromptLimiter},
 }

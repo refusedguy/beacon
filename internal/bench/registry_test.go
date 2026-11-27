@@ -79,6 +79,8 @@ func TestRegistryPRBenchSpecs(t *testing.T) {
 	}
 	for _, tc := range []struct{ key, limiter string }{
 		{"reconcile-tick-counts", reconcileTickLimiter},
+		{"base-red-check", baseRedCheckLimiter},
+		{"base-red-block", baseRedBlockLimiter},
 		{"planner-select-injected-checker", plannerSelectLimiter},
 		{"dispatch-prompt", dispatchPromptLimiter},
 	} {

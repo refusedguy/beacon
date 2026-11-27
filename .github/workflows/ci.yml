@@ -771,9 +771,20 @@ jobs:
             'planner-select-injected-checker': 'PlannerSelectInjectedChecker',
             'dispatch-prompt': 'SpawnPrompt',
             'reconcile-tick-counts': 'ReconcileTickCounts',
+            'base-red-check': 'BaseRedCheck',
+            'base-red-block': 'BaseRedBlockFanout',
             'json-control': 'JSONControl',
             'http-frame-emission': 'HTTPFramesEmission',
             'go-tui-view': 'GoTUIView',
+          };
+          // Deterministic call counters each key owns. The reconcile tick
+          // counts guard the green-base path. The two base-red keys publish
+          // their own lists, observes and saves, so their counters decide a
+          // calls-reduced verdict instead of borrowing ReconcileTickCounts.
+          const counterFields = {
+            'reconcile-tick-counts': ['lists-per-tick', 'observes-per-tick', 'gets-per-tick'],
+            'base-red-check': ['lists-per-tick', 'observes-per-tick', 'saves-per-tick'],
+            'base-red-block': ['lists-per-tick', 'observes-per-tick', 'saves-per-tick'],
           };
           const hotPathKeys = new Set([
             'sqlite-snapshot', 'card-parse', 'wire-encode', 'redaction',
@@ -1065,18 +1076,18 @@ jobs:
                (Number.isFinite(bytesDelta) && bytesDelta <= -allocDropPct));
             const callsReduced = key === 'worktree-remove' && errsZero && noRise &&
               median(wa) === 3 && median(wb) === 2;
-            const counterFalls = key.startsWith('reconcile-') && errsZero && noRise &&
-              equalWork && ['lists-per-tick', 'observes-per-tick', 'gets-per-tick']
-                .some(suffix => {
-                  const bench = allocBench[key] || 'ReconcileTickCounts';
-                  for (const [unit, table] of allocMetrics) {
-                    if (!unit.endsWith(`-${suffix}`)) continue;
-                    for (const [name, value] of table) {
-                      if (benchNameMatches(name, bench) && value.next < value.old) return true;
-                    }
+            const ownCounters = counterFields[key];
+            const counterFalls = ownCounters && errsZero && noRise &&
+              equalWork && ownCounters.some(suffix => {
+                const bench = allocBench[key];
+                for (const [unit, table] of allocMetrics) {
+                  if (!unit.endsWith(`-${suffix}`)) continue;
+                  for (const [name, value] of table) {
+                    if (benchNameMatches(name, bench) && value.next < value.old) return true;
                   }
-                  return false;
-                });
+                }
+                return false;
+              });
             let verdict;
             if (workMismatch || inconclusiveAll || !registry.has(key)) {
               verdict = 'inconclusive';
@@ -1115,7 +1126,7 @@ jobs:
             '',
             ...(notes.length ? ['Parser notes:', '', ...notes.map(n => `- ${n}`), ''] : []),
             `A timing verdict needs an absolute delta of at least ${floorPct}% and greater than the larger trimmed within-side spread; otherwise the row is flat.`,
-            `A flat row becomes 'gain (allocs/bytes)' when allocs/op or B/op falls at least ${allocDropPct}% with equal work, zero errors and no median rise beyond the row floor. Worktree removal with work 3 to 2, and reconcile keys with a falling deterministic counter, become 'gain (calls reduced)' under the same error and rise limits.`,
+            `A flat row becomes 'gain (allocs/bytes)' when allocs/op or B/op falls at least ${allocDropPct}% with equal work, zero errors and no median rise beyond the row floor. Worktree removal with work 3 to 2 becomes 'gain (calls reduced)'. The green-base reconcile guard and the two red-base keys become 'gain (calls reduced)' when their own lists, observes, gets or saves counters fall under the same error and rise limits.`,
             'Spread drops one extreme sample from either end of five medians per side, using min(s[3]-s[0], s[4]-s[1]), so a single spike does not force a false verdict. Range relation is supporting text only.',
             `Cache states recorded from canonical rows: ${cacheStates.join(', ') || '-'}.`,
             status.length ? `Aborted passes: ${status.join(', ')}.` : 'No aborted passes.',
