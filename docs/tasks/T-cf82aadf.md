@@ -1,7 +1,7 @@
 ---
 id: T-cf82aadf
 title: '[bench] In-memory snapshot assembly benchmark'
-status: available
+status: done
 scope:
     - internal/bench/snapshot_assembly_bench_test.go
 priority: 82
