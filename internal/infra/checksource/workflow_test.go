@@ -48,6 +48,28 @@ func TestWorkflowNamesUsesInjectedDetect(t *testing.T) {
 	}
 }
 
+func TestWorkflowNamesUsesFallbackWhenDetectionEmpty(t *testing.T) {
+	src := Workflow{
+		Root:     "/project",
+		Detect:   func(string) []string { return nil },
+		Fallback: []string{"manual-gate"},
+	}
+	got, err := src.Names(context.Background())
+	if err != nil {
+		t.Fatalf("Names: %v", err)
+	}
+	if want := []string{"manual-gate"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Names = %v, want %v", got, want)
+	}
+}
+
+func TestWorkflowNamesFailsClosedWithoutNames(t *testing.T) {
+	src := Workflow{Root: "/project", Detect: func(string) []string { return nil }}
+	if _, err := src.Names(context.Background()); err == nil {
+		t.Fatal("Names returned no error when neither detection nor fallback had a name")
+	}
+}
+
 func TestWorkflowNamesAgreeWithConfigDetector(t *testing.T) {
 	// config and checksource keep two copies of the workflow parser. Both
 	// adapters must return the same names for one fixture, fail-fast matrix

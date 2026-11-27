@@ -71,6 +71,11 @@ type Config struct {
 	Webhook       Webhook     `yaml:"webhook"`
 	Notify        Notify      `yaml:"notify"`
 
+	// ProjectRoot is the repository root the config was loaded from. Load sets
+	// it so the composition root can resolve live workflow names from the same
+	// root the detector reads. Code-built configs leave it empty.
+	ProjectRoot string `yaml:"-"`
+
 	// interval is the parsed PollInterval. Load sets it once so readers of a
 	// loaded config never parse the same value again. Code-built configs leave
 	// it zero and Interval falls back to the silent default.
@@ -130,6 +135,12 @@ type Merge struct {
 	AutoRebase         bool     `yaml:"auto_rebase"`
 	MaxAttempts        int      `yaml:"max_attempts"`
 	MaxAutoRebases     int      `yaml:"max_auto_rebases"`
+
+	// RequiredChecksFallback keeps the operator-supplied explicit list before
+	// workflow detection replaces RequiredChecks. A live workflow source uses
+	// it only when detection yields no names, so fail-closed mode never treats
+	// stale detected names as a fallback.
+	RequiredChecksFallback []string `yaml:"-"`
 }
 
 // OnBaseRed configures the response to a failing base branch.
@@ -290,6 +301,7 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
+	c.ProjectRoot = projectRootFromConfigPath(path)
 	expandNonSecrets(&c)
 	c.Webhook.Secret = EnvOr(c.Webhook.SecretEnv, c.Webhook.Secret)
 	if err := ValidateWebhook(c.Webhook); err != nil {
@@ -387,8 +399,11 @@ func warnModelOverride(c Config) {
 // resolveRequiredChecks replaces the configured names with the job names in
 // .github/workflows when the config selects workflow mode. A manual config, or
 // a workflow directory with no job names, keeps the explicit list so an
-// operator always has a working fallback.
+// operator always has a working fallback. The operator's list is preserved
+// separately because a live source must not mistake resolved names for that
+// fallback after the workflow changes.
 func resolveRequiredChecks(c *Config, path string) {
+	c.Merge.RequiredChecksFallback = append([]string(nil), c.Merge.RequiredChecks...)
 	if c.Merge.RequiredChecksMode != RequiredChecksWorkflow {
 		return
 	}
