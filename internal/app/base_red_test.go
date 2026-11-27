@@ -385,6 +385,21 @@ func TestBaseStatusMemoizedWithinTick(t *testing.T) {
 	}
 }
 
+func TestBaseStatusMemoizedPerDistinctBranch(t *testing.T) {
+	ctx := withTickCache(context.Background())
+	store := newFakeStore()
+	store.incidents["one"] = &core.BaseIncident{ID: "inc-1", Signature: "one", BaseBranch: "main", Status: "open"}
+	store.incidents["two"] = &core.BaseIncident{ID: "inc-2", Signature: "two", BaseBranch: "beacon/T-EPIC", Status: "open"}
+	scm := &countingBaseSCM{fakeSCM: &fakeSCM{base: core.BaseStatus{BaseBranch: "main"}}}
+	r := &Reconciler{Store: store, SCM: scm, BaseBranch: "main"}
+	if err := r.checkBaseRecovery(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if scm.baseCalls != 2 {
+		t.Fatalf("BaseBranchStatus called %d times, want 2", scm.baseCalls)
+	}
+}
+
 func TestReconcileReadsSourceOnceOnRedBase(t *testing.T) {
 	r, source, _ := redBaseTreeReconciler(t, 4, 1)
 	r.Policy = fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictNeedsAgentFix, Reason: "ci failed"}}
