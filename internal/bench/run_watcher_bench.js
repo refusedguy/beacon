@@ -6,6 +6,11 @@ import { performance } from "node:perf_hooks"
 import { createRunChangeWatcher, snapshotFingerprint } from "../../.opencode/plugins/beacon-project/run_watcher.js"
 import { joinKey, normalizeSnapshot } from "../../.opencode/plugins/beacon-project/ui/ui_model.js"
 const TICKS = +(process.env.BENCH_TICKS ?? 1001), ROUNDS = +(process.env.BENCH_ROUNDS ?? 5)
+// The moving arm has its own canonical key and its own expected normalization
+// count. It stays opt-in because the PR advisory reads the base registry, which
+// does not list the key; printing the row in every pass would make the whole
+// comparison inconclusive instead of just the stable deciding row.
+const MOVING = process.env.BENCH_MOVING_ARM === "1", MOVING_KEY = "run-watcher-fp-moving"
 const ACTIVE = 20, TIMELINE = 40, DECISIONS = 40, CHECKS = 8, QUEUE = 30
 // CACHE names the policy the measurement ran under; an unset variable is
 // reported as "unset" so every canonical row carries the field.
@@ -40,15 +45,16 @@ const snapAt = (t) => ({
   active: Array.from({ length: ACTIVE }, (_, i) => run(`run-${i}`, i === 0 && t >= 400 ? "waiting_ci" : "running")),
   recent: t > 700 ? [run("run-100", "merged")] : [],
 })
+const movingAt = (t) => ({ ...snapAt(t), generated_at: stamp(t) })
 const full = (raw) => JSON.stringify(raw ?? null)
 const identity = (raw) => JSON.stringify([...(raw?.active ?? []), ...(raw?.recent ?? [])].map((r) => joinKey(r.id, r.head_sha, r.state, r.updated_at)))
-async function drive(fn) {
+async function drive(fn, snapshot = snapAt) {
   let chars = 0, snapshots = 0, norm = 0, emissions = 0, errs = 0
   const emitted = [], original = JSON.stringify
   JSON.stringify = (...a) => { const out = original(...a); if (typeof out === "string") chars += out.length; return out }
   try {
     let t = 0
-    const w = createRunChangeWatcher({ snapshot: async () => { snapshots++; return snapAt(t++) } }, {
+    const w = createRunChangeWatcher({ snapshot: async () => { snapshots++; return snapshot(t++) } }, {
       emit: (c) => { emissions++; emitted.push(c) },
       deps: { fingerprint: fn, normalizeSnapshot: (v) => { norm++; return normalizeSnapshot(v) } },
     })
@@ -68,8 +74,8 @@ assert.deepEqual(samples.before[0].rendered, samples.after[0].rendered)
 assert.deepEqual(samples.after[0].rendered, samples.production[0].rendered)
 for (const k of ["snapshots", "norm", "emissions", "errs"]) for (const s of ["after", "production"]) assert.equal(samples.before[0][k], samples[s][0][k])
 const median = (xs) => { const a = [...xs].sort((x, y) => x - y), m = Math.floor(a.length / 2); return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2 }
-const summary = (s) => {
-  const ss = samples[s], ms = ss.map((x) => x.ms), cs = ss.map((x) => x.chars).sort((x, y) => x - y)
+const summary = (s, collection = samples) => {
+  const ss = collection[s], ms = ss.map((x) => x.ms), cs = ss.map((x) => x.chars).sort((x, y) => x - y)
   return { ms: median(ms), min: Math.min(...ms), max: Math.max(...ms), chars: median(cs), cmin: cs[0], cmax: cs[cs.length - 1], snapshots: ss[0].snapshots, norm: ss[0].norm, emissions: ss[0].emissions, errs: ss.reduce((n, x) => n + x.errs, 0) }
 }
 const p = summary("production")
@@ -77,6 +83,34 @@ console.log(`run-watcher-fp: median ${p.ms.toFixed(2)} ms, range ${p.min.toFixed
 console.log(`run-watcher-fp-chars: ${p.chars} characters, range ${p.cmin} to ${p.cmax}`)
 console.log(`run-watcher-fp-work: snapshots=${p.snapshots} normalizations=${p.norm} emissions=${p.emissions}`)
 console.log(`run-watcher-fp-errs: ${p.errs} errors`)
+if (MOVING) {
+  const moving = { before: [], after: [], production: [] }
+  for (let round = 0; round < ROUNDS; round += 1) {
+    for (const s of (round % 2 ? ["production", "after", "before"] : ["before", "after", "production"])) {
+      const start = performance.now(), r = await drive(sides[s], movingAt)
+      moving[s].push({ ...r, ms: performance.now() - start })
+    }
+  }
+  assert.deepEqual(moving.before[0].rendered, moving.after[0].rendered)
+  assert.deepEqual(moving.after[0].rendered, moving.production[0].rendered)
+  // A moving generated_at changes the key on every tick, so every tick
+  // normalizes. This count belongs to the moving arm alone; it is not part of
+  // the stable arm's equal-work assertion above.
+  for (const s of ["before", "after", "production"]) assert.equal(moving[s][0].norm, TICKS)
+  for (const k of ["snapshots", "emissions", "errs"]) for (const s of ["after", "production"]) assert.equal(moving.before[0][k], moving[s][0][k])
+  const m = summary("production", moving)
+  console.log(`${MOVING_KEY}: median ${m.ms.toFixed(2)} ms, normalizations=${m.norm}, errors=${m.errs}`)
+  console.log(`beacon-perf: ${JSON.stringify({
+    key: MOVING_KEY,
+    median_ms: m.ms,
+    min_ms: m.min,
+    max_ms: m.max,
+    work: m.snapshots + m.norm + m.emissions,
+    errs: m.errs,
+    limiter: "generated_at timestamp churn",
+    cache: CACHE,
+  })}`)
+}
 // The canonical row uses one fixed field set. The character and counter
 // details stay on the human lines above for the existing advisory report.
 console.log(`beacon-perf: ${JSON.stringify({
