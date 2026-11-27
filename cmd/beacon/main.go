@@ -326,6 +326,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		MaxFixTries:        cfg.OnBaseRed.MaxFixAttempts,
 		MaxAttempts:        cfg.Merge.MaxAttempts,
 		Interval:           cfg.Interval(),
+		OrphanTimeout:      cfg.OrphanTimeoutDuration(),
 		AutoRebase:         cfg.Merge.AutoRebase,
 		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
 	}, infra.store, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
@@ -380,6 +381,7 @@ func newReconciler(
 		MaxAttempts:        cfg.MaxAttempts,
 		ParentSessionID:    cfg.ParentSession,
 		Interval:           cfg.Interval,
+		OrphanTimeout:      cfg.OrphanTimeout,
 		AutoRebase:         cfg.AutoRebase,
 		MaxAutoRebases:     cfg.MaxAutoRebases,
 	}
@@ -431,20 +433,32 @@ func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarnes
 	}
 }
 
+// modelProvider is the provider recorded on a model taken from the config or
+// the environment. An empty harness provider builds the default harness, so
+// the same default applies to the model reference.
+func modelProvider(cfg config.Config) string {
+	if p := strings.TrimSpace(cfg.Harness.Provider); p != "" {
+		return p
+	}
+	return "opencode"
+}
+
 // resolveModel uses the configured model, then BEACON_MODEL, then the model
 // of the orchestrator session so workers run with the user's current choice.
 func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
+	provider := modelProvider(cfg)
 	if v := envOr("BEACON_MODEL", ""); v != "" {
-		return core.ModelRef{ProviderID: "opencode", ID: v}
+		return core.ModelRef{ProviderID: provider, ID: v}
 	}
 	if cfg.Harness.Model != "" {
-		return core.ModelRef{ProviderID: "opencode", ID: cfg.Harness.Model}
+		return core.ModelRef{ProviderID: provider, ID: cfg.Harness.Model}
 	}
 	if parent == "" || token == "" || cfg.Harness.Endpoint == "" {
 		return core.ModelRef{}
 	}
 	endpoint := strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	timeout := cfg.ModelTimeoutDuration()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -458,6 +472,9 @@ func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			slog.Warn("model resolution timed out", "provider", provider, "timeout", timeout, "parent", parent)
+		}
 		return core.ModelRef{}
 	}
 	defer resp.Body.Close()

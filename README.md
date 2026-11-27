@@ -21,8 +21,8 @@ After Go code lands on `main`, run `bash scripts/build-beacon.sh` and restart th
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--max-in-flight` | `10` | Maximum unfinished runs. |
-| `--max-active-agents` | `2` | Maximum active agent sessions. |
+| `--max-in-flight` | `20` | Maximum unfinished runs. |
+| `--max-active-agents` | `4` | Maximum active agent sessions. |
 | `--task-source` | `markdown` | One of `markdown`, `github_issues`, `gitlab_issues`. |
 | `--scm` | detected from the remote | `github` or `gitlab`. |
 | `--harness` | `opencode` | `opencode` or `cli`. |
@@ -34,7 +34,7 @@ After Go code lands on `main`, run `bash scripts/build-beacon.sh` and restart th
 | `--weak-pc` | `true` | Write targeted test instructions. Set to `false` for full verification. |
 | `--skip-plugin` | `false` | Do not deploy the project plugin. |
 
-The wizard writes `harness.command: worker`, `merge.max_attempts: 12`, and `on_base_red.mode: spawn_fixer` with `on_base_red.max_fix_attempts: 2`. It sets concurrency from `--max-in-flight` and `--max-active-agents`. It reads job names from `.github/workflows/*.yml` into `merge.required_checks` and prints them for review.
+The wizard writes `harness.command: worker`, `merge.max_attempts: 12`, and `on_base_red.mode: spawn_fixer` with `on_base_red.max_fix_attempts: 2`. It sets concurrency from `--max-in-flight` and `--max-active-agents`. The flag defaults, `ApplyDefaults`, and the config loader's no-file fallback all read `DefaultMaxInFlight` and `DefaultMaxActiveAgents` in `internal/infra/config/config.go`, so a config gets the same concurrency whichever path created it. It reads job names from `.github/workflows/*.yml` into `merge.required_checks` and prints them for review.
 
 Stack detection checks `go.mod`, `package.json`, `pyproject.toml` or `requirements.txt`, `Cargo.toml`, then `*.sln` or `*.csproj`, in that order. Detected stacks get example test commands for that language. Other projects get the language-agnostic worker instructions described below.
 
@@ -155,7 +155,18 @@ The `harness` block in `.beacon/config.yaml` is provider neutral. `harness.provi
 | `prompt_template` | CLI adapters. |
 | `worker_instructions` | Every worker prompt, as a prefix added by the dispatcher. |
 
-The OpenCode adapter talks to the running OpenCode background server. Set `harness.endpoint` for it. Authentication uses either a bearer token or `user:password` in `harness.token`, or the variable named by `harness.token_env`. The model resolves in this order: `BEACON_MODEL`, `harness.model`, then the model of the orchestrator session named in `harness.parent_session_id`. The ACP adapter launches the executable in `harness.command` over stdio and ignores `harness.endpoint`.
+The OpenCode adapter talks to the running OpenCode background server. Set `harness.endpoint` for it. Authentication uses either a bearer token or `user:password` in `harness.token`, or the variable named by `harness.token_env`. The model resolves in this order: `BEACON_MODEL`, `harness.model`, then the model of the orchestrator session named in `harness.parent_session_id`. A model from the config or the environment carries `harness.provider`, or `opencode` when that field is empty. A model from the parent session carries the provider the server reports. The ACP adapter launches the executable in `harness.command` over stdio and ignores `harness.endpoint`.
+
+`BEACON_MODEL` overrides `harness.model`. When both are set, config load logs a warning with both values so a worker does not silently use a model the config does not show. Do not remove the Beacon environment variables: the pooled MCP daemon uses `BEACON_PROJECT_ROOT` to pin the repository root.
+
+### Timeouts
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `orphan_timeout` | `1m30s` | How long a running run without a PR may go stale before its worker session is checked for liveness. Raise it when PR creation is slow. A dead session keeps its slot until the timeout expires. |
+| `model_timeout` | `3s` | How long the parent-session model lookup may take. A timeout logs a warning with the provider and the parent session, then workers inherit the server default. |
+
+Both fields accept any value `time.ParseDuration` understands. Config load rejects a malformed value instead of substituting a default.
 
 `beacon init` writes `harness.provider: opencode` and `harness.command: worker`. The OpenCode harness passes the command as the session agent, so workers inherit the global deny rules for the four orchestrator-only tools. A worker must never create, delete or update task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
 

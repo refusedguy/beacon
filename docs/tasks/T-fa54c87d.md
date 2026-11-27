@@ -1,7 +1,7 @@
 ---
 id: T-fa54c87d
 title: Align config defaults and expose orphan and model timeouts
-status: available
+status: done
 scope:
     - internal/infra/config/config.go
     - internal/app/reconciler.go
