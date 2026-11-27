@@ -1,15 +1,45 @@
-// Counts fingerprint characters over 1001 ticks; before is fixed, production per-tree.
+// Counts fingerprint characters over 1001 ticks on a realistic snapshot:
+// 20 active runs, each carrying 40 timeline events, 40 decisions and 8 checks,
+// plus 30 queue rows. The arms differ only in how they fingerprint that payload.
 import assert from "node:assert/strict"
 import { performance } from "node:perf_hooks"
 import { createRunChangeWatcher, snapshotFingerprint } from "../../.opencode/plugins/beacon-project/run_watcher.js"
 import { joinKey, normalizeSnapshot } from "../../.opencode/plugins/beacon-project/ui/ui_model.js"
 const TICKS = +(process.env.BENCH_TICKS ?? 1001), ROUNDS = +(process.env.BENCH_ROUNDS ?? 5)
+const ACTIVE = 20, TIMELINE = 40, DECISIONS = 40, CHECKS = 8, QUEUE = 30
 // CACHE names the policy the measurement ran under; an unset variable is
 // reported as "unset" so every canonical row carries the field.
 const CACHE = process.env.BEACON_BENCH_CACHE || "unset"
-const run = (id, state) => ({ id, task_id: `T-${id}`, state, head_sha: "abcdef0123456789", updated_at: "2026-11-27T10:00:00Z", detail: "x".repeat(240) })
-const shared = { queue: [], metrics: { dispatch_count: 25 }, daemon: { PID: 42 }, base_incident: { ID: "INC-1" } }
-const snapAt = (t) => ({ ...shared, active: [run("run-1", t < 400 ? "running" : "waiting_ci"), run("run-2", "running")], recent: t > 700 ? [run("run-4", "merged")] : [] })
+const stamp = (i) => `2026-11-27T10:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z`
+const timeline = (id) => Array.from({ length: TIMELINE }, (_, i) => ({
+  at: stamp(i), kind: i % 3 === 0 ? "rebase" : "checks_passed", state: "waiting_ci",
+  sha: `sha-${id}-${i}`, task_id: `T-${id}`,
+}))
+const decisions = (id) => Array.from({ length: DECISIONS }, (_, i) => ({
+  at: stamp(i), kind: "transition.rebase", verdict: "approve", action: "rebased",
+  task_id: `T-${id}`, fields: { attempt: i + 1, new_sha: `sha-${id}-${i}` },
+}))
+const checks = (id) => Array.from({ length: CHECKS }, (_, i) => ({
+  name: `check-${i}`, state: "success", duration_seconds: i + 1, head_sha: `sha-${id}-${i}`,
+}))
+const run = (id, state) => ({
+  id, task_id: `T-${id}`, state, head_sha: "abcdef0123456789",
+  updated_at: "2026-11-27T10:00:00Z",
+  durations: { waiting_ci_seconds: 12, running_seconds: 3 },
+  timeline: timeline(id), decisions: decisions(id), checks: checks(id),
+})
+const shared = {
+  queue: Array.from({ length: QUEUE }, (_, i) => ({
+    id: `T-${i}`, title: `Card ${i}`, kind: "task", priority: i, status: "ready", depends_on: [],
+  })),
+  metrics: { dispatch_count: 25 }, daemon: { PID: 42 }, base_incident: { ID: "INC-1" },
+  generated_at: "2026-11-27T11:00:00Z",
+}
+const snapAt = (t) => ({
+  ...shared,
+  active: Array.from({ length: ACTIVE }, (_, i) => run(`run-${i}`, i === 0 && t >= 400 ? "waiting_ci" : "running")),
+  recent: t > 700 ? [run("run-100", "merged")] : [],
+})
 const full = (raw) => JSON.stringify(raw ?? null)
 const identity = (raw) => JSON.stringify([...(raw?.active ?? []), ...(raw?.recent ?? [])].map((r) => joinKey(r.id, r.head_sha, r.state, r.updated_at)))
 async function drive(fn) {
