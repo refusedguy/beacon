@@ -1,6 +1,9 @@
 // Run: node --test .opencode/plugins/beacon-project/ui_model_test.js
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { mkdirSync, mkdtempSync, readFileSync as fsReadFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { NOW, lines, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
@@ -149,6 +152,53 @@ test("readCard caches a parsed card until its file stamp changes", () => {
   ui.readCard("/cache", "T-100", injected)
   ui.readCard("/cache", "T-100", injected)
   assert.equal(reads, 4, "an injected readFileSync without statSync bypasses the cache")
+})
+
+test("readCard invalidates a same-size rewrite that keeps its mtime", () => {
+  const path = "/cache/docs/tasks/T-200.md"
+  const bodyOf = (title) => `---\nid: T-200\ntitle: ${title}\nstatus: ready\n---\nGoal: work.\n`
+  let body = bodyOf("AAAAA")
+  let info = { mtimeMs: 1000, ctimeMs: 1, size: body.length }
+  const deps = {
+    existsSync: (p) => p === path,
+    readFileSync: () => body,
+    statSync: () => info,
+  }
+  assert.equal(ui.readCard("/cache", "T-200", deps).title, "AAAAA")
+  body = bodyOf("BBBBB")
+  info = { mtimeMs: 1000, ctimeMs: 2, size: body.length }
+  assert.equal(ui.readCard("/cache", "T-200", deps).title, "BBBBB", "a same-size rewrite with the same mtime invalidates the card")
+})
+
+test("CLI source keeps title-less card reads at R across snapshots without an injected statSync", async () => {
+  const root = mkdtempSync(join(tmpdir(), "beacon-card-counter-"))
+  try {
+    const tasks = join(root, "docs", "tasks")
+    mkdirSync(tasks, { recursive: true })
+    const R = 12
+    for (let i = 1; i <= R; i++) {
+      writeFileSync(join(tasks, `T-${i}.md`), `---\nid: T-${i}\ntitle: Card ${i}\nstatus: running\n---\n`)
+    }
+    let reads = 0
+    const deps = {
+      command: () => ["/bin/beacon"],
+      execFile: async () => ({ stdout: JSON.stringify({
+        active: Array.from({ length: R }, (_, i) => makeRun({ ID: `run-${i}`, TaskID: `T-${i + 1}`, title: "" })),
+        recent: [],
+      }) }),
+      readFileSync: (path, ...args) => { reads++; return fsReadFileSync(path, ...args) },
+    }
+    const source = new CliStatusSource({ root, deps })
+    const first = await source.snapshot()
+    assert.equal(first.active.length, R)
+    assert.equal(first.active[0].title, "Card 1")
+    assert.equal(reads, R, "the first snapshot reads each title-less card once")
+    const second = await source.snapshot()
+    assert.equal(second.active.length, R)
+    assert.equal(reads, R, "the second snapshot reuses the cached cards without another read")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test("parseSnapshot tolerates null, empty and malformed output", () => {
@@ -687,4 +737,27 @@ test("normalizeAttempt tells a failed rebase from one still running", () => {
     decisions: [],
   })
   assert.equal(running.rebaseStatus, "running")
+})
+
+test("readCard returns a defensive copy and keeps recently read cards on eviction", () => {
+  const files = new Map()
+  const info = { mtimeMs: 1000, ctimeMs: 1, size: 80 }
+  const deps = { existsSync: (p) => files.has(p), readFileSync: (p) => files.get(p), statSync: () => info }
+  const kept = "/cache/docs/tasks/T-300.md"
+  files.set(kept, "---\nid: T-300\ntitle: Original\nstatus: ready\n---\nGoal: work.\n")
+  const card = ui.readCard("/cache", "T-300", deps)
+  card.title = "Mutated"
+  card.meta.title = "Mutated meta"
+  assert.equal(ui.readCard("/cache", "T-300", deps).title, "Original", "a caller cannot mutate the cached card")
+  assert.equal(ui.readCard("/cache", "T-300", deps).meta.title, "Original", "meta is copied too")
+
+  // The cache holds 512 entries. Reading the kept card after each insert marks
+  // it as most recent, so it survives even after more than 512 other cards.
+  for (let i = 0; i < 520; i++) {
+    const id = `T-${400 + i}`
+    files.set(`/cache/docs/tasks/${id}.md`, `---\nid: ${id}\ntitle: ${id}\nstatus: ready\n---\nGoal: work.\n`)
+    ui.readCard("/cache", id, deps)
+    ui.readCard("/cache", "T-300", deps)
+  }
+  assert.equal(ui.readCard("/cache", "T-300", deps).title, "Original", "frequent access keeps the card in the LRU")
 })
