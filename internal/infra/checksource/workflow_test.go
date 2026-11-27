@@ -70,6 +70,66 @@ func TestWorkflowNamesFailsClosedWithoutNames(t *testing.T) {
 	}
 }
 
+func TestWorkflowConditionalNamesDetectsJobLevelIfGates(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "name: CI\non: pull_request\njobs:\n" +
+		"  verify:\n    runs-on: ubuntu-latest\n" +
+		"  mark-ready:\n    if: >-\n      github.event_name == 'pull_request'\n    runs-on: ubuntu-latest\n" +
+		"  plugin-tui-smoke:\n    if: github.event_name == 'pull_request'\n    runs-on: ubuntu-latest\n" +
+		"  perf-nightly:\n    if: github.event_name == 'schedule'\n    runs-on: ubuntu-latest\n" +
+		"  step-gated:\n    runs-on: ubuntu-latest\n    steps:\n      - name: conditional step\n        if: github.event_name == 'push'\n        run: echo ok\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := Workflow{Root: root}
+	names, err := src.Names(context.Background())
+	if err != nil {
+		t.Fatalf("Names: %v", err)
+	}
+	wantNames := []string{"mark-ready", "perf-nightly", "plugin-tui-smoke", "step-gated", "verify"}
+	if !reflect.DeepEqual(names, wantNames) {
+		t.Fatalf("Names = %v, want %v", names, wantNames)
+	}
+	gated, err := src.ConditionalNames(context.Background())
+	if err != nil {
+		t.Fatalf("ConditionalNames: %v", err)
+	}
+	wantGated := []string{"mark-ready", "perf-nightly", "plugin-tui-smoke"}
+	if !reflect.DeepEqual(gated, wantGated) {
+		t.Fatalf("ConditionalNames = %v, want %v", gated, wantGated)
+	}
+}
+
+func TestWorkflowConditionalNamesUsesInjectedDetect(t *testing.T) {
+	src := Workflow{
+		Root: "/project",
+		Detect: func(string) []string {
+			return []string{"build", "mark-ready"}
+		},
+		ConditionalDetect: func(string) []string {
+			return []string{"mark-ready", "not-required"}
+		},
+	}
+	got, err := src.ConditionalNames(context.Background())
+	if err != nil {
+		t.Fatalf("ConditionalNames: %v", err)
+	}
+	if want := []string{"mark-ready"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ConditionalNames = %v, want %v", got, want)
+	}
+}
+
+func TestWorkflowConditionalNamesPropagatesNameError(t *testing.T) {
+	src := Workflow{Root: "/project", Detect: func(string) []string { return nil }}
+	if _, err := src.ConditionalNames(context.Background()); err == nil {
+		t.Fatal("ConditionalNames returned no error when Names failed")
+	}
+}
+
 func TestWorkflowNamesAgreeWithConfigDetector(t *testing.T) {
 	// config and checksource keep two copies of the workflow parser. Both
 	// adapters must return the same names for one fixture, fail-fast matrix
