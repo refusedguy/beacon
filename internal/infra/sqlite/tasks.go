@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -110,7 +111,14 @@ type syncStatements struct {
 func prepareSyncStatements(ctx context.Context, tx *sql.Tx) (*syncStatements, error) {
 	task, err := tx.PrepareContext(ctx, `
 INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET
+ title=excluded.title, body=excluded.body, status=excluded.status,
+ scope_json=excluded.scope_json, priority=excluded.priority,
+ source_ref=excluded.source_ref, updated_at=excluded.updated_at,
+ kind=excluded.kind, parent=excluded.parent, base_branch=excluded.base_branch,
+ require_review=excluded.require_review, plan_json=excluded.plan_json,
+ worker_agent=excluded.worker_agent, worker_prompt=excluded.worker_prompt`)
 	if err != nil {
 		return nil, err
 	}
@@ -127,44 +135,98 @@ func (st *syncStatements) close() {
 	_ = st.deps.Close()
 }
 
-// writeSyncRows clears the old graph and inserts the current cards. The
-// statements are prepared once by the caller, so each row pays only an Exec.
-func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []core.Task) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps`); err != nil {
-		return err
+// beaconDoneTasks returns the ids of stored cards Beacon marked done. A card
+// whose status is done in SQLite is authoritative over a stale working tree.
+func beaconDoneTasks(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id FROM tasks WHERE status=?`, statusDone)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks`); err != nil {
-		return err
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
 	}
+	return out, rows.Err()
+}
+
+// writeSyncRows merges the current cards into the stored graph. Beacon controls
+// status through SetTaskStatus, so a merge keeps the stored status when it is
+// Beacon-authoritative: a task with a live or finished run stays done even if
+// a stale working tree still reports it available. Other fields always follow
+// the file. Rows and dependencies absent from tasks are removed, so deletions
+// still take effect. The statements are prepared once by the caller.
+func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []core.Task, done map[string]bool) error {
+	ids := make([]string, 0, len(tasks))
 	for _, t := range tasks {
-		scope, err := json.Marshal(t.Scope)
-		if err != nil {
+		if err := writeSyncTask(ctx, st, t, done); err != nil {
 			return err
 		}
-		plan, err := json.Marshal(t.Plan)
-		if err != nil {
+		ids = append(ids, string(t.ID))
+	}
+	return pruneSyncRows(ctx, tx, ids)
+}
+
+// writeSyncTask upserts one card and its dependency edges. A stale working
+// tree cannot revert a card Beacon already marked done.
+func writeSyncTask(ctx context.Context, st *syncStatements, t core.Task, done map[string]bool) error {
+	scope, err := json.Marshal(t.Scope)
+	if err != nil {
+		return err
+	}
+	plan, err := json.Marshal(t.Plan)
+	if err != nil {
+		return err
+	}
+	status := string(t.Status)
+	if status == "" {
+		status = statusAvailable
+	}
+	if done[string(t.ID)] && status != statusDone && status != statusDropped {
+		status = statusDone
+	}
+	kind := string(t.Kind)
+	if kind == "" {
+		kind = "task"
+	}
+	if _, err := st.task.ExecContext(ctx, string(t.ID), t.Title, t.Body, status, t.Priority,
+		string(scope), t.SourceRef, nowUnix(), kind, string(t.Parent), t.BaseBranch,
+		string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
+		return err
+	}
+	for _, dep := range t.DependsOn {
+		if _, err := st.deps.ExecContext(ctx, string(t.ID), string(dep)); err != nil {
 			return err
-		}
-		status := string(t.Status)
-		if status == "" {
-			status = statusAvailable
-		}
-		kind := string(t.Kind)
-		if kind == "" {
-			kind = "task"
-		}
-		if _, err := st.task.ExecContext(ctx, string(t.ID), t.Title, t.Body, status, t.Priority,
-			string(scope), t.SourceRef, nowUnix(), kind, string(t.Parent), t.BaseBranch,
-			string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
-			return err
-		}
-		for _, dep := range t.DependsOn {
-			if _, err := st.deps.ExecContext(ctx, string(t.ID), string(dep)); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
+}
+
+// pruneSyncRows removes every stored row and edge not named by ids.
+func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string) error {
+	if len(ids) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM tasks`)
+		return err
+	}
+	marks := make([]string, len(ids))
+	args := make([]any, 0, 2*len(ids))
+	for i, id := range ids {
+		marks[i] = "?"
+		args = append(args, id)
+	}
+	depsArgs := append(append([]any(nil), args...), args...)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps WHERE task_id NOT IN (`+strings.Join(marks, ",")+`) OR depends_on NOT IN (`+strings.Join(marks, ",")+`)`, depsArgs...); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE id NOT IN (`+strings.Join(marks, ",")+`)`, args...)
+	return err
 }
 
 // SyncTasks replaces the stored cards and dependencies with tasks. An
@@ -192,6 +254,10 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return err
 	}
+	done, err := beaconDoneTasks(ctx, s.db)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -202,7 +268,7 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 		return err
 	}
 	defer stmts.close()
-	if err := writeSyncRows(ctx, tx, stmts, tasks); err != nil {
+	if err := writeSyncRows(ctx, tx, stmts, tasks, done); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

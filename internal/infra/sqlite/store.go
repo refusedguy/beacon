@@ -671,9 +671,12 @@ ORDER BY priority DESC, id`, openTaskStatuses, terminalStates)
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// A missing dependency row is gone, not pending. Match readyTasksQuery,
+	// which joins task_deps to tasks, so a deleted card stops blocking the
+	// monitor's queue instead of showing a phantom waiting_deps entry.
 	depsQuery, depsArgs := inQuery(`SELECT d.task_id, d.depends_on FROM task_deps d
-LEFT JOIN tasks t ON t.id = d.depends_on
-WHERE t.status NOT IN (%s) OR t.id IS NULL
+JOIN tasks t ON t.id = d.depends_on
+WHERE t.status NOT IN (%s)
 ORDER BY d.task_id, d.depends_on`, resolvedTaskStatuses)
 	deps, err := s.db.QueryContext(ctx, depsQuery, depsArgs...)
 	if err != nil {

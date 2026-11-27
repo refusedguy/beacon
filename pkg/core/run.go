@@ -388,6 +388,10 @@ func (r *Run) Apply(e Event) error {
 	}
 	if e.Reason != "" {
 		r.Reason = e.Reason
+	} else if e.Kind == EvAgentFixed || e.Kind == EvChecksPassed || e.Kind == EvRebased {
+		// These events mark a recovered run, so a prior failure reason is no
+		// longer current. Preserve an explicit reason when one is supplied.
+		r.Reason = ""
 	}
 	r.State = next
 	r.UpdatedAt = time.Now().UTC()

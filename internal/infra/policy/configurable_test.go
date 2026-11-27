@@ -83,7 +83,7 @@ func TestEvaluateWorkflowSkippedWithFailureBlocks(t *testing.T) {
 	obs := core.Observation{
 		PRState:         "open",
 		WorkflowSkipped: true,
-		Checks:          []core.CheckResult{{Name: "manual", State: core.CheckFailure}},
+		Checks:          []core.CheckResult{{Name: "build", State: core.CheckFailure}},
 	}
 	got := New(cfg).Evaluate(obs)
 	if got.Verdict != core.VerdictNeedsAgentFix {
@@ -94,6 +94,21 @@ func TestEvaluateWorkflowSkippedWithFailureBlocks(t *testing.T) {
 	}
 	if verdict, _ := (SourceChecksRule{Source: cfg.RequiredCheckSource}).Evaluate(obs); verdict == core.VerdictNoop {
 		t.Fatal("SourceChecksRule returned noop for a reported failure")
+	}
+}
+
+func TestEvaluateIgnoresOptionalFailedCheck(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build"}}}
+	obs := core.Observation{
+		PRState: "open",
+		Checks: []core.CheckResult{
+			{Name: "build", State: core.CheckSuccess},
+			{Name: "manual", State: core.CheckFailure},
+		},
+	}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictMerge {
+		t.Fatalf("verdict = %s, want %s (reason %q)", got.Verdict, core.VerdictMerge, got.Reason)
 	}
 }
 

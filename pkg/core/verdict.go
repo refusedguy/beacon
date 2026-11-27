@@ -136,14 +136,31 @@ type Observation struct {
 	IncompleteReason string
 }
 
-// Failure returns the first failed check.
-func (o Observation) Failure() (CheckResult, bool) {
+// Failure returns the first failed required check. When names is empty it
+// considers every reported check. An optional check that fails cannot block a
+// merge, so it is skipped even when the failure invariant runs before policy.
+func (o Observation) Failure(names ...string) (CheckResult, bool) {
 	for _, c := range o.Checks {
-		if c.State == CheckFailure {
-			return c, true
+		if c.State != CheckFailure || !checkRequired(c.Name, names) {
+			continue
 		}
+		return c, true
 	}
 	return CheckResult{}, false
+}
+
+// checkRequired reports whether name belongs to the required set. An empty set
+// means every check is in scope, matching the old caller behavior.
+func checkRequired(name string, names []string) bool {
+	if len(names) == 0 {
+		return true
+	}
+	for _, want := range names {
+		if strings.EqualFold(name, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasPending reports whether any check is still running. A behind pull request
@@ -289,6 +306,8 @@ type MergeDecision struct {
 
 // Decide applies invariants, then the configured criteria in order.
 // It returns VerdictMerge only when every invariant and every rule passed.
+// A policy that can name its required checks is consulted so an optional
+// failed check never fires the failure invariant.
 func Decide(o Observation, criteria []Criterion) MergeDecision {
 	if DecideFinalState(o.PRState).Closed {
 		return MergeDecision{Verdict: VerdictNoop, Reason: "pull request is " + o.PRState}
@@ -310,7 +329,16 @@ func Decide(o Observation, criteria []Criterion) MergeDecision {
 			Criterion: "invariant",
 		}
 	}
-	if c, ok := o.Failure(); ok {
+	var required []string
+	for _, criterion := range criteria {
+		if p, ok := criterion.(RequiredCheckPolicy); ok {
+			if names, known := p.RequiredChecks(); known {
+				required = names
+			}
+			break
+		}
+	}
+	if c, ok := o.Failure(required...); ok {
 		reason := "required check failed: " + c.Name
 		if o.FailureExcerpt != "" {
 			reason += ": " + o.FailureExcerpt
