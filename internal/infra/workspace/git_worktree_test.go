@@ -1003,3 +1003,106 @@ func TestGitWorktreeForceRemoveReportsBranchDeleteFailure(t *testing.T) {
 		t.Fatalf("ForceRemove() error = %v, want the branch delete failure", err)
 	}
 }
+
+func TestGitWorktreeRemoveCleanPathLimitsGitCalls(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-RM-COUNT"})
+	if err != nil {
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-RM-COUNT\"}): %v", err)
+	}
+	var calls [][]string
+	wt.commandHook = func(_ string, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	if err := wt.Remove(ctx, ws); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("Remove() ran %d git commands, want 2: %v", len(calls), calls)
+	}
+	for _, call := range calls {
+		if len(call) > 0 && call[0] == "status" {
+			t.Fatalf("Remove() ran a separate status check on a clean path: %v", calls)
+		}
+	}
+}
+
+// removeBaseline reproduces the clean-check-first order Remove used before the
+// latency cut. It is the A side of the alternating measurement below.
+func removeBaseline(g *GitWorktree, ctx context.Context, ws core.Workspace) error {
+	if ws.Path == "" {
+		return nil
+	}
+	defer g.refresh(ctx)
+	clean := true
+	if _, err := os.Stat(ws.Path); err == nil {
+		var checkErr error
+		clean, checkErr = g.Clean(ctx, ws)
+		if checkErr != nil {
+			return checkErr
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if !clean {
+		return core.WorkspaceConflict(ws.Path)
+	}
+	if _, err := g.run(ctx, "worktree", "remove", ws.Path); err != nil {
+		return err
+	}
+	if ws.Branch != "" {
+		return g.deleteBranch(ctx, ws.Branch, false)
+	}
+	return nil
+}
+
+// TestGitWorktreeRemoveLatencyAlternating measures the old and new Remove
+// orders on real worktrees, alternating five times so machine noise does not
+// favour one order. It logs wall seconds and git call counts for the report.
+func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock measurement")
+	}
+	ctx := context.Background()
+
+	createWT, _ := newTestGitWorktree(t)
+	createCalls := 0
+	createWT.commandHook = func(_ string, _ []string) error { createCalls++; return nil }
+	createStart := time.Now()
+	if _, err := createWT.Create(ctx, core.Task{ID: "T-AB-CREATE"}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	t.Logf("create: %.3fs, %d git calls", time.Since(createStart).Seconds(), createCalls)
+
+	for run := 1; run <= 5; run++ {
+		baseWT, _ := newTestGitWorktree(t)
+		baseWS, err := baseWT.Create(ctx, core.Task{ID: "T-AB-OLD"})
+		if err != nil {
+			t.Fatalf("baseline Create() error = %v", err)
+		}
+		baseCalls := 0
+		baseWT.commandHook = func(_ string, _ []string) error { baseCalls++; return nil }
+		start := time.Now()
+		if err := removeBaseline(baseWT, ctx, baseWS); err != nil {
+			t.Fatalf("baseline Remove() error = %v", err)
+		}
+		baseSec := time.Since(start).Seconds()
+
+		fastWT, _ := newTestGitWorktree(t)
+		fastWS, err := fastWT.Create(ctx, core.Task{ID: "T-AB-NEW"})
+		if err != nil {
+			t.Fatalf("optimized Create() error = %v", err)
+		}
+		fastCalls := 0
+		fastWT.commandHook = func(_ string, _ []string) error { fastCalls++; return nil }
+		start = time.Now()
+		if err := fastWT.Remove(ctx, fastWS); err != nil {
+			t.Fatalf("optimized Remove() error = %v", err)
+		}
+		fastSec := time.Since(start).Seconds()
+
+		t.Logf("run %d: old %.3fs/%d calls, new %.3fs/%d calls", run, baseSec, baseCalls, fastSec, fastCalls)
+	}
+}
