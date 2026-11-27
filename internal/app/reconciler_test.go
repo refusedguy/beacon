@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -817,6 +818,251 @@ func TestEpicPROpensOnceWhenChildrenDone(t *testing.T) {
 	}
 	if len(scm.openedPRs) != 1 {
 		t.Fatalf("epic PRs opened = %d, want 1", len(scm.openedPRs))
+	}
+}
+
+// TestReconcileEpicsSkipsTreeWithoutEpic pins V1: a tick whose ready list has
+// no epic must not read the task source at all.
+func TestReconcileEpicsSkipsTreeWithoutEpic(t *testing.T) {
+	ctx := context.Background()
+	source := &countingSource{fakeSource: &fakeSource{tasks: []core.Task{
+		{ID: "T-CHILD", Status: core.TaskAvailable},
+	}}}
+	store := newFakeStore()
+	store.ready = []core.Task{{ID: "T-CHILD", Title: "child", Status: core.TaskAvailable}}
+	r := &Reconciler{
+		Store: store, SCM: &fakeSCM{}, Harness: &fakeHarness{},
+		Source: source, Workspace: &fakeWorkspace{}, BaseBranch: "main",
+	}
+	if err := r.reconcileEpics(ctx); err != nil {
+		t.Fatalf("r.reconcileEpics(ctx): %v", err)
+	}
+	if source.lists != 0 {
+		t.Fatalf("ListAvailable called %d times, want 0", source.lists)
+	}
+}
+
+// TestReconcileEpicsReadsTreeOnceForEpic keeps the other half of V1: a ready
+// epic still gets exactly one tree read.
+func TestReconcileEpicsReadsTreeOnceForEpic(t *testing.T) {
+	ctx := context.Background()
+	source := &countingSource{fakeSource: &fakeSource{tasks: []core.Task{
+		{ID: "T-EPIC", Title: "Big epic", Kind: core.TaskKindEpic, Status: core.TaskAvailable},
+	}}}
+	store := newFakeStore()
+	store.ready = []core.Task{{ID: "T-EPIC", Title: "Big epic", Kind: core.TaskKindEpic}}
+	r := &Reconciler{
+		Store: store, SCM: &fakeSCM{}, Harness: &fakeHarness{},
+		Source: source, Workspace: &fakeWorkspace{}, BaseBranch: "main",
+	}
+	if err := r.reconcileEpics(ctx); err != nil {
+		t.Fatalf("r.reconcileEpics(ctx): %v", err)
+	}
+	if source.lists != 1 {
+		t.Fatalf("ListAvailable called %d times, want 1", source.lists)
+	}
+}
+
+// TestTickCacheSharesOneTreeAcrossGoroutines supports V3. A fanout on one tick
+// must build a single tree even when every goroutine asks for it.
+func TestTickCacheSharesOneTreeAcrossGoroutines(t *testing.T) {
+	ctx := withTickCache(context.Background())
+	source := &countingSource{fakeSource: &fakeSource{tasks: []core.Task{
+		{ID: "T-1", Status: core.TaskAvailable},
+	}}}
+	r := &Reconciler{Source: source}
+	const goroutines = 16
+	done := make(chan struct{}, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			_ = r.taskTree(ctx)
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+	if source.lists != 1 {
+		t.Fatalf("ListAvailable called %d times, want 1", source.lists)
+	}
+}
+
+// gatedSCM blocks inside Observe so a test can count how many reconciles are
+// in flight at once before releasing them.
+type gatedSCM struct {
+	*fakeSCM
+	mu      sync.Mutex
+	active  int
+	max     int
+	total   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedSCM) Observe(ctx context.Context, pr int) (core.Observation, error) {
+	s.mu.Lock()
+	s.active++
+	if s.active > s.max {
+		s.max = s.active
+	}
+	s.total++
+	s.mu.Unlock()
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	s.active--
+	s.mu.Unlock()
+	return core.Observation{PRNumber: pr, HeadSHA: "sha2", PRState: "open"}, nil
+}
+
+// lockedStore serializes fake store methods a concurrent tick touches. The
+// shared fake maps are not safe for parallel access.
+type lockedStore struct {
+	*fakeStore
+	mu sync.Mutex
+}
+
+func (s *lockedStore) Save(ctx context.Context, run *core.Run) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.Save(ctx, run)
+}
+
+func (s *lockedStore) FindByPR(ctx context.Context, pr int) (*core.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.FindByPR(ctx, pr)
+}
+
+func (s *lockedStore) Approved(ctx context.Context, id core.RunID, sha string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.Approved(ctx, id, sha)
+}
+
+func (s *lockedStore) ClaimDelivery(ctx context.Context, key string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.ClaimDelivery(ctx, key)
+}
+
+func (s *lockedStore) ReleaseDelivery(ctx context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.ReleaseDelivery(ctx, key)
+}
+
+// TestReconcileActivePRsBoundsFanout pins V3: at most four observes are in
+// flight at once and every active PR is still reconciled.
+func TestReconcileActivePRsBoundsFanout(t *testing.T) {
+	ctx := context.Background()
+	store := &lockedStore{fakeStore: newFakeStore()}
+	const count = 8
+	runs := make([]*core.Run, 0, count)
+	for i := 1; i <= count; i++ {
+		run := makeRun(core.RunID("r"+strconv.Itoa(i)), 100+i, core.RunWaitingCI)
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatalf("store.Save(ctx, run): %v", err)
+		}
+		runs = append(runs, run)
+	}
+	scm := &gatedSCM{
+		fakeSCM: &fakeSCM{},
+		entered: make(chan struct{}, count),
+		release: make(chan struct{}),
+	}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictWait}},
+		Harness: &fakeHarness{}, Source: &fakeSource{}, Workspace: &fakeWorkspace{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.reconcileActivePRs(ctx, runs)
+		close(done)
+	}()
+	for i := 0; i < reconcileFanout; i++ {
+		select {
+		case <-scm.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d reconciles entered Observe", i, reconcileFanout)
+		}
+	}
+	scm.mu.Lock()
+	peak := scm.max
+	scm.mu.Unlock()
+	if peak != reconcileFanout {
+		t.Fatalf("max concurrent observes before release = %d, want %d", peak, reconcileFanout)
+	}
+	close(scm.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fanout did not finish after release")
+	}
+	scm.mu.Lock()
+	defer scm.mu.Unlock()
+	if scm.total != count {
+		t.Fatalf("observes = %d, want %d", scm.total, count)
+	}
+	if scm.max != reconcileFanout {
+		t.Fatalf("max concurrent observes = %d, want %d", scm.max, reconcileFanout)
+	}
+}
+
+// TestMergeReadsTaskTreeOnce pins V2 on the current tree: merge receives the
+// epic result from the review gate instead of reading the cards again.
+func TestMergeReadsTaskTreeOnce(t *testing.T) {
+	ctx := context.Background()
+	task := func() *core.Run { return makeRun("r-task", 42, core.RunWaitingCI) }
+	epic := func() *core.Run {
+		run := makeRun("r-epic", 42, core.RunWaitingCI)
+		run.TaskID = "T-EPIC"
+		return run
+	}
+	cases := []struct {
+		name  string
+		run   *core.Run
+		tasks []core.Task
+	}{
+		{name: "task run", run: task()},
+		{name: "epic run", run: epic(), tasks: []core.Task{
+			{ID: "T-EPIC", Title: "epic", Kind: core.TaskKindEpic,
+				Status: core.TaskAvailable, RequireReview: core.ReviewModeNone},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			if err := store.Save(ctx, tc.run); err != nil {
+				t.Fatalf("store.Save(ctx, tc.run): %v", err)
+			}
+			src := &countingSource{fakeSource: &fakeSource{tasks: tc.tasks}}
+			r := &Reconciler{
+				Store: store,
+				SCM: &fakeSCM{obs: core.Observation{
+					PRNumber: 42, HeadSHA: "sha2", PRState: "open",
+				}},
+				Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge}},
+				Harness: &fakeHarness{}, Source: src, Workspace: &fakeWorkspace{},
+			}
+			if _, err := r.Reconcile(ctx, 42); err != nil {
+				t.Fatalf("r.Reconcile(ctx, 42): %v", err)
+			}
+			if src.lists != 1 {
+				t.Fatalf("ListAvailable calls = %d, want 1", src.lists)
+			}
+			if got := store.runs[tc.run.ID]; got.State != core.RunMerged {
+				t.Fatalf("state = %s, want merged", got.State)
+			}
+		})
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -12,6 +13,11 @@ import (
 // defaultOrphanTimeout is how long a running run without a PR may go stale
 // before its worker session is checked for liveness.
 const defaultOrphanTimeout = 90 * time.Second
+
+// reconcileFanout bounds how many active PRs one reconcile tick polls at once.
+// Four round trips overlap without opening an unbounded burst against the
+// provider or the state store.
+const reconcileFanout = 4
 
 // DefaultOrphanTimeout exposes the built-in fallback to the composition root.
 // A configured timeout and the reconciler's own default then share one value.
@@ -332,11 +338,7 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 				continue
 			}
 			r.reconcileOrphanRunning(tickCtx, runs)
-			for _, run := range runs {
-				if run.PRNumber > 0 {
-					r.safeReconcile(tickCtx, run.PRNumber)
-				}
-			}
+			r.reconcileActivePRs(tickCtx, runs)
 			if r.Promoter != nil {
 				if _, err := r.Promoter.PromotePending(tickCtx); err != nil {
 					slog.Error("promote pending", "error", err)
@@ -344,6 +346,29 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 			}
 		}
 	}
+}
+
+// reconcileActivePRs fans active pull requests out through a bounded
+// semaphore. One slow SCM observe no longer holds up every other PR on the
+// tick. Each reconcile goes through safeReconcile, so a bad PR cannot stop the
+// others. The wait covers every goroutine even when a slot blocks on a slow PR.
+func (r *Reconciler) reconcileActivePRs(ctx context.Context, runs []*core.Run) {
+	sem := make(chan struct{}, reconcileFanout)
+	var wg sync.WaitGroup
+	for _, run := range runs {
+		if run.PRNumber <= 0 {
+			continue
+		}
+		pr := run.PRNumber
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			r.safeReconcile(ctx, pr)
+		}()
+	}
+	wg.Wait()
 }
 
 func (r *Reconciler) safeReconcile(ctx context.Context, pr int) {

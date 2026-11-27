@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -131,9 +132,10 @@ func parentEpicID(id core.TaskID) core.TaskID {
 type tickCacheKey struct{}
 
 type tickCache struct {
-	tree      core.TaskTree
-	treeReady bool
-	base      map[string]core.BaseStatus
+	treeOnce sync.Once
+	tree     core.TaskTree
+	baseMu   sync.Mutex
+	base     map[string]core.BaseStatus
 }
 
 func withTickCache(ctx context.Context) context.Context {
@@ -151,15 +153,15 @@ func cacheFrom(ctx context.Context) *tickCache {
 // taskTree indexes one source read. Every relation question in reconciliation
 // goes through it, so the parent field is read once instead of scanning IDs.
 // A tick cache turns the read into one per tick rather than one per question.
+// The once also makes the shared cache safe when several PRs reconcile in
+// parallel on one tick.
 func (r *Reconciler) taskTree(ctx context.Context) core.TaskTree {
-	if c := cacheFrom(ctx); c != nil && c.treeReady {
-		return c.tree
+	c := cacheFrom(ctx)
+	if c == nil {
+		return r.loadTaskTree(ctx)
 	}
-	tree := r.loadTaskTree(ctx)
-	if c := cacheFrom(ctx); c != nil {
-		c.tree, c.treeReady = tree, true
-	}
-	return tree
+	c.treeOnce.Do(func() { c.tree = r.loadTaskTree(ctx) })
+	return c.tree
 }
 
 func (r *Reconciler) loadTaskTree(ctx context.Context) core.TaskTree {
@@ -177,8 +179,12 @@ func (r *Reconciler) loadTaskTree(ctx context.Context) core.TaskTree {
 // distinct branch on a tick. checkBaseRed and checkBaseRecovery often inspect
 // the same branch during one tick, so the second read reuses the first result.
 func (r *Reconciler) baseStatus(ctx context.Context, branch string) (core.BaseStatus, error) {
-	if c := cacheFrom(ctx); c != nil {
-		if status, ok := c.base[branch]; ok {
+	c := cacheFrom(ctx)
+	if c != nil {
+		c.baseMu.Lock()
+		status, ok := c.base[branch]
+		c.baseMu.Unlock()
+		if ok {
 			return status, nil
 		}
 	}
@@ -186,8 +192,10 @@ func (r *Reconciler) baseStatus(ctx context.Context, branch string) (core.BaseSt
 	if err != nil {
 		return core.BaseStatus{}, err
 	}
-	if c := cacheFrom(ctx); c != nil {
+	if c != nil {
+		c.baseMu.Lock()
 		c.base[branch] = status
+		c.baseMu.Unlock()
 	}
 	return status, nil
 }
@@ -229,6 +237,18 @@ func (r *Reconciler) reconcileEpics(ctx context.Context) error {
 	ready, err := r.Store.ListReadyTasks(ctx)
 	if err != nil {
 		return err
+	}
+	// The tree is only needed to publish an epic. Most ticks have no ready
+	// epic, so skip the source read instead of building a tree nothing uses.
+	hasEpic := false
+	for _, task := range ready {
+		if task.Kind == core.TaskKindEpic {
+			hasEpic = true
+			break
+		}
+	}
+	if !hasEpic {
+		return nil
 	}
 	tree := r.taskTree(ctx)
 	for _, task := range ready {
