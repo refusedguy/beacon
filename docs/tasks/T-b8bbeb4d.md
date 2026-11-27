@@ -1,7 +1,7 @@
 ---
 id: T-b8bbeb4d
 title: 'M3: skip self-hosted perf-nightly on manual dispatch'
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 priority: 38
