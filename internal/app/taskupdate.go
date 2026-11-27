@@ -285,12 +285,26 @@ func cleanList(values []string) []string {
 	return out
 }
 
+// yamlLeadingIndicators holds the ASCII characters that cannot start a plain
+// YAML scalar. A value whose first non-space character is one of them needs
+// quotes, otherwise a title like "[perf] speed up" decodes as a malformed flow
+// sequence and the card is dropped from the index.
+const yamlLeadingIndicators = "-?:[],{}&*#!|>%@`"
+
 func fieldValue(value string) string {
-	if value == "" || strings.Contains(value, ": ") || strings.Contains(value, " #") ||
-		strings.ContainsAny(value, "\n\r\"'") {
+	if needsYAMLQuote(value) {
 		return strconv.Quote(value)
 	}
 	return value
+}
+
+func needsYAMLQuote(value string) bool {
+	if value == "" || strings.Contains(value, ": ") || strings.Contains(value, " #") ||
+		strings.ContainsAny(value, "\n\r\"'") {
+		return true
+	}
+	trimmed := strings.TrimLeft(value, " \t")
+	return trimmed == "" || strings.ContainsRune(yamlLeadingIndicators, rune(trimmed[0]))
 }
 
 func listLines(key string, values []string) []string {
