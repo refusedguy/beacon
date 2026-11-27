@@ -9,15 +9,20 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// fakeCheckSource returns a fixed list of names, with an optional error. It
-// stands in for any provider implementation of the port.
+// fakeCheckSource returns a fixed list of names and gates, with an optional
+// error. It stands in for any provider implementation of the port.
 type fakeCheckSource struct {
-	names []string
-	err   error
+	names       []string
+	conditional []string
+	err         error
 }
 
 func (f fakeCheckSource) Names(ctx context.Context) ([]string, error) {
 	return f.names, f.err
+}
+
+func (f fakeCheckSource) ConditionalNames(ctx context.Context) ([]string, error) {
+	return f.conditional, nil
 }
 
 func TestEvaluateAllGreenReturnsMerge(t *testing.T) {
@@ -443,5 +448,132 @@ func TestPolicyEmptySourceAddsNoGate(t *testing.T) {
 	p := New(Config{RequiredCheckSource: fakeCheckSource{}})
 	if got := p.Evaluate(core.Observation{PRState: "open"}); got.Verdict != core.VerdictMerge {
 		t.Fatalf("decision = %+v, want merge with no required checks", got)
+	}
+}
+
+// TestEvaluateSkippedConditionalRequiredCheckMerges covers an ordinary PR
+// where GitHub reports a gated job as skipped next to real green checks.
+func TestEvaluateSkippedConditionalRequiredCheckMerges(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{
+		names:       []string{"verify", "mark-ready"},
+		conditional: []string{"mark-ready"},
+	}}
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "verify", State: core.CheckSuccess},
+		{Name: "mark-ready", State: core.CheckSkipped},
+	}}
+	if got := New(cfg).Evaluate(obs); got.Verdict != core.VerdictMerge {
+		t.Fatalf("decision = %+v, want merge", got)
+	}
+}
+
+// TestEvaluateOmittedConditionalRequiredCheckMerges covers a gated job GitHub
+// never reports as a check run on this pull request.
+func TestEvaluateOmittedConditionalRequiredCheckMerges(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{
+		names:       []string{"verify", "mark-ready", "perf-nightly"},
+		conditional: []string{"mark-ready", "perf-nightly"},
+	}}
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "verify", State: core.CheckSuccess},
+	}}
+	if got := New(cfg).Evaluate(obs); got.Verdict != core.VerdictMerge {
+		t.Fatalf("decision = %+v, want merge", got)
+	}
+}
+
+// TestEvaluateAllGatedChecksMissingStillWaits proves the absent-check waiver
+// needs at least one reported required check to know the workflow ran.
+func TestEvaluateAllGatedChecksMissingStillWaits(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{
+		names:       []string{"verify", "perf-nightly"},
+		conditional: []string{"verify", "perf-nightly"},
+	}}
+	got := New(cfg).Evaluate(core.Observation{PRState: "open"})
+	if got.Verdict != core.VerdictWait || got.Criterion != "required_checks" {
+		t.Fatalf("decision = %+v, want wait/required_checks", got)
+	}
+}
+
+// TestEvaluateFailedConditionalRequiredCheckBlocks proves a gate waiver does
+// not hide a job that ran and failed.
+func TestEvaluateFailedConditionalRequiredCheckBlocks(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{
+		names:       []string{"verify", "mark-ready"},
+		conditional: []string{"mark-ready"},
+	}}
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "verify", State: core.CheckSuccess},
+		{Name: "mark-ready", State: core.CheckFailure},
+	}}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictNeedsAgentFix || got.Criterion != "invariant" {
+		t.Fatalf("decision = %+v, want needs_agent_fix/invariant", got)
+	}
+}
+
+func TestEvaluateCancelledConditionalRequiredCheckWaits(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{
+		names:       []string{"verify", "plugin-tui-smoke"},
+		conditional: []string{"plugin-tui-smoke"},
+	}}
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "verify", State: core.CheckSuccess},
+		{Name: "plugin-tui-smoke", State: core.CheckCancelled},
+	}}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictWait || got.Criterion != "required_checks" {
+		t.Fatalf("decision = %+v, want wait/required_checks", got)
+	}
+	if !strings.Contains(got.Reason, "plugin-tui-smoke (cancelled)") {
+		t.Fatalf("reason = %q, want the cancelled gated check named", got.Reason)
+	}
+}
+
+// TestEvaluateSkippedUngatedRequiredCheckStillWaits proves the waiver is
+// scoped: a gate on a different job cannot excuse a skipped required check.
+func TestEvaluateSkippedUngatedRequiredCheckStillWaits(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{
+		names:       []string{"verify", "mark-ready"},
+		conditional: []string{"perf-nightly"},
+	}}
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "verify", State: core.CheckSuccess},
+		{Name: "mark-ready", State: core.CheckSkipped},
+	}}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictWait || got.Criterion != "required_checks" {
+		t.Fatalf("decision = %+v, want wait/required_checks", got)
+	}
+	if !strings.Contains(got.Reason, "mark-ready (skipped)") {
+		t.Fatalf("reason = %q, want the skipped ungated check named", got.Reason)
+	}
+}
+
+func TestAllRequiredPassWithGates(t *testing.T) {
+	cases := []struct {
+		name    string
+		checks  []core.CheckResult
+		names   []string
+		gated   []string
+		skipped bool
+		want    bool
+	}{
+		{"gated check skipped", []core.CheckResult{{Name: "ci", State: core.CheckSuccess}, {Name: "mark-ready", State: core.CheckSkipped}}, []string{"ci", "mark-ready"}, []string{"mark-ready"}, false, true},
+		{"ungated check skipped", []core.CheckResult{{Name: "ci", State: core.CheckSuccess}, {Name: "mark-ready", State: core.CheckSkipped}}, []string{"ci", "mark-ready"}, nil, false, false},
+		{"gated check missing", []core.CheckResult{{Name: "ci", State: core.CheckSuccess}}, []string{"ci", "perf-nightly"}, []string{"perf-nightly"}, false, true},
+		{"all gated checks missing", nil, []string{"ci", "perf-nightly"}, []string{"ci", "perf-nightly"}, false, false},
+		{"ungated check missing", []core.CheckResult{{Name: "ci", State: core.CheckSuccess}}, []string{"ci", "vet"}, nil, false, false},
+		{"gated check failed", []core.CheckResult{{Name: "ci", State: core.CheckSuccess}, {Name: "mark-ready", State: core.CheckFailure}}, []string{"ci", "mark-ready"}, []string{"mark-ready"}, false, false},
+		{"gated check cancelled", []core.CheckResult{{Name: "ci", State: core.CheckSuccess}, {Name: "mark-ready", State: core.CheckCancelled}}, []string{"ci", "mark-ready"}, []string{"mark-ready"}, false, false},
+		{"whole workflow skipped", nil, []string{"ci", "vet"}, nil, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obs := core.Observation{Checks: tc.checks, WorkflowSkipped: tc.skipped}
+			if got := obs.AllRequiredPassWithGates(tc.names, tc.gated); got != tc.want {
+				t.Fatalf("AllRequiredPassWithGates = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }

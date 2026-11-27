@@ -162,11 +162,24 @@ func (o Observation) HasPending() bool {
 	return false
 }
 
-// checkPassed reports whether c satisfies a required check. A skipped check
-// counts only when the provider declared the whole workflow skipped for this
-// diff, so a required job skipped by an if condition cannot open the gate.
+// CheckPassed reports whether c satisfies a required check. A skipped check
+// passes when the provider declared the whole workflow skipped for this diff,
+// or when gated reports that the job's if condition did not apply. A failure,
+// cancellation, pending or unknown state never passes.
+func (o Observation) CheckPassed(c CheckResult, gated bool) bool {
+	switch c.State {
+	case CheckSuccess:
+		return true
+	case CheckSkipped:
+		return o.WorkflowSkipped || gated
+	default:
+		return false
+	}
+}
+
+// checkPassed is the ungated form used when no workflow declares a gate.
 func (o Observation) checkPassed(c CheckResult) bool {
-	return c.State == CheckSuccess || (c.State == CheckSkipped && o.WorkflowSkipped)
+	return o.CheckPassed(c, false)
 }
 
 // AllRequiredPass reports whether every named check passed. An empty name list
@@ -199,6 +212,63 @@ func (o Observation) AllRequiredPass(names []string) bool {
 		}
 	}
 	return true
+}
+
+// ReportsAny reports whether the observation includes at least one of names.
+// A gated waiver must not fire when the provider reports none of the required
+// checks: the workflow may not have run, or the names may be stale.
+func (o Observation) ReportsAny(names []string) bool {
+	for _, c := range o.Checks {
+		if hasName(names, c.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllRequiredPassWithGates reports whether every named check passed. A name in
+// gated has a workflow if gate that did not apply, so a skipped or absent check
+// passes while a reported failure still blocks. The absent-check waiver needs
+// at least one reported required name, so an observation with none of them
+// cannot open the gate. WorkflowSkipped keeps its whole-workflow waiver. An
+// empty name list considers every reported check.
+func (o Observation) AllRequiredPassWithGates(names, gated []string) bool {
+	if len(names) == 0 {
+		for _, c := range o.Checks {
+			if !o.CheckPassed(c, false) {
+				return false
+			}
+		}
+		return len(o.Checks) > 0
+	}
+	reported := o.ReportsAny(names)
+	for _, want := range names {
+		gate := hasName(gated, want)
+		found := false
+		for _, c := range o.Checks {
+			if strings.EqualFold(c.Name, want) {
+				found = true
+				if !o.CheckPassed(c, gate) {
+					return false
+				}
+				break
+			}
+		}
+		if !found && !o.WorkflowSkipped && !(gate && reported) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasName reports whether names holds want, ignoring case.
+func hasName(names []string, want string) bool {
+	for _, name := range names {
+		if strings.EqualFold(name, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // Verdict is the reconciler's decision for one observation.
