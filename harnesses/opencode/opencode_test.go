@@ -470,6 +470,10 @@ func TestConfiguredRepoScopesWorktreeRefresh(t *testing.T) {
 			_, _ = io.WriteString(w, `[{"id":"prj_1","canonical":"/repo/one"}]`)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/worktree/refresh":
 			refreshed <- struct{}{}
+		case r.Method == http.MethodPost && r.URL.Path == "/api/location/reload":
+			// The reload is best effort for this test; the retry case is covered
+			// by TestRefreshWorktreesRetriesTransientLocationReload.
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -484,6 +488,43 @@ func TestConfiguredRepoScopesWorktreeRefresh(t *testing.T) {
 	case <-refreshed:
 	default:
 		t.Fatal("configured repo did not scope the refresh")
+	}
+}
+
+func TestRefreshWorktreesRetriesTransientLocationReload(t *testing.T) {
+	const stale = "/repo/one/worktrees/T-STALE"
+	inventory := map[string]bool{stale: true}
+	reloads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/project":
+			_, _ = io.WriteString(w, `[{"id":"prj_1","canonical":"/repo/one"}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/worktree/refresh":
+			// The editor drops the stale worktree row when it accepts the refresh.
+			delete(inventory, stale)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/location/reload":
+			reloads++
+			if reloads == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(Config{Endpoint: srv.URL, Repo: "/repo/one"})
+	if err := h.RefreshWorktrees(context.Background()); err != nil {
+		t.Fatalf("RefreshWorktrees: %v", err)
+	}
+	if reloads != 2 {
+		t.Fatalf("location reloads = %d, want 2 after a transient 503", reloads)
+	}
+	if inventory[stale] {
+		t.Fatal("removed worktree still appears in the editor inventory after the retry")
 	}
 }
 

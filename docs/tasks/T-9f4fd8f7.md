@@ -1,7 +1,7 @@
 ---
 id: T-9f4fd8f7
 title: Fix SCM observation correctness on provider edge cases
-status: available
+status: done
 scope:
     - internal/infra/scm/github.go
     - internal/infra/scm/gitlab_mr.go
