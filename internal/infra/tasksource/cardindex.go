@@ -143,14 +143,23 @@ func refreshIndexedCard(idx *cardIndex, path string) (indexedCard, bool) {
 // noteIndexedCard folds a write made through this package back into the index
 // so the writer never has to rescan its own change.
 func noteIndexedCard(dir, path, content string) {
+	t, parsed, hasFM := parseCardFields(content, path)
+	if !parsed {
+		return
+	}
+	noteParsedCard(dir, path, content, t, hasFM)
+}
+
+// noteParsedCard folds a write back into the index using a task the caller has
+// already parsed. Status patches use it: the text before the write was decoded
+// once, and a status-only rewrite cannot change any other field, so decoding
+// the rewritten text again would repeat the same YAML work. The caller passes
+// that task with its status set to the value written to disk.
+func noteParsedCard(dir, path, content string, t core.Task, hasFM bool) {
 	cardIndexCache.mu.Lock()
 	defer cardIndexCache.mu.Unlock()
 	idx, ok := cardIndexCache.byDir[cardIndexKey(dir)]
 	if !ok {
-		return
-	}
-	t, parsed, hasFM := parseCardFields(content, path)
-	if !parsed {
 		return
 	}
 	if old := idx.byPath[path]; old.task.ID != "" && old.task.ID != t.ID && idx.byID[old.task.ID] == path {
@@ -190,6 +199,8 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 		return err
 	}
 	var path, updated string
+	var task core.Task
+	var hasFM bool
 	err := withCardIndex(s.Dir, func(idx *cardIndex) error {
 		p, ok := idx.byID[id]
 		if !ok {
@@ -201,6 +212,8 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 		}
 		path = entry.path
 		updated = rewriteStatus(entry.content, status, entry.hasFM)
+		task = entry.task
+		hasFM = entry.hasFM
 		return nil
 	})
 	if err != nil {
@@ -212,6 +225,10 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		return err
 	}
-	noteIndexedCard(s.Dir, path, updated)
+	// rewriteStatus only touches the status line, so the task parsed before
+	// the write stays valid once its status is replaced. This avoids a second
+	// YAML decode of the rewritten text.
+	task.Status = normalizeStatus(status)
+	noteParsedCard(s.Dir, path, updated, task, hasFM)
 	return nil
 }
