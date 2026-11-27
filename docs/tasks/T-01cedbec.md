@@ -1,7 +1,7 @@
 ---
 id: T-01cedbec
 title: '[bench] Duplicate mutation encode on MCP journal'
-status: available
+status: done
 scope:
     - internal/infra/mcp/duplicate_encode_bench_test.go
 priority: 75
