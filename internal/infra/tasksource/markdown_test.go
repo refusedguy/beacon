@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
+	"gopkg.in/yaml.v3"
 )
 
 const legacyCard = `# T-1. Fix parser
@@ -552,6 +553,55 @@ func TestMarkdownMalformedFrontmatterReported(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "malformed card frontmatter") {
 		t.Fatalf("malformed frontmatter not reported: %s", logs.String())
+	}
+}
+
+// TestMarkdownBracketedTitleDropsCard records the failure mode behind
+// T-dc19680d. An unquoted [perf] title is a malformed YAML flow sequence, so
+// the card is skipped and never reaches the index. The corpus test below keeps
+// that shape out of docs/tasks, and fieldValue quotes it on write.
+func TestMarkdownBracketedTitleDropsCard(t *testing.T) {
+	dir := t.TempDir()
+	content := "---\nid: T-PERF\ntitle: [perf] Speed up indexing\nstatus: available\n---\n# T-PERF. Wrong\n"
+	path := filepath.Join(dir, "T-PERF.md")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(path, []byte(content), 0o644): %v", err)
+	}
+	tasks, err := NewMarkdown(dir).ListAvailable(context.Background())
+	if err != nil {
+		t.Fatalf("ListAvailable(context.Background()): %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("unquoted [perf] title parsed as a card: %+v", tasks)
+	}
+}
+
+// TestTaskCardCorpusFrontmatter decodes every card shipped in docs/tasks. A
+// malformed header names the file and the YAML line so CI catches the next
+// hand-authored bad card before the daemon silently drops it.
+func TestTaskCardCorpusFrontmatter(t *testing.T) {
+	dir := filepath.Join("..", "..", "..", "docs", "tasks")
+	paths, err := (CardStore{Dir: dir}).cards()
+	if err != nil {
+		t.Fatalf("cards(%s): %v", dir, err)
+	}
+	if len(paths) == 0 {
+		t.Fatalf("no cards found under %s", dir)
+	}
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("%s: %v", path, err)
+			continue
+		}
+		fm, _, hasFM := splitFrontmatterLines(cardLines(string(b)))
+		if !hasFM {
+			continue
+		}
+		var schema cardSchema
+		if err := yaml.Unmarshal([]byte(fm), &schema); err != nil {
+			t.Errorf("%s: malformed frontmatter: %v", path, err)
+		}
 	}
 }
 
