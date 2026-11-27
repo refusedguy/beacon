@@ -1,7 +1,7 @@
 ---
 id: T-5a0b4a2a
 title: Make scheduled runs execute perf work only
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
     - scripts/bench-e2e.sh

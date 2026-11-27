@@ -12,6 +12,7 @@ on:
       - '**.md'
   schedule:
     - cron: '0 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,7 +23,7 @@ concurrency:
 
 jobs:
   warm-cache:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -69,7 +70,7 @@ jobs:
         run: go test -race -run '^$' ./...
 
   verify:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: warm-cache
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -130,7 +131,7 @@ jobs:
         run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test ".opencode/plugins/beacon-project/**/*_test.js"
 
   build:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -138,7 +139,7 @@ jobs:
       - run: echo "build passed in verify"
 
   vet:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -146,7 +147,7 @@ jobs:
       - run: echo "vet passed in verify"
 
   lint:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -154,7 +155,7 @@ jobs:
       - run: echo "lint passed in verify"
 
   test-modules:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: warm-cache
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -210,46 +211,15 @@ jobs:
         run: go test ${{ matrix.race && '-race' || '' }} -shuffle=on ${{ matrix.packages }}
 
   test:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: test-modules
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - run: echo "all module suites passed"
 
-  test-nightly:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - module: root
-            dir: .
-          - module: acp
-            dir: harnesses/acp
-          - module: opencode
-            dir: harnesses/opencode
-          - module: tui
-            dir: ui/tui
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
-
-      - name: Test ${{ matrix.module }} module with race
-        working-directory: ${{ matrix.dir }}
-        run: go test -race -shuffle=on ./...
-
   plugin-tui-smoke:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -279,7 +249,7 @@ jobs:
         run: bash scripts/plugin-tui-smoke.sh
 
   perf-smoke:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: warm-cache
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -299,7 +269,7 @@ jobs:
         run: timeout 30s bash scripts/bench-e2e.sh --smoke
 
   perf-nightly:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64, perf]
     timeout-minutes: 30
     permissions:
@@ -315,9 +285,6 @@ jobs:
           cache-dependency-path: |
             go.sum
             ui/tui/go.sum
-
-      - name: Install benchstat
-        run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
 
       - name: Find the previous nightly run
         id: previous
@@ -346,6 +313,10 @@ jobs:
           run-id: ${{ steps.previous.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install benchstat
+        if: steps.baseline.outcome == 'success'
+        run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
+
       - name: Measure current HEAD
         run: |
           mkdir -p bench-results
@@ -353,6 +324,7 @@ jobs:
             -benchtime=1x -count=10 ./internal/bench/ | tee bench-results/current.txt
 
       - name: Compare with benchstat
+        id: compare
         if: steps.baseline.outcome == 'success'
         run: |
           benchstat="$(go env GOPATH)/bin/benchstat"
@@ -362,7 +334,7 @@ jobs:
           bash scripts/check-bench-regression.sh bench-results/compare.csv
 
       - name: Upload benchstat artifacts
-        if: always()
+        if: steps.compare.outcome == 'success' || steps.compare.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: benchstat-nightly-${{ github.run_number }}
