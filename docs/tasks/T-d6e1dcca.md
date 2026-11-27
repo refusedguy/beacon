@@ -1,7 +1,7 @@
 ---
 id: T-d6e1dcca
 title: 'P4: Wire real base-red counters into advisory'
-status: available
+status: done
 scope:
   - internal/bench/reconcile_bench_test.go
   - internal/bench/registry.go
