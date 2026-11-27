@@ -3,6 +3,7 @@ package bench
 import (
 	"bytes"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -63,6 +64,46 @@ func TestRegistryReusesReportLimiterStrings(t *testing.T) {
 	for _, name := range []string{phaseReads, phaseAssembly, phaseTotal} {
 		if got := byKey[name].Limiter; got != snapshotLimiters[name] {
 			t.Errorf("%s limiter = %q, want report.go value %q", name, got, snapshotLimiters[name])
+		}
+	}
+}
+
+// harnessSources are the files that print canonical perf rows. Go benchmarks
+// print through printPerfRow; the Node harnesses and the workspace latency
+// test print the JSON payload themselves.
+var harnessSources = []string{
+	"report.go",
+	"snapshot_bench_test.go",
+	"ui_bench.js",
+	"run_watcher_bench.js",
+	"../infra/workspace/git_worktree_test.go",
+}
+
+// canonicalKeyRe finds the key a harness publishes for a canonical row. It
+// matches the key field of a printed payload and the key argument of
+// printPerfRow. A dynamic name such as s.Name is deliberately not matched:
+// those names come from report.go and are covered by the registry table.
+var canonicalKeyRe = regexp.MustCompile(`(?:\b[Kk]ey:\s*|printPerfRow\([^,\n]+,\s*)"([a-z0-9][a-z0-9-]*)"`)
+
+// TestHarnessKeysAreRegistered checks the other direction of the cross-check:
+// every canonical key a harness prints must have a registry entry. An
+// unregistered key makes the advisory comment fall back to the harness for
+// limiter text, which defeats the registry as the single source of truth.
+func TestHarnessKeysAreRegistered(t *testing.T) {
+	registered := make(map[string]bool, len(Registry()))
+	for _, spec := range Registry() {
+		registered[spec.Key] = true
+	}
+	for _, path := range harnessSources {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, match := range canonicalKeyRe.FindAllStringSubmatch(string(data), -1) {
+			key := match[1]
+			if !registered[key] {
+				t.Errorf("%s prints canonical key %q with no registry entry", path, key)
+			}
 		}
 	}
 }
@@ -132,6 +173,15 @@ func benchSource(t *testing.T) string {
 		data, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
+		}
+		b.Write(data)
+	}
+	// The Node harnesses and the workspace latency test publish canonical
+	// rows too, so their keys and field names count as emitted.
+	for _, path := range harnessSources[2:] {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
 		}
 		b.Write(data)
 	}

@@ -125,6 +125,42 @@
       "errMetric": "",
       "placement": "nightly",
       "thresholdPct": 15
+    },
+    {
+      "key": "snapshot",
+      "limiter": "SQLite VM, ListRunEvents sort and JSON reflection",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "worktree-remove",
+      "limiter": "git subprocess spawn and worktree metadata",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "tui-view",
+      "limiter": "normalizeSnapshot + render",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "run-watcher-fp",
+      "limiter": "JSON.stringify character volume",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
     }
   ]
 }
