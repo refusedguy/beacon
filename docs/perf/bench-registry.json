@@ -97,15 +97,6 @@
       "thresholdPct": 15
     },
     {
-      "key": "prompt-build",
-      "limiter": "strings.Builder + prompt bytes",
-      "unit": "ns",
-      "workMetric": "prompt-build-work",
-      "errMetric": "prompt-build-errs",
-      "placement": "both",
-      "thresholdPct": 15
-    },
-    {
       "key": "snapshot-reads",
       "limiter": "WAL page reads",
       "unit": "ns",

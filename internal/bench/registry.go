@@ -106,7 +106,7 @@ type registryDocument struct {
 // for each benchmark that reports a median, so the generated JSON has one
 // authoritative source.
 func Registry() []Spec {
-	specs := make([]Spec, 0, len(hotspotOrder)+2+len(snapshotLimiters)+len(prHarnessLimiters)+len(prBenchLimiters))
+	specs := make([]Spec, 0, len(hotspotOrder)+1+len(snapshotLimiters)+len(prHarnessLimiters)+len(prBenchLimiters))
 	for _, name := range hotspotOrder {
 		specs = append(specs, Spec{
 			Key:          name,
@@ -118,15 +118,6 @@ func Registry() []Spec {
 			ThresholdPct: 15,
 		})
 	}
-	specs = append(specs, Spec{
-		Key:          namePrompt,
-		Limiter:      "strings.Builder + prompt bytes",
-		Unit:         "ns",
-		WorkMetric:   namePrompt + "-work",
-		ErrMetric:    namePrompt + "-errs",
-		Placement:    PlacementBoth,
-		ThresholdPct: 15,
-	})
 	for _, name := range []string{phaseReads, phaseAssembly, phaseTotal} {
 		work, errs := name+"-work", "snapshot-errs"
 		if name == phaseTotal {
