@@ -547,7 +547,10 @@ jobs:
           for tree in perf-base perf-head; do
             (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' -bench '^$' ./internal/bench/) \
               || echo "warmup $tree" >> "$RUNNER_TEMP/perf-status"
+            (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' ./internal/infra/workspace/) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/perf-status"
           done
+          export BEACON_BENCH_CACHE=warm
           run_side() {
             local side="$1" dir="$2"
             {
@@ -608,15 +611,20 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+            const list = event => github.paginate(github.rest.actions.listWorkflowRuns, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'ci.yml',
-              event: 'schedule',
+              event,
               status: 'success',
               per_page: 10,
             })
-            const last = runs.find(run => run.id !== context.runId)
+            const runs = [
+              ...await list('schedule'),
+              ...await list('workflow_dispatch'),
+            ].filter(run => run.id !== context.runId)
+             .sort((a, b) => b.id - a.id)
+            const last = runs[0]
             core.setOutput('run_id', last ? String(last.id) : '')
 
       - name: Download calibrated noise floor
@@ -726,9 +734,10 @@ jobs:
                 notes.push(`${side}: invalid values in ${row.key}`); continue;
               }
               if (!pass) { pass = { rows: [], bad: [] }; passes.push(pass); }
-              if (pass.rows.some(r => r.key === row.key)) {
-                pass.bad.push(`duplicate ${row.key}`); continue;
-              }
+              // With -benchtime=5x testing.B emits a calibration row from run1
+              // and a measured row from runN. Keep the later row, not both.
+              const prior = pass.rows.findIndex(r => r.key === row.key);
+              if (prior >= 0) { pass.rows[prior] = row; continue; }
               pass.rows.push(row);
             }
             return passes;
@@ -783,13 +792,15 @@ jobs:
           }
           if (missing.length) notes.push(`missing rows: ${[...new Set(missing)].join(', ')}`);
 
-          // The pure control must travel with every pass. A pass whose control
-          // is absent or moved beyond the floor cannot separate code from load.
+          // Control drift decides only the ratio columns. The base, head,
+          // delta, range, spread, work, errs and verdict columns use every
+          // shape-valid pass, so a drifting control cannot erase raw rows or
+          // force an inconclusive verdict.
           const controlOf = pass => pass.rows.find(r => r.key === controlKey);
           const allControl = [...basePasses, ...headPasses]
             .map(controlOf).filter(Boolean).map(r => r.median_ms);
           const controlRef = allControl.length ? median(allControl) : NaN;
-          const usable = (side, passes) => passes.filter((pass, i) => {
+          const ratioPasses = (side, passes) => passes.filter((pass, i) => {
             const c = controlOf(pass);
             if (!c) { notes.push(`${side} pass ${i + 1}: missing ${controlKey}`); return false; }
             if (!Number.isFinite(controlRef) || controlRef <= 0) return false;
@@ -800,11 +811,15 @@ jobs:
             }
             return true;
           });
-          const baseOK = usable('base', basePasses);
-          const headOK = usable('head', headPasses);
+          const baseRatio = ratioPasses('base', basePasses);
+          const headRatio = ratioPasses('head', headPasses);
+          const ratiosUsable = baseRatio.length >= 2 && headRatio.length >= 2;
+          if (!ratiosUsable) {
+            notes.push('control drift left fewer than two passes on a side; ratio columns are -');
+          }
 
           const inconclusiveAll = status.length > 0 || !sameHarness || badShape ||
-            registry.size === 0 || extra.length > 0 || baseOK.length < 2 || headOK.length < 2;
+            registry.size === 0 || extra.length > 0;
 
           const values = (passes, key, field) => passes
             .map(p => p.rows.find(r => r.key === key))
@@ -831,21 +846,21 @@ jobs:
             const baseRow = basePasses[0].rows.find(r => r.key === key);
             const limiter = (spec && spec.limiter) || (baseRow && baseRow.limiter) || '-';
             const cache = (baseRow && baseRow.cache) || '-';
-            const a = values(baseOK, key, 'median_ms');
-            const b = values(headOK, key, 'median_ms');
+            const a = values(basePasses, key, 'median_ms');
+            const b = values(headPasses, key, 'median_ms');
             if (!a.length || !b.length) {
               rows.push(`| ${key} | - | - | - | - | - | - | - | - | - | ${limiter} | ${cache} | inconclusive |`);
               continue;
             }
             const am = median(a), bm = median(b);
-            const amin = extreme(baseOK, key, 'min_ms', Math.min);
-            const amax = extreme(baseOK, key, 'max_ms', Math.max);
-            const bmin = extreme(headOK, key, 'min_ms', Math.min);
-            const bmax = extreme(headOK, key, 'max_ms', Math.max);
-            const wa = values(baseOK, key, 'work');
-            const wb = values(headOK, key, 'work');
-            const ea = values(baseOK, key, 'errs');
-            const eb = values(headOK, key, 'errs');
+            const amin = extreme(basePasses, key, 'min_ms', Math.min);
+            const amax = extreme(basePasses, key, 'max_ms', Math.max);
+            const bmin = extreme(headPasses, key, 'min_ms', Math.min);
+            const bmax = extreme(headPasses, key, 'max_ms', Math.max);
+            const wa = values(basePasses, key, 'work');
+            const wb = values(headPasses, key, 'work');
+            const ea = values(basePasses, key, 'errs');
+            const eb = values(headPasses, key, 'errs');
             let workMismatch = !wa.length || !wb.length || median(wa) !== median(wb) ||
               !ea.length || !eb.length || median(ea) !== median(eb);
             // Worktree removal drops a git status call by design.
@@ -859,9 +874,10 @@ jobs:
               ? 'inconclusive'
               : !decisive ? 'flat'
               : delta <= -floorPct ? 'gain' : 'regression';
-            const ra = median(ratios(baseOK, key));
-            const rb = median(ratios(headOK, key));
-            const ratioDelta = Number.isFinite(ra) && ra !== 0 ? 100 * (rb - ra) / ra : NaN;
+            const ra = ratiosUsable ? median(ratios(baseRatio, key)) : NaN;
+            const rb = ratiosUsable ? median(ratios(headRatio, key)) : NaN;
+            const ratioDelta = Number.isFinite(ra) && ra !== 0 && Number.isFinite(rb)
+              ? 100 * (rb - ra) / ra : NaN;
             rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}% | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${relation} | ${fmt(ra)} | ${fmt(rb)} | ${fmt(ratioDelta, 2)}% | ${limiter} | ${cache} | ${verdict} |`);
           }
 
@@ -871,7 +887,7 @@ jobs:
             '### Advisory perf comparison, base vs head',
             '',
             'Five alternating passes per side (B A A B B A A B B A) on two detached worktrees at the merge base and the real head SHA.',
-            'One uncounted compile-only warmup per tree precedes the passes; measurement runs on one CPU from Cpus_allowed_list via taskset.',
+            'One uncounted compile-only warmup per tree compiles the bench and workspace packages before the passes; measurement runs on one CPU from Cpus_allowed_list via taskset.',
             'Canonical rows come from the harness output; names, limiter text and the noise floor come from the registry on the base ref.',
             `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}.`,
             'Times are in ms. Work and errs are counts. Ratios divide each plan by the pure json-control row in the same pass.',
@@ -933,7 +949,7 @@ jobs:
   # The published floor lets PR comments reject a false regression.
   perf-noise-floor:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, linux, x64, perf]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
     permissions:
@@ -984,7 +1000,10 @@ jobs:
           for tree in perf-base perf-head; do
             (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' -bench '^$' ./internal/bench/) \
               || echo "warmup $tree" >> "$RUNNER_TEMP/floor-status"
+            (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' ./internal/infra/workspace/) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/floor-status"
           done
+          export BEACON_BENCH_CACHE=warm
           run_side() {
             local side="$1" dir="$2"
             {
