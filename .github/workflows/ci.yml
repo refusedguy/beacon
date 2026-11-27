@@ -876,14 +876,15 @@ jobs:
             const xs = values(passes, key, field);
             return xs.length ? fn(...xs) : NaN;
           };
-          // Five medians per side, sorted s[0..4]. The inner three decide the
-          // spread so one outlier in s[0] or s[4] cannot force a flat verdict.
+          // Five medians per side, sorted s[0..4]. Drop exactly one extreme
+          // from either end: min(s[3]-s[0], s[4]-s[1]). One spike cannot force
+          // a false verdict while the rest of the spread still blocks one.
           const spread = xs => {
             const s = [...xs].sort((a, b) => a - b);
             const m = median(s);
             if (!s.length || !(m > 0)) return Infinity;
             if (s.length < 5) return 100 * (s[s.length - 1] - s[0]) / m;
-            return 100 * (s[s.length - 2] - s[1]) / m;
+            return 100 * Math.min(s[3] - s[0], s[4] - s[1]) / m;
           };
           const ratios = (passes, key) => passes.map(p => {
             const r = p.rows.find(x => x.key === key);
@@ -1002,7 +1003,7 @@ jobs:
             ...(notes.length ? ['Parser notes:', '', ...notes.map(n => `- ${n}`), ''] : []),
             `A timing verdict needs an absolute delta of at least ${floorPct}% and greater than the larger trimmed within-side spread; otherwise the row is flat.`,
             `A flat row becomes 'gain (allocs/bytes)' when allocs/op or B/op falls at least ${allocDropPct}% with equal work, zero errors and no median rise beyond the row floor. Worktree removal with work 3 to 2, and reconcile keys with a falling deterministic counter, become 'gain (calls reduced)' under the same error and rise limits.`,
-            'Spread uses the inner three of five medians per side, so one outlier in the lowest or highest sample does not force flat. Range relation is supporting text only.',
+            'Spread drops one extreme sample from either end of five medians per side, using min(s[3]-s[0], s[4]-s[1]), so a single spike does not force a false verdict. Range relation is supporting text only.',
             `Cache states recorded from canonical rows: ${cacheStates.join(', ') || '-'}.`,
             status.length ? `Aborted passes: ${status.join(', ')}.` : 'No aborted passes.',
             'Raw logs and per-side CSVs are in the artifact.',
