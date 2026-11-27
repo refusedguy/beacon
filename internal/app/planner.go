@@ -307,11 +307,12 @@ func leadingWildcard(value string) bool {
 	return strings.ContainsAny(value[:end], "*?")
 }
 
+// appendUnique adds i to indices when it is not already present. The caller
+// walks runs in ascending order, so a repeated i is always the last element.
+// Checking only that element deduplicates in constant time without a scan.
 func appendUnique(indices []int, i int) []int {
-	for _, existing := range indices {
-		if existing == i {
-			return indices
-		}
+	if n := len(indices); n > 0 && indices[n-1] == i {
+		return indices
 	}
 	return append(indices, i)
 }
