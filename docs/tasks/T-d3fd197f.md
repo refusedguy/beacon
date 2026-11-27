@@ -1,7 +1,7 @@
 ---
 id: T-d3fd197f
 title: Add prerequisite preflight for tools and panel
-status: in_progress
+status: done
 scope:
     - cmd/beacon/doctor.go
     - cmd/beacon/main.go
