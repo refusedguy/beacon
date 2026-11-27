@@ -446,6 +446,10 @@ jobs:
           # stays at its own tree's revision.
           while IFS= read -r path; do
             case "$path" in
+              # This script checks its after mirror against that tree's
+              # production ui_view.js, so each tree must keep its own copy.
+              internal/bench/ui_bench.js)
+                ;;
               internal/bench/*|.opencode/plugins/beacon-project/*|docs/perf/*)
                 if [[ -f "$RUNNER_TEMP/perf-head/$path" ]]; then
                   mkdir -p "$RUNNER_TEMP/perf-base/$(dirname "$path")"
