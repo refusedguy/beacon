@@ -349,12 +349,21 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 }
 
 func mergePolicy(cfg config.Config) app.ReconcilerPolicy {
-	// Required checks reach policy only through the source port. Config load
-	// resolves workflow job names into cfg.Merge.RequiredChecks in workflow
-	// mode, and the manual list is the override the source returns on both the
-	// initial load and every watcher reload. SCM adapters can add a fallback
-	// source later without a policy change.
-	source := checksource.Config{Explicit: cfg.Merge.RequiredChecks}
+	// Required checks reach policy only through the source port. Manual mode
+	// uses the configured list. Workflow mode re-reads the workflow on every
+	// evaluation, so a rename at the head changes the required set on the next
+	// tick without a config edit or a daemon restart. The operator's explicit
+	// list is a fallback only when detection finds no names; with neither, the
+	// source returns an error and the policy waits instead of merging.
+	var source core.RequiredCheckSource
+	if cfg.Merge.RequiredChecksMode == config.RequiredChecksWorkflow {
+		source = checksource.Workflow{
+			Root:     cfg.ProjectRoot,
+			Fallback: cfg.Merge.RequiredChecksFallback,
+		}
+	} else {
+		source = checksource.Config{Explicit: cfg.Merge.RequiredChecks}
+	}
 	return policy.New(policy.Config{
 		RequiredCheckSource: source, RequiredApprovals: cfg.Merge.RequiredApprovals,
 		Labels: cfg.Merge.Labels, CommandGate: cfg.Merge.CommandGate,

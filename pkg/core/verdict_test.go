@@ -216,26 +216,30 @@ func TestDecideLockedNeverMerges(t *testing.T) {
 
 func TestAllRequiredPass(t *testing.T) {
 	cases := []struct {
-		name   string
-		checks []CheckResult
-		names  []string
-		want   bool
+		name            string
+		checks          []CheckResult
+		names           []string
+		workflowSkipped bool
+		want            bool
 	}{
-		{"no checks, no names", nil, nil, false},
-		{"no checks, with names", nil, []string{"ci"}, false},
-		{"all success, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckSuccess}}, nil, true},
-		{"success and skipped, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckSkipped}}, nil, true},
-		{"pending, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckPending}}, nil, false},
-		{"failure, no names", []CheckResult{{Name: "a", State: CheckFailure}}, nil, false},
-		{"unknown state, no names", []CheckResult{{Name: "a", State: CheckState("unknown")}}, nil, false},
-		{"named check present and green", []CheckResult{{Name: "ci", State: CheckSuccess}}, []string{"ci"}, true},
-		{"named check missing", []CheckResult{{Name: "other", State: CheckSuccess}}, []string{"ci"}, false},
-		{"named check pending", []CheckResult{{Name: "ci", State: CheckPending}}, []string{"ci"}, false},
-		{"named check case insensitive", []CheckResult{{Name: "CI", State: CheckSuccess}}, []string{"ci"}, true},
+		{"no checks, no names", nil, nil, false, false},
+		{"no checks, with names", nil, []string{"ci"}, false, false},
+		{"all success, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckSuccess}}, nil, false, true},
+		{"success and skipped, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckSkipped}}, nil, false, false},
+		{"success and declared skip, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckSkipped}}, nil, true, true},
+		{"pending, no names", []CheckResult{{Name: "a", State: CheckSuccess}, {Name: "b", State: CheckPending}}, nil, false, false},
+		{"failure, no names", []CheckResult{{Name: "a", State: CheckFailure}}, nil, false, false},
+		{"unknown state, no names", []CheckResult{{Name: "a", State: CheckState("unknown")}}, nil, false, false},
+		{"named check present and green", []CheckResult{{Name: "ci", State: CheckSuccess}}, []string{"ci"}, false, true},
+		{"named check missing", []CheckResult{{Name: "other", State: CheckSuccess}}, []string{"ci"}, false, false},
+		{"named check pending", []CheckResult{{Name: "ci", State: CheckPending}}, []string{"ci"}, false, false},
+		{"named check skipped", []CheckResult{{Name: "ci", State: CheckSkipped}}, []string{"ci"}, false, false},
+		{"named check declared skip", []CheckResult{{Name: "ci", State: CheckSkipped}}, []string{"ci"}, true, true},
+		{"named check case insensitive", []CheckResult{{Name: "CI", State: CheckSuccess}}, []string{"ci"}, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			obs := Observation{Checks: tc.checks}
+			obs := Observation{Checks: tc.checks, WorkflowSkipped: tc.workflowSkipped}
 			if got := obs.AllRequiredPass(tc.names); got != tc.want {
 				t.Fatalf("AllRequiredPass(%v) = %t, want %t", tc.names, got, tc.want)
 			}

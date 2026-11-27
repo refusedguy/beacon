@@ -29,12 +29,39 @@ func TestEvaluateAllGreenReturnsMerge(t *testing.T) {
 	}
 	obs := core.Observation{
 		PRState:   "open",
-		Checks:    []core.CheckResult{{Name: "ci", State: core.CheckSuccess}, {Name: "lint", State: core.CheckSkipped}},
+		Checks:    []core.CheckResult{{Name: "ci", State: core.CheckSuccess}, {Name: "lint", State: core.CheckSuccess}},
 		Approvals: 2,
 		Labels:    []string{"ready", "automerge"},
 	}
 	got := New(cfg).Evaluate(obs)
 	if got.Verdict != core.VerdictMerge {
+		t.Fatalf("verdict = %s, want %s (reason %q)", got.Verdict, core.VerdictMerge, got.Reason)
+	}
+}
+
+func TestEvaluateSkippedRequiredCheckWaitsWithoutDiffSkip(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build"}}}
+	obs := core.Observation{
+		PRState: "open",
+		Checks:  []core.CheckResult{{Name: "build", State: core.CheckSkipped}},
+	}
+	got := New(cfg).Evaluate(obs)
+	if got.Verdict != core.VerdictWait || got.Criterion != "required_checks" {
+		t.Fatalf("decision = %+v, want wait/required_checks", got)
+	}
+	if !strings.Contains(got.Reason, "build (skipped)") {
+		t.Fatalf("reason = %q, want the skipped check named", got.Reason)
+	}
+}
+
+func TestEvaluateDeclaredSkipAcceptsSkippedRequiredCheck(t *testing.T) {
+	cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build"}}}
+	obs := core.Observation{
+		PRState:         "open",
+		WorkflowSkipped: true,
+		Checks:          []core.CheckResult{{Name: "build", State: core.CheckSkipped}},
+	}
+	if got := New(cfg).Evaluate(obs); got.Verdict != core.VerdictMerge {
 		t.Fatalf("verdict = %s, want %s (reason %q)", got.Verdict, core.VerdictMerge, got.Reason)
 	}
 }
