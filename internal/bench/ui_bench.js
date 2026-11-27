@@ -337,3 +337,14 @@ console.log(`production: median ${production.ms.toFixed(2)} ms, range ${producti
 console.log(`normalize work removed: ${(normalizeShare * 100).toFixed(1)}% of the before median`)
 console.log(`cost per removed normalize: ${perNormalizeMs.toFixed(4)} ms`)
 console.log(`limiter: one normalizeSnapshot at the entry point is ${(afterNormalizeShare * 100).toFixed(1)}% of the after median; renderOnly is ${(renderOnly.ms / before.ms * 100).toFixed(1)}% of the before median`)
+// One canonical row for the measured plan. Work is the sink flag the human
+// report already checks; the harness aborts on a mismatch, so errs is zero.
+console.log(`beacon-perf: ${JSON.stringify({
+  key: "tui-view",
+  median_ms: production.ms,
+  min_ms: production.min,
+  max_ms: production.max,
+  work: before.sink && after.sink ? 1 : 0,
+  errs: 0,
+  limiter: "normalizeSnapshot + render",
+})}`)

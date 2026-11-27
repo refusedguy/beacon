@@ -1,11 +1,52 @@
 package bench
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
 	"time"
 )
+
+// perfPrefix marks one canonical row in a benchmark log. The payload is JSON
+// so limiter strings may contain spaces.
+const perfPrefix = "beacon-perf: "
+
+// perfRow is the fixed payload of every canonical row. Consumers validate the
+// field set, so no harness may add another field or rename one.
+type perfRow struct {
+	Key      string  `json:"key"`
+	MedianMS float64 `json:"median_ms"`
+	MinMS    float64 `json:"min_ms"`
+	MaxMS    float64 `json:"max_ms"`
+	Work     int64   `json:"work"`
+	Errs     int64   `json:"errs"`
+	Limiter  string  `json:"limiter"`
+}
+
+// perfLine renders one canonical row. Benchmarks time in nanoseconds and the
+// advisory report reads in milliseconds, so the published values are ms.
+func perfLine(key string, median, min, max time.Duration, work, errs int64, limiter string) string {
+	data, err := json.Marshal(perfRow{
+		Key:      key,
+		MedianMS: float64(median) / float64(time.Millisecond),
+		MinMS:    float64(min) / float64(time.Millisecond),
+		MaxMS:    float64(max) / float64(time.Millisecond),
+		Work:     work,
+		Errs:     errs,
+		Limiter:  limiter,
+	})
+	if err != nil {
+		return ""
+	}
+	return perfPrefix + string(data)
+}
+
+// printPerfRow writes one canonical row after the human-readable line. Every
+// harness prints both so a reader and a parser see the same measurement.
+func printPerfRow(w io.Writer, key string, median, min, max time.Duration, work, errs int64, limiter string) {
+	fmt.Fprintln(w, perfLine(key, median, min, max, work, errs, limiter))
+}
 
 // Hotspot names are fixed so every report has the same row order.
 const (
@@ -114,6 +155,7 @@ func printReport(w io.Writer, sums []summary, total time.Duration, iterations in
 	for _, s := range sums {
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %5.1f%%  %s\n",
 			s.Name, s.Median, s.Max-s.Min, s.Work, s.Errors, s.Share, s.Limiter)
+		printPerfRow(w, s.Name, s.Median, s.Min, s.Max, s.Work, s.Errors, s.Limiter)
 	}
 	marshal, delivered, dropped := takeFanoutCounts()
 	fmt.Fprintf(w, "sse-fanout (8 and 64 subscribers): marshal=%d delivery=%d drop=%d\n", marshal, delivered, dropped)
@@ -227,6 +269,7 @@ func printSnapshotReport(w io.Writer, phases []snapshotPhase, fixture string, pa
 	for _, p := range phases {
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %7d %7.1f %5.1f%%  %s\n",
 			p.Name, p.Median, p.Max-p.Min, p.Work, p.Errs, p.Bytes, p.Allocs, p.Share, snapshotLimiters[p.Name])
+		printPerfRow(w, p.Name, p.Median, p.Min, p.Max, p.Work, p.Errs, snapshotLimiters[p.Name])
 	}
 	fmt.Fprintln(w, "shares are of one full snapshot CPU: reads plus assembly, not the hot-path micro benchmark")
 }

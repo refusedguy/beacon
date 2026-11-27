@@ -1048,4 +1048,27 @@ func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
 	fmt.Printf("worktree-remove: median=%.3fs range=%.3fs-%.3fs work=%d status=%d errs=%d limiter=git subprocess spawn and worktree metadata\n",
 		walls[len(walls)/2], walls[0], walls[len(walls)-1],
 		works[len(works)/2], statuses[len(statuses)/2], errs)
+	// Keep the test as the harness and print the canonical row alongside the
+	// human line. The status count stays in the human line only: the canonical
+	// payload has a fixed field set shared by every harness.
+	row := struct {
+		Key      string  `json:"key"`
+		MedianMS float64 `json:"median_ms"`
+		MinMS    float64 `json:"min_ms"`
+		MaxMS    float64 `json:"max_ms"`
+		Work     int64   `json:"work"`
+		Errs     int64   `json:"errs"`
+		Limiter  string  `json:"limiter"`
+	}{
+		Key:      "worktree-remove",
+		MedianMS: walls[len(walls)/2] * 1000,
+		MinMS:    walls[0] * 1000,
+		MaxMS:    walls[len(walls)-1] * 1000,
+		Work:     int64(works[len(works)/2]),
+		Errs:     int64(errs),
+		Limiter:  "git subprocess spawn and worktree metadata",
+	}
+	if data, err := json.Marshal(row); err == nil {
+		fmt.Printf("beacon-perf: %s\n", data)
+	}
 }

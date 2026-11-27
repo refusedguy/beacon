@@ -318,7 +318,13 @@ func BenchmarkSQLiteSnapshot(b *testing.B) {
 	fmt.Printf("sqlite snapshot deep: runs=%d decisions=%d events=%d active_ids=%d iterations=%d\n", e.runs, e.decisions, e.events, len(e.ids), b.N)
 	fmt.Printf("sqlite snapshot deep: median=%s mean=%s min=%s max=%s range=%s work=%d errs=%d\n",
 		median, avg, min, max, max-min, work, errs)
+	// The canonical row exposes min and max directly instead of only the
+	// range, so a consumer never has to infer the sample spread.
+	printPerfRow(os.Stdout, "snapshot", median, min, max, work, errs,
+		"SQLite VM, ListRunEvents sort and JSON reflection")
 	b.ReportMetric(float64(median.Nanoseconds()), "snapshot-median-ns")
+	b.ReportMetric(float64(min.Nanoseconds()), "snapshot-min-ns")
+	b.ReportMetric(float64(max.Nanoseconds()), "snapshot-max-ns")
 	b.ReportMetric(float64((max - min).Nanoseconds()), "snapshot-range-ns")
 	b.ReportMetric(float64(work), "snapshot-work")
 	b.ReportMetric(float64(errs), "snapshot-errs")
