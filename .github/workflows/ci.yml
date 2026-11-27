@@ -116,27 +116,35 @@ jobs:
           - module: root command
             dir: .
             packages: ./cmd/...
+            race: true
           - module: root app
             dir: .
             packages: ./internal/app/...
+            race: true
           - module: root infra
             dir: .
             packages: ./internal/infra/...
+            race: true
           - module: root bench
             dir: .
             packages: ./internal/bench/...
+            race: true
           - module: root core
             dir: .
             packages: . ./pkg/...
+            race: false
           - module: acp
             dir: harnesses/acp
             packages: ./...
+            race: false
           - module: opencode
             dir: harnesses/opencode
             packages: ./...
+            race: true
           - module: tui
             dir: ui/tui
             packages: ./...
+            race: true
     steps:
       - uses: actions/checkout@v4
 
@@ -150,7 +158,7 @@ jobs:
 
       - name: Test ${{ matrix.module }} module
         working-directory: ${{ matrix.dir }}
-        run: go test -race -shuffle=on ${{ matrix.packages }}
+        run: go test ${{ matrix.race && '-race' || '' }} -shuffle=on ${{ matrix.packages }}
 
   test:
     if: github.event_name != 'schedule'
@@ -159,6 +167,37 @@ jobs:
     timeout-minutes: 20
     steps:
       - run: echo "all module suites passed"
+
+  test-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: root
+            dir: .
+          - module: acp
+            dir: harnesses/acp
+          - module: opencode
+            dir: harnesses/opencode
+          - module: tui
+            dir: ui/tui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
+
+      - name: Test ${{ matrix.module }} module with race
+        working-directory: ${{ matrix.dir }}
+        run: go test -race -shuffle=on ./...
 
   plugin-tui-smoke:
     if: github.event_name != 'schedule'
