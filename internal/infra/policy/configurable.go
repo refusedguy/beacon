@@ -171,6 +171,14 @@ func (p *Policy) explainRequiredChecks() []string {
 	return nil
 }
 
+// conditionalCheckSource is an optional capability of a RequiredCheckSource.
+// It names the required checks whose workflow job declares a job-level if
+// gate. Those checks may be skipped or omitted on an ordinary pull request,
+// so the policy can accept that state without weakening the failure invariant.
+type conditionalCheckSource interface {
+	ConditionalNames(ctx context.Context) ([]string, error)
+}
+
 // SourceChecksRule gates a merge on the names reported by a source. Names are
 // resolved on each evaluation, so a source that changes its answer is honoured
 // without rebuilding the policy.
@@ -194,53 +202,60 @@ func (r SourceChecksRule) RequiredChecks() ([]string, bool) {
 	return names, true
 }
 
-// Evaluate resolves the source's names and applies the same check gate. A
-// source that cannot be read fails closed with a wait verdict.
+// Evaluate resolves the source's names and gates, then applies the check gate.
+// A source that cannot be read fails closed with a wait verdict.
 func (r SourceChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
 	if r.Source == nil {
-		return evaluateChecks(nil, o)
+		return evaluateChecks(nil, nil, o)
 	}
 	names, err := r.Source.Names(context.Background())
 	if err != nil {
 		return core.VerdictWait, "required checks unavailable: " + err.Error()
 	}
-	return evaluateChecks(names, o)
+	var gated []string
+	if source, ok := r.Source.(conditionalCheckSource); ok {
+		gated, err = source.ConditionalNames(context.Background())
+		if err != nil {
+			return core.VerdictWait, "required check gates unavailable: " + err.Error()
+		}
+	}
+	return evaluateChecks(names, gated, o)
 }
 
-// evaluateChecks is the shared gate for a resolved list of names. An empty
-// list means no checks are required, so it never blocks a merge. A source that
-// fails closed never reaches this path with an empty list.
-func evaluateChecks(names []string, o core.Observation) (core.Verdict, string) {
+// evaluateChecks is the shared gate for a resolved list of names. A name in
+// gated carries a workflow if gate that did not apply, so its skipped or
+// absent state is accepted while a reported failure still blocks. An empty
+// list means no checks are required, so it never blocks a merge.
+func evaluateChecks(names, gated []string, o core.Observation) (core.Verdict, string) {
 	if len(names) == 0 {
 		return core.VerdictNoop, ""
 	}
-	if o.AllRequiredPass(names) {
+	if o.AllRequiredPassWithGates(names, gated) {
 		return core.VerdictNoop, ""
 	}
-	passed := func(state string) bool {
-		switch core.CheckState(state) {
-		case core.CheckSuccess:
-			return true
-		case core.CheckSkipped:
-			return o.WorkflowSkipped
-		default:
-			return false
+	isGated := func(name string) bool {
+		for _, want := range gated {
+			if strings.EqualFold(name, want) {
+				return true
+			}
 		}
+		return false
 	}
+	reported := o.ReportsAny(names)
 	var notPassed []string
 	for _, want := range names {
-		state := "missing"
+		found := false
 		for _, c := range o.Checks {
 			if strings.EqualFold(c.Name, want) {
-				state = string(c.State)
+				if !o.CheckPassed(c, isGated(want)) {
+					notPassed = append(notPassed, want+" ("+string(c.State)+")")
+				}
+				found = true
 				break
 			}
 		}
-		if o.WorkflowSkipped && state == "missing" {
-			continue
-		}
-		if !passed(state) {
-			notPassed = append(notPassed, want+" ("+state+")")
+		if !found && !o.WorkflowSkipped && !(isGated(want) && reported) {
+			notPassed = append(notPassed, want+" (missing)")
 		}
 	}
 	if len(notPassed) == 0 {
