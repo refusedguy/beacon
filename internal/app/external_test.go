@@ -162,7 +162,7 @@ func TestGuardEpicReviewUsesPolicyGate(t *testing.T) {
 	run := store.runs["epic-1"]
 	obs := core.Observation{PRNumber: 55, HeadSHA: "sha1", PRState: "open", Approvals: 1}
 
-	ok, err := r.guardEpicReview(ctx, run, obs)
+	ok, _, err := r.guardEpicReview(ctx, run, obs)
 	if err != nil {
 		t.Fatalf(`r.guardEpicReview(ctx, run, obs): %v`, err)
 	}
@@ -177,7 +177,7 @@ func TestGuardEpicReviewUsesPolicyGate(t *testing.T) {
 	}
 
 	gate.required = false
-	ok, err = r.guardEpicReview(ctx, run, obs)
+	ok, _, err = r.guardEpicReview(ctx, run, obs)
 	if err != nil {
 		t.Fatalf(`r.guardEpicReview(ctx, run, obs): %v`, err)
 	}
@@ -195,12 +195,15 @@ func TestGuardEpicReviewWithoutGateHoldsMerge(t *testing.T) {
 	epicRun(t, store, "epic-1", 55)
 	r := &Reconciler{Store: store, Policy: behindAwarePolicy{}, Source: epicSource(core.ReviewModeNone)}
 
-	ok, err := r.guardEpicReview(ctx, store.runs["epic-1"], core.Observation{PRNumber: 55, HeadSHA: "sha1"})
+	ok, isEpic, err := r.guardEpicReview(ctx, store.runs["epic-1"], core.Observation{PRNumber: 55, HeadSHA: "sha1"})
 	if err != nil {
 		t.Fatalf(`r.guardEpicReview(ctx, store.runs["epic-1"], core.Observation{PRNumber: 55, HeadSHA: "sha1"}): %v`, err)
 	}
 	if ok {
 		t.Fatal("policy without a review gate must not clear the epic gate")
+	}
+	if !isEpic {
+		t.Fatal("epic run was not reported as an epic to the merge path")
 	}
 }
 

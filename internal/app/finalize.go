@@ -175,6 +175,16 @@ func (r *Reconciler) reconcileEpics(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	hasEpic := false
+	for _, task := range ready {
+		if task.Kind == core.TaskKindEpic {
+			hasEpic = true
+			break
+		}
+	}
+	if !hasEpic {
+		return nil
+	}
 	tree := r.taskTree(ctx)
 	for _, task := range ready {
 		epic, ok := tree.Task(task.ID)
@@ -254,11 +264,12 @@ func (r *Reconciler) openEpicPR(ctx context.Context, epic core.Task) error {
 }
 
 // guardEpicReview applies the epic's review mode before a merge. The LLM
-// reviewer starts once per observed commit and reports through approval.
-func (r *Reconciler) guardEpicReview(ctx context.Context, run *core.Run, obs core.Observation) (bool, error) {
+// reviewer starts once per observed commit and reports through approval. The
+// isEpic result lets the caller skip a second task tree read in merge.
+func (r *Reconciler) guardEpicReview(ctx context.Context, run *core.Run, obs core.Observation) (reviewOK, isEpic bool, err error) {
 	epic, ok := r.epicTask(ctx, run.TaskID)
 	if !ok {
-		return true, nil
+		return true, false, nil
 	}
 	mode := epic.RequireReview
 	if mode == "" {
@@ -267,7 +278,7 @@ func (r *Reconciler) guardEpicReview(ctx context.Context, run *core.Run, obs cor
 	if mode == core.ReviewModeLLM {
 		r.maybeSpawnReviewer(ctx, run, obs)
 	}
-	return !r.Policy.ReviewRequired(mode, obs), nil
+	return !r.Policy.ReviewRequired(mode, obs), true, nil
 }
 
 // maybeSpawnReviewer starts one LLM review session for an epic commit. The
@@ -302,14 +313,14 @@ func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs 
 }
 
 func (r *Reconciler) mergeIfReviewed(ctx context.Context, run *core.Run, obs core.Observation, decision core.MergeDecision) (core.MergeDecision, error) {
-	ok, err := r.guardEpicReview(ctx, run, obs)
+	ok, isEpic, err := r.guardEpicReview(ctx, run, obs)
 	if err != nil {
 		return decision, err
 	}
 	if !ok {
 		return core.MergeDecision{Verdict: core.VerdictWait, Reason: "epic review pending"}, nil
 	}
-	return decision, r.merge(ctx, run, obs)
+	return decision, r.merge(ctx, run, obs, isEpic)
 }
 
 // finalizeExternal closes a run whose PR was merged or closed outside Beacon.

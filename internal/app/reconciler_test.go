@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1449,4 +1450,169 @@ func TestFixerPromptUsesCopiedWorkerInstructions(t *testing.T) {
 		}
 	}
 	t.Fatalf("fixer prompts = %q, want copied worker instructions", h.prompts)
+}
+
+func TestReconcileEpicsSkipsTaskTreeWithoutReadyEpic(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	store.ready = []core.Task{{ID: "T-1", Title: "task", Kind: core.TaskKindTask, Status: core.TaskAvailable}}
+	src := &countingSource{fakeSource: &fakeSource{tasks: []core.Task{
+		{ID: "T-1", Title: "task", Kind: core.TaskKindTask, Status: core.TaskAvailable},
+	}}}
+	r := &Reconciler{Store: store, Source: src, SCM: &fakeSCM{}, Harness: &fakeHarness{}}
+
+	if err := r.reconcileEpics(ctx); err != nil {
+		t.Fatalf(`r.reconcileEpics(ctx): %v`, err)
+	}
+	if src.lists != 0 {
+		t.Fatalf("ListAvailable calls = %d, want 0 with no ready epic", src.lists)
+	}
+
+	store.ready = append(store.ready, core.Task{
+		ID: "T-EPIC", Title: "epic", Kind: core.TaskKindEpic, Status: core.TaskAvailable,
+	})
+	if err := r.reconcileEpics(ctx); err != nil {
+		t.Fatalf(`r.reconcileEpics(ctx): %v`, err)
+	}
+	if src.lists != 1 {
+		t.Fatalf("ListAvailable calls = %d, want 1 with a ready epic", src.lists)
+	}
+}
+
+func TestMergeReadsTaskTreeOnce(t *testing.T) {
+	ctx := context.Background()
+	task := func() *core.Run { return makeRun("r-task", 42, core.RunWaitingCI) }
+	epic := func() *core.Run {
+		run := makeRun("r-epic", 42, core.RunWaitingCI)
+		run.TaskID = "T-EPIC"
+		return run
+	}
+	cases := []struct {
+		name  string
+		run   *core.Run
+		tasks []core.Task
+	}{
+		{name: "task run", run: task()},
+		{name: "epic run", run: epic(), tasks: []core.Task{
+			{ID: "T-EPIC", Title: "epic", Kind: core.TaskKindEpic,
+				Status: core.TaskAvailable, RequireReview: core.ReviewModeNone},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			if err := store.Save(ctx, tc.run); err != nil {
+				t.Fatalf(`store.Save(ctx, tc.run): %v`, err)
+			}
+			src := &countingSource{fakeSource: &fakeSource{tasks: tc.tasks}}
+			r := &Reconciler{
+				Store: store,
+				SCM: &fakeSCM{obs: core.Observation{
+					PRNumber: 42, HeadSHA: "sha2", PRState: "open",
+				}},
+				Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge}},
+				Harness: &fakeHarness{}, Source: src, Workspace: &fakeWorkspace{},
+			}
+			if _, err := r.Reconcile(ctx, 42); err != nil {
+				t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
+			}
+			if src.lists != 1 {
+				t.Fatalf("ListAvailable calls = %d, want 1", src.lists)
+			}
+			if got := store.runs[tc.run.ID]; got.State != core.RunMerged {
+				t.Fatalf("state = %s, want merged", got.State)
+			}
+		})
+	}
+}
+
+// gatedSCM blocks inside Observe so a test can count how many reconciles are
+// in flight at once before releasing them.
+type gatedSCM struct {
+	*fakeSCM
+	mu      sync.Mutex
+	active  int
+	max     int
+	total   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedSCM) Observe(ctx context.Context, pr int) (core.Observation, error) {
+	s.mu.Lock()
+	s.active++
+	if s.active > s.max {
+		s.max = s.active
+	}
+	s.total++
+	s.mu.Unlock()
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	s.active--
+	s.mu.Unlock()
+	return core.Observation{PRNumber: pr, HeadSHA: "sha2", PRState: "open"}, nil
+}
+
+func TestReconcileActivePRsBoundsFanout(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	const count = 8
+	runs := make([]*core.Run, 0, count)
+	for i := 1; i <= count; i++ {
+		run := makeRun(core.RunID("r"+strconv.Itoa(i)), 100+i, core.RunWaitingCI)
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatalf(`store.Save(ctx, run): %v`, err)
+		}
+		runs = append(runs, run)
+	}
+	scm := &gatedSCM{
+		fakeSCM: &fakeSCM{},
+		entered: make(chan struct{}, count),
+		release: make(chan struct{}),
+	}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictWait}},
+		Harness: &fakeHarness{}, Source: &fakeSource{}, Workspace: &fakeWorkspace{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.reconcileActivePRs(ctx, runs)
+		close(done)
+	}()
+	for i := 0; i < reconcileFanout; i++ {
+		select {
+		case <-scm.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d reconciles entered Observe", i, reconcileFanout)
+		}
+	}
+	scm.mu.Lock()
+	peak := scm.max
+	scm.mu.Unlock()
+	if peak != reconcileFanout {
+		t.Fatalf("max concurrent observes before release = %d, want %d", peak, reconcileFanout)
+	}
+	close(scm.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fanout did not finish after release")
+	}
+	scm.mu.Lock()
+	defer scm.mu.Unlock()
+	if scm.total != count {
+		t.Fatalf("observes = %d, want %d", scm.total, count)
+	}
+	if scm.max != reconcileFanout {
+		t.Fatalf("max concurrent observes = %d, want %d", scm.max, reconcileFanout)
+	}
 }

@@ -6,12 +6,19 @@ import (
 	"log/slog"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
 // defaultOrphanTimeout is how long a running run without a PR may go stale
 // before its worker session is checked for liveness.
 const defaultOrphanTimeout = 90 * time.Second
+
+// reconcileFanout is the maximum number of active PRs reconciled at once on a
+// tick. It matches the SQLite adapter's open connection limit so concurrent
+// observes and writes stay within the pool's WAL budget.
+const reconcileFanout = 4
 
 // ReconcilerStore is the store surface Reconciler and its helpers use, from
 // reconciliation through incident repair and idle-session wakeups.
@@ -148,9 +155,10 @@ func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Eve
 	return r.Store.Save(ctx, run)
 }
 
-func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
+// merge applies a merge verdict to run. isEpic comes from the review gate so
+// the task tree is read once for the whole reconcile instead of once here.
+func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation, isEpic bool) error {
 	run.NoteObservation(obs.HeadSHA, obs.BaseSHA)
-	_, isEpic := r.epicTask(ctx, run.TaskID)
 	if !run.IsFixer && !isEpic && run.WorkspacePath != "" {
 		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {
 			return err
@@ -319,11 +327,7 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 				continue
 			}
 			r.reconcileOrphanRunning(ctx, runs)
-			for _, run := range runs {
-				if run.PRNumber > 0 {
-					r.safeReconcile(ctx, run.PRNumber)
-				}
-			}
+			r.reconcileActivePRs(ctx, runs)
 			if r.Promoter != nil {
 				if _, err := r.Promoter.PromotePending(ctx); err != nil {
 					slog.Error("promote pending", "error", err)
@@ -331,6 +335,26 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 			}
 		}
 	}
+}
+
+// reconcileActivePRs fans active pull requests out with a bounded group. A
+// single slow SCM observe no longer holds up every other PR on the tick. Each
+// reconcile still runs through safeReconcile, so one bad PR cannot stop the
+// others or return an error to the group.
+func (r *Reconciler) reconcileActivePRs(ctx context.Context, runs []*core.Run) {
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(reconcileFanout)
+	for _, run := range runs {
+		if run.PRNumber <= 0 {
+			continue
+		}
+		pr := run.PRNumber
+		g.Go(func() error {
+			r.safeReconcile(gctx, pr)
+			return nil
+		})
+	}
+	_ = g.Wait()
 }
 
 func (r *Reconciler) safeReconcile(ctx context.Context, pr int) {
