@@ -112,8 +112,18 @@ func (r *Reconciler) blockRunsOnRedBaseNames(ctx context.Context, in *core.BaseI
 		if r.baseBranchForTree(tree, other) != baseBranch {
 			continue
 		}
-		otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
-		if err != nil || !intersects(failedNames(otherObs.Checks), baseFailed) {
+		// Reconcile persists Checks on every tick, so a stored slice is the
+		// observation already made for this run. Only a run with no recorded
+		// checks needs a fresh SCM read here.
+		checks := other.Checks
+		if len(checks) == 0 {
+			otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
+			if err != nil {
+				continue
+			}
+			checks = otherObs.Checks
+		}
+		if !intersects(failedNames(checks), baseFailed) {
 			continue
 		}
 		if err := other.Apply(core.Event{Kind: core.EvBlock, Reason: "base_red"}); err != nil {
@@ -250,12 +260,26 @@ func (r *Reconciler) checkBaseRecovery(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Incidents on one branch share the same status. Read each branch once and
+	// apply the result to every incident that names it.
+	status := make(map[string]core.BaseStatus, len(incidents))
+	failed := make(map[string]error)
 	for _, in := range incidents {
+		if _, seen := status[in.BaseBranch]; seen {
+			continue
+		}
 		base, err := r.SCM.BaseBranchStatus(ctx, in.BaseBranch)
 		if err != nil {
+			failed[in.BaseBranch] = err
+		}
+		status[in.BaseBranch] = base
+	}
+	for _, in := range incidents {
+		if err, bad := failed[in.BaseBranch]; bad {
 			slog.Error("base status", "incident", in.ID, "error", err)
 			continue
 		}
+		base := status[in.BaseBranch]
 		if base.Red() {
 			continue
 		}
