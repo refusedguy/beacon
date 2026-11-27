@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -708,4 +710,93 @@ func BenchmarkViewFiveRuns(b *testing.B) {
 			benchViewOut = fixtures[i&1].View()
 		}
 	})
+}
+
+// The Go TUI view harness is copied from the PR head into the base tree by the
+// advisory job, so both sides measure identical harness code. Work and errs
+// are constants, so a no-change comparison sees equal counts and zero errors.
+const (
+	goTUIViewLimiter = "truncate + padding cache + reused row buffer"
+	goTUIViewWork    = int64(5)
+	goTUIViewErrs    = int64(0)
+)
+
+// goTUIViewRow is the canonical payload, declared locally so the TUI harness
+// owns its wire shape like the pure control does.
+type goTUIViewRow struct {
+	Key      string  `json:"key"`
+	MedianMS float64 `json:"median_ms"`
+	MinMS    float64 `json:"min_ms"`
+	MaxMS    float64 `json:"max_ms"`
+	Work     int64   `json:"work"`
+	Errs     int64   `json:"errs"`
+	Limiter  string  `json:"limiter"`
+	Cache    string  `json:"cache"`
+}
+
+// BenchmarkGoTUIView times the five-row monitor view and emits one canonical
+// row. The whole run is one sample, so median, min and max agree.
+func BenchmarkGoTUIView(b *testing.B) {
+	fixture := viewModel(80, 0, benchmarkFiveRuns("ready"), "loaded 5 run(s)", false)
+	want := viewBaseline(fixture)
+	if got := fixture.View(); got != want {
+		b.Fatalf("view differs from baseline:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	start := time.Now()
+	for i := 0; i < b.N; i++ {
+		benchViewOut = fixture.View()
+	}
+	ms := float64(time.Since(start)) / float64(time.Millisecond)
+	b.StopTimer()
+
+	cache := os.Getenv("BEACON_BENCH_CACHE")
+	if cache == "" {
+		cache = "unset"
+	}
+	row := goTUIViewRow{
+		Key:      "go-tui-view",
+		MedianMS: ms,
+		MinMS:    ms,
+		MaxMS:    ms,
+		Work:     goTUIViewWork,
+		Errs:     goTUIViewErrs,
+		Limiter:  goTUIViewLimiter,
+		Cache:    cache,
+	}
+	data, err := json.Marshal(row)
+	if err != nil {
+		b.Fatal(err)
+	}
+	fmt.Printf("beacon-perf: %s\n", data)
+}
+
+// TestGoTUIViewCanonicalRow checks the exact field set the advisory parser
+// accepts, so a harness edit cannot silently change the wire shape.
+func TestGoTUIViewCanonicalRow(t *testing.T) {
+	data, err := json.Marshal(goTUIViewRow{
+		Key:      "go-tui-view",
+		MedianMS: 1,
+		MinMS:    1,
+		MaxMS:    1,
+		Work:     goTUIViewWork,
+		Errs:     goTUIViewErrs,
+		Limiter:  goTUIViewLimiter,
+		Cache:    "unset",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"key", "median_ms", "min_ms", "max_ms", "work", "errs", "limiter", "cache"}
+	if len(fields) != len(want) {
+		t.Fatalf("Go TUI view row has %d fields, want %d: %s", len(fields), len(want), data)
+	}
+	for _, name := range want {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("Go TUI view row is missing %q: %s", name, data)
+		}
+	}
 }

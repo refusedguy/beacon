@@ -70,14 +70,17 @@ func TestRegistryReusesReportLimiterStrings(t *testing.T) {
 }
 
 // harnessSources are the files that print canonical perf rows. Go benchmarks
-// print through printPerfRow; the Node harnesses and the workspace latency
-// test print the JSON payload themselves.
+// print through printPerfRow; the Node harnesses, the workspace latency test,
+// the HTTP frame harness and the Go TUI view harness print the payload
+// themselves.
 var harnessSources = []string{
 	"report.go",
 	"snapshot_bench_test.go",
 	"ui_bench.js",
 	"run_watcher_bench.js",
 	"../infra/workspace/git_worktree_test.go",
+	"../../cmd/beacon/http_test.go",
+	"../../ui/tui/model_test.go",
 }
 
 // canonicalKeyRe finds the key a harness publishes for a canonical row. It
@@ -251,8 +254,9 @@ func benchSource(t *testing.T) string {
 		}
 		b.Write(data)
 	}
-	// The Node harnesses and the workspace latency test publish canonical
-	// rows too, so their keys and field names count as emitted.
+	// The Node harnesses, the workspace latency test and the Go benchmark
+	// harnesses outside this package publish canonical rows too, so their
+	// keys and field names count as emitted.
 	for _, path := range harnessSources[2:] {
 		data, err := os.ReadFile(path)
 		if err != nil {

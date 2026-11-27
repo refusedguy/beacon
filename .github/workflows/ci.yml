@@ -485,7 +485,7 @@ jobs:
           while IFS= read -r path; do
             case "$path" in
               internal/bench/ui_bench.js) continue ;;
-              internal/bench/*|docs/perf/*|internal/infra/workspace/git_worktree_test.go)
+              internal/bench/*|docs/perf/*|internal/infra/workspace/git_worktree_test.go|cmd/beacon/http_test.go|ui/tui/model_test.go|ui/tui/refresh_bench_test.go)
                 if [[ -f "$RUNNER_TEMP/perf-head/$path" ]]; then
                   mkdir -p "$RUNNER_TEMP/perf-base/$(dirname "$path")"
                   cp "$RUNNER_TEMP/perf-head/$path" "$RUNNER_TEMP/perf-base/$path"
@@ -549,6 +549,10 @@ jobs:
               || echo "warmup $tree" >> "$RUNNER_TEMP/perf-status"
             (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' ./internal/infra/workspace/) \
               || echo "warmup $tree" >> "$RUNNER_TEMP/perf-status"
+            (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' -bench '^$' ./cmd/beacon/) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/perf-status"
+            (cd "$RUNNER_TEMP/$tree/ui/tui" && go test -vet=off -run '^$' -bench '^$' ./) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/perf-status"
           done
           export BEACON_BENCH_CACHE=warm
           run_side() {
@@ -578,6 +582,12 @@ jobs:
               (cd "$dir" && taskset -c "$cpu" env BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && taskset -c "$cpu" env BENCH_TICKS=1001 BENCH_ROUNDS=5 node internal/bench/run_watcher_bench.js) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkHTTPFramesEmission$' -benchtime=1x -count=1 -benchmem ./cmd/beacon/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir/ui/tui" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkGoTUIView$' -benchtime=1x -count=1 -benchmem ./) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
             } 2>&1 | tee -a "$RUNNER_TEMP/perf-$side.txt"
           }
@@ -1016,6 +1026,10 @@ jobs:
               || echo "warmup $tree" >> "$RUNNER_TEMP/floor-status"
             (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' ./internal/infra/workspace/) \
               || echo "warmup $tree" >> "$RUNNER_TEMP/floor-status"
+            (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' -bench '^$' ./cmd/beacon/) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/floor-status"
+            (cd "$RUNNER_TEMP/$tree/ui/tui" && go test -vet=off -run '^$' -bench '^$' ./) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/floor-status"
           done
           export BEACON_BENCH_CACHE=warm
           run_side() {
@@ -1045,6 +1059,12 @@ jobs:
               (cd "$dir" && taskset -c "$cpu" env BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js) \
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
               (cd "$dir" && taskset -c "$cpu" env BENCH_TICKS=1001 BENCH_ROUNDS=5 node internal/bench/run_watcher_bench.js) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkHTTPFramesEmission$' -benchtime=1x -count=1 -benchmem ./cmd/beacon/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir/ui/tui" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkGoTUIView$' -benchtime=1x -count=1 -benchmem ./) \
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
             } 2>&1 | tee -a "$RUNNER_TEMP/perf-$side.txt"
           }

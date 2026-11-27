@@ -34,6 +34,8 @@ var prHarnessLimiters = []struct{ key, limiter string }{
 	{"worktree-remove", "git subprocess spawn and worktree metadata"},
 	{"tui-view", "normalizeSnapshot + render"},
 	{"run-watcher-fp", "JSON.stringify character volume"},
+	{"http-frame-emission", "json.Marshal + eight-subscriber lossy fanout"},
+	{"go-tui-view", "truncate + padding cache + reused row buffer"},
 }
 
 // The pure control benchmark owns no Beacon code, so its canonical name and
