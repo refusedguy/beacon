@@ -633,6 +633,65 @@ func TestClaimDirKeys(t *testing.T) {
 	}
 }
 
+func TestLeadingWildcard(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"*.go", true},
+		{"?*.go", true},
+		{"*/*.go", true},
+		{"src/*.go", false},
+		{"src/a/*/c.go", false},
+		{"src/*.go/lead", false},
+		{"plain.go", false},
+		{"", false},
+		{"a/b?/c", false},
+		{"a/*", false},
+	} {
+		if got := leadingWildcard(tc.value); got != tc.want {
+			t.Errorf("leadingWildcard(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestActiveScopeIndexMatchingStableAcrossCalls(t *testing.T) {
+	active := []*core.Run{
+		{ID: "r1", TaskID: "A1", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("src/a.go")}},
+		{ID: "r2", TaskID: "A2", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("src/b.go")}},
+		{ID: "r3", TaskID: "A3", State: core.RunRunning, Scope: []core.ScopePath{core.ScopeFile("docs/readme.md")}},
+	}
+	idx := newActiveScopeIndex(active)
+	tasks := []core.Task{
+		{ID: "t1", Scope: []core.ScopePath{core.ScopeFile("src/a.go")}},
+		{ID: "t2", Scope: []core.ScopePath{core.ScopeFile("src/a.go"), core.ScopeFile("src/b.go")}},
+		{ID: "t3", Scope: []core.ScopePath{core.ScopeDir("src")}},
+		{ID: "t4", Scope: []core.ScopePath{core.ScopeAll()}},
+		{ID: "t5", Scope: []core.ScopePath{core.ScopePattern("*.go")}},
+	}
+	for pass := 0; pass < 3; pass++ {
+		for _, task := range tasks {
+			got := idx.matching(task)
+			want := newActiveScopeIndex(active).matching(task)
+			if !equalInts(got, want) {
+				t.Fatalf("pass %d task %s matching = %v, want %v", pass, task.ID, got, want)
+			}
+		}
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func BenchmarkPlannerSelectLargeDispatch(b *testing.B) {
 	tasks, active := largeDispatchFixtures()
 	const limit = 20
