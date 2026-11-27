@@ -1,11 +1,12 @@
 ---
 id: T-5d11af6c
-title: Planner allocation cut after dispatch merge
+title: [perf] Planner allocation cut after dispatch merge
 status: available
 scope:
     - internal/app/planner.go
     - internal/app/planner_test.go
     - internal/bench/planner_bench_test.go
+perf: true
 priority: 95
 kind: task
 require_review: llm
