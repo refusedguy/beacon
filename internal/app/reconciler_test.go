@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -1449,4 +1450,153 @@ func TestFixerPromptUsesCopiedWorkerInstructions(t *testing.T) {
 		}
 	}
 	t.Fatalf("fixer prompts = %q, want copied worker instructions", h.prompts)
+}
+
+// perfStore, perfSCM and perfSink count the work a tick performs. They wrap the
+// shared fakes so the numbers stay comparable across code changes.
+type perfStore struct {
+	*fakeStore
+	saves int
+}
+
+func (s *perfStore) Save(ctx context.Context, run *core.Run) error {
+	s.saves++
+	return s.fakeStore.Save(ctx, run)
+}
+
+type perfSCM struct {
+	*fakeSCM
+	observes  int
+	baseCalls int
+}
+
+func (s *perfSCM) Observe(ctx context.Context, pr int) (core.Observation, error) {
+	s.observes++
+	return s.fakeSCM.Observe(ctx, pr)
+}
+
+func (s *perfSCM) BaseBranchStatus(ctx context.Context, branch string) (core.BaseStatus, error) {
+	s.baseCalls++
+	return s.fakeSCM.BaseBranchStatus(ctx, branch)
+}
+
+type perfSink struct{ writes int }
+
+func (s *perfSink) RecordDecision(context.Context, Decision) error          { s.writes++; return nil }
+func (s *perfSink) LastDecision(context.Context, string) (*Decision, error) { return nil, nil }
+
+// BenchmarkReconcileTickCounts runs five ticks over eight unchanged pull
+// requests. It counts Observe calls, store writes and persisted decisions.
+func BenchmarkReconcileTickCounts(b *testing.B) {
+	ctx := context.Background()
+	const prs, ticks = 8, 5
+	checks := []core.CheckResult{{Name: "ci", State: core.CheckSuccess}}
+	var observes, saves, decisions int
+	for i := 0; i < b.N; i++ {
+		store := &perfStore{fakeStore: newFakeStore()}
+		scm := &perfSCM{fakeSCM: &fakeSCM{obs: core.Observation{
+			PRState: "open", HeadSHA: "sha1", BaseSHA: "base1", Checks: checks,
+		}}}
+		sink := &perfSink{}
+		r := &Reconciler{
+			Store: store, SCM: scm,
+			Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictWait, Reason: "checks pending"}},
+			Harness: &fakeHarness{}, Source: &fakeSource{}, Workspace: &fakeWorkspace{},
+			Decisions: DecisionLogger{Sink: sink},
+		}
+		for pr := 100; pr < 100+prs; pr++ {
+			run := makeRun(core.RunID(fmt.Sprintf("r-%d", pr)), pr, core.RunWaitingCI)
+			run.ObservedSHA, run.ObservedBaseSHA = "sha1", "base1"
+			if err := store.fakeStore.Save(ctx, run); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for t := 0; t < ticks; t++ {
+			for pr := 100; pr < 100+prs; pr++ {
+				if _, err := r.Reconcile(ctx, pr); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+		observes += scm.observes
+		saves += store.saves
+		decisions += sink.writes
+	}
+	div := float64(b.N)
+	b.ReportMetric(float64(observes)/div, "observes/op")
+	b.ReportMetric(float64(saves)/div, "saves/op")
+	b.ReportMetric(float64(decisions)/div, "decisions/op")
+}
+
+// BenchmarkBaseRedBlockCounts runs one red-base reconciliation with eight
+// waiting runs whose stored checks already show the failing base check.
+func BenchmarkBaseRedBlockCounts(b *testing.B) {
+	ctx := context.Background()
+	checks := []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
+	var observes, saves, decisions int
+	for i := 0; i < b.N; i++ {
+		store := &perfStore{fakeStore: newFakeStore()}
+		scm := &perfSCM{fakeSCM: &fakeSCM{
+			obs:  core.Observation{PRNumber: 42, PRState: "open", HeadSHA: "sha2", Checks: checks},
+			base: core.BaseStatus{BaseBranch: "main", FailedChecks: checks},
+		}}
+		sink := &perfSink{}
+		r := &Reconciler{
+			Store: store, SCM: scm,
+			Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictNeedsAgentFix, Reason: "ci failed"}},
+			Harness: &fakeHarness{}, Source: &fakeSource{}, Workspace: &fakeWorkspace{},
+			Repo: "o/r", BaseBranch: "main", BaseRedMode: "notify_orchestrator",
+			Decisions: DecisionLogger{Sink: sink},
+		}
+		if err := store.fakeStore.Save(ctx, makeRun("r-42", 42, core.RunWaitingCI)); err != nil {
+			b.Fatal(err)
+		}
+		for pr := 200; pr < 208; pr++ {
+			other := makeRun(core.RunID(fmt.Sprintf("o-%d", pr)), pr, core.RunWaitingCI)
+			other.Checks = checks
+			if err := store.fakeStore.Save(ctx, other); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if _, err := r.Reconcile(ctx, 42); err != nil {
+			b.Fatal(err)
+		}
+		observes += scm.observes
+		saves += store.saves
+		decisions += sink.writes
+	}
+	div := float64(b.N)
+	b.ReportMetric(float64(observes)/div, "observes/op")
+	b.ReportMetric(float64(saves)/div, "saves/op")
+	b.ReportMetric(float64(decisions)/div, "decisions/op")
+}
+
+// BenchmarkBaseRecoveryStatusCounts runs recovery over six incidents that
+// share two base branches. It counts base status calls and store writes.
+func BenchmarkBaseRecoveryStatusCounts(b *testing.B) {
+	ctx := context.Background()
+	var baseCalls, saves int
+	for i := 0; i < b.N; i++ {
+		store := &perfStore{fakeStore: newFakeStore()}
+		scm := &perfSCM{fakeSCM: &fakeSCM{base: core.BaseStatus{BaseBranch: "main"}}}
+		for j := 0; j < 6; j++ {
+			branch := "main"
+			if j%2 == 1 {
+				branch = "beacon/epic"
+			}
+			in := &core.BaseIncident{ID: fmt.Sprintf("i-%d", j), Signature: fmt.Sprintf("sig-%d", j), BaseBranch: branch}
+			if _, err := store.fakeStore.CreateIncident(ctx, in); err != nil {
+				b.Fatal(err)
+			}
+		}
+		r := &Reconciler{Store: store, SCM: scm}
+		if err := r.checkBaseRecovery(ctx); err != nil {
+			b.Fatal(err)
+		}
+		baseCalls += scm.baseCalls
+		saves += store.saves
+	}
+	div := float64(b.N)
+	b.ReportMetric(float64(baseCalls)/div, "base_status/op")
+	b.ReportMetric(float64(saves)/div, "incident_writes/op")
 }

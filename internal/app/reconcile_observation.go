@@ -14,6 +14,23 @@ func sameObservation(run *core.Run, obs core.Observation) bool {
 	return run.ObservedSHA == obs.HeadSHA && run.ObservedBaseSHA == obs.BaseSHA
 }
 
+// sameChecks reports whether two check slices carry the same results. Time
+// values are compared with Equal so a parsed timestamp with a different
+// location pointer still counts as unchanged. Reconcile uses this to skip the
+// store write when an observation brings no new check results.
+func sameChecks(a, b []core.CheckResult) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].State != b[i].State || a[i].Output != b[i].Output ||
+			!a[i].StartedAt.Equal(b[i].StartedAt) || !a[i].CompletedAt.Equal(b[i].CompletedAt) {
+			return false
+		}
+	}
+	return true
+}
+
 // DefaultMaxAutoRebases is the fallback automatic branch-update cap for
 // Reconcilers built without a configured value. Rebases get their own small
 // budget so a moving base cannot spend the whole fix budget before a real
