@@ -421,6 +421,18 @@ func DetectRequiredChecks(root string) []string {
 	return shared.DetectWorkflowJobNames(root)
 }
 
+// WorkflowFilePaths returns the CI workflow files that resolveRequiredChecks
+// reads for a config at path. The config watcher hashes these together with
+// the config file, so a job rename re-runs resolution without a config edit.
+// The glob mirrors the parser in internal/infra/shared.
+func WorkflowFilePaths(path string) []string {
+	files, err := filepath.Glob(filepath.Join(projectRootFromConfigPath(path), ".github", "workflows", "*.y*ml"))
+	if err != nil {
+		return nil
+	}
+	return files
+}
+
 // EnvOr returns the non-empty value of the environment variable named key,
 // else fallback. The key stays at the read site so every config name remains
 // visible where it is used. Secrets and regular settings share this resolver.

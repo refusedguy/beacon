@@ -62,8 +62,8 @@ func TestTaskCreatorCreatesAndCommits(t *testing.T) {
 	if err != nil {
 		t.Fatalf(`creator.Create(context.Background(), CreateTaskInput{ Title: " Add orchestrator tool ", Body: "Create cards in one call.", Scope: []string{"internal/app/", "internal/**/*.go", ""}, Depends: []string{" E2E-03 ", ""}, Priority: 11, }): %v`, err)
 	}
-	if !regexp.MustCompile(`^T-[0-9]{8}-[0-9a-f]{8}$`).MatchString(got.ID) {
-		t.Fatalf("id = %q, want date plus short hex", got.ID)
+	if !stableIDPattern.MatchString(got.ID) {
+		t.Fatalf("id = %q, want a content-derived id", got.ID)
 	}
 	if got.Path != "docs/tasks/"+got.ID+".md" || !got.Pushed {
 		t.Fatalf("result = %+v", got)
@@ -633,6 +633,27 @@ func TestTaskCreatorCreateBatchStableAcrossDays(t *testing.T) {
 	}
 	if got.ID != dayOne[2].ID {
 		t.Fatalf("standalone epic = %q, batch epic = %q", got.ID, dayOne[2].ID)
+	}
+}
+
+func TestTaskCreatorPlainCreateMatchesBatchID(t *testing.T) {
+	in := CreateTaskInput{Title: "Same card", Body: "Same body", Priority: 2}
+	newCreator := func() *TaskCreator {
+		return &TaskCreator{
+			Source: &fakeSource{log: &callLog{}}, Workspace: &fakeWorkspace{log: &callLog{}},
+			Root: core.Workspace{Path: "/root", Branch: "main"},
+		}
+	}
+	alone, err := newCreator().Create(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	batch, err := newCreator().CreateBatch(context.Background(), []CreateTaskInput{in})
+	if err != nil {
+		t.Fatalf("CreateBatch: %v", err)
+	}
+	if len(batch) != 1 || alone.ID != batch[0].ID || alone.Path != batch[0].Path {
+		t.Fatalf("plain create = %+v, batch = %+v", alone, batch)
 	}
 }
 

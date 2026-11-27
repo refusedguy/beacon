@@ -5,10 +5,12 @@ import (
 	"container/list"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -30,7 +32,7 @@ func NewServer(sv Services) *msdk.Server {
 func registerTaskCreate(s *msdk.Server, sv Services) {
 	// Journal operation ids so an interrupted call can be retried without
 	// writing the same cards twice. The create wrapper also accepts epic fields.
-	journal := newOpJournal()
+	journal := newOpJournal(journalStore(sv))
 	msdk.AddTool(s, catalogTool("beacon_task_create"), func(ctx context.Context, req *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
 		if err := requireOrchestrator(req); err != nil {
 			return nil, nil, err
@@ -80,7 +82,7 @@ func hasSingleCreateFields(a epicCreateArgs) bool {
 }
 
 func registerTaskUpdate(s *msdk.Server, sv Services) {
-	journal := newOpJournal()
+	journal := newOpJournal(journalStore(sv))
 	msdk.AddTool(s, catalogTool("beacon_task_update"), func(ctx context.Context, req *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
 		if err := requireOrchestrator(req); err != nil {
 			return nil, nil, err
@@ -108,7 +110,7 @@ func updateTasks(ctx context.Context, updater *app.TaskUpdater, a updateTaskArgs
 }
 
 func registerTaskDelete(s *msdk.Server, sv Services) {
-	journal := newOpJournal()
+	journal := newOpJournal(journalStore(sv))
 	msdk.AddTool(s, catalogTool("beacon_task_delete"), func(ctx context.Context, req *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
 		if err := requireOrchestrator(req); err != nil {
 			return nil, nil, err
@@ -132,31 +134,75 @@ const operationJournalLimit = 128
 // maxOperationIDLength keeps a caller-supplied key from growing the map without bound.
 const maxOperationIDLength = 256
 
-type journalEntry struct{ result any }
+// operationStore is the durable half of the mutation journal. The SQLite state
+// store satisfies it; the interface lives here so this package does not import
+// a sibling adapter.
+type operationStore interface {
+	LoadOperation(ctx context.Context, id string) (payload, errText string, found bool, err error)
+	SaveOperation(ctx context.Context, id, payload, errText string) error
+}
+
+// journalStore finds the durable store carried by the wired task services.
+// Every task service is built on the same state store, so any one of them
+// exposes it. A nil result leaves the journal memory-only, which is how the
+// tools behave when no store is configured.
+func journalStore(sv Services) operationStore {
+	var ports []any
+	if sv.TaskCreator != nil {
+		ports = append(ports, sv.TaskCreator.Store)
+	}
+	if sv.TaskUpdater != nil {
+		ports = append(ports, sv.TaskUpdater.Store)
+	}
+	if sv.TaskDeleter != nil {
+		ports = append(ports, sv.TaskDeleter.Store)
+	}
+	for _, port := range ports {
+		if store, ok := port.(operationStore); ok && store != nil {
+			return store
+		}
+	}
+	return nil
+}
+
+// journalEntry is one in-memory operation outcome. Failure entries are kept so
+// a duplicate caller receives the original error instead of re-running the
+// mutation.
+type journalEntry struct {
+	result any
+	err    error
+}
 
 // opJournal stores the result of each completed mutation by operation id. A
 // single-flight channel keeps concurrent calls with the same id from writing
 // twice. Entries are bounded and the oldest are evicted first. Recency is an
-// LRU list, and index maps an id to its list element so touch stays O(1).
+// LRU list, and index maps an id to its list element so touch stays O(1). The
+// durable store is a fallback: memory answers first, the database answers
+// after a restart or an eviction.
 type opJournal struct {
 	mu       sync.Mutex
 	done     map[string]journalEntry
 	order    *list.List
 	index    map[string]*list.Element
 	inflight map[string]chan struct{}
+	store    operationStore
 }
 
-func newOpJournal() *opJournal {
-	return &opJournal{
+func newOpJournal(stores ...operationStore) *opJournal {
+	j := &opJournal{
 		done:     make(map[string]journalEntry),
 		order:    list.New(),
 		index:    make(map[string]*list.Element),
 		inflight: make(map[string]chan struct{}),
 	}
+	if len(stores) > 0 {
+		j.store = stores[0]
+	}
+	return j
 }
 
 // claim returns a nil wait when the caller owns the operation. A done entry
-// also yields no owner; the caller reads it with cached instead.
+// also yields no owner; the caller reads it with entry instead.
 func (j *opJournal) claim(id string) (<-chan struct{}, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -182,12 +228,24 @@ func (j *opJournal) touch(id string) {
 	j.index[id] = j.order.PushBack(id)
 }
 
-func (j *opJournal) finish(id string, result any, err error) {
+// finish records the outcome in memory and in the durable store, then releases
+// every waiter. A panic path passes keep=false so a later call can retry it.
+func (j *opJournal) finish(ctx context.Context, id string, result any, err error, keep bool) {
+	status := "applied"
+	if ctx.Err() != nil {
+		status = "recovered"
+	}
+	payload, marshalErr := json.Marshal(withMeta(result, id, status))
+	if marshalErr != nil {
+		slog.WarnContext(ctx, "operation journal encode", "operation_id", id, "error", marshalErr)
+		payload = []byte(`{}`)
+	}
+
 	j.mu.Lock()
 	wait := j.inflight[id]
 	delete(j.inflight, id)
-	if err == nil {
-		j.done[id] = journalEntry{result: result}
+	if keep {
+		j.done[id] = journalEntry{result: result, err: err}
 		j.touch(id)
 		for len(j.done) > operationJournalLimit {
 			oldest := j.order.Front()
@@ -201,22 +259,110 @@ func (j *opJournal) finish(id string, result any, err error) {
 		}
 	}
 	j.mu.Unlock()
-	close(wait)
+	if wait != nil {
+		close(wait)
+	}
+
+	if j.store == nil || !keep {
+		return
+	}
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	// The caller may have cancelled after the commit. A detached, bounded
+	// context still lets the durable record land.
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if saveErr := j.store.SaveOperation(saveCtx, id, string(payload), errText); saveErr != nil {
+		slog.WarnContext(ctx, "operation journal save", "operation_id", id, "error", saveErr)
+	}
 }
 
+// cached returns the in-memory result for id and whether it was present.
 func (j *opJournal) cached(id string) (any, bool) {
+	entry, ok := j.entry(id)
+	return entry.result, ok
+}
+
+// entry returns the in-memory outcome for id and touches it in the LRU.
+func (j *opJournal) entry(id string) (journalEntry, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	entry, ok := j.done[id]
 	if ok {
 		j.touch(id)
 	}
-	return entry.result, ok
+	return entry, ok
+}
+
+// storedOutcome is an outcome recovered from one of the two journal layers.
+type storedOutcome struct {
+	value any
+	err   error
+}
+
+// lookup checks memory first, then the durable store. A failed operation is a
+// stored outcome too: its error is replayed rather than running the mutation.
+func (j *opJournal) lookup(ctx context.Context, id string) (storedOutcome, bool) {
+	if entry, ok := j.entry(id); ok {
+		if entry.err != nil {
+			return storedOutcome{err: entry.err}, true
+		}
+		return storedOutcome{value: withMeta(entry.result, id, "duplicate")}, true
+	}
+	if j.store == nil {
+		return storedOutcome{}, false
+	}
+	payload, errText, found, err := j.store.LoadOperation(ctx, id)
+	if err != nil {
+		slog.WarnContext(ctx, "operation journal lookup", "operation_id", id, "error", err)
+		return storedOutcome{}, false
+	}
+	if !found {
+		return storedOutcome{}, false
+	}
+	if errText != "" {
+		return storedOutcome{err: restoreOperationError(errText)}, true
+	}
+	return storedOutcome{value: duplicatePayload(payload, id)}, true
+}
+
+// duplicatePayload rewrites a stored result with duplicate status. It works on
+// the JSON form, so the journal needs no registry of concrete result types.
+func duplicatePayload(payload string, id string) json.RawMessage {
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(payload), &fields); err != nil || fields == nil {
+		return json.RawMessage(payload)
+	}
+	fields["status"] = "duplicate"
+	fields["operation_id"] = id
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return json.RawMessage(payload)
+	}
+	return out
+}
+
+// restoreOperationError rebuilds a coded error from its stored text so a
+// duplicate caller sees the original code, not a generic unavailable code.
+func restoreOperationError(text string) error {
+	code, message, ok := strings.Cut(text, ": ")
+	if !ok {
+		return errors.New(text)
+	}
+	switch core.ErrorCode(code) {
+	case core.CodeInvalidInput, core.CodeNotFound, core.CodeConflict, core.CodeUnavailable,
+		core.CodeInvalidTransition, core.CodeExhausted, core.CodeBaseRed:
+		return &core.AppError{Code: core.ErrorCode(code), Message: message}
+	default:
+		return errors.New(text)
+	}
 }
 
 // run applies fn once per operation id. Repeats and concurrent callers reuse
-// the stored result with a duplicate status. A caller cancelled after its
-// commit records a recovered status, since the push finished in a detached
+// the stored result or error with a duplicate status. A caller cancelled after
+// its commit records a recovered status, since the push finished in a detached
 // context. A cancelled waiter returns ctx.Err. A panic in fn is recovered into
 // an error and still releases every waiter, so a later call can retry.
 func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context) (any, error)) (out any, err error) {
@@ -225,6 +371,9 @@ func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context)
 	}
 	if len(id) > maxOperationIDLength {
 		return nil, core.Errorf(core.CodeInvalidInput, "operation_id is too long")
+	}
+	if stored, ok := j.lookup(ctx, id); ok {
+		return stored.value, stored.err
 	}
 	wait, owner := j.claim(id)
 	if !owner {
@@ -235,19 +384,19 @@ func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context)
 				return nil, ctx.Err()
 			}
 		}
-		if result, ok := j.cached(id); ok {
-			return withMeta(result, id, "duplicate"), nil
+		if stored, ok := j.lookup(ctx, id); ok {
+			return stored.value, stored.err
 		}
 		return nil, core.Errorf(core.CodeUnavailable, "operation %q did not complete", id)
 	}
 	var result any
 	defer func() {
+		keep := true
 		if rec := recover(); rec != nil {
 			err = core.Errorf(core.CodeUnavailable, "operation %q panicked: %v", id, rec)
-			j.finish(id, nil, err)
-			return
+			keep = false
 		}
-		j.finish(id, result, err)
+		j.finish(ctx, id, result, err, keep)
 	}()
 	result, err = fn(ctx)
 	if err != nil {
