@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -42,7 +43,7 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 // by the open *sql.DB. A reopened database starts cold under a new key.
 type syncCache struct {
 	mu          sync.Mutex
-	fingerprint string
+	fingerprint []byte
 }
 
 var syncCaches sync.Map // map[*sql.DB]*syncCache
@@ -54,12 +55,9 @@ func cacheForDB(db *sql.DB) *syncCache {
 
 // syncFingerprint encodes every field SyncTasks persists. core.Task exports
 // all of those fields, so the encoding changes whenever a task write would.
-func syncFingerprint(tasks []core.Task) (string, error) {
-	b, err := json.Marshal(tasks)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
+// The bytes are held as is, so a warm sync pays no string copy.
+func syncFingerprint(tasks []core.Task) ([]byte, error) {
+	return json.Marshal(tasks)
 }
 
 // syncStatements are the two inserts reused for every card in one sync.
@@ -140,12 +138,12 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	cache := cacheForDB(s.db)
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	if cache.fingerprint == fp {
+	if bytes.Equal(cache.fingerprint, fp) {
 		return nil
 	}
 	// A failed transaction leaves the cache cold so the next call rewrites the
 	// tables instead of trusting a half-applied sync.
-	cache.fingerprint = ""
+	cache.fingerprint = nil
 
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return err
@@ -198,7 +196,7 @@ func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status st
 	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
 	cache := cacheForDB(s.db)
 	cache.mu.Lock()
-	cache.fingerprint = ""
+	cache.fingerprint = nil
 	cache.mu.Unlock()
 	return err
 }
