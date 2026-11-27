@@ -29,7 +29,7 @@ func NewLogger(level string) *slog.Logger {
 type redactHandler struct{ slog.Handler }
 
 func (h redactHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.NumAttrs() == 0 && !redact.HasCandidate(r.Message) {
+	if !recordHasCandidate(r) {
 		return h.Handler.Handle(ctx, r)
 	}
 	nr := slog.NewRecord(r.Time, r.Level, redact.Redact(r.Message), r.PC)
@@ -38,6 +38,46 @@ func (h redactHandler) Handle(ctx context.Context, r slog.Record) error {
 		return true
 	})
 	return h.Handler.Handle(ctx, nr)
+}
+
+// recordHasCandidate reports whether the message or any attribute needs
+// redaction. A false result lets Handle pass the original record straight
+// through instead of building a replacement.
+func recordHasCandidate(r slog.Record) bool {
+	if redact.HasCandidate(r.Message) {
+		return true
+	}
+	found := false
+	r.Attrs(func(a slog.Attr) bool {
+		if hasCandidateAttr(a) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func hasCandidateAttr(a slog.Attr) bool {
+	return hasCandidateValue(a.Value)
+}
+
+func hasCandidateValue(v slog.Value) bool {
+	switch v.Kind() {
+	case slog.KindString:
+		return redact.HasCandidate(v.String())
+	case slog.KindAny:
+		if err, ok := v.Any().(error); ok {
+			return redact.HasCandidate(err.Error())
+		}
+	case slog.KindGroup:
+		for _, a := range v.Group() {
+			if hasCandidateAttr(a) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h redactHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
