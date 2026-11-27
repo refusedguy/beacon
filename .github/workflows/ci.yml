@@ -410,6 +410,14 @@ jobs:
           git fetch origin "$BASE_REF" || true
           git fetch origin "$BASE_BRANCH" || true
           BASE="$(git merge-base "$BASE_REF" "$HEAD_REF")"
+          # The checked-out workflow belongs to the PR head. If a PR edits it,
+          # its inline verdict rules are untrusted and the advisory is
+          # inconclusive instead of running those rules.
+          if git diff --name-only "$BASE_REF...$HEAD_REF" | grep -qx '.github/workflows/ci.yml'; then
+            echo "ci_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ci_changed=false" >> "$GITHUB_OUTPUT"
+          fi
           # The comment parser takes its names and limiter text from the base
           # ref. A PR cannot rewrite those inputs, including on a fork.
           git show "$BASE_REF:docs/perf/bench-registry.json" \
@@ -439,6 +447,33 @@ jobs:
           done < <(git diff --name-only "$BASE" "$HEAD_REF")
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
+      # The run checks out the PR head, so an inline verdict rule would be
+      # editable by the PR. Run the comment builder copied from BASE_REF
+      # instead. The source stays inline below so the base ref can supply it.
+      - name: Extract advisory scripts from base ref
+        id: base_scripts
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.event.pull_request.base.sha }}"
+          git show "$BASE_REF:.github/workflows/ci.yml" > "$RUNNER_TEMP/base-ci.yml"
+          extract() {
+            awk -v marker="$1" '
+              index($0, "advisory-script:" marker ":begin") { on=1; next }
+              index($0, "advisory-script:" marker ":end") { on=0 }
+              on {
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                print line
+              }
+            ' "$RUNNER_TEMP/base-ci.yml" > "$2"
+          }
+          extract comment-builder "$RUNNER_TEMP/comment-builder.js"
+          if [[ ! -s "$RUNNER_TEMP/comment-builder.js" ]]; then
+            echo "cannot extract comment builder from $BASE_REF" >> "$GITHUB_STEP_SUMMARY"
+            echo "unsafe=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Both trees must measure the same harness. Hash every file that can
       # move a number: benchmark sources, fixtures, the registry, module pins,
       # the Node harnesses and the workspace latency test. Production code
@@ -454,6 +489,9 @@ jobs:
               {
                 find internal/bench docs/perf -type f -print 2>/dev/null
                 printf '%s\n' internal/infra/workspace/git_worktree_test.go \
+                  cmd/beacon/http_test.go \
+                  ui/tui/model_test.go \
+                  ui/tui/refresh_bench_test.go \
                   go.mod go.sum go.work go.work.sum
                 find . -type d -name testdata -prune -print 2>/dev/null \
                   | while IFS= read -r d; do find "$d" -type f -print; done
@@ -546,6 +584,41 @@ jobs:
           run_side head "$RUNNER_TEMP/perf-head"
           run_side base "$RUNNER_TEMP/perf-base"
 
+      # printReport writes to stdout while testing.B is still emitting the
+      # result line. The report text lands on that line and benchstat drops
+      # BenchmarkHotPaths together with its B/op and allocs/op columns. Put the
+      # report back on its own lines and give the timing row its benchmark name.
+      - name: Repair HotPaths benchmark lines
+        continue-on-error: true
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const temp = process.env.RUNNER_TEMP;
+          for (const side of ['base', 'head']) {
+            const path = `${temp}/perf-${side}.txt`;
+            let lines;
+            try { lines = fs.readFileSync(path, 'utf8').split(/\r?\n/); }
+            catch (e) { console.log(`cannot read ${path}: ${e.message}`); continue; }
+            const out = [];
+            let hotPaths = false;
+            for (const line of lines) {
+              if (/^BenchmarkHotPaths[ \t]+hot paths:/.test(line)) {
+                hotPaths = true;
+                out.push(line.replace(/^BenchmarkHotPaths[ \t]+/, ''));
+                continue;
+              }
+              if (hotPaths && /^\s+\d+\s+[0-9.eE+-]+\s+ns\/op\b/.test(line) &&
+                  line.includes('B/op') && line.includes('allocs/op')) {
+                out.push(`BenchmarkHotPaths\t${line.replace(/^\s+/, '')}`);
+                hotPaths = false;
+                continue;
+              }
+              out.push(line);
+            }
+            fs.writeFileSync(path, out.join('\n'));
+          }
+          NODE
+
       - name: Write per-side CSV and comparison
         continue-on-error: true
         run: |
@@ -561,6 +634,7 @@ jobs:
       # recent one; a missing artifact leaves the registry default in place.
       - name: Find the calibrated noise floor
         id: floor
+        if: steps.trees.outputs.ci_changed != 'true' && steps.base_scripts.outputs.unsafe != 'true'
         continue-on-error: true
         uses: actions/github-script@v7
         with:
@@ -582,7 +656,7 @@ jobs:
             core.setOutput('run_id', last ? String(last.id) : '')
 
       - name: Download calibrated noise floor
-        if: steps.floor.outputs.run_id != ''
+        if: steps.trees.outputs.ci_changed != 'true' && steps.base_scripts.outputs.unsafe != 'true' && steps.floor.outputs.run_id != ''
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -591,12 +665,29 @@ jobs:
           run-id: ${{ steps.floor.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Mark advisory inconclusive for untrusted workflow
+        if: steps.trees.outputs.ci_changed == 'true' || steps.base_scripts.outputs.unsafe == 'true'
+        continue-on-error: true
+        run: |
+          mkdir -p perf-results
+          {
+            printf '%s\n' '<!-- beacon-pr-perf -->' \
+              '### Advisory perf comparison, base vs head' \
+              '' \
+              'Advisory inconclusive: this PR edits .github/workflows/ci.yml, which owns the verdict rules. Inline rules from the PR head are not trusted.'
+          } > perf-results/comment.md
+
       # One comment per PR. A spread rule decides a verdict; the range relation
       # is supporting text only.
       - name: Build comparison comment
+        if: steps.trees.outputs.ci_changed != 'true' && steps.base_scripts.outputs.unsafe != 'true'
         continue-on-error: true
         run: |
-          node - <<'NODE'
+          # The inline source below is extracted from BASE_REF and run as that
+          # copy, so a PR cannot rewrite its own verdict rules.
+          node "$RUNNER_TEMP/comment-builder.js"
+          : <<'NODE'
+          // advisory-script:comment-builder:begin
           const fs = require('fs');
           const temp = process.env.RUNNER_TEMP;
           const prefix = 'beacon-perf: ';
@@ -818,61 +909,61 @@ jobs:
 
           if (!basePasses.length || !headPasses.length) notes.push('missing pass markers');
 
-          // The trusted base pass names the expected rows. Nightly-only keys
-          // do not belong in a PR pass, and a head-only key has no counterpart.
-          const expected = new Set();
-          for (const p of basePasses) for (const r of p.rows) {
-            const spec = registry.get(r.key);
-            if (spec && spec.placement === 'nightly') continue;
-            expected.add(r.key);
-          }
-          const extra = [];
-          for (const p of headPasses) for (const r of p.rows) {
-            if (!expected.has(r.key)) extra.push(r.key);
-          }
-          if (extra.length) notes.push(`rejected head-only keys: ${[...new Set(extra)].join(', ')}`);
-
-          const unregistered = [...expected].filter(k => !registry.has(k));
-          if (unregistered.length) {
-            notes.push(`keys without a registry entry: ${unregistered.join(', ')}`);
-          }
+          // The base registry, not a measured pass, names the expected rows.
+          // Nightly-only keys do not belong in a PR comparison.
+          const expected = new Set([...registry.values()]
+            .filter(s => s.placement === 'pr' || s.placement === 'both')
+            .map(s => s.key));
+          if (!expected.size) notes.push('registry has no pr or both specs');
 
           let badShape = false;
-          const missing = [];
           for (const [side, passes] of [['base', basePasses], ['head', headPasses]]) {
             if (passes.length !== 5) {
               notes.push(`${side} ran ${passes.length} passes, want 5`); badShape = true;
             }
             passes.forEach((p, i) => {
-              if (p.rows.length !== expected.size) {
-                notes.push(`${side} pass ${i + 1} has ${p.rows.length} rows, want ${expected.size}`);
+              const seen = new Set(p.rows.map(r => r.key));
+              if (seen.size !== p.rows.length) {
+                notes.push(`${side} pass ${i + 1}: duplicate canonical rows`);
                 badShape = true;
               }
-              for (const key of expected) {
-                if (!p.rows.some(r => r.key === key)) missing.push(`${side} pass ${i + 1}: ${key}`);
+              const missing = [...expected].filter(k => !seen.has(k));
+              const extra = [...seen].filter(k => !expected.has(k));
+              if (missing.length) {
+                notes.push(`${side} pass ${i + 1}: missing ${missing.join(', ')}`);
+                badShape = true;
+              }
+              if (extra.length) {
+                notes.push(`${side} pass ${i + 1}: unexpected ${extra.join(', ')}`);
+                badShape = true;
               }
               if (p.bad.length) {
                 notes.push(`${side} pass ${i + 1}: ${p.bad.join(', ')}`); badShape = true;
               }
             });
           }
-          if (missing.length) notes.push(`missing rows: ${[...new Set(missing)].join(', ')}`);
 
-          // Control drift decides only the ratio columns. The base, head,
-          // delta, range, spread, work, errs and verdict columns use every
-          // shape-valid pass, so a drifting control cannot erase raw rows or
-          // force an inconclusive verdict.
+          // Every pass needs the pure control row. A pass without it, or one
+          // whose control drifts past the floor, cannot support a timing
+          // verdict for any key. Ratio columns use only the passes that pass
+          // this check.
           const controlOf = pass => pass.rows.find(r => r.key === controlKey);
           const allControl = [...basePasses, ...headPasses]
             .map(controlOf).filter(Boolean).map(r => r.median_ms);
           const controlRef = allControl.length ? median(allControl) : NaN;
+          let controlDrift = !Number.isFinite(controlRef) || controlRef <= 0;
+          if (controlDrift) notes.push('no usable control row');
           const ratioPasses = (side, passes) => passes.filter((pass, i) => {
             const c = controlOf(pass);
-            if (!c) { notes.push(`${side} pass ${i + 1}: missing ${controlKey}`); return false; }
-            if (!Number.isFinite(controlRef) || controlRef <= 0) return false;
+            if (!c) {
+              notes.push(`${side} pass ${i + 1}: missing ${controlKey}`);
+              controlDrift = true;
+              return false;
+            }
             const drift = 100 * Math.abs(c.median_ms - controlRef) / controlRef;
             if (drift > floorPct) {
               notes.push(`${side} pass ${i + 1}: control drift ${drift.toFixed(2)}% exceeds ${floorPct}% floor`);
+              controlDrift = true;
               return false;
             }
             return true;
@@ -885,7 +976,7 @@ jobs:
           }
 
           const inconclusiveAll = status.length > 0 || !sameHarness || badShape ||
-            registry.size === 0 || extra.length > 0;
+            registry.size === 0 || !expected.size || controlDrift;
 
           const values = (passes, key, field) => passes
             .map(p => p.rows.find(r => r.key === key))
@@ -915,7 +1006,8 @@ jobs:
             .flatMap(p => p.rows.map(r => r.cache)))];
           for (const key of [...expected]) {
             const spec = registry.get(key);
-            const baseRow = basePasses[0].rows.find(r => r.key === key);
+            const baseRow = basePasses.length
+              ? basePasses[0].rows.find(r => r.key === key) : null;
             const limiter = (spec && spec.limiter) || (baseRow && baseRow.limiter) || '-';
             const cache = (baseRow && baseRow.cache) || '-';
             const a = values(basePasses, key, 'median_ms');
@@ -935,8 +1027,12 @@ jobs:
             const eb = values(headPasses, key, 'errs');
             let workMismatch = !wa.length || !wb.length || median(wa) !== median(wb) ||
               !ea.length || !eb.length || median(ea) !== median(eb);
-            // Worktree removal drops a git status call by design.
-            if (key === 'worktree-remove') workMismatch = false;
+            const errsZero = ea.length > 0 && eb.length > 0 &&
+              ea.every(v => v === 0) && eb.every(v => v === 0);
+            // Worktree removal drops one git status call by design: work 3 to 2.
+            // No other work or error change is forgiven for that key.
+            if (key === 'worktree-remove' && errsZero &&
+                median(wa) === 3 && median(wb) === 2) workMismatch = false;
             const overlap = amax >= bmin && bmax >= amin;
             const relation = overlap ? 'overlap' : 'separate';
             const delta = am === 0 ? 0 : 100 * (bm - am) / am;
@@ -956,9 +1052,8 @@ jobs:
             } else if (!Number.isFinite(rawPerKey)) {
               notes.push(`${key}: using uncalibrated floor ${rowFloor}%`);
             }
-            const decisive = Math.abs(delta) >= rowFloor && Math.abs(delta) > maxSpread;
-            const errsZero = ea.length > 0 && eb.length > 0 &&
-              ea.every(v => v === 0) && eb.every(v => v === 0);
+            const decisive = errsZero && Math.abs(delta) >= rowFloor &&
+              Math.abs(delta) > maxSpread;
             const equalWork = wa.length > 0 && wb.length > 0 && median(wa) === median(wb);
             const noRise = delta <= rowFloor;
             const allocEntry = metricOf(allocMetrics, key, 'allocs/op');
@@ -1028,6 +1123,7 @@ jobs:
           ].join('\n');
           fs.mkdirSync('perf-results', { recursive: true });
           fs.writeFileSync('perf-results/comment.md', body + '\n');
+          // advisory-script:comment-builder:end
           NODE
 
       - name: Upload comparison artifacts
@@ -1199,15 +1295,25 @@ jobs:
             const mid = Math.floor(s.length / 2);
             return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
           };
+          // Build one map per pass, keeping the later row for a 5x duplicate,
+          // then take the median across passes. Counting the calibration rows
+          // as extra samples makes the global floor far too large.
           const side = name => {
-            const out = new Map();
+            const passes = [];
+            let pass = null;
             for (const line of fs.readFileSync(`${temp}/perf-${name}.txt`, 'utf8').split(/\r?\n/)) {
+              if (/^== pass \S+ ==$/.test(line)) { pass = new Map(); passes.push(pass); continue; }
               if (!line.startsWith(prefix)) continue;
               let row;
               try { row = JSON.parse(line.slice(prefix.length)); } catch (e) { continue; }
               if (!row || fields.some(f => !(f in row))) continue;
-              if (!out.has(row.key)) out.set(row.key, []);
-              out.get(row.key).push(row.median_ms);
+              if (!pass) { pass = new Map(); passes.push(pass); }
+              pass.set(row.key, row);
+            }
+            const out = new Map();
+            for (const p of passes) for (const [key, row] of p) {
+              if (!out.has(key)) out.set(key, []);
+              out.get(key).push(row.median_ms);
             }
             const med = new Map();
             for (const [key, values] of out) med.set(key, median(values));
