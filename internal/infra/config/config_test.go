@@ -635,6 +635,25 @@ func TestLoadWorkflowRequiredChecksResolveJobNames(t *testing.T) {
 	}
 }
 
+func TestLoadWorkflowPreservesExplicitFallback(t *testing.T) {
+	const workflow = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n"
+	path := writeWorkflowConfig(t,
+		"merge:\n  required_checks_mode: workflow\n  required_checks: [manual-gate]\n", workflow)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	if want := []string{"verify"}; !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
+		t.Fatalf("required_checks = %v, want detected %v", c.Merge.RequiredChecks, want)
+	}
+	if want := []string{"manual-gate"}; !reflect.DeepEqual(c.Merge.RequiredChecksFallback, want) {
+		t.Fatalf("required_checks_fallback = %v, want %v", c.Merge.RequiredChecksFallback, want)
+	}
+	if c.ProjectRoot != projectRootFromConfigPath(path) {
+		t.Fatalf("ProjectRoot = %q, want %q", c.ProjectRoot, projectRootFromConfigPath(path))
+	}
+}
+
 func TestWorkflowRequiredChecksFollowRenameOnReload(t *testing.T) {
 	const oldWorkflow = "name: CI\njobs:\n" +
 		"  build:\n    runs-on: ubuntu-latest\n" +

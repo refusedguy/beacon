@@ -208,7 +208,8 @@ func (r SourceChecksRule) Evaluate(o core.Observation) (core.Verdict, string) {
 }
 
 // evaluateChecks is the shared gate for a resolved list of names. An empty
-// list means no checks are required, so it never blocks a merge.
+// list means no checks are required, so it never blocks a merge. A source that
+// fails closed never reaches this path with an empty list.
 func evaluateChecks(names []string, o core.Observation) (core.Verdict, string) {
 	if len(names) == 0 {
 		return core.VerdictNoop, ""
@@ -217,9 +218,13 @@ func evaluateChecks(names []string, o core.Observation) (core.Verdict, string) {
 		return core.VerdictNoop, ""
 	}
 	if o.WorkflowSkipped {
-		if _, failed := o.Failure(); !failed {
+		if _, failed := o.Failure(names...); !failed {
 			return core.VerdictNoop, ""
 		}
+	}
+	passed := func(state string) bool {
+		return state == string(core.CheckSuccess) ||
+			(state == string(core.CheckSkipped) && o.WorkflowSkipped)
 	}
 	var notPassed []string
 	for _, want := range names {
@@ -230,7 +235,7 @@ func evaluateChecks(names []string, o core.Observation) (core.Verdict, string) {
 				break
 			}
 		}
-		if state != string(core.CheckSuccess) && state != string(core.CheckSkipped) {
+		if !passed(state) {
 			notPassed = append(notPassed, want+" ("+state+")")
 		}
 	}

@@ -620,3 +620,64 @@ func TestWireServicesPassesRealStoreToControl(t *testing.T) {
 		t.Error("control is missing the real store")
 	}
 }
+
+func TestMergePolicyWorkflowModeReadsLiveWorkflow(t *testing.T) {
+	root := t.TempDir()
+	workflowDir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(workflowDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(body string) {
+		if err := os.WriteFile(filepath.Join(workflowDir, "ci.yml"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n")
+	cfg := config.Config{
+		ProjectRoot: root,
+		Merge:       config.Merge{RequiredChecksMode: config.RequiredChecksWorkflow},
+	}
+	p := mergePolicy(cfg)
+	oldChecks := core.Observation{PRState: "open", Checks: []core.CheckResult{{Name: "build", State: core.CheckSuccess}}}
+	if got := p.Evaluate(oldChecks); got.Verdict != core.VerdictMerge {
+		t.Fatalf("initial verdict = %s, want merge (reason %q)", got.Verdict, got.Reason)
+	}
+
+	write("name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n")
+	if got := p.Evaluate(oldChecks); got.Verdict != core.VerdictWait {
+		t.Fatalf("stale names still merged after rename: %+v", got)
+	}
+	newChecks := core.Observation{PRState: "open", Checks: []core.CheckResult{{Name: "verify", State: core.CheckSuccess}}}
+	if got := p.Evaluate(newChecks); got.Verdict != core.VerdictMerge {
+		t.Fatalf("verdict after rename = %s, want merge (reason %q)", got.Verdict, got.Reason)
+	}
+}
+
+func TestMergePolicyWorkflowModeFailsClosedWithoutNames(t *testing.T) {
+	cfg := config.Config{
+		ProjectRoot: t.TempDir(),
+		Merge:       config.Merge{RequiredChecksMode: config.RequiredChecksWorkflow},
+	}
+	got := mergePolicy(cfg).Evaluate(core.Observation{PRState: "open"})
+	if got.Verdict != core.VerdictWait || got.Criterion != "required_checks" {
+		t.Fatalf("decision = %+v, want wait/required_checks", got)
+	}
+}
+
+func TestMergePolicyWorkflowModeUsesExplicitFallback(t *testing.T) {
+	cfg := config.Config{
+		ProjectRoot: t.TempDir(),
+		Merge: config.Merge{
+			RequiredChecksMode:     config.RequiredChecksWorkflow,
+			RequiredChecksFallback: []string{"manual-gate"},
+		},
+	}
+	p := mergePolicy(cfg)
+	if got := p.Evaluate(core.Observation{PRState: "open"}); got.Verdict != core.VerdictWait {
+		t.Fatalf("verdict without fallback check = %s, want wait", got.Verdict)
+	}
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{{Name: "manual-gate", State: core.CheckSuccess}}}
+	if got := p.Evaluate(obs); got.Verdict != core.VerdictMerge {
+		t.Fatalf("verdict with fallback check = %s, want merge (reason %q)", got.Verdict, got.Reason)
+	}
+}

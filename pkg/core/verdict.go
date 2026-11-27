@@ -160,14 +160,22 @@ func (o Observation) HasPending() bool {
 	return false
 }
 
-// AllRequiredPass reports whether every named check passed or was skipped.
+// checkPassed reports whether c satisfies a required check. A skipped check
+// counts only when the provider declared the whole workflow skipped for this
+// diff, so a required job skipped by an if condition cannot open the gate.
+func (o Observation) checkPassed(c CheckResult) bool {
+	return c.State == CheckSuccess || (c.State == CheckSkipped && o.WorkflowSkipped)
+}
+
+// AllRequiredPass reports whether every named check passed. An empty name list
+// considers every reported check.
 func (o Observation) AllRequiredPass(names []string) bool {
 	if len(o.Checks) == 0 {
 		return false
 	}
 	if len(names) == 0 {
 		for _, c := range o.Checks {
-			if c.State != CheckSuccess && c.State != CheckSkipped {
+			if !o.checkPassed(c) {
 				return false
 			}
 		}
@@ -178,7 +186,7 @@ func (o Observation) AllRequiredPass(names []string) bool {
 		for _, c := range o.Checks {
 			if strings.EqualFold(c.Name, want) {
 				found = true
-				if c.State != CheckSuccess && c.State != CheckSkipped {
+				if !o.checkPassed(c) {
 					return false
 				}
 				break
