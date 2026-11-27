@@ -145,8 +145,18 @@ function recentFromViewWith(view, active) {
 }
 function recentFromView(view) { return recentFromViewWith(view, activeFromView(view)) }
 function stateBarFromView(view, active = activeFromView(view), recent = recentFromView(view)) {
-  const counts = Object.fromEntries(STATE_BAR_KEYS.map((key) => [key, 0]))
-  for (const run of [...active, ...recent]) {
+  // A prepared literal with the same keys as STATE_BAR_KEYS avoids building an
+  // entries array and a combined run array on every refresh. Walk the two
+  // views in place instead of spreading them into a third array.
+  const counts = {
+    pending: 0, running: 0, waiting_ci: 0, needs_rebase: 0,
+    needs_agent_fix: 0, blocked: 0, merged: 0, closed: 0,
+  }
+  for (const run of active) {
+    const state = str(run.state).toLowerCase()
+    if (Object.hasOwn(counts, state)) counts[state] += 1
+  }
+  for (const run of recent) {
     const state = str(run.state).toLowerCase()
     if (Object.hasOwn(counts, state)) counts[state] += 1
   }
