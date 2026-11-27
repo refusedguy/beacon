@@ -1,7 +1,7 @@
 package app
 
 import (
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -144,8 +144,8 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 // newActiveRunIndex builds the per-cycle view of active runs: busy task IDs and
 // an index of live scope claims. Terminal and nil runs are ignored.
 func newActiveRunIndex(active []*core.Run) (map[core.TaskID]*core.Run, *activeScopeIndex) {
-	busyIDs := make(map[core.TaskID]*core.Run)
-	var live []*core.Run
+	busyIDs := make(map[core.TaskID]*core.Run, len(active))
+	live := make([]*core.Run, 0, len(active))
 	for _, r := range active {
 		if r == nil || r.State.Terminal() {
 			continue
@@ -167,14 +167,19 @@ type activeScopeIndex struct {
 	globs  []int
 	unpath []int
 	broad  []int
+	epoch  int
+	seen   []int
+	out    []int
 }
 
 func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 	idx := &activeScopeIndex{
 		runs:  runs,
-		exact: make(map[core.ScopePath][]int),
-		cover: make(map[core.ScopePath][]int),
-		under: make(map[core.ScopePath][]int),
+		exact: make(map[core.ScopePath][]int, len(runs)),
+		cover: make(map[core.ScopePath][]int, len(runs)),
+		under: make(map[core.ScopePath][]int, len(runs)),
+		seen:  make([]int, len(runs)),
+		out:   make([]int, 0, len(runs)),
 	}
 	for i, r := range runs {
 		for _, claim := range r.Scope {
@@ -204,15 +209,20 @@ func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 
 // matching returns the live runs whose claims could overlap t, in live order.
 // The result is a superset: every overlapping run is included, and the caller
-// confirms each one with the injected checker.
+// confirms each one with the injected checker. The index owns the returned
+// slice and reuses it on the next call, so callers must consume it before
+// calling matching again. Deduplication uses an epoch buffer instead of a map
+// so a candidate costs no per-candidate heap allocations. The seen slice is
+// sized to the live run count, which bounds every index below.
 func (idx *activeScopeIndex) matching(t core.Task) []int {
-	seen := make(map[int]bool)
-	var out []int
+	idx.epoch++
+	out := idx.out[:0]
 	add := func(i int) {
-		if !seen[i] {
-			seen[i] = true
-			out = append(out, i)
+		if idx.seen[i] == idx.epoch {
+			return
 		}
+		idx.seen[i] = idx.epoch
+		out = append(out, i)
 	}
 	allRuns := func() {
 		for i := range idx.runs {
@@ -259,7 +269,8 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 	for _, i := range idx.broad {
 		add(i)
 	}
-	sort.Ints(out)
+	slices.Sort(out)
+	idx.out = out
 	return out
 }
 
@@ -289,7 +300,11 @@ func claimDirKeys(claim core.ScopePath) []core.ScopePath {
 }
 
 func leadingWildcard(value string) bool {
-	return strings.ContainsAny(strings.Split(value, "/")[0], "*?")
+	end := strings.IndexByte(value, '/')
+	if end < 0 {
+		end = len(value)
+	}
+	return strings.ContainsAny(value[:end], "*?")
 }
 
 func appendUnique(indices []int, i int) []int {
