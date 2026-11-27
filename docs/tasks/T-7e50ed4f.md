@@ -1,7 +1,7 @@
 ---
 id: T-7e50ed4f
 title: Add four hot path coverage rows
-status: available
+status: done
 scope:
     - internal/bench/bench_test.go
     - internal/bench/report.go
