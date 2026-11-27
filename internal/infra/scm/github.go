@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/go-github/v93/github"
@@ -25,22 +24,30 @@ type GitHub struct {
 	Repo   string
 	base   string
 	br     *gobreaker.CircuitBreaker[any]
-	etagMu sync.Mutex
-	etags  map[int]*etagEntry
-	prGet  singleflight.Group
+
+	prCache     *etagCache[*github.PullRequest]
+	prGet       singleflight.Group
+	checkCache  *etagCache[checkCacheValue]
+	checkGet    singleflight.Group
+	reviewCache *etagCache[reviewCacheValue]
+	reviewGet   singleflight.Group
+	compares    *compareCache
+	compareGet  singleflight.Group
 }
 
 // NewGitHub builds a GitHub gateway for owner and repo.
 func NewGitHub(client *github.Client, owner, repo, base string) *GitHub {
-	g := &GitHub{
-		Client: client,
-		Owner:  owner,
-		Repo:   repo,
-		base:   base,
-		br:     newSCMBreaker("github"),
+	return &GitHub{
+		Client:      client,
+		Owner:       owner,
+		Repo:        repo,
+		base:        base,
+		br:          newSCMBreaker("github"),
+		prCache:     newETagCache[*github.PullRequest](),
+		checkCache:  newETagCache[checkCacheValue](),
+		reviewCache: newETagCache[reviewCacheValue](),
+		compares:    newCompareCache(),
 	}
-	initETagCache(g)
-	return g
 }
 
 // newSCMBreaker builds a circuit breaker with the settings shared by both SCM
@@ -310,10 +317,7 @@ func (g *GitHub) fetchSignals(ctx context.Context, pr int, sha, base string) git
 		return out.approvalsErr
 	})
 	group.Go(func() error {
-		out.cmp, out.compareErr = guarded(g.br, func() (*github.CommitsComparison, error) {
-			c, _, err := g.Client.Repositories.CompareCommits(ctx, g.Owner, g.Repo, base, sha, nil)
-			return c, err
-		})
+		out.cmp, out.compareErr = g.compare(ctx, base, sha)
 		return out.compareErr
 	})
 	_ = group.Wait()
@@ -326,44 +330,18 @@ func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, er
 	return checks, err
 }
 
-// checksCapped reads check runs and reports a truncated page walk. Filter is
-// set to latest explicitly so the adapter never depends on a provider default
-// that can change. GitHub still lists every attempt of a named check on a SHA,
-// so a cancelled earlier attempt must not shadow a later success. Keep the
-// newest attempt per name by completion time, breaking ties by start time.
+// checksCapped reads check runs keyed by SHA. Filter is set to latest
+// explicitly so the adapter never depends on a provider default that can
+// change. The conditional read returns the cached slice on a 304 and a newly
+// completed check still replaces it on the next tick.
 func (g *GitHub) checksCapped(ctx context.Context, sha string) ([]core.CheckResult, bool, error) {
-	checkRuns, capped, err := paginateCapped(g.br, func(opts *github.ListOptions) ([]*github.CheckRun, *github.Response, error) {
-		res, resp, err := g.Client.Checks.ListCheckRunsForRef(ctx, g.Owner, g.Repo, sha, &github.ListCheckRunsOptions{
-			Filter:      github.String("latest"),
-			ListOptions: *opts,
-		})
-		if res == nil {
-			return nil, resp, err
-		}
-		return res.CheckRuns, resp, err
-	}, func(c *github.CheckRun) int64 { return c.GetID() })
+	v, err := cachedFetch(&g.checkGet, g.checkCache, "checks:"+sha, func(etag string) (checkCacheValue, bool, string, error) {
+		return g.fetchChecks(ctx, sha, etag)
+	})
 	if err != nil {
-		return nil, capped, err
+		return nil, false, err
 	}
-	latest := make(map[string]*github.CheckRun, len(checkRuns))
-	for _, c := range checkRuns {
-		name := c.GetName()
-		prev := latest[name]
-		if prev == nil || checkRunNewer(c, prev) {
-			latest[name] = c
-		}
-	}
-	out := make([]core.CheckResult, 0, len(latest))
-	for _, c := range latest {
-		out = append(out, core.CheckResult{
-			Name:        c.GetName(),
-			State:       checkState(c),
-			Output:      strings.TrimSpace(c.GetOutput().GetTitle() + " " + c.GetOutput().GetText()),
-			StartedAt:   c.GetStartedAt().Time,
-			CompletedAt: c.GetCompletedAt().Time,
-		})
-	}
-	return out, capped, nil
+	return v.checks, v.capped, nil
 }
 
 // checkRunNewer reports whether c is a later attempt than prev. Completion time
@@ -454,36 +432,16 @@ func reviewNewer(c, prev reviewState) bool {
 	return c.id > prev.id
 }
 
+// approvalsCapped counts approvals keyed by PR. The conditional read returns
+// the cached count on a 304 and a new review replaces it on the next tick.
 func (g *GitHub) approvalsCapped(ctx context.Context, pr int) (int, bool, error) {
-	reviews, capped, err := paginateCapped(g.br, func(opts *github.ListOptions) ([]*github.PullRequestReview, *github.Response, error) {
-		return g.Client.PullRequests.ListReviews(ctx, g.Owner, g.Repo, pr, opts)
-	}, func(r *github.PullRequestReview) int64 { return r.GetID() })
+	v, err := cachedFetch(&g.reviewGet, g.reviewCache, fmt.Sprintf("reviews:%d", pr), func(etag string) (reviewCacheValue, bool, string, error) {
+		return g.fetchReviews(ctx, pr, etag)
+	})
 	if err != nil {
-		return 0, capped, err
+		return 0, false, err
 	}
-	latest := make(map[string]reviewState, len(reviews))
-	for _, r := range reviews {
-		if r.GetUser() == nil {
-			continue
-		}
-		login := r.GetUser().GetLogin()
-		next := reviewState{state: r.GetState(), id: r.GetID(), at: r.GetSubmittedAt().Time}
-		if prev, ok := latest[login]; !ok || reviewNewer(next, prev) {
-			latest[login] = next
-		}
-	}
-	n := 0
-	for _, review := range latest {
-		// A review without a timestamp cannot be placed against the rest of
-		// the history. Fail closed: it cannot supply an approval.
-		if review.at.IsZero() {
-			continue
-		}
-		if strings.EqualFold(review.state, "APPROVED") {
-			n++
-		}
-	}
-	return n, capped, nil
+	return v.approvals, v.capped, nil
 }
 
 // updateBranchResponse is the GraphQL response for a branch update.
