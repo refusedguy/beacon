@@ -1428,3 +1428,35 @@ func TestCountedReadsKeepExactRows(t *testing.T) {
 		t.Fatalf("decisions = %d, want 10", len(decisions))
 	}
 }
+
+func TestInQueryExpandsListsInOrder(t *testing.T) {
+	query, args := inQuery(`a IN (%s) AND b IN (%s)`, []string{"x", "y"}, []string{"z"})
+	if want := `a IN (?,?) AND b IN (?)`; query != want {
+		t.Fatalf("query = %q, want %q", query, want)
+	}
+	if want := []any{"x", "y", "z"}; !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %+v, want %+v", args, want)
+	}
+
+	query, args = inQuery(`a IN (%s)`, nil)
+	if want := `a IN ()`; query != want || len(args) != 0 {
+		t.Fatalf("empty list: query = %q args = %+v, want %q and no args", query, args, want)
+	}
+}
+
+func TestDecisionCountQueryBindsEveryPlaceholder(t *testing.T) {
+	for _, tc := range []struct {
+		runIDs []string
+		limit  int
+		orphan int
+	}{
+		{nil, 20, 100},
+		{[]string{"r1"}, 20, 100},
+		{[]string{"r1", "r2"}, 2, 3},
+	} {
+		query, args := decisionCountQuery(tc.runIDs, tc.limit, tc.orphan)
+		if n := strings.Count(query, "?"); n != len(args) {
+			t.Fatalf("runIDs=%v: %d placeholders but %d args: %q", tc.runIDs, n, len(args), query)
+		}
+	}
+}

@@ -541,23 +541,7 @@ UNION ALL SELECT ` + decisionColumns + ` FROM orphan
 ORDER BY at, id`
 		args = append(ids, limit)
 	}
-	// Count the exact result size without re-running the window function. Each
-	// run contributes at most limit rows and the orphan bucket at most
-	// orphanLimit, so MIN over each group summed gives the capacity.
-	countQuery := `SELECT COALESCE(SUM(n), 0) FROM (
-SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id = ''
-)`
-	countArgs := []any{orphanLimit}
-	if len(runIDs) > 0 {
-		perRun, ids := inQuery(`SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id IN (%s) GROUP BY run_id`, runIDs)
-		countQuery = `SELECT COALESCE(SUM(n), 0) FROM (
-` + perRun + `
-UNION ALL
-SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id = ''
-)`
-		countArgs = append([]any{limit}, ids...)
-		countArgs = append(countArgs, orphanLimit)
-	}
+	countQuery, countArgs := decisionCountQuery(runIDs, limit, orphanLimit)
 	var n int
 	if err := s.db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&n); err != nil {
 		return nil, err
@@ -573,6 +557,24 @@ SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id = ''
 		}
 		return *d, nil
 	})
+}
+
+// decisionCountQuery returns a cheap COUNT statement for the rows ListDecisions
+// returns. Each run contributes at most limit rows and the orphan bucket at
+// most orphanLimit, so MIN over each group gives the exact size without running
+// the window function a second time.
+func decisionCountQuery(runIDs []string, limit, orphanLimit int) (string, []any) {
+	const orphan = `SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id = ''`
+	if len(runIDs) == 0 {
+		return `SELECT COALESCE(SUM(n), 0) FROM (` + orphan + `)`, []any{orphanLimit}
+	}
+	perRun, ids := inQuery(`SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id IN (%s) GROUP BY run_id`, runIDs)
+	query := `SELECT COALESCE(SUM(n), 0) FROM (
+` + perRun + `
+UNION ALL
+` + orphan + `
+)`
+	return query, append(append([]any{limit}, ids...), orphanLimit)
 }
 
 // scanDecision decodes one decision row into an app.Decision. Row-level errors,
