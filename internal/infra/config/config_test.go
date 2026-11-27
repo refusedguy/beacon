@@ -837,7 +837,8 @@ func TestApplyDefaultsFillsUnsetValues(t *testing.T) {
 		{"base branch", c.BaseBranch, "main"},
 		{"max attempts", c.Merge.MaxAttempts, 12},
 		{"max auto rebases", c.Merge.MaxAutoRebases, DefaultMaxAutoRebases},
-		{"max in flight", c.Concurrency.MaxInFlight, 20},
+		{"max in flight", c.Concurrency.MaxInFlight, DefaultMaxInFlight},
+		{"max active agents", c.Concurrency.MaxActiveAgents, DefaultMaxActiveAgents},
 		{"on base red mode", c.OnBaseRed.Mode, "spawn_fixer"},
 		{"max fix attempts", c.OnBaseRed.MaxFixAttempts, 2},
 		{"worker instructions", c.Harness.WorkerInstructions, DefaultWorkerInstructions},
@@ -879,5 +880,81 @@ func TestApplyDefaultsKeepsExplicitValues(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+func TestDefaultSourcesAgreeOnConcurrency(t *testing.T) {
+	fromDefaults := defaults()
+	var viaApply Config
+	ApplyDefaults(&viaApply)
+	if viaApply.Concurrency != fromDefaults.Concurrency {
+		t.Fatalf("ApplyDefaults gave %+v, defaults gave %+v", viaApply.Concurrency, fromDefaults.Concurrency)
+	}
+	if fromDefaults.Concurrency.MaxInFlight != DefaultMaxInFlight ||
+		fromDefaults.Concurrency.MaxActiveAgents != DefaultMaxActiveAgents {
+		t.Fatalf("defaults concurrency = %+v, want %d/%d", fromDefaults.Concurrency,
+			DefaultMaxInFlight, DefaultMaxActiveAgents)
+	}
+}
+
+func writeProjectWorkflowNamed(t *testing.T, root, name, workflow string) {
+	t.Helper()
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(.github/workflows): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(workflow), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%s): %v", name, err)
+	}
+}
+
+func TestLoadRejectsUnreportableRequiredCheckFallback(t *testing.T) {
+	const workflow = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n" +
+		"  test-modules:\n    runs-on: ubuntu-latest\n" +
+		"    strategy:\n      matrix:\n        module: [cmd, pkg]\n"
+	path := writeWorkflowConfig(t,
+		"merge:\n  required_checks_mode: workflow\n  required_checks: [verify, test-modules]\n",
+		workflow)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a matrix parent name in the fallback")
+	}
+	for _, want := range []string{"merge.required_checks", "test-modules", "never reports"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+func TestLoadRejectsReusableWorkflowJobInFallback(t *testing.T) {
+	root := filepath.Dir(filepath.Dir(writeWorkflowConfig(t, "", "")))
+	writeProjectWorkflowNamed(t, root, "ci.yml", "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n")
+	writeProjectWorkflowNamed(t, root, "reusable.yml", "name: Reusable\non:\n  workflow_call:\n"+
+		"jobs:\n  inner:\n    runs-on: ubuntu-latest\n")
+	path := filepath.Join(root, ".beacon", "config.yaml")
+	body := "merge:\n  required_checks_mode: workflow\n  required_checks: [inner]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(config.yaml): %v", err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a reusable workflow inner job in the fallback")
+	}
+	if !strings.Contains(err.Error(), "inner") {
+		t.Fatalf("error = %q, want the rejected name", err)
+	}
+}
+
+func TestLoadAcceptsReportableManualFallback(t *testing.T) {
+	const workflow = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n" +
+		"  test-modules:\n    runs-on: ubuntu-latest\n" +
+		"    strategy:\n      matrix:\n        module: [cmd, pkg]\n"
+	path := writeWorkflowConfig(t, "merge:\n  required_checks: [verify, test]\n", workflow)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	if want := []string{"verify", "test"}; !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
+		t.Fatalf("required_checks = %v, want %v", c.Merge.RequiredChecks, want)
 	}
 }

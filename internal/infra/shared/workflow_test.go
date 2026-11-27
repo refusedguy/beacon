@@ -22,25 +22,34 @@ const workflowFixture = "name: CI\njobs:\n" +
 	"  test:\n    needs: test-modules\n    runs-on: ubuntu-latest\n"
 
 // advisoryWorkflowFixture has one job with a job-level continue-on-error and
-// another with only a step-level flag. Both are advisory and must not be
-// reported as required checks; verify stays required.
+// another with only a step-level flag. The step-level flag does not remove the
+// job, so perf-nightly stays required. verify stays required as well.
 const advisoryWorkflowFixture = "name: CI\njobs:\n" +
 	"  perf-pr-advisory:\n    runs-on: ubuntu-latest\n    continue-on-error: true\n" +
 	"  perf-nightly:\n    runs-on: ubuntu-latest\n    steps:\n" +
 	"      - name: Optional download\n        continue-on-error: true\n        run: echo optional\n" +
 	"  verify:\n    runs-on: ubuntu-latest\n"
 
+const reusableWorkflowFixture = "name: Reusable\n" +
+	"on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\n" +
+	"jobs:\n  inner:\n    runs-on: ubuntu-latest\n"
+
 func writeWorkflow(t *testing.T, content string) string {
 	t.Helper()
 	root := t.TempDir()
+	writeNamedWorkflow(t, root, "ci.yml", content)
+	return root
+}
+
+func writeNamedWorkflow(t *testing.T, root, name, content string) {
+	t.Helper()
 	dir := filepath.Join(root, ".github", "workflows")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return root
 }
 
 func writeWorkflowFixture(t *testing.T) string {
@@ -84,7 +93,7 @@ func TestParseWorkflowJobNamesKeepsMatrixWithFailFastSibling(t *testing.T) {
 
 func TestAdvisoryJobsAreNotRequiredChecks(t *testing.T) {
 	root := writeWorkflow(t, advisoryWorkflowFixture)
-	want := []string{"verify"}
+	want := []string{"perf-nightly", "verify"}
 
 	if got := shared.ParseWorkflowJobNames(advisoryWorkflowFixture); !reflect.DeepEqual(got, want) {
 		t.Fatalf("ParseWorkflowJobNames = %v, want %v", got, want)
@@ -101,5 +110,74 @@ func TestAdvisoryJobsAreNotRequiredChecks(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fromSource, want) {
 		t.Fatalf("check source resolved %v, want %v", fromSource, want)
+	}
+}
+
+func TestTolerantStepDoesNotRemoveRequiredJob(t *testing.T) {
+	const content = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n" +
+		"    steps:\n      - name: Optional\n        continue-on-error: true\n        run: echo optional\n"
+	got := shared.ParseWorkflowJobNames(content)
+	if want := []string{"verify"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseWorkflowJobNames = %v, want %v", got, want)
+	}
+}
+
+func TestMatrixDetectionToleratesAlternateForms(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "matrix after two strategy keys",
+			content: "jobs:\n  suite:\n    strategy:\n      fail-fast: false\n" +
+				"      max-parallel: 2\n      matrix:\n        os: [ubuntu]\n",
+		},
+		{
+			name: "matrix before sibling keys",
+			content: "jobs:\n  suite:\n    strategy:\n      matrix:\n        os: [ubuntu]\n" +
+				"      fail-fast: false\n",
+		},
+		{
+			name:    "inline matrix",
+			content: "jobs:\n  suite:\n    strategy: {matrix: {os: [ubuntu]}}\n",
+		},
+		{
+			name: "four space job indentation",
+			content: "jobs:\n    suite:\n        strategy:\n            matrix:\n" +
+				"                os: [ubuntu]\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shared.ParseWorkflowJobNames(tc.content)
+			if len(got) != 0 {
+				t.Fatalf("ParseWorkflowJobNames = %v, want no job names", got)
+			}
+		})
+	}
+}
+
+func TestReusableWorkflowJobsAreNotRequiredChecks(t *testing.T) {
+	root := t.TempDir()
+	writeNamedWorkflow(t, root, "ci.yml", "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n")
+	writeNamedWorkflow(t, root, "reusable.yml", reusableWorkflowFixture)
+
+	if got, want := shared.DetectWorkflowJobNames(root), []string{"verify"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("DetectWorkflowJobNames = %v, want %v", got, want)
+	}
+	if got, want := config.DetectRequiredChecks(root), []string{"verify"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("config resolved %v, want %v", got, want)
+	}
+}
+
+func TestDetectUnreportableJobNames(t *testing.T) {
+	root := t.TempDir()
+	writeNamedWorkflow(t, root, "ci.yml", workflowFixture)
+	writeNamedWorkflow(t, root, "reusable.yml", reusableWorkflowFixture)
+
+	got := shared.DetectUnreportableJobNames(root)
+	want := []string{"inner", "test-modules"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DetectUnreportableJobNames = %v, want %v", got, want)
 	}
 }
