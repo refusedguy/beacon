@@ -83,6 +83,35 @@ test("skipping unchanged ticks emits the same events as normalizing every tick",
   assert.equal(skipped.emitted.length, 2)
 })
 
+test("a small fingerprint emits the same events as stringifying the whole payload", async () => {
+  // Decoration fields change on every tick, but they never enter changedRuns.
+  // The cheap fingerprint must ignore them and still emit the same run events.
+  const tick = (i) => ({
+    active: [run("a", i < 3 ? "running" : "done", i < 4 ? "abc123" : "def456")],
+    recent: i > 4 ? [run("b")] : [],
+    metrics: { dispatch_count: i },
+    queue: [{ id: `T-${i}`, title: `card ${i}` }],
+    generated_at: `2026-01-01T00:00:${String(i).padStart(2, "0")}Z`,
+  })
+  const drive = (fingerprint) => {
+    const emitted = []
+    let i = 0
+    const watcher = createRunChangeWatcher({ snapshot: async () => tick(i++) }, {
+      emit: (change) => { emitted.push(change) },
+      deps: fingerprint ? { fingerprint } : {},
+    })
+    return { emitted, run: async () => { for (let n = 0; n < 6; n++) await watcher.tick() } }
+  }
+  const cheap = drive()
+  const whole = drive((raw) => JSON.stringify(raw ?? null))
+  await cheap.run()
+  await whole.run()
+  assert.deepEqual(cheap.emitted, whole.emitted)
+  assert.deepEqual(cheap.emitted.map((e) => [e.id, e.state, e.sha]), [
+    ["a", "done", "abc123"], ["a", "done", "def456"], ["b", "running", "abc123"],
+  ])
+})
+
 test("the watcher still honours a custom interval and stops", () => {
   const timers = []
   const watcher = createRunChangeWatcher({ snapshot: async () => ({ active: [], recent: [] }) }, {
