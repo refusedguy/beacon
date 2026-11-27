@@ -170,3 +170,65 @@ test("a destroyed sidebar slot is rebuilt without touching the other slots", asy
   assert.ok(second.children.some((child) => child.item?.runID === "run-1"), "the new node shows current runs")
   dispose()
 })
+
+test("the rendered detail panel hides checks from the previous head", async () => {
+  const retryRun = {
+    id: "run-1", task_id: "T-retry", state: "waiting_ci", pr: 42,
+    head_sha: "newsha1111", branch: "beacon/T-retry", reason: "waiting CI",
+    created_at: "2026-11-23T10:00:00Z", updated_at: "2026-11-23T10:09:00Z",
+    rebase_attempts: 1, fix_attempts: 0, max_attempts: 12,
+    durations: {
+      waiting_ci_seconds: 180, waiting_ci_initial_seconds: 120,
+      waiting_ci_rebase_seconds: 60, waiting_ci_fix_seconds: 0,
+      running_seconds: 420, blocked_seconds: 0,
+    },
+    timeline: [
+      { at: "2026-11-23T10:00:00Z", kind: "start", state: "running", head_sha: "oldsha0000" },
+      { at: "2026-11-23T10:02:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "oldsha0000" },
+      { at: "2026-11-23T10:05:00Z", kind: "behind", state: "needs_rebase", head_sha: "oldsha0000" },
+      { at: "2026-11-23T10:07:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "newsha1111" },
+    ],
+    decisions: [
+      { at: "2026-11-23T10:06:00Z", kind: "transition.rebase", action: "rebased", fields: { attempt: 1, new_sha: "newsha1111" } },
+    ],
+    checks: [
+      { name: "old-build", state: "success", duration_seconds: 28, head_sha: "oldsha0000" },
+      { name: "verify", state: "pending", duration_seconds: 0, head_sha: "newsha1111" },
+    ],
+  }
+  const created = []
+  const renderers = Object.create(null)
+  const storage = storageStub()
+  const ctx = {
+    theme: themeStub(),
+    client: { rpc: () => ({ snapshot: async () => ({ active: [retryRun], recent: [] }) }) },
+    storage: storage.api,
+    ui: {
+      slot: ({ append, render }) => { renderers[append] = render; return () => { delete renderers[append] } },
+      panel: { open: () => {}, close: () => {}, current: () => ({ name: PANEL_NAME }) },
+    },
+    keymap: { layer: () => () => {} },
+  }
+  const dispose = await beaconStatusDefinition.setup(ctx, {
+    options: { statusPollMs: 0, watcherEnabled: false },
+    import: (specifier) => modules(created)[specifier],
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  let detail = renderers["session.panel"]({ name: PANEL_NAME })
+  const findSection = (root, key) => root.children.find((child) => child.item?.sectionKey === key)
+    ?? root.children.flatMap((child) => child.children ?? []).find((child) => child.item?.sectionKey === key)
+  const technical = findSection(detail, "technical")
+  assert.ok(technical, "the Technical header is clickable")
+  technical.props.onMouseDown()
+  detail = renderers["session.panel"]({ name: PANEL_NAME })
+  const names = []
+  const collect = (node) => {
+    if (node.item?.name) names.push(node.item.name)
+    for (const child of node.children ?? []) collect(child)
+  }
+  collect(detail)
+  assert.equal(names.some((name) => name.includes("old-build")), false, "the stale green check is not rendered")
+  assert.ok(names.some((name) => name.startsWith("verify")), "the pending check for the new head is rendered")
+  assert.ok(names.some((name) => name.includes("rebased")), "the rebase outcome is named")
+  dispose()
+})

@@ -107,12 +107,16 @@ const DECISION_SPEC = [
 ]
 const DURATION_SPEC = [
   ["waitingCI", ["waiting_ci_seconds", "waitingCISeconds", "waitingCI"], num],
+  ["waitingCIInitial", ["waiting_ci_initial_seconds", "waitingCIInitialSeconds", "waitingCIInitial"], num],
+  ["waitingCIRebase", ["waiting_ci_rebase_seconds", "waitingCIRebaseSeconds", "waitingCIRebase"], num],
+  ["waitingCIFix", ["waiting_ci_fix_seconds", "waitingCIFixSeconds", "waitingCIFix"], num],
   ["running", ["running_seconds", "runningSeconds", "running"], num],
   ["blocked", ["blocked_seconds", "blockedSeconds", "blocked"], num],
 ]
 const CHECK_SPEC = [
   ["name", ["Name", "name"]], ["state", ["State", "state"]],
   ["durationSeconds", ["duration_seconds", "durationSeconds"], num],
+  ["headSHA", ["head_sha", "headSHA", "headSha"]],
 ]
 const QUEUE_SPEC = [
   ["id", ["ID", "id"]], ["title", ["Title", "title"]], ["kind", ["Kind", "kind"]],
@@ -170,7 +174,44 @@ function normalizeMetrics(v) {
   for (const [key, name] of Object.entries(METRIC_KEYS)) out[key] = num(pick(s, [name, key]))
   return out
 }
-export const normalizeRun = (v) => normalize(v, RUN_SPEC)
+// An attempt starts at the first timeline event and restarts at each rebase or
+// agent-fix transition. The transition's decision carries the result and the
+// head it produced, so the view can tell a finished attempt from a running one.
+const ATTEMPT_STATES = Object.freeze({ needs_rebase: "rebase", needs_agent_fix: "fix" })
+const ATTEMPT_KINDS = Object.freeze({ behind: "rebase", checks_failed: "fix", rebase: "rebase", fix: "fix" })
+const RETRY_DECISIONS = Object.freeze({ "transition.rebase": "rebase", "transition.wake": "fix" })
+const byTime = (a, b) => str(a?.at).localeCompare(str(b?.at))
+const eventKind = (event) => str(event?.kind).toLowerCase()
+const lastOfKind = (list, kinds) => [...list].reverse().find((item) => kinds(item)) ?? null
+
+export function normalizeAttempt(run) {
+  const timeline = [...(run?.timeline ?? [])].sort(byTime)
+  const decisions = [...(run?.decisions ?? [])].sort(byTime)
+  const firstAt = str(timeline[0]?.at)
+  const event = lastOfKind(timeline, (e) =>
+    Boolean(ATTEMPT_STATES[str(e?.state).toLowerCase()] || ATTEMPT_KINDS[eventKind(e)]))
+  const since = event && (!firstAt || str(event.at) >= firstAt) ? str(event.at) : ""
+  const kind = event
+    ? ATTEMPT_STATES[str(event.state).toLowerCase()] ?? ATTEMPT_KINDS[eventKind(event)] ?? "initial"
+    : "initial"
+  const decision = lastOfKind(decisions, (d) =>
+    RETRY_DECISIONS[str(d?.kind)] === kind && (!since || str(d.at) >= since))
+  const fields = decision?.fields && typeof decision.fields === "object" ? decision.fields : {}
+  const outcome = str(decision?.action)
+  const pendingHead = lastOfKind(timeline, (e) => eventKind(e) === "checks_pending")?.sha
+  const headSHA = str(pick(fields, ["new_sha", "newSHA"]) ?? pendingHead) || str(run?.sha)
+  const rebaseStatus = kind !== "rebase" ? "none"
+    : outcome === "rebased" ? "passed"
+      : outcome === "failed" ? "failed" : "running"
+  const number = kind === "initial" ? 1 : num(fields.attempt) || num(run?.rebaseAttempts) + num(run?.fixAttempts) || 1
+  return { number, kind, startedAt: since, headSHA, outcome, rebaseStatus }
+}
+
+export function normalizeRun(v) {
+  const run = normalize(v, RUN_SPEC)
+  run.attempt = normalizeAttempt(run)
+  return run
+}
 export function normalizeSnapshot(v) {
   const s = v && typeof v === "object" ? v : {}
   const out = { active: list(s.active, normalizeRun), recent: list(s.recent, normalizeRun), queue: [] }

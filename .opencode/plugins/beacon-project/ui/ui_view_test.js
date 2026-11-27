@@ -5,7 +5,7 @@ import { NOW, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
   DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, GROUP_TITLE_WIDTH, PANEL_NAME, REASON_WIDTH,
-  SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
+  SIDEBAR_OPEN, STATE_BAR_WIDTH, checksForRun, cleanErrorMessage, compactReason, detailActions, detailCommand,
   detailLines, detailModel, elapsed, mergedReason, metricsLine, normalizeRun, phaseLabel, renderSnapshotLines,
   runLineItems, runTotalTime, sidebarModel, stateBarItem, truncate,
 } = ui
@@ -630,3 +630,69 @@ test("one snapshot renders the same through every public entry point", () => {
   assert.deepEqual(lines, renderSnapshotLines(snapshot, null, NOW))
 })
 
+
+// A rebase changes the head while the old green checks are still on the run.
+// The next observation carries a pending check for the new head.
+const RETRY_FIXTURE = {
+  id: "run-retry",
+  task_id: "T-retry",
+  state: "waiting_ci",
+  pr: 42,
+  head_sha: "newsha1111",
+  branch: "beacon/T-retry",
+  reason: "waiting CI",
+  created_at: "2026-11-23T10:00:00Z",
+  updated_at: "2026-11-23T10:09:00Z",
+  rebase_attempts: 1,
+  fix_attempts: 0,
+  max_attempts: 12,
+  durations: {
+    waiting_ci_seconds: 180, waiting_ci_initial_seconds: 120,
+    waiting_ci_rebase_seconds: 60, waiting_ci_fix_seconds: 0,
+    running_seconds: 420, blocked_seconds: 0,
+  },
+  timeline: [
+    { at: "2026-11-23T10:00:00Z", kind: "start", state: "running", head_sha: "oldsha0000" },
+    { at: "2026-11-23T10:02:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "oldsha0000" },
+    { at: "2026-11-23T10:05:00Z", kind: "behind", state: "needs_rebase", head_sha: "oldsha0000" },
+    { at: "2026-11-23T10:07:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "newsha1111" },
+  ],
+  decisions: [
+    { at: "2026-11-23T10:06:00Z", kind: "transition.rebase", action: "rebased", fields: { attempt: 1, new_sha: "newsha1111" } },
+  ],
+  checks: [
+    { name: "old-build", state: "success", duration_seconds: 28, head_sha: "oldsha0000" },
+    { name: "old-lint", state: "success", duration_seconds: 30, head_sha: "oldsha0000" },
+    { name: "verify", state: "pending", duration_seconds: 0, head_sha: "newsha1111" },
+  ],
+}
+
+test("the detail panel hides checks from the previous head and names the pending head", () => {
+  const run = normalizeRun(RETRY_FIXTURE)
+  const { checks, stale } = checksForRun(run)
+  assert.deepEqual(checks.map((c) => c.name), ["verify"])
+  assert.deepEqual(stale.map((c) => c.name), ["old-build", "old-lint"])
+
+  const model = detailModel(run, {}, NOW, { ...DETAIL_OPEN, technical: true })
+  const checkHeader = model.rows.find((i) => i.sectionKey === "checks")
+  assert.equal(checkHeader.status, "pending for newsha1")
+  const names = model.rows.map((i) => i.name ?? "")
+  assert.equal(names.includes("old-build"), false, "a green check from the old head is hidden")
+  assert.equal(names.includes("old-lint"), false)
+  assert.ok(names.some((name) => name.startsWith("verify")), "the pending check for the new head stays")
+  assert.ok(names.includes("Checks pending for head newsha1"))
+})
+
+test("the detail panel measures the current CI round and keeps the cumulative total", () => {
+  const run = normalizeRun(RETRY_FIXTURE)
+  assert.equal(phaseLabel(run, NOW), "CI wait 1m")
+  const model = detailModel(run, {}, NOW, { ...DETAIL_OPEN, technical: true })
+  assert.match(model.badge, /CI wait 1m/, "the hero badge uses the current attempt")
+  assert.match(model.phase, /CI wait 1m/, "the phase line uses the current attempt")
+  assert.doesNotMatch(model.phase, /CI wait 3m/)
+  const names = model.rows.map((i) => i.name ?? "")
+  assert.ok(names.includes("#1 rebase · rebased · head newsha1"), "the attempt names the rebase outcome and head")
+  assert.ok(names.includes("passed"), "a short rebase status names the result")
+  assert.ok(names.some((n) => n.includes("Rebase 1/12 · Fix 0/12")), "old counters stay as secondary data")
+  assert.ok(names.some((n) => n.startsWith("Coding 7m · CI wait 3m")), "cumulative time has its own label")
+})
