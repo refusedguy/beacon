@@ -51,6 +51,19 @@ type Harness struct {
 	modelDefault core.ModelRef
 }
 
+// modelWire is the vendor wire shape of a model reference. The core model ref
+// is transport neutral, so this mapping belongs at the adapter boundary.
+type modelWire struct {
+	ID         string `json:"id"`
+	ProviderID string `json:"providerID"`
+	Variant    string `json:"variant,omitempty"`
+}
+
+// wireModel maps a neutral core model ref onto the vendor wire object.
+func wireModel(ref core.ModelRef) modelWire {
+	return modelWire{ID: ref.ID, ProviderID: ref.ProviderID, Variant: ref.Variant}
+}
+
 // Config holds the settings used to build a Harness.
 type Config struct {
 	Endpoint        string
@@ -295,7 +308,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	}
 	ref := h.modelRef(req)
 	if !ref.IsZero() {
-		body["model"] = ref
+		body["model"] = wireModel(ref)
 	}
 	data, _, err := h.do(ctx, http.MethodPost, "/api/session", body)
 	if err != nil {

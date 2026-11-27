@@ -1,14 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
-
-	"github.com/refusedguy/beacon/pkg/core"
 )
 
 // Event is the monitor's copy of the daemon's loopback wire event. It is a
@@ -136,10 +136,55 @@ func (c *Client) streamOnce(ctx context.Context, onEvent func(Event), lastID *st
 	})
 }
 
+// sseInitialBuffer and sseMaxToken bound the stream scanner. A frame whose
+// data line exceeds the token limit is a transport error, not a partial frame.
+const (
+	sseInitialBuffer = 64 * 1024
+	sseMaxToken      = 4 << 20
+)
+
 // readSSE parses the loopback stream. A frame left open when the stream ends
 // is incomplete and is dropped, so the next connection resumes with its id.
+// The TUI is a separate module and imports no Beacon package, so this decoder
+// mirrors the daemon's wire format locally. The wire contract tests in this
+// package fail on drift between the two sides.
 func readSSE(r io.Reader, onFrame func(sseFrame)) error {
-	return core.ParseSSE(r, core.SSEDropPartial, func(f core.SSEFrame) {
-		onFrame(sseFrame{id: f.ID, event: f.Event, data: f.Data})
-	})
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, sseInitialBuffer), sseMaxToken)
+	var frame sseFrame
+	var data strings.Builder
+	emit := func() {
+		if frame.id != "" || frame.event != "" || data.Len() != 0 {
+			frame.data = data.String()
+			onFrame(frame)
+			data.Reset()
+		}
+	}
+	for scanner.Scan() {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if line == "" {
+			emit()
+			frame = sseFrame{}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, value := line, ""
+		if i := strings.IndexByte(line, ':'); i >= 0 {
+			field, value = line[:i], strings.TrimPrefix(line[i+1:], " ")
+		}
+		switch field {
+		case "id":
+			frame.id = value
+		case "event":
+			frame.event = value
+		case "data":
+			if data.Len() != 0 {
+				data.WriteByte('\n')
+			}
+			data.WriteString(value)
+		}
+	}
+	return scanner.Err()
 }

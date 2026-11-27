@@ -35,12 +35,12 @@ type WorkspaceManager interface {
 }
 
 // ModelRef names the model a harness session should use. The zero value means
-// no model was resolved, so the harness keeps its own default. The JSON tags
-// keep the OpenCode wire shape unchanged.
+// no model was resolved, so the harness keeps its own default. The fields are
+// transport neutral; each harness adapter maps them onto its own wire shape.
 type ModelRef struct {
-	ProviderID string `json:"providerID"`
-	ID         string `json:"id"`
-	Variant    string `json:"variant,omitempty"`
+	ProviderID string
+	ID         string
+	Variant    string
 }
 
 // IsZero reports whether no model is set.

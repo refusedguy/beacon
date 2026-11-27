@@ -55,17 +55,18 @@ const (
 	LaunchDaemon LaunchSource = "daemon"
 )
 
-// ParseLaunchSource accepts a source token from MCP metadata, the CLI
-// environment or an automatic path. Unknown and empty values resolve to
-// daemon, the automatic path, so a caller cannot inject arbitrary labels into
-// metrics.
+// ParseLaunchSource accepts a neutral source token from MCP metadata, the CLI
+// environment or an automatic path. Callers normalize vendor-specific
+// metadata to these tokens at the boundary before calling it. Unknown and
+// empty values resolve to daemon, the automatic path, so a caller cannot inject
+// arbitrary labels into metrics.
 func ParseLaunchSource(raw string) LaunchSource {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case string(LaunchMCP), "opencode":
+	case string(LaunchMCP):
 		return LaunchMCP
 	case string(LaunchCLI):
 		return LaunchCLI
-	case string(LaunchUI), "tui":
+	case string(LaunchUI):
 		return LaunchUI
 	default:
 		return LaunchDaemon

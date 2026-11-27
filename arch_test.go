@@ -14,6 +14,11 @@ import (
 const maxProductionLines = 350
 const maxFunctionComplexity = 20
 
+// beaconModule is the import prefix of every package in the root module. The
+// external modules must never reach back into it beyond the shared core
+// contract described below.
+const beaconModule = "github.com/refusedguy/beacon"
+
 // complexityGrandfathered exempts two functions from the complexity limit
 // until they are decomposed.
 var complexityGrandfathered = map[string]bool{
@@ -29,7 +34,7 @@ var skippedDirs = map[string]bool{
 func goFiles(t *testing.T) []string {
 	t.Helper()
 	var files []string
-	for _, root := range []string{".", "harnesses/opencode", "ui/tui"} {
+	for _, root := range []string{".", "harnesses/acp", "harnesses/opencode", "ui/tui"} {
 		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -232,15 +237,28 @@ func TestSecretPatternsOnlyInRedact(t *testing.T) {
 	}
 }
 
+// sharedCoreImport reports whether imp is a package of the public core
+// contract. Harness modules still need it for the domain types and prompt
+// wording. A public prompt seam will remove that dependency in a follow-up;
+// until then it is the only Beacon import an external module may use.
+func sharedCoreImport(imp string) bool {
+	return imp == beaconModule+"/pkg/core" || strings.HasPrefix(imp, beaconModule+"/pkg/core/")
+}
+
 func TestExternalModulesDoNotImportInternal(t *testing.T) {
 	for _, path := range goFiles(t) {
-		if !strings.HasPrefix(path, "harnesses/") && !strings.HasPrefix(path, "ui/") {
+		external := strings.HasPrefix(path, "harnesses/") || strings.HasPrefix(path, "ui/")
+		if !external {
 			continue
 		}
 		for _, imp := range importsOf(t, path) {
-			if strings.HasPrefix(imp, "github.com/refusedguy/beacon/internal/") {
-				t.Errorf("external module %s imports %s", path, imp)
+			if !strings.HasPrefix(imp, beaconModule+"/") {
+				continue
 			}
+			if strings.HasPrefix(path, "harnesses/") && sharedCoreImport(imp) {
+				continue
+			}
+			t.Errorf("external module %s imports %s", path, imp)
 		}
 	}
 }

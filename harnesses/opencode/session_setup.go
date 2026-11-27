@@ -18,7 +18,7 @@ func (h *Harness) applyModel(ctx context.Context, id string, ref core.ModelRef) 
 		return nil
 	}
 	_, status, err := h.do(ctx, http.MethodPost, "/api/session/"+url.PathEscape(id)+"/model", map[string]any{
-		"model": ref,
+		"model": wireModel(ref),
 	})
 	if err != nil && status != http.StatusNotFound && status != http.StatusConflict {
 		return err
