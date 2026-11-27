@@ -107,10 +107,35 @@ func newConfigWatcher(path, root, parent string, initial *liveState, interval ti
 		cw.interval = configWatchInterval
 	}
 	cw.live.Store(initial)
-	if data, err := os.ReadFile(cw.path); err == nil {
-		cw.hash = sha256.Sum256(data)
+	if sum, err := cw.watchHash(); err == nil {
+		cw.hash = sum
 	}
 	return cw
+}
+
+// watchHash hashes the config file and every CI workflow file that required
+// checks are resolved from. A workflow job rename changes the hash even when
+// the config bytes stay identical, so the watcher re-runs resolution. Files
+// the parser cannot read are skipped here for the same reason detection skips
+// them.
+func (cw *configWatcher) watchHash() ([sha256.Size]byte, error) {
+	h := sha256.New()
+	data, err := os.ReadFile(cw.path)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	_, _ = h.Write(data)
+	for _, path := range config.WorkflowFilePaths(cw.path) {
+		workflow, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		_, _ = h.Write([]byte(path))
+		_, _ = h.Write(workflow)
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
 }
 
 // newLiveState builds a config snapshot with its harness, policy and event relay.
@@ -138,12 +163,11 @@ func (cw *configWatcher) Run(ctx context.Context) {
 func (cw *configWatcher) reload() bool {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
-	data, err := os.ReadFile(cw.path)
+	sum, err := cw.watchHash()
 	if err != nil {
 		slog.Warn("config watch: read failed", "path", cw.path)
 		return false
 	}
-	sum := sha256.Sum256(data)
 	if sum == cw.hash {
 		return false
 	}
@@ -154,7 +178,13 @@ func (cw *configWatcher) reload() bool {
 		return false
 	}
 	previous := cw.live.Load()
-	restart, modelOnly := configChange(previous.cfg, cfg)
+	if reflect.DeepEqual(previous.cfg, cfg) {
+		// Only workflow bytes changed, but resolution produced the same
+		// config (manual mode, or an edit that did not change job names).
+		// Keep the live state instead of rebuilding services for nothing.
+		return false
+	}
+	restart, modelOnly, checksOnly := configChange(previous.cfg, cfg)
 	if len(restart) > 0 {
 		// The running services were wired with the previous values for these
 		// fields. Storing the new config would make the snapshot disagree with
@@ -175,6 +205,23 @@ func (cw *configWatcher) reload() bool {
 			cfg:        cfg,
 			harness:    previous.harness,
 			policy:     previous.policy,
+			relay:      previous.relay,
+			generation: cw.generations + 1,
+		}
+		cw.live.Store(state)
+		cw.generations++
+		return true
+	}
+	if checksOnly {
+		// A workflow job rename (or removal) re-resolved merge.required_checks
+		// in workflow mode. Only the policy reads those names, and the stable
+		// reloadablePolicy wrapper reads the policy from live state on every
+		// evaluation. Keep the harness and the event relay, rebuild just the
+		// policy, and do not broadcast a reload: no service is replaced.
+		state := &liveState{
+			cfg:        cfg,
+			harness:    previous.harness,
+			policy:     mergePolicy(cfg),
 			relay:      previous.relay,
 			generation: cw.generations + 1,
 		}
@@ -284,19 +331,29 @@ func restartFields(old, next config.Config) []string {
 }
 
 // configChange classifies a config edit before any service is rebuilt. It
-// returns the restart fields that changed and whether the edit is confined to
-// the model. Restart changes cannot be applied to running services. A
-// model-only change needs no new harness or policy, because dispatch resolves
-// the model from the live config. Any other change rebuilds the harness or
-// policy from the new config.
-func configChange(old, next config.Config) (restart []string, modelOnly bool) {
+// returns the restart fields that changed, whether the edit is confined to the
+// model, and whether it is confined to workflow-resolved required checks.
+// Restart changes cannot be applied to running services. A model-only change
+// needs no new harness or policy, because dispatch resolves the model from the
+// live config. A checks-only change in workflow mode comes from a workflow job
+// rename and needs a new policy but no new harness or reload broadcast. Any
+// other change rebuilds the harness and policy from the new config.
+func configChange(old, next config.Config) (restart []string, modelOnly, checksOnly bool) {
 	restart = restartFields(old, next)
 	if len(restart) > 0 {
-		return restart, false
+		return restart, false, false
 	}
 	probe := old
 	probe.Harness.Model = next.Harness.Model
-	return nil, reflect.DeepEqual(probe, next)
+	if reflect.DeepEqual(probe, next) {
+		return nil, true, false
+	}
+	probe = old
+	probe.Merge.RequiredChecks = next.Merge.RequiredChecks
+	if next.Merge.RequiredChecksMode == config.RequiredChecksWorkflow && reflect.DeepEqual(probe, next) {
+		return nil, false, true
+	}
+	return nil, false, false
 }
 
 // eventForwarder copies events from one harness channel into the stable relay.

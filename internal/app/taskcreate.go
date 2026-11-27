@@ -97,8 +97,8 @@ type TaskCreator struct {
 	Workspace TaskWorkspace
 	Root      core.Workspace
 	Store     TaskGraphStore
-	// Date overrides the date used by generated random IDs. Derived epic and
-	// batch IDs ignore it, so setting it cannot change a content-derived ID.
+	// Date opts into a generated, dated id for a plain create. Derived epic
+	// and batch ids ignore it, so a content-derived id never changes by day.
 	Date string
 
 	Writer    CardWriter
@@ -139,15 +139,9 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	}
 	kind := core.NormalizeTaskKind(in.Kind)
 	epic := kind == core.TaskKindEpic
-	id := core.TaskID(strings.TrimSpace(in.ID))
-	if id == "" && epic {
-		id = c.ids().ForEpic(title, in.Plan)
-	}
-	if id == "" {
-		var err error
-		if id, err = c.ids().New(); err != nil {
-			return out, err
-		}
+	id, err := c.createID(in, title, epic)
+	if err != nil {
+		return out, err
 	}
 	children := epicChildren(id, in.Plan)
 	key := idempotencyKey(id, title, in.Plan)
@@ -202,6 +196,23 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		c.Cache.RememberCreated(key, created)
 	}
 	return c.result(created), nil
+}
+
+// createID resolves the id of one create. An explicit id wins and an epic keeps
+// its content-derived id. A plain card derives the id CreateBatch would give a
+// one-card batch, so a retry adopts the card. An injected factory or an explicit
+// Date opts into New, which callers use to generate an id with a pinned date.
+func (c *TaskCreator) createID(in CreateTaskInput, title string, epic bool) (core.TaskID, error) {
+	if id := core.TaskID(strings.TrimSpace(in.ID)); id != "" {
+		return id, nil
+	}
+	if epic {
+		return c.ids().ForEpic(title, in.Plan), nil
+	}
+	if c.IDs == nil && c.Date == "" {
+		return c.singleCardID(in), nil
+	}
+	return c.ids().New()
 }
 
 // ensureEpicBranch publishes an epic base branch through the composed workspace
