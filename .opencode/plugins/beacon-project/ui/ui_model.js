@@ -460,14 +460,12 @@ class RpcStatusSource {
     // The RPC server reads through CliStatusSource, which already normalizes
     // every run and marks it with an attempt. Skip that work on a normal wire
     // result and normalize only a raw payload from a test double or older peer.
-    let raw = false
-    for (const group of [value?.active, value?.recent]) {
-      if (!Array.isArray(group)) continue
-      for (const run of group) {
-        if (run && !Object.hasOwn(run, "attempt")) { raw = true; break }
-      }
-      if (raw) break
+    const hasRawRun = (group) => {
+      if (!Array.isArray(group)) return false
+      for (const run of group) if (run && !Object.hasOwn(run, "attempt")) return true
+      return false
     }
+    const raw = hasRawRun(value?.active) || hasRawRun(value?.recent)
     // A payload without a queue still needs normalization: snapshotView and
     // mergeDispatch read value.queue directly and must never see undefined.
     return raw || !Array.isArray(value?.queue) ? normalizeSnapshot(value) : value
