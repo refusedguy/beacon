@@ -1,7 +1,7 @@
 ---
 id: T-b08e5abe
 title: Register four missing perf keys
-status: available
+status: done
 scope:
     - internal/bench/registry.go
     - internal/bench/registry_test.go

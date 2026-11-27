@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"time"
 )
@@ -13,7 +14,9 @@ import (
 const perfPrefix = "beacon-perf: "
 
 // perfRow is the fixed payload of every canonical row. Consumers validate the
-// field set, so no harness may add another field or rename one.
+// field set, so no harness may add another field or rename one. Cache names the
+// cache policy the measurement ran under, so two rows from different policies
+// can never be read as the same sample.
 type perfRow struct {
 	Key      string  `json:"key"`
 	MedianMS float64 `json:"median_ms"`
@@ -22,6 +25,17 @@ type perfRow struct {
 	Work     int64   `json:"work"`
 	Errs     int64   `json:"errs"`
 	Limiter  string  `json:"limiter"`
+	Cache    string  `json:"cache"`
+}
+
+// benchCache returns the cache state stamped on every canonical row. CI sets
+// BEACON_BENCH_CACHE when it runs a harness under a named policy; without an
+// override the row reports "unset" instead of omitting the field.
+func benchCache() string {
+	if value := os.Getenv("BEACON_BENCH_CACHE"); value != "" {
+		return value
+	}
+	return "unset"
 }
 
 // perfLine renders one canonical row. Benchmarks time in nanoseconds and the
@@ -35,6 +49,7 @@ func perfLine(key string, median, min, max time.Duration, work, errs int64, limi
 		Work:     work,
 		Errs:     errs,
 		Limiter:  limiter,
+		Cache:    benchCache(),
 	})
 	if err != nil {
 		return ""
