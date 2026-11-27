@@ -370,8 +370,15 @@ type scanner interface{ Scan(...any) error }
 // close and the iteration error live here. Each caller supplies its own column
 // list through the scan function.
 func collectRows[T any](rows *sql.Rows, scan func(scanner) (T, error)) ([]T, error) {
+	return collectRowsCap(rows, 0, scan)
+}
+
+// collectRowsCap is collectRows with the result slice allocated up front. A
+// reader that knows its row count allocates once instead of growing the slice
+// through a series of reallocations and copies.
+func collectRowsCap[T any](rows *sql.Rows, capacity int, scan func(scanner) (T, error)) ([]T, error) {
 	defer rows.Close()
-	out := make([]T, 0)
+	out := make([]T, 0, capacity)
 	for rows.Next() {
 		v, err := scan(rows)
 		if err != nil {
@@ -473,13 +480,20 @@ func (s *Store) ListRunEvents(ctx context.Context, runIDs []string) ([]app.RunEv
 	if len(runIDs) == 0 {
 		return []app.RunEvent{}, nil
 	}
-	query, args := inQuery(`SELECT id, run_id, kind, state, at, head_sha, pr_number, reason
-FROM run_events WHERE run_id IN (%s) ORDER BY at, id`, runIDs)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	where, args := inQuery(`run_id IN (%s)`, runIDs)
+	// The count pass reads the same index entries as the scan and adds no sort.
+	// It gives collectRowsCap the exact size so the event slice is allocated
+	// once instead of growing roughly thirteen times for a full snapshot.
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_events WHERE `+where, args...).Scan(&n); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, kind, state, at, head_sha, pr_number, reason
+FROM run_events WHERE `+where+` ORDER BY at, id`, args...)
 	if err != nil {
 		return nil, err
 	}
-	return collectRows(rows, scanRunEvent)
+	return collectRowsCap(rows, n, scanRunEvent)
 }
 
 // scanRunEvent decodes one run event row into an app.RunEvent.
@@ -527,11 +541,32 @@ UNION ALL SELECT ` + decisionColumns + ` FROM orphan
 ORDER BY at, id`
 		args = append(ids, limit)
 	}
+	// Count the exact result size without re-running the window function. Each
+	// run contributes at most limit rows and the orphan bucket at most
+	// orphanLimit, so MIN over each group summed gives the capacity.
+	countQuery := `SELECT COALESCE(SUM(n), 0) FROM (
+SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id = ''
+)`
+	countArgs := []any{orphanLimit}
+	if len(runIDs) > 0 {
+		perRun, ids := inQuery(`SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id IN (%s) GROUP BY run_id`, runIDs)
+		countQuery = `SELECT COALESCE(SUM(n), 0) FROM (
+` + perRun + `
+UNION ALL
+SELECT MIN(COUNT(*), ?) AS n FROM decisions WHERE run_id = ''
+)`
+		countArgs = append([]any{limit}, ids...)
+		countArgs = append(countArgs, orphanLimit)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&n); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	return collectRows(rows, func(row scanner) (app.Decision, error) {
+	return collectRowsCap(rows, n, func(row scanner) (app.Decision, error) {
 		d, err := scanDecision(row)
 		if err != nil {
 			return app.Decision{}, err
@@ -663,12 +698,28 @@ func (s *Store) CurrentIncident(ctx context.Context) (*core.BaseIncident, error)
 }
 
 // inQuery expands one %s per list in template into bound placeholders. It
-// returns the values for those placeholders in list order.
+// returns the values for those placeholders in list order. Both the argument
+// slice and each placeholder string are sized once, so a snapshot with a large
+// run-id set does not grow them a slice at a time.
 func inQuery(template string, lists ...[]string) (string, []any) {
 	holders := make([]any, len(lists))
-	var args []any
+	total := 0
+	for _, list := range lists {
+		total += len(list)
+	}
+	args := make([]any, 0, total)
 	for i, list := range lists {
-		holders[i] = strings.TrimSuffix(strings.Repeat("?,", len(list)), ",")
+		var b strings.Builder
+		if len(list) > 0 {
+			b.Grow(2*len(list) - 1)
+		}
+		for j := range list {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('?')
+		}
+		holders[i] = b.String()
 		for _, v := range list {
 			args = append(args, v)
 		}

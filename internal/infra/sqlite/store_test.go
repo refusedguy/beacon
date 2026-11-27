@@ -1369,3 +1369,62 @@ func TestActiveTaskIDsProjectsOnlyTaskAndState(t *testing.T) {
 		t.Fatalf("ActiveTaskIDs(nil) = %+v, want empty", empty)
 	}
 }
+
+// TestCountedReadsKeepExactRows pins the count passes that size the result
+// slices for ListRunEvents and ListDecisions. A wrong count would show up as a
+// wrong length, a missing row or an out-of-order timeline.
+func TestCountedReadsKeepExactRows(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	const perRun = 150
+	base := time.Now().UTC().Add(-time.Hour)
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	for _, runID := range []string{"r1", "r2"} {
+		for i := 0; i < perRun; i++ {
+			at := base.Add(time.Duration(i) * time.Second).UnixNano()
+			if _, err := tx.ExecContext(ctx, `INSERT INTO run_events (run_id, kind, state, at) VALUES (?,?,?,?)`, runID, "state", "running", at); err != nil {
+				_ = tx.Rollback()
+				t.Fatalf("insert event: %v", err)
+			}
+		}
+	}
+	for i := 0; i < perRun; i++ {
+		at := base.Add(time.Duration(i) * time.Second).UnixNano()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO decisions (at, kind, run_id, fields_json) VALUES (?,?,?,?)`, at, "transition.spawn", "r1", "{}"); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("insert decision: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	events, err := store.ListRunEvents(ctx, []string{"r1", "r2"})
+	if err != nil {
+		t.Fatalf("ListRunEvents: %v", err)
+	}
+	if len(events) != 2*perRun {
+		t.Fatalf("events = %d, want %d", len(events), 2*perRun)
+	}
+	for i := 1; i < len(events); i++ {
+		if events[i].At.Before(events[i-1].At) {
+			t.Fatalf("event[%d] at %s precedes event[%d] at %s", i, events[i].At, i-1, events[i-1].At)
+		}
+	}
+
+	decisions, err := store.ListDecisions(ctx, []string{"r1"}, 10, 10)
+	if err != nil {
+		t.Fatalf("ListDecisions: %v", err)
+	}
+	if len(decisions) != 10 {
+		t.Fatalf("decisions = %d, want 10", len(decisions))
+	}
+}
