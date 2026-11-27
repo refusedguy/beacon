@@ -158,6 +158,59 @@ func TestGitWorktreeCreateUsesTaskBaseBranch(t *testing.T) {
 	}
 }
 
+func TestGitWorktreeCreateRejectsCollidingTaskIDs(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	first := core.Task{ID: "T-a-b"}
+	ws, err := wt.Create(ctx, first)
+	if err != nil {
+		t.Fatalf("Create(first) error = %v", err)
+	}
+
+	// The slash is sanitized to a dash, so this id targets the same branch
+	// and worktree path as the first task.
+	second := core.Task{ID: "T-a/b"}
+	_, err = wt.Create(ctx, second)
+	if core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("Create(second) error = %v, want CodeConflict", err)
+	}
+	for _, id := range []string{"T-a-b", "T-a/b"} {
+		if !strings.Contains(err.Error(), id) {
+			t.Fatalf("Create(second) error = %q, want it to name task %s", err, id)
+		}
+	}
+	if clean, err := wt.Clean(ctx, ws); err != nil || !clean {
+		t.Fatalf("Create(second) disturbed the first worktree: clean=%v err=%v", clean, err)
+	}
+}
+
+func TestGitWorktreeForceRemoveDeletesBranchWhenWorktreeIsGone(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-GONE-BRANCH"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	branch := ws.Branch
+
+	// Drop the directory and git's administrative entry. Git then refuses
+	// `worktree remove`, while the branch ref is still present locally.
+	if err := os.RemoveAll(ws.Path); err != nil {
+		t.Fatalf("os.RemoveAll(ws.Path): %v", err)
+	}
+	admin := filepath.Join(wt.Root, ".git", "worktrees", filepath.Base(ws.Path))
+	if err := os.RemoveAll(admin); err != nil {
+		t.Fatalf("os.RemoveAll(admin): %v", err)
+	}
+	if err := wt.ForceRemove(ctx, ws); err != nil {
+		t.Fatalf("ForceRemove() with a missing worktree error = %v", err)
+	}
+	cmd := exec.Command("git", "-C", wt.Repo, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("stale branch %s survived ForceRemove: %s", branch, out)
+	}
+}
+
 func TestGitWorktreeCreateRecoversFromDeadAdminEntry(t *testing.T) {
 	wt, repo := newTestGitWorktree(t)
 	ctx := context.Background()

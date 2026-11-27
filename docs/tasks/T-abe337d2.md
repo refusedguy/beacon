@@ -1,7 +1,7 @@
 ---
 id: T-abe337d2
 title: Fix worktree branch collision and cleanup gaps
-status: available
+status: done
 scope:
     - internal/infra/workspace/git_worktree.go
     - internal/infra/workspace/git_worktree_test.go
