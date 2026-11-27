@@ -687,6 +687,56 @@ FROM decisions WHERE run_id=? ORDER BY at DESC, id DESC LIMIT 1`, runID)
 	return d, err
 }
 
+// DecisionsSince returns every decision recorded at or after since, oldest
+// first. Unlike ListDecisions it has no per-run cap: the window is bounded by
+// retention and a report needs the whole set for its counts.
+func (s *Store) DecisionsSince(ctx context.Context, since time.Time) ([]app.Decision, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+decisionColumns+` FROM decisions
+WHERE at>=? ORDER BY at, id`, since.UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, func(row scanner) (app.Decision, error) {
+		d, err := scanDecision(row)
+		if err != nil {
+			return app.Decision{}, err
+		}
+		return *d, nil
+	})
+}
+
+// EventsSince returns every run event recorded at or after since, oldest
+// first. The at index serves the range scan.
+func (s *Store) EventsSince(ctx context.Context, since time.Time) ([]app.RunEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, kind, state, at, head_sha, pr_number, reason
+FROM run_events WHERE at>=? ORDER BY at, id`, since.UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, scanRunEvent)
+}
+
+// IncidentsSince returns incidents opened in the window, resolved in the
+// window, or still open. The open set includes incidents created before since,
+// so a shift report can name an incident that crossed the boundary.
+func (s *Store) IncidentsSince(ctx context.Context, since time.Time) ([]*core.BaseIncident, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+incidentColumns+` FROM base_incidents
+WHERE created_at>=? OR resolved_at>=? OR status='open' ORDER BY created_at, id`,
+		since.UnixNano(), since.UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, s.scanIncident)
+}
+
+// RunsSince returns runs that reached a terminal state at or after since and
+// every run still active. The active rows let a report name a run whose
+// activity stopped before the window began.
+func (s *Store) RunsSince(ctx context.Context, since time.Time) ([]*core.Run, error) {
+	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs
+WHERE updated_at>=? OR state NOT IN (`+activeStatesSQL+`) ORDER BY updated_at`, since.UnixNano())
+}
+
 // ListQueueTasks reads local task cards and their unresolved dependencies
 // straight from SQLite. It makes no SCM or task-source calls, so a snapshot
 // stays safe for both markdown and remote task sources.
@@ -788,3 +838,4 @@ var _ app.DecisionLookup = (*Store)(nil)
 var _ app.SnapshotStore = (*Store)(nil)
 var _ app.QueueStore = (*Store)(nil)
 var _ app.IncidentStore = (*Store)(nil)
+var _ app.ReportStore = (*Store)(nil)

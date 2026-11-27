@@ -221,6 +221,44 @@ func newExplainCommand(configPath *string, fn wireFn) *cobra.Command {
 	return cmd
 }
 
+// newReportCommand prints a bounded shift report from the state database. It
+// only reads: the daemon API and the status snapshot keep their shapes.
+func newReportCommand(configPath *string) *cobra.Command {
+	since := ""
+	jsonOutput := false
+	cmd := &cobra.Command{
+		Use:   "report",
+		Short: "Print a bounded report of what happened on a shift",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			window, err := time.ParseDuration(since)
+			if err != nil {
+				return fmt.Errorf("invalid --since %q: %w", since, err)
+			}
+			if window <= 0 {
+				return errors.New("--since must be positive")
+			}
+			_, store, _, err := wireReadOnly(*configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			report, err := (app.ReportService{Store: store}).Report(cmd.Context(), window, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				return printJSON(report)
+			}
+			fmt.Fprint(cmd.OutOrStdout(), app.FormatReport(report))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&since, "since", app.DefaultReportSince.String(), "length of the reporting window, for example 8h or 30m")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "print a machine readable report")
+	return cmd
+}
+
 func newGCCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "gc",
