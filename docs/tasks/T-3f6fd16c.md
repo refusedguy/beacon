@@ -5,9 +5,7 @@ status: available
 scope:
     - .github/workflows/ci.yml
     - .opencode/plugins/beacon-project/ui/ui_exports_test.js
-depends:
-    - T-d7ec575a
-    - T-97b1c03b
+depends: []
 priority: 82
 kind: task
 require_review: llm

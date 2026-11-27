@@ -5,8 +5,7 @@ status: available
 scope:
     - .github/workflows/ci.yml
     - scripts/bench-e2e.sh
-depends:
-    - T-5c9551de
+depends: []
 priority: 85
 kind: task
 require_review: llm
