@@ -3,6 +3,7 @@ package scm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -86,6 +87,10 @@ type glJob struct {
 	FinishedAt    glTimestamp `json:"finished_at"`
 }
 
+// errCappedRead marks a page walk that stopped at the provider cap. A capped
+// list is partial, so the observation that carries it must be incomplete.
+var errCappedRead = errors.New("capped page read")
+
 // observationErrors collects failed provider calls so an observation can be
 // marked incomplete instead of silently dropping the failures.
 type observationErrors []string
@@ -143,10 +148,13 @@ func (g *GitLab) latestPipeline(ctx context.Context, query url.Values) (glPipeli
 // the first round. Provider failures are reported through failed and leave the
 // checks empty.
 func (g *GitLab) observeChecks(ctx context.Context, o *core.Observation, pipeline glPipeline, failed *observationErrors) {
-	checks, excerpt, err := g.pipelineChecks(ctx, pipeline.ID)
+	checks, excerpt, capped, err := g.pipelineChecksCapped(ctx, pipeline.ID)
 	failed.add("jobs", err)
 	if err != nil {
 		return
+	}
+	if capped {
+		failed.add("jobs", errCappedRead)
 	}
 	applyChecks(o, checks, excerpt, pipeline)
 }
@@ -166,22 +174,62 @@ func applyChecks(o *core.Observation, checks []core.CheckResult, excerpt string,
 }
 
 func (g *GitLab) pipelineChecks(ctx context.Context, pipelineID int) ([]core.CheckResult, string, error) {
-	jobs, err := g.pipelineJobs(ctx, pipelineID)
+	checks, excerpt, _, err := g.pipelineChecksCapped(ctx, pipelineID)
+	return checks, excerpt, err
+}
+
+func (g *GitLab) pipelineChecksCapped(ctx context.Context, pipelineID int) ([]core.CheckResult, string, bool, error) {
+	jobs, capped, err := g.pipelineJobsCapped(ctx, pipelineID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", capped, err
 	}
 	checks, excerpt := g.checksFromJobs(ctx, jobs)
-	return checks, excerpt, nil
+	return checks, excerpt, capped, nil
 }
 
 func (g *GitLab) pipelineJobs(ctx context.Context, pipelineID int) ([]glJob, error) {
+	jobs, _, err := g.pipelineJobsCapped(ctx, pipelineID)
+	return jobs, err
+}
+
+func (g *GitLab) pipelineJobsCapped(ctx context.Context, pipelineID int) ([]glJob, bool, error) {
 	path := fmt.Sprintf("/projects/%s/pipelines/%d/jobs", g.project(), pipelineID)
-	return getJSONPages[glJob](g, ctx, path, nil)
+	return getJSONPages[glJob](g, ctx, path, nil, func(j glJob) int64 { return int64(j.ID) })
+}
+
+// newestJobsByName collapses retried jobs to one result per name. A re-run
+// that ended in a cancelled state must not leave an older failure deciding the
+// verdict. The newest finish wins, with the job ID breaking ties.
+func newestJobsByName(jobs []glJob) []glJob {
+	latest := make(map[string]int, len(jobs))
+	for i, job := range jobs {
+		if job.Name == "" {
+			continue
+		}
+		prev, ok := latest[job.Name]
+		if !ok {
+			latest[job.Name] = i
+			continue
+		}
+		previous := jobs[prev]
+		if job.FinishedAt.Time.After(previous.FinishedAt.Time) ||
+			(job.FinishedAt.Time.Equal(previous.FinishedAt.Time) && job.ID > previous.ID) {
+			latest[job.Name] = i
+		}
+	}
+	out := make([]glJob, 0, len(jobs))
+	for i, job := range jobs {
+		if keep, ok := latest[job.Name]; job.Name == "" || (ok && keep == i) {
+			out = append(out, job)
+		}
+	}
+	return out
 }
 
 // checksFromJobs fetches failure traces concurrently but fills checks and the
 // excerpt in job order, so callers see the same first failure as before.
 func (g *GitLab) checksFromJobs(ctx context.Context, jobs []glJob) ([]core.CheckResult, string) {
+	jobs = newestJobsByName(jobs)
 	checks := make([]core.CheckResult, len(jobs))
 	outputs := make([]string, len(jobs))
 	var group errgroup.Group

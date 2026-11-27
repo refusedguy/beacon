@@ -3,6 +3,7 @@ package scm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -92,10 +93,15 @@ type githubPage[T any] struct {
 	resp  *github.Response
 }
 
-// paginate follows NextPage until GitHub stops sending one or the cap is hit.
-// Every request goes through br, so pagination does not bypass the breaker.
-func paginate[T any](br *gobreaker.CircuitBreaker[any], fetch func(*github.ListOptions) ([]T, *github.Response, error)) ([]T, error) {
+// paginateCapped follows NextPage until GitHub stops sending one or the cap is
+// hit. It reports both the items and whether the cap cut the read short, so an
+// adapter can mark an incomplete observation instead of acting on a partial
+// list. Every request goes through br, so pagination does not bypass the
+// breaker. When id is non-nil, entries with the same non-zero provider ID are
+// collapsed: pages can shift under concurrent writes and repeat an entry.
+func paginateCapped[T any](br *gobreaker.CircuitBreaker[any], fetch func(*github.ListOptions) ([]T, *github.Response, error), id func(T) int64) ([]T, bool, error) {
 	var all []T
+	seen := make(map[int64]bool)
 	opts := github.ListOptions{PerPage: 100}
 	for n := 0; n < maxGitHubPages; n++ {
 		page, err := guarded(br, func() (githubPage[T], error) {
@@ -103,15 +109,33 @@ func paginate[T any](br *gobreaker.CircuitBreaker[any], fetch func(*github.ListO
 			return githubPage[T]{items: items, resp: resp}, err
 		})
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		all = append(all, page.items...)
+		for _, item := range page.items {
+			if id != nil {
+				key := id(item)
+				if key != 0 {
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+				}
+			}
+			all = append(all, item)
+		}
 		if page.resp == nil || page.resp.NextPage == 0 {
-			return all, nil
+			return all, false, nil
 		}
 		opts.Page = page.resp.NextPage
 	}
-	return all, nil
+	return all, true, nil
+}
+
+// paginate keeps the uncapped entry point used by callers that only need the
+// items and cannot mark an observation incomplete.
+func paginate[T any](br *gobreaker.CircuitBreaker[any], fetch func(*github.ListOptions) ([]T, *github.Response, error)) ([]T, error) {
+	items, _, err := paginateCapped(br, fetch, nil)
+	return items, err
 }
 
 // Observe reads the current state of pull request pr.
@@ -131,8 +155,9 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 	}
 	// A false mergeable flag alone does not mean a conflict. GitHub reports it
 	// for PRs blocked by required checks. Only these states describe a dirty
-	// tree; checks stay a policy decision for ChecksRule.
-	conflict := p.GetMergeableState() == "dirty" || p.GetMergeableState() == "conflict"
+	// tree; checks stay a policy decision for ChecksRule. The comparison below
+	// cross-checks this flag for an open PR.
+	conflict := mergeableConflict(p)
 	o := core.Observation{
 		PRNumber: pr,
 		HeadSHA:  sha,
@@ -145,19 +170,18 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 	if core.DecideFinalState(state).Closed {
 		return o, nil
 	}
-	base := p.GetBase().GetRef()
-	if base == "" {
-		base = g.base
-	}
-	signals := g.fetchSignals(ctx, pr, sha, base)
+	signals := g.fetchSignals(ctx, pr, sha, compareBase(p, g.base))
 
-	// Report failures in the original call order so callers see the same first
-	// error and the same partially filled observation. Changed files depend on
-	// the check result and stay in a second round.
+	// Report hard failures in the original call order so callers see the same
+	// first error. Capped reads are kept and marked incomplete instead.
+	var failed observationErrors
 	if signals.checksErr != nil {
 		return o, signals.checksErr
 	}
 	o.Checks = signals.checks
+	if signals.checksCapped {
+		failed.add("checks", errCappedRead)
+	}
 	for _, c := range signals.checks {
 		if c.State == core.CheckFailure {
 			o.FailureExcerpt = c.Output
@@ -165,36 +189,110 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		}
 	}
 	if state == "open" && len(signals.checks) == 0 {
-		files, err := g.changedFiles(ctx, pr)
-		if err != nil {
+		if err := g.observeWorkflowSkipped(ctx, &o, pr, &failed); err != nil {
 			return o, err
 		}
-		o.WorkflowSkipped = ignoredPathsOnly(files)
 	}
 	if signals.approvalsErr != nil {
 		return o, signals.approvalsErr
 	}
+	if signals.approvalsCapped {
+		failed.add("reviews", errCappedRead)
+	}
 	o.Approvals = signals.approvals
-	for _, l := range p.Labels {
-		o.Labels = append(o.Labels, l.GetName())
+	o.Labels = observationLabels(p.Labels)
+	applyCompare(&o, p, signals, &failed)
+	failed.apply(&o)
+	return o, nil
+}
+
+// observationLabels copies the provider labels into the observation.
+func observationLabels(labels []*github.Label) []string {
+	if len(labels) == 0 {
+		return nil
 	}
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		out = append(out, label.GetName())
+	}
+	return out
+}
+
+// compareBase returns the base commit to compare against. The commit in the PR
+// object stays addressable after the base branch is deleted, unlike its ref.
+func compareBase(p *github.PullRequest, fallback string) string {
+	if sha := p.GetBase().GetSHA(); sha != "" {
+		return sha
+	}
+	if ref := p.GetBase().GetRef(); ref != "" {
+		return ref
+	}
+	return fallback
+}
+
+// applyCompare records the comparison and cross-checks the provider conflict
+// flag. A dirty state with no commits ahead of the base is stale, not a
+// conflict, and must not dispatch an agent in place of a branch update.
+func applyCompare(o *core.Observation, p *github.PullRequest, signals githubSignals, failed *observationErrors) {
 	if signals.compareErr != nil {
-		return o, signals.compareErr
+		failed.add("compare", compareFailure(signals.compareErr))
+		return
 	}
+	if signals.cmp == nil {
+		return
+	}
+	o.Conflict = crossCheckConflict(p, signals.cmp)
 	o.Behind = signals.cmp.GetBehindBy() > 0
 	o.BaseSHA = signals.cmp.GetBaseCommit().GetSHA()
-	return o, nil
+}
+
+// observeWorkflowSkipped reads the changed files and records a capped read on
+// the same error list. A hard failure is returned to Observe unchanged.
+func (g *GitHub) observeWorkflowSkipped(ctx context.Context, o *core.Observation, pr int, failed *observationErrors) error {
+	files, capped, err := g.changedFilesCapped(ctx, pr)
+	if err != nil {
+		return err
+	}
+	if capped {
+		failed.add("files", errCappedRead)
+	}
+	o.WorkflowSkipped = ignoredPathsOnly(files)
+	return nil
+}
+
+func mergeableConflict(p *github.PullRequest) bool {
+	state := p.GetMergeableState()
+	return state == "dirty" || state == "conflict"
+}
+
+// crossCheckConflict keeps a provider conflict only when the comparison shows
+// the head actually diverged. An empty ahead-by count means there is nothing
+// for the provider to conflict over.
+func crossCheckConflict(p *github.PullRequest, cmp *github.CommitsComparison) bool {
+	return mergeableConflict(p) && cmp.GetAheadBy() > 0
+}
+
+// compareFailure names a deleted base explicitly instead of leaking a raw
+// provider error into the observation.
+func compareFailure(err error) error {
+	var respErr *github.ErrorResponse
+	if errors.As(err, &respErr) && respErr.Response != nil && respErr.Response.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("base branch was deleted or its commit is unavailable: %w", err)
+	}
+	return err
 }
 
 // githubSignals carries the results of the first Observe round. Errors stay
 // separate so Observe can report them in the original call order.
 type githubSignals struct {
-	checks       []core.CheckResult
-	approvals    int
-	cmp          *github.CommitsComparison
-	checksErr    error
-	approvalsErr error
-	compareErr   error
+	checks          []core.CheckResult
+	approvals       int
+	cmp             *github.CommitsComparison
+	checksCapped    bool
+	approvalsCapped bool
+	checksErr       error
+	approvalsErr    error
+	compareErr      error
 }
 
 // fetchSignals runs checks, approvals and the base comparison together. None of
@@ -204,11 +302,11 @@ func (g *GitHub) fetchSignals(ctx context.Context, pr int, sha, base string) git
 	var group errgroup.Group
 	group.SetLimit(observeParallelLimit)
 	group.Go(func() error {
-		out.checks, out.checksErr = g.checks(ctx, sha)
+		out.checks, out.checksCapped, out.checksErr = g.checksCapped(ctx, sha)
 		return out.checksErr
 	})
 	group.Go(func() error {
-		out.approvals, out.approvalsErr = g.approvals(ctx, pr)
+		out.approvals, out.approvalsCapped, out.approvalsErr = g.approvalsCapped(ctx, pr)
 		return out.approvalsErr
 	})
 	group.Go(func() error {
@@ -222,22 +320,30 @@ func (g *GitHub) fetchSignals(ctx context.Context, pr int, sha, base string) git
 	return out
 }
 
-// checks returns the check runs for commit sha. GitHub lists every attempt of
-// a named check on a SHA, so a cancelled earlier attempt must not shadow a
-// later success. Keep the newest attempt per name by completion time, breaking
-// ties by start time, and map a cancelled conclusion to skipped.
+// checks returns the check runs for commit sha.
 func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, error) {
-	checkRuns, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.CheckRun, *github.Response, error) {
+	checks, _, err := g.checksCapped(ctx, sha)
+	return checks, err
+}
+
+// checksCapped reads check runs and reports a truncated page walk. Filter is
+// set to latest explicitly so the adapter never depends on a provider default
+// that can change. GitHub still lists every attempt of a named check on a SHA,
+// so a cancelled earlier attempt must not shadow a later success. Keep the
+// newest attempt per name by completion time, breaking ties by start time.
+func (g *GitHub) checksCapped(ctx context.Context, sha string) ([]core.CheckResult, bool, error) {
+	checkRuns, capped, err := paginateCapped(g.br, func(opts *github.ListOptions) ([]*github.CheckRun, *github.Response, error) {
 		res, resp, err := g.Client.Checks.ListCheckRunsForRef(ctx, g.Owner, g.Repo, sha, &github.ListCheckRunsOptions{
+			Filter:      github.String("latest"),
 			ListOptions: *opts,
 		})
 		if res == nil {
 			return nil, resp, err
 		}
 		return res.CheckRuns, resp, err
-	})
+	}, func(c *github.CheckRun) int64 { return c.GetID() })
 	if err != nil {
-		return nil, err
+		return nil, capped, err
 	}
 	latest := make(map[string]*github.CheckRun, len(checkRuns))
 	for _, c := range checkRuns {
@@ -257,7 +363,7 @@ func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, er
 			CompletedAt: c.GetCompletedAt().Time,
 		})
 	}
-	return out, nil
+	return out, capped, nil
 }
 
 // checkRunNewer reports whether c is a later attempt than prev. Completion time
@@ -291,9 +397,14 @@ func checkState(c *github.CheckRun) core.CheckState {
 
 // changedFiles reads every changed file of a PR, one page at a time.
 func (g *GitHub) changedFiles(ctx context.Context, pr int) ([]*github.CommitFile, error) {
-	return paginate(g.br, func(opts *github.ListOptions) ([]*github.CommitFile, *github.Response, error) {
+	files, _, err := g.changedFilesCapped(ctx, pr)
+	return files, err
+}
+
+func (g *GitHub) changedFilesCapped(ctx context.Context, pr int) ([]*github.CommitFile, bool, error) {
+	return paginateCapped(g.br, func(opts *github.ListOptions) ([]*github.CommitFile, *github.Response, error) {
 		return g.Client.PullRequests.ListFiles(ctx, g.Owner, g.Repo, pr, opts)
-	})
+	}, nil)
 }
 
 // ignoredPathsOnly reports whether every changed path is one the CI workflow
@@ -318,32 +429,61 @@ func ignoredPathsOnly(files []*github.CommitFile) bool {
 
 // approvals counts the latest approval review per user on pr.
 func (g *GitHub) approvals(ctx context.Context, pr int) (int, error) {
-	reviews, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.PullRequestReview, *github.Response, error) {
-		return g.Client.PullRequests.ListReviews(ctx, g.Owner, g.Repo, pr, opts)
-	})
-	if err != nil {
-		return 0, err
+	n, _, err := g.approvalsCapped(ctx, pr)
+	return n, err
+}
+
+// reviewState is the newest review seen for one login. The monotonic review ID
+// orders same-time reviews and stands in when a timestamp is missing.
+type reviewState struct {
+	state string
+	id    int64
+	at    time.Time
+}
+
+// reviewNewer picks the later review. A dismissed review submitted at the same
+// instant as an approval must win, so equal timestamps fall back to the review
+// ID instead of the order the pages happened to arrive in.
+func reviewNewer(c, prev reviewState) bool {
+	if c.at.IsZero() || prev.at.IsZero() {
+		return c.id > prev.id
 	}
-	latest := make(map[string]string)
-	times := make(map[string]time.Time)
+	if !c.at.Equal(prev.at) {
+		return c.at.After(prev.at)
+	}
+	return c.id > prev.id
+}
+
+func (g *GitHub) approvalsCapped(ctx context.Context, pr int) (int, bool, error) {
+	reviews, capped, err := paginateCapped(g.br, func(opts *github.ListOptions) ([]*github.PullRequestReview, *github.Response, error) {
+		return g.Client.PullRequests.ListReviews(ctx, g.Owner, g.Repo, pr, opts)
+	}, func(r *github.PullRequestReview) int64 { return r.GetID() })
+	if err != nil {
+		return 0, capped, err
+	}
+	latest := make(map[string]reviewState, len(reviews))
 	for _, r := range reviews {
 		if r.GetUser() == nil {
 			continue
 		}
 		login := r.GetUser().GetLogin()
-		at := r.GetSubmittedAt().Time
-		if t, ok := times[login]; !ok || at.After(t) {
-			times[login] = at
-			latest[login] = r.GetState()
+		next := reviewState{state: r.GetState(), id: r.GetID(), at: r.GetSubmittedAt().Time}
+		if prev, ok := latest[login]; !ok || reviewNewer(next, prev) {
+			latest[login] = next
 		}
 	}
 	n := 0
-	for _, state := range latest {
-		if strings.EqualFold(state, "APPROVED") {
+	for _, review := range latest {
+		// A review without a timestamp cannot be placed against the rest of
+		// the history. Fail closed: it cannot supply an approval.
+		if review.at.IsZero() {
+			continue
+		}
+		if strings.EqualFold(review.state, "APPROVED") {
 			n++
 		}
 	}
-	return n, nil
+	return n, capped, nil
 }
 
 // updateBranchResponse is the GraphQL response for a branch update.
@@ -406,6 +546,13 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 	if sha == "" {
 		return "", core.Errorf(core.CodeUnavailable, "update branch returned no head SHA")
 	}
+	g.writePRCache(pr, func(p *github.PullRequest) {
+		if head := p.GetHead(); head != nil {
+			updated := *head
+			updated.SHA = github.String(sha)
+			p.Head = &updated
+		}
+	})
 	return sha, nil
 }
 
@@ -424,6 +571,10 @@ func (g *GitHub) Merge(ctx context.Context, pr int, expectedSHA, title string) e
 	if !merged.GetMerged() {
 		return core.Errorf(core.CodeConflict, "merge of PR %d was rejected", pr)
 	}
+	g.writePRCache(pr, func(p *github.PullRequest) {
+		p.State = github.String("closed")
+		p.Merged = github.Bool(true)
+	})
 	return nil
 }
 
