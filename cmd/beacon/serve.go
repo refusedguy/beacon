@@ -15,6 +15,9 @@ func newServeCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
 		Short: "Run the reconciler, dispatcher queue, webhook and loopback API",
+		Long: `serve is the long-lived daemon. It writes the loopback address, a fresh token and its PID to .beacon/connection.json.
+Set BEACON_API_ADDR to change the listen address; it defaults to 127.0.0.1:7432. BEACON_API_ADDR is the only way to set it.
+Clients read the current token from that file after each restart.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			parent := parentSessionFromEnv()
 			w, err := wire(*configPath, parent)
