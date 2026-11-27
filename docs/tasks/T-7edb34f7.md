@@ -1,7 +1,7 @@
 ---
 id: T-7edb34f7
 title: '[bench] Card index invalidation'
-status: available
+status: done
 scope:
     - internal/infra/tasksource/cardindex_bench_test.go
 priority: 77
