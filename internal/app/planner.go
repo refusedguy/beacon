@@ -212,15 +212,13 @@ func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 // confirms each one with the injected checker. The index owns the returned
 // slice and reuses it on the next call, so callers must consume it before
 // calling matching again. Deduplication uses an epoch buffer instead of a map
-// so a candidate costs no per-candidate heap allocations.
+// so a candidate costs no per-candidate heap allocations. The seen slice is
+// sized to the live run count, which bounds every index below.
 func (idx *activeScopeIndex) matching(t core.Task) []int {
 	idx.epoch++
 	epoch := idx.epoch
 	out := idx.out[:0]
 	add := func(i int) {
-		if i >= len(idx.seen) {
-			idx.seen = append(idx.seen, make([]int, i+1-len(idx.seen))...)
-		}
 		if idx.seen[i] == epoch {
 			return
 		}
