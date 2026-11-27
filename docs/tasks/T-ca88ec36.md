@@ -1,7 +1,7 @@
 ---
 id: T-ca88ec36
 title: 'A4: Task sync and dispatcher launch cost'
-status: available
+status: done
 scope:
     - internal/infra/sqlite/tasks.go
     - internal/app/dispatcher.go
