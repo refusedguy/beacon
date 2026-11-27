@@ -29,11 +29,11 @@ type dispatchOutcome struct {
 
 func registerDispatch(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, catalogTool("beacon_dispatch"), func(ctx context.Context, req *msdk.CallToolRequest, a DispatchArgs) (*msdk.CallToolResult, any, error) {
+		if a.N <= 0 {
+			return nil, nil, core.Errorf(core.CodeInvalidInput, "n must be positive")
+		}
 		if err := requireService("dispatcher", sv.Dispatcher); err != nil {
 			return nil, nil, err
-		}
-		if a.N <= 0 {
-			a.N = 1
 		}
 		if parent := parentSession(req); parent != "" {
 			ctx = app.WithParentSession(ctx, parent)

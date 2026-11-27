@@ -13,6 +13,7 @@ import (
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/app"
+	"github.com/refusedguy/beacon/internal/infra/tasksource"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -143,14 +144,18 @@ func controlText(t *testing.T, res *msdk.CallToolResult) string {
 
 func parseControlBatch(t *testing.T, res *msdk.CallToolResult) controlBatch {
 	t.Helper()
-	if res.IsError {
-		t.Fatalf("unexpected tool error: %s", controlText(t, res))
-	}
 	var out controlBatch
 	if err := json.Unmarshal([]byte(controlText(t, res)), &out); err != nil {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func requireBatchError(t *testing.T, res *msdk.CallToolResult) {
+	t.Helper()
+	if !res.IsError {
+		t.Fatalf("batch with failed items reported success: %s", controlText(t, res))
+	}
 }
 
 func newControlServices(store *controlStore) Services {
@@ -180,6 +185,7 @@ func TestControlBatchCancelReportsPerID(t *testing.T) {
 	res := callControl(t, cs, map[string]any{
 		"action": "cancel", "run_ids": []any{"r1", "r2", "missing"},
 	})
+	requireBatchError(t, res)
 	got := parseControlBatch(t, res)
 	if got.Action != "cancel" || len(got.Results) != 3 {
 		t.Fatalf("result = %+v", got)
@@ -229,9 +235,11 @@ func TestControlBatchReportsPersistentBusyPerID(t *testing.T) {
 	store.failures["r1"] = 100
 	cs := controlClient(t, newControlServices(store))
 
-	got := parseControlBatch(t, callControl(t, cs, map[string]any{
+	res := callControl(t, cs, map[string]any{
 		"action": "cancel", "run_ids": []any{"r1", "r2"},
-	}))
+	})
+	requireBatchError(t, res)
+	got := parseControlBatch(t, res)
 	if len(got.Results) != 2 {
 		t.Fatalf("result = %+v", got)
 	}
@@ -258,9 +266,11 @@ func TestControlRemoteBatchCollectsOutcomesSequentially(t *testing.T) {
 	}}
 	cs := controlClient(t, sv)
 
-	got := parseControlBatch(t, callControl(t, cs, map[string]any{
+	res := callControl(t, cs, map[string]any{
 		"action": "cancel", "run_ids": []any{"good", "bad", "good2"},
-	}))
+	})
+	requireBatchError(t, res)
+	got := parseControlBatch(t, res)
 	want := []string{"cancel:good", "cancel:bad", "cancel:good2"}
 	if strings.Join(calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v, want %v", calls, want)
@@ -488,9 +498,11 @@ func TestControlInvalidTransitionReportsStructuredErrorWithoutPartialSuccess(t *
 		core.Event{Kind: core.EvStart}, core.Event{Kind: core.EvBlock}))
 	cs := controlClient(t, newControlServices(store))
 
-	got := parseControlBatch(t, callControl(t, cs, map[string]any{
+	res := callControl(t, cs, map[string]any{
 		"action": "unblock", "run_ids": []any{"r1", "r2"},
-	}))
+	})
+	requireBatchError(t, res)
+	got := parseControlBatch(t, res)
 	if len(got.Results) != 2 {
 		t.Fatalf("result = %+v", got)
 	}
@@ -539,6 +551,7 @@ func TestControlBatchExampleReturnsJSONResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := callControl(t, cs, arguments)
+	requireBatchError(t, res)
 	got := parseControlBatch(t, res)
 	if got.Action != "unblock" || len(got.Results) != 2 {
 		t.Fatalf("result = %+v", got)
@@ -557,4 +570,187 @@ func TestControlBatchExampleReturnsJSONResult(t *testing.T) {
 	t.Logf("request: %s", request)
 	t.Logf("result: %s", controlText(t, res))
 	t.Logf("r1 state=%s r2 state=%s", store.runs["r1"].State, store.runs["r2"].State)
+}
+
+func TestControlRemoteNudgeCarriesMessage(t *testing.T) {
+	var action, runID, message string
+	sv := Services{Remote: func(ctx context.Context, a, id string, _ int, _ string) error {
+		action, runID, message = a, id, ControlMessage(ctx)
+		return nil
+	}}
+	cs := controlClient(t, sv)
+
+	res := callControl(t, cs, map[string]any{
+		"action": "nudge", "run_id": "r1", "message": "follow the checklist",
+	})
+	if res.IsError || controlText(t, res) != "ok" {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+	if action != "nudge" || runID != "r1" || message != "follow the checklist" {
+		t.Fatalf("forwarded action=%q run=%q message=%q", action, runID, message)
+	}
+}
+
+func TestControlNudgeRequiresMessage(t *testing.T) {
+	cs := controlClient(t, Services{})
+	for _, args := range []map[string]any{
+		{"action": "nudge", "run_id": "r1"},
+		{"action": "nudge", "run_id": "r1", "message": "  "},
+		{"action": "nudge", "run_ids": []any{"r1"}},
+	} {
+		res := callControl(t, cs, args)
+		if !res.IsError || !strings.Contains(controlText(t, res), "message is required") {
+			t.Fatalf("args %v: result = %+v, text = %q", args, res, controlText(t, res))
+		}
+	}
+}
+
+func TestControlRejectsMixedSingleAndBatchShapes(t *testing.T) {
+	cs := controlClient(t, Services{})
+	res := callControl(t, cs, map[string]any{
+		"action": "cancel", "run_id": "r1", "run_ids": []any{"r2"},
+	})
+	if !res.IsError || !strings.Contains(controlText(t, res), "cannot be combined") {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+}
+
+func TestControlApproveRejectsActiveAndOwnRun(t *testing.T) {
+	t.Run("running run", func(t *testing.T) {
+		store := newControlStore()
+		store.add(controlRunInState(t, "r1", core.Event{Kind: core.EvStart}))
+		cs := controlClient(t, newControlServices(store))
+
+		res := callControl(t, cs, map[string]any{"action": "approve", "run_id": "r1"})
+		if !res.IsError || !strings.Contains(controlText(t, res), "idle run") {
+			t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+		}
+		if store.approval("r1") != "" {
+			t.Fatal("approval was recorded on a running run")
+		}
+	})
+	t.Run("worker approving its own run", func(t *testing.T) {
+		store := newControlStore()
+		run := core.NewRun("r1", "T-1", time.Now())
+		run.AgentIdentity = "worker"
+		store.add(run)
+		cs := controlClient(t, newControlServices(store))
+
+		res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+			Name:      "beacon_control",
+			Arguments: map[string]any{"action": "approve", "run_id": "r1"},
+			Meta:      msdk.Meta{"beacon/agent": "worker"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.IsError || !strings.Contains(controlText(t, res), "own run") {
+			t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+		}
+		if store.approval("r1") != "" {
+			t.Fatal("worker self-approval was recorded")
+		}
+	})
+}
+
+func TestWaitRejectsOutOfRangeTimeout(t *testing.T) {
+	cs := controlClient(t, Services{})
+	for _, timeout := range []any{0, -1, maxWaitMS + 1} {
+		res := callTool(t, cs, "beacon_wait", map[string]any{
+			"run_id": "r1", "timeout_ms": timeout,
+		})
+		if !res.IsError || !strings.Contains(controlText(t, res), "invalid_input") {
+			t.Fatalf("timeout %v: result = %+v, text = %q", timeout, res, controlText(t, res))
+		}
+	}
+}
+
+func TestDispatchRejectsNonPositiveN(t *testing.T) {
+	cs := controlClient(t, Services{})
+	for _, n := range []any{0, -1} {
+		res := callTool(t, cs, "beacon_dispatch", map[string]any{"n": n})
+		if !res.IsError || !strings.Contains(controlText(t, res), "invalid_input") {
+			t.Fatalf("n %v: result = %+v, text = %q", n, res, controlText(t, res))
+		}
+	}
+}
+
+func TestTaskCreateRejectsMixedShapes(t *testing.T) {
+	dir := t.TempDir()
+	creator := &app.TaskCreator{
+		Source: tasksource.NewMarkdown(dir), Workspace: &stubCommitter{},
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	cs := controlClient(t, Services{TaskCreator: creator})
+
+	res := callTool(t, cs, "beacon_task_create", map[string]any{
+		"title": "single", "tasks": []any{map[string]any{"title": "batch"}},
+	})
+	if !res.IsError || !strings.Contains(controlText(t, res), "cannot be combined") {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+}
+
+func TestTaskUpdateRejectsStatus(t *testing.T) {
+	cs := controlClient(t, Services{TaskUpdater: &app.TaskUpdater{}})
+	res := callTool(t, cs, "beacon_task_update", map[string]any{
+		"updates": []any{map[string]any{"id": "T-1", "status": "done"}},
+	})
+	if !res.IsError || !strings.Contains(controlText(t, res), "status cannot be set") {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+}
+
+func TestTaskUpdateKeepsChildBody(t *testing.T) {
+	in := updateInput(updateOneArgs{
+		ID:   "T-1",
+		Plan: &[]epicChildArg{{Title: "child", Body: "child body", Scope: []string{"a.go"}}},
+	})
+	if in.Plan == nil || len(*in.Plan) != 1 || (*in.Plan)[0].Body != "child body" {
+		t.Fatalf("child plan = %+v", in.Plan)
+	}
+}
+
+func TestReconcileErrorSetsToolError(t *testing.T) {
+	ticker := &stubTickReconciler{err: errors.New("scm down")}
+	cs := controlClient(t, Services{Reconcile: &app.ReconcileService{Reconciler: ticker}})
+
+	res := callTool(t, cs, "beacon_reconcile", map[string]any{"pr": 7})
+	if !res.IsError {
+		t.Fatalf("reconcile error reported success: %s", controlText(t, res))
+	}
+	var out app.ReconcileResult
+	if err := json.Unmarshal([]byte(controlText(t, res)), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error != "scm down" {
+		t.Fatalf("error = %q, want %q", out.Error, "scm down")
+	}
+}
+
+func TestOrchestratorToolsRejectWorkerCaller(t *testing.T) {
+	cs := controlClient(t, Services{})
+	cases := []struct {
+		name string
+		args map[string]any
+	}{
+		{"beacon_task_create", map[string]any{"title": "x"}},
+		{"beacon_task_update", map[string]any{"updates": []any{}}},
+		{"beacon_task_delete", map[string]any{"ids": []any{"T-1"}}},
+		{"beacon_reconcile", map[string]any{"pr": 7}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+				Name: tc.name, Arguments: tc.args,
+				Meta: msdk.Meta{"beacon/agent": "worker"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !res.IsError || !strings.Contains(controlText(t, res), "orchestrator only") {
+				t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+			}
+		})
+	}
 }

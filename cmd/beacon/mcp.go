@@ -87,8 +87,9 @@ type remoteClient struct {
 }
 
 func (c *remoteClient) call(ctx context.Context, action, runID string, pr int, sha string) error {
-	payload, err := json.Marshal(map[string]any{
-		"action": action, "run_id": runID, "pr": pr, "sha": sha,
+	payload, err := json.Marshal(controlRequest{
+		Action: action, RunID: runID, SHA: sha, PR: pr,
+		Message: beaconmcp.ControlMessage(ctx),
 	})
 	if err != nil {
 		return err

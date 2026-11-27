@@ -16,10 +16,30 @@ import (
 // ToolSpec describes one MCP tool. Catalog metadata and the register function
 // live in the same value, so adding a tool needs one table entry.
 type ToolSpec struct {
-	Name             string
-	Description      string
+	Name        string
+	Description string
+	// OrchestratorOnly denies a tool to workers in opencode.json. Workers
+	// inherit the pooled MCP daemon without call metadata, so the daemon is a
+	// trusted boundary and the client permission is the role gate. A caller
+	// that does declare the worker role is still refused server-side.
 	OrchestratorOnly bool
 	Register         func(*msdk.Server, Services)
+}
+
+// requireOrchestrator refuses a tool call whose metadata names a worker agent.
+// An absent or operator identity is allowed: the pooled daemon serves trusted
+// sessions that send no metadata at all.
+func requireOrchestrator(req *msdk.CallToolRequest) error {
+	agent := metaString(req, "beacon/agent", "ai.opencode/agent")
+	if isWorkerAgent(agent) {
+		return core.Errorf(core.CodeInvalidInput, "tool is orchestrator only; caller agent %q is a worker", agent)
+	}
+	return nil
+}
+
+func isWorkerAgent(agent string) bool {
+	name := strings.ToLower(strings.TrimSpace(agent))
+	return name == "worker" || strings.HasSuffix(name, "-worker")
 }
 
 // toolSpecs is the one registration table. NewServer walks its derived

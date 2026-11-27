@@ -31,7 +31,10 @@ func registerTaskCreate(s *msdk.Server, sv Services) {
 	// Journal operation ids so an interrupted call can be retried without
 	// writing the same cards twice. The create wrapper also accepts epic fields.
 	journal := newOpJournal()
-	msdk.AddTool(s, catalogTool("beacon_task_create"), func(ctx context.Context, _ *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_task_create"), func(ctx context.Context, req *msdk.CallToolRequest, a epicCreateArgs) (*msdk.CallToolResult, any, error) {
+		if err := requireOrchestrator(req); err != nil {
+			return nil, nil, err
+		}
 		if err := requireService("task creator", sv.TaskCreator); err != nil {
 			return nil, nil, err
 		}
@@ -42,8 +45,11 @@ func registerTaskCreate(s *msdk.Server, sv Services) {
 }
 
 func createTasks(ctx context.Context, creator *app.TaskCreator, a epicCreateArgs) (any, error) {
-	inputs := []app.CreateTaskInput{createInput(a)}
 	batch := len(a.Tasks) > 0
+	if batch && hasSingleCreateFields(a) {
+		return nil, core.Errorf(core.CodeInvalidInput, "tasks cannot be combined with single card fields")
+	}
+	inputs := []app.CreateTaskInput{createInput(a)}
 	if batch {
 		inputs = inputs[:0]
 		for _, item := range a.Tasks {
@@ -64,9 +70,21 @@ func createTasks(ctx context.Context, creator *app.TaskCreator, a epicCreateArgs
 	return out, nil
 }
 
+// hasSingleCreateFields reports whether a create call mixes a batch with the
+// fields of one card. A mixed call cannot be honoured without discarding one
+// shape, so it is rejected before any card is written.
+func hasSingleCreateFields(a epicCreateArgs) bool {
+	return a.Title != "" || a.Body != "" || len(a.Scope) > 0 || len(a.Depends) > 0 ||
+		a.Priority != 0 || a.ID != "" || a.Kind != "" || a.BaseBranch != "" ||
+		a.RequireReview != "" || len(a.Plan) > 0
+}
+
 func registerTaskUpdate(s *msdk.Server, sv Services) {
 	journal := newOpJournal()
-	msdk.AddTool(s, catalogTool("beacon_task_update"), func(ctx context.Context, _ *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_task_update"), func(ctx context.Context, req *msdk.CallToolRequest, a updateTaskArgs) (*msdk.CallToolResult, any, error) {
+		if err := requireOrchestrator(req); err != nil {
+			return nil, nil, err
+		}
 		if err := requireService("task updater", sv.TaskUpdater); err != nil {
 			return nil, nil, err
 		}
@@ -77,6 +95,11 @@ func registerTaskUpdate(s *msdk.Server, sv Services) {
 }
 
 func updateTasks(ctx context.Context, updater *app.TaskUpdater, a updateTaskArgs) (any, error) {
+	for _, item := range a.Updates {
+		if item.Status != nil {
+			return nil, core.Errorf(core.CodeInvalidInput, "status cannot be set through task update")
+		}
+	}
 	updates := make([]app.UpdateInput, 0, len(a.Updates))
 	for _, item := range a.Updates {
 		updates = append(updates, updateInput(item))
@@ -86,7 +109,10 @@ func updateTasks(ctx context.Context, updater *app.TaskUpdater, a updateTaskArgs
 
 func registerTaskDelete(s *msdk.Server, sv Services) {
 	journal := newOpJournal()
-	msdk.AddTool(s, catalogTool("beacon_task_delete"), func(ctx context.Context, _ *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_task_delete"), func(ctx context.Context, req *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
+		if err := requireOrchestrator(req); err != nil {
+			return nil, nil, err
+		}
 		if err := requireService("task deleter", sv.TaskDeleter); err != nil {
 			return nil, nil, err
 		}
@@ -335,7 +361,7 @@ type updateOneArgs struct {
 	RequireReview *string         `json:"require_review,omitempty"`
 	BaseBranch    *string         `json:"base_branch,omitempty"`
 	Plan          *[]epicChildArg `json:"plan,omitempty"`
-	Status        *string         `json:"status,omitempty"` // accepted but ignored: task flow belongs to Beacon
+	Status        *string         `json:"status,omitempty"` // rejected by updateTasks: task flow belongs to Beacon
 }
 
 func updateInput(a updateOneArgs) app.UpdateInput {
@@ -347,7 +373,7 @@ func updateInput(a updateOneArgs) app.UpdateInput {
 		plan := make([]core.ChildSpec, 0, len(*a.Plan))
 		for _, spec := range *a.Plan {
 			plan = append(plan, core.ChildSpec{
-				Title: spec.Title, Scope: specScopes(spec.Scope),
+				Title: spec.Title, Body: spec.Body, Scope: specScopes(spec.Scope),
 				Depends: specDeps(spec.Depends), Priority: spec.Priority,
 			})
 		}
@@ -368,15 +394,20 @@ type reconcileArgs struct {
 }
 
 func registerReconcile(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, catalogTool("beacon_reconcile"), func(ctx context.Context, _ *msdk.CallToolRequest, a reconcileArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_reconcile"), func(ctx context.Context, req *msdk.CallToolRequest, a reconcileArgs) (*msdk.CallToolResult, any, error) {
+		if err := requireOrchestrator(req); err != nil {
+			return nil, nil, err
+		}
 		if err := requireService("reconcile service", sv.Reconcile); err != nil {
 			return nil, nil, err
 		}
 		result := sv.Reconcile.Tick(ctx, a.PR)
+		out := jsonResult(result)
 		if result.Error != "" {
 			slog.WarnContext(ctx, "beacon_reconcile", "pr", a.PR, "error", redact.Redact(result.Error))
+			out.IsError = true
 		}
-		return jsonResult(result), nil, nil
+		return out, nil, nil
 	})
 }
 

@@ -66,6 +66,30 @@ type ControlArgs struct {
 	Message string
 }
 
+// controlActorKey carries the agent that initiated a control action. A
+// boundary sets it from caller metadata without changing the ControlPort
+// methods. Control uses it to reject a worker that acts on its own run.
+type controlActorKey struct{}
+
+// WithControlActor binds the acting agent to ctx. An empty agent is allowed:
+// boundaries that cannot identify their caller keep the existing behaviour.
+func WithControlActor(ctx context.Context, agent string) context.Context {
+	return context.WithValue(ctx, controlActorKey{}, strings.TrimSpace(agent))
+}
+
+// ControlActor returns the acting agent bound by WithControlActor.
+func ControlActor(ctx context.Context) string {
+	actor, _ := ctx.Value(controlActorKey{}).(string)
+	return actor
+}
+
+// isWorkerAgent recognizes the worker role and its configured aliases without
+// treating every name that contains "worker" as a worker.
+func isWorkerAgent(agent string) bool {
+	name := strings.ToLower(strings.TrimSpace(agent))
+	return name == "worker" || strings.HasSuffix(name, "-worker")
+}
+
 // ControlPort is the slice of Control that every boundary drives. Each method
 // maps to one ControlAction, so a port needs no verb-specific switch of its own.
 type ControlPort interface {
@@ -264,12 +288,22 @@ func (c *Control) Unblock(ctx context.Context, id core.RunID) error {
 	})
 }
 
-// Approve records a manual approval bound to the observed commit.
+// Approve records a manual approval bound to the observed commit. Approval
+// needs a run that is not terminal and has no active agent, so a worker cannot
+// approve the run it is executing. A caller that identifies itself as the
+// worker that launched the run is refused in every state.
 func (c *Control) Approve(ctx context.Context, id core.RunID, sha string) error {
 	return c.write(ctx, func() error {
 		run, err := c.get(ctx, id)
 		if err != nil {
 			return err
+		}
+		if run.State.Terminal() || run.State.ActiveAgent() {
+			return core.Errorf(core.CodeConflict, "run %s is %s; approve needs an idle run", id, run.State)
+		}
+		actor := ControlActor(ctx)
+		if isWorkerAgent(actor) && actor == run.AgentIdentity {
+			return core.Errorf(core.CodeConflict, "worker %s cannot approve its own run %s", actor, id)
 		}
 		if sha == "" {
 			sha = run.HeadSHA

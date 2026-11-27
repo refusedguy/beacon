@@ -538,7 +538,7 @@ func TestTaskUpdateSingleOverInMemoryTransport(t *testing.T) {
 	cs := deleteClient(t, updateService(dir, &deleteRunStore{}, committer))
 
 	got := callUpdate(t, cs, map[string]any{
-		"id": "T-A", "title": "New title", "status": "done",
+		"id": "T-A", "title": "New title",
 	})
 	if !got.Pushed || len(got.Results) != 1 || got.Results[0].Status != "updated" {
 		t.Fatalf("result = %+v", got)
@@ -695,7 +695,9 @@ func callReconcile(t *testing.T, cs *msdk.ClientSession, pr int) app.ReconcileRe
 	if err != nil {
 		t.Fatalf("cs.CallTool(Name: \"beacon_reconcile\"): %v", err)
 	}
-	if res.IsError || len(res.Content) == 0 {
+	// A reconcile that reports an error sets IsError while still carrying the
+	// structured decision body. Callers read the body either way.
+	if len(res.Content) == 0 {
 		t.Fatalf("unexpected reconcile result: %+v", res)
 	}
 	text, ok := res.Content[0].(*msdk.TextContent)
