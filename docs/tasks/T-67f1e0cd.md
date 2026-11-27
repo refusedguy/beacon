@@ -1,7 +1,7 @@
 ---
 id: T-67f1e0cd
 title: '[bench] Frontmatter validation and alias normalization'
-status: in_progress
+status: done
 scope:
     - internal/bench/card_frontmatter_bench_test.go
 priority: 78
