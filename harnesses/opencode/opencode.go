@@ -24,6 +24,16 @@ import (
 // requestTimeout bounds each OpenCode HTTP request.
 const requestTimeout = 30 * time.Second
 
+// locationReloadAttempts bounds the number of editor location reload tries.
+const locationReloadAttempts = 3
+
+// locationReloadBackoff is the pause between location reload retries.
+const locationReloadBackoff = 100 * time.Millisecond
+
+// statusClientClosedRequest is the non-standard 499 that OpenCode returns when
+// an editor closes a reload request before it finishes.
+const statusClientClosedRequest = 499
+
 // Harness is an AgentHarness that talks to a running OpenCode server.
 type Harness struct {
 	Endpoint        string
@@ -373,6 +383,35 @@ func canonicalPath(path string) string {
 	return filepath.Clean(path)
 }
 
+// reloadLocations tells the live editor to drop its cached worktree locations.
+// OpenCode answers 503 while it is still removing a stale row and 499 when an
+// editor closes the request early. Both are transient, so they are retried
+// with a short bounded backoff. The last error is returned once the attempts
+// run out; callers decide whether that error is fatal.
+func (h *Harness) reloadLocations(ctx context.Context) error {
+	var lastErr error
+	for attempt := 0; attempt < locationReloadAttempts; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(locationReloadBackoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		_, status, err := h.do(ctx, http.MethodPost, "/api/location/reload", nil)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if status != http.StatusServiceUnavailable && status != statusClientClosedRequest {
+			return err
+		}
+	}
+	return lastErr
+}
+
 // RefreshWorktrees removes stale OpenCode worktree rows for the configured
 // repo, then tells the live editor to drop the locations it has cached.
 func (h *Harness) RefreshWorktrees(ctx context.Context) error {
@@ -404,8 +443,9 @@ func (h *Harness) RefreshWorktrees(ctx context.Context) error {
 			slog.Warn("worktree refresh POST failed", "error", err, "project", p.ID)
 			return err
 		}
-		if _, _, err := h.do(ctx, http.MethodPost, "/api/location/reload", nil); err != nil {
+		if err := h.reloadLocations(ctx); err != nil {
 			slog.Warn("worktree location reload failed", "error", err)
+			return err
 		}
 		return nil
 	}
