@@ -44,3 +44,14 @@ console.log(`run-watcher-fp: median ${p.ms.toFixed(2)} ms, range ${p.min.toFixed
 console.log(`run-watcher-fp-chars: ${p.chars} characters, range ${p.cmin} to ${p.cmax}`)
 console.log(`run-watcher-fp-work: snapshots=${p.snapshots} normalizations=${p.norm} emissions=${p.emissions}`)
 console.log(`run-watcher-fp-errs: ${p.errs} errors`)
+// The canonical row uses one fixed field set. The character and counter
+// details stay on the human lines above for the existing advisory report.
+console.log(`beacon-perf: ${JSON.stringify({
+  key: "run-watcher-fp",
+  median_ms: p.ms,
+  min_ms: p.min,
+  max_ms: p.max,
+  work: p.snapshots + p.norm + p.emissions,
+  errs: p.errs,
+  limiter: "JSON.stringify character volume",
+})}`)
