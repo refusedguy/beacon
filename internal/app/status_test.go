@@ -847,3 +847,54 @@ func TestAddCountMetricsKeepsEveryCounter(t *testing.T) {
 		t.Fatalf("fix count = %d, want 8", m.FixCount)
 	}
 }
+
+func TestCollectRunIDsKeepsFirstOccurrenceInGroupOrder(t *testing.T) {
+	now := time.Now().UTC()
+	first := core.NewRun("run-a", "T-A", now)
+	second := core.NewRun("run-b", "T-B", now)
+	blank := core.NewRun("", "T-BLANK", now)
+	third := core.NewRun("run-c", "T-C", now)
+
+	got := collectRunIDs(
+		[]*core.Run{first, second, blank, first},
+		[]*core.Run{second, third},
+	)
+	want := []string{"run-a", "run-b", "run-c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("collectRunIDs = %v, want %v", got, want)
+	}
+}
+
+func TestGroupHistoryBucketsRowsByRun(t *testing.T) {
+	events := []RunEvent{
+		{RunID: "run-a", Kind: "state"},
+		{RunID: "run-b", Kind: "merged"},
+		{RunID: "run-a", Kind: "merged"},
+	}
+	decisions := []Decision{
+		{RunID: "run-a", Kind: "transition.spawn"},
+		{RunID: "run-b", Kind: "transition.merge"},
+		{RunID: "run-b", Kind: "reconcile.decision"},
+	}
+	timeline, histories := groupHistory(events, decisions)
+
+	if got := timeline["run-a"]; len(got) != 2 || got[0].Kind != "state" || got[1].Kind != "merged" {
+		t.Fatalf("run-a timeline = %+v", got)
+	}
+	if got := timeline["run-b"]; len(got) != 1 || got[0].Kind != "merged" {
+		t.Fatalf("run-b timeline = %+v", got)
+	}
+	if _, ok := timeline["run-missing"]; ok {
+		t.Fatal("timeline has an entry for a run with no events")
+	}
+	if got := histories["run-a"]; len(got) != 1 || got[0].Kind != "transition.spawn" {
+		t.Fatalf("run-a decisions = %+v", got)
+	}
+	if got := histories["run-b"]; len(got) != 2 || got[0].Kind != "transition.merge" ||
+		got[1].Kind != "reconcile.decision" {
+		t.Fatalf("run-b decisions = %+v", got)
+	}
+	if _, ok := histories["run-missing"]; ok {
+		t.Fatal("histories has an entry for a run with no decisions")
+	}
+}

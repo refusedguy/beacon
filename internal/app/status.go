@@ -377,7 +377,11 @@ func nonNullStrings(values []string) []string {
 // final size instead of growing through repeated appends. The second pass
 // clears each seen entry as it is emitted, keeping one map and stable order.
 func collectRunIDs(groups ...[]*core.Run) []string {
-	seen := make(map[string]bool)
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	seen := make(map[string]bool, total)
 	for _, group := range groups {
 		for _, run := range group {
 			id := string(run.ID)
