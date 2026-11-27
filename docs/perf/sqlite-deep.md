@@ -537,3 +537,35 @@ The prune call was slower on the new side in all five pairs, with medians 11.63 
 ### Correctness
 
 A temporary test seeded five old and three recent decisions and run events. One prune removed the ten old rows and left the three recent ones. `ListDecisions`, `LastDecision` and `DecisionCounts` all returned the recent decisions, and `decision_summary` fell from 8 to 3 to match the remaining rows. A second prune removed nothing. The prune bounds row counts and lets SQLite reuse freed pages. It does not compact the file. `PRAGMA page_count` stayed at 164 while `PRAGMA freelist_count` rose from 0 to 57. No verdict, cap or wire field changed.
+
+## CI placement (T-b186b563)
+
+Where a benchmark runs matters more than its absolute number. The nightly job
+on the `perf` runner supplies every comparison used as a gate. No number in
+this note is re-measured on a GitHub-hosted PR runner.
+
+| Path | Plans | Gate |
+| --- | --- | --- |
+| Every PR | bounded `bench-e2e.sh --smoke` inside the root bench test leg | compile and hang signal only, no timing gate |
+| PR labeled `perf` | six cheap plans: planner, prompt, MCP journal, redaction, TUI view, HTTP frames | advisory two-tree comparison, always exits zero |
+| Nightly `schedule` | HotPaths and E2EOperatorPaths against the fixed `bench-baseline` artifact | 2 percent noise floor, 15 and 20 percent limits |
+| `workflow_dispatch` | the ten heavy plans, including SQLiteSnapshot, FullSnapshot, the 1001-tick plugin watcher and a bounded git-worktree latency proxy | full suite on the perf runner |
+
+The labeled PR job checks out two detached worktrees at the merge base and at
+`github.event.pull_request.head.sha`, copies harness changes onto both sides,
+and runs A B B A B passes. It writes per-side CSVs and a comparison CSV, keeps
+raw logs and CSVs for seven days, and updates one comment behind the
+`<!-- beacon-pr-perf -->` marker. Rows whose ranges overlap are reported as
+inconclusive rather than as gains. GitHub-hosted and self-hosted numbers are
+never compared.
+
+The nightly comparison script rejects a baseline whose observed median is more
+than `BEACON_BASELINE_SANITY_FACTOR` times the recorded median, with a default
+factor of three. A missing baseline fails the job explicitly instead of leaving
+a green run with no comparison. A regressed run cannot publish a new baseline
+because the publish step follows the guarded comparison. No required Criterion
+name is added for any advisory job.
+
+Wall clock for a normal PR is reported from GitHub Actions, not from a local
+run. Where the measured ranges overlap, the result is inconclusive. Local
+checks on a weak machine stay limited to format and the targeted package tests.
