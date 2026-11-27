@@ -527,37 +527,54 @@ jobs:
             echo "measurement trees differ" >> "$RUNNER_TEMP/perf-status"
           fi
 
-      - name: Run A B B A B A passes
+      - name: Run five low-noise passes per side
         continue-on-error: true
         run: |
           set -euo pipefail
           : > "$RUNNER_TEMP/perf-base.txt"
           : > "$RUNNER_TEMP/perf-head.txt"
           : > "$RUNNER_TEMP/perf-status"
+          allowed="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+          cpu="${allowed%%,*}"
+          cpu="${cpu%%-*}"
+          if [[ -z "$cpu" ]]; then
+            echo "no allowed CPU in Cpus_allowed_list" >> "$RUNNER_TEMP/perf-status"
+            cpu=0
+          fi
+          echo "pinned measurement CPU: $cpu"
+          # Compile every measured package before the pinned passes. This
+          # warmup writes no canonical row and is not counted as a pass.
+          for tree in perf-base perf-head; do
+            (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' -bench '^$' ./internal/bench/) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/perf-status"
+          done
           run_side() {
             local side="$1" dir="$2"
             {
               echo "== pass $side =="
-              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench 'BenchmarkReconcileTickCounts|BenchmarkBaseRedCheck|BenchmarkBaseRedBlockFanout' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkSQLiteSnapshot$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkPlannerSelectInjectedChecker$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkSpawnPrompt$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && BEACON_BENCH_SMOKE=1 GOMAXPROCS=1 go test -vet=off -run '^$' \
-                -bench '^BenchmarkHotPaths$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkHotPaths$' -benchtime=5x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && go test ./internal/infra/workspace/ -run '^TestGitWorktreeRemoveLatencyAlternating$' -count=1 -v) \
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js) \
+              (cd "$dir" && taskset -c "$cpu" go test ./internal/infra/workspace/ -run '^TestGitWorktreeRemoveLatencyAlternating$' -count=1 -v) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && BENCH_TICKS=1001 BENCH_ROUNDS=5 node internal/bench/run_watcher_bench.js) \
+              (cd "$dir" && taskset -c "$cpu" env BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BENCH_TICKS=1001 BENCH_ROUNDS=5 node internal/bench/run_watcher_bench.js) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
             } 2>&1 | tee -a "$RUNNER_TEMP/perf-$side.txt"
           }
@@ -565,6 +582,10 @@ jobs:
           run_side head "$RUNNER_TEMP/perf-head"
           run_side head "$RUNNER_TEMP/perf-head"
           run_side base "$RUNNER_TEMP/perf-base"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side head "$RUNNER_TEMP/perf-head"
           run_side head "$RUNNER_TEMP/perf-head"
           run_side base "$RUNNER_TEMP/perf-base"
 
@@ -579,8 +600,37 @@ jobs:
           "$benchstat" -format csv "$RUNNER_TEMP/perf-base.txt" "$RUNNER_TEMP/perf-head.txt" \
             > perf-results/compare.csv
 
-      # One comment per PR. Ranges that overlap are reported as inconclusive,
-      # so a noisy head run cannot be presented as a gain.
+      # The no-change control publishes the observed floor. A PR reads the most
+      # recent one; a missing artifact leaves the registry default in place.
+      - name: Find the calibrated noise floor
+        id: floor
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              event: 'schedule',
+              status: 'success',
+              per_page: 10,
+            })
+            const last = runs.find(run => run.id !== context.runId)
+            core.setOutput('run_id', last ? String(last.id) : '')
+
+      - name: Download calibrated noise floor
+        if: steps.floor.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-noise-floor
+          path: ${{ runner.temp }}/bench-noise-floor
+          run-id: ${{ steps.floor.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # One comment per PR. A spread rule decides a verdict; the range relation
+      # is supporting text only.
       - name: Build comparison comment
         continue-on-error: true
         run: |
@@ -588,7 +638,8 @@ jobs:
           const fs = require('fs');
           const temp = process.env.RUNNER_TEMP;
           const prefix = 'beacon-perf: ';
-          const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter'];
+          const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
+          const controlKey = 'json-control';
           const notes = [];
 
           const readLines = path => {
@@ -596,15 +647,22 @@ jobs:
             catch (e) { notes.push(`cannot read ${path}: ${e.message}`); return []; }
           };
 
-          // Names and limiter text come from the registry on the base ref. A
-          // fork PR cannot rewrite this file, and no printed string is trusted
-          // for the limiter column.
+          const median = xs => {
+            const s = [...xs].sort((a, b) => a - b);
+            const mid = Math.floor(s.length / 2);
+            return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+          };
+          const fmt = (x, digits = 3) => Number.isFinite(x) ? x.toFixed(digits) : '-';
+
+          // Names, limiter text and the noise policy come from the registry on
+          // the base ref. A fork PR cannot rewrite these inputs.
           const registryPath = process.env.BENCH_REGISTRY || `${temp}/bench-registry.json`;
-          let specs = [];
+          let specs = [], noise = {};
           try {
             const doc = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
             if (!Array.isArray(doc.specs)) throw new Error('missing specs array');
             specs = doc.specs;
+            noise = doc.noise || {};
           } catch (e) {
             notes.push(`cannot read registry: ${e.message}`);
           }
@@ -613,6 +671,25 @@ jobs:
             if (!s || typeof s.key !== 'string' || !s.key) continue;
             if (registry.has(s.key)) { notes.push(`duplicate registry key ${s.key}`); continue; }
             registry.set(s.key, s);
+          }
+          const defaultFloor = Number.isFinite(noise.defaultFloorPct) && noise.defaultFloorPct > 0
+            ? noise.defaultFloorPct : 2;
+          const minSamples = Number.isFinite(noise.minSamples) && noise.minSamples > 0
+            ? noise.minSamples : 5;
+          const quantile = Number.isFinite(noise.quantile) ? noise.quantile : 0.95;
+
+          // The nightly no-change control publishes the observed floor. Use it
+          // when available and say so when the comparison is uncalibrated.
+          let floorPct = defaultFloor;
+          let calibrated = false;
+          try {
+            const doc = JSON.parse(fs.readFileSync(`${temp}/bench-noise-floor/noise-floor.json`, 'utf8'));
+            if (Number.isFinite(doc.floorPct) && doc.floorPct > 0) {
+              floorPct = Math.max(defaultFloor, doc.floorPct);
+              calibrated = true;
+            }
+          } catch (e) {
+            notes.push(`noise floor uncalibrated; using registry default ${defaultFloor}%`);
           }
 
           // One canonical row per named plan per pass. Every failure is reported
@@ -635,8 +712,9 @@ jobs:
                 notes.push(`${side}: canonical row fields ${keys.join(',')}`); continue;
               }
               if (typeof row.key !== 'string' || !row.key ||
-                  typeof row.limiter !== 'string' || !row.limiter) {
-                notes.push(`${side}: canonical row has no key or limiter`); continue;
+                  typeof row.limiter !== 'string' || !row.limiter ||
+                  typeof row.cache !== 'string' || !row.cache) {
+                notes.push(`${side}: canonical row has no key, limiter or cache`); continue;
               }
               if (['median_ms', 'min_ms', 'max_ms', 'work', 'errs'].some(f =>
                     typeof row[f] !== 'number' || !Number.isFinite(row[f]))) {
@@ -687,8 +765,8 @@ jobs:
           let badShape = false;
           const missing = [];
           for (const [side, passes] of [['base', basePasses], ['head', headPasses]]) {
-            if (passes.length !== 3) {
-              notes.push(`${side} ran ${passes.length} passes, want 3`); badShape = true;
+            if (passes.length !== 5) {
+              notes.push(`${side} ran ${passes.length} passes, want 5`); badShape = true;
             }
             passes.forEach((p, i) => {
               if (p.rows.length !== expected.size) {
@@ -705,14 +783,29 @@ jobs:
           }
           if (missing.length) notes.push(`missing rows: ${[...new Set(missing)].join(', ')}`);
 
-          const inconclusiveAll = status.length > 0 || !sameHarness || badShape ||
-            registry.size === 0 || extra.length > 0;
+          // The pure control must travel with every pass. A pass whose control
+          // is absent or moved beyond the floor cannot separate code from load.
+          const controlOf = pass => pass.rows.find(r => r.key === controlKey);
+          const allControl = [...basePasses, ...headPasses]
+            .map(controlOf).filter(Boolean).map(r => r.median_ms);
+          const controlRef = allControl.length ? median(allControl) : NaN;
+          const usable = (side, passes) => passes.filter((pass, i) => {
+            const c = controlOf(pass);
+            if (!c) { notes.push(`${side} pass ${i + 1}: missing ${controlKey}`); return false; }
+            if (!Number.isFinite(controlRef) || controlRef <= 0) return false;
+            const drift = 100 * Math.abs(c.median_ms - controlRef) / controlRef;
+            if (drift > floorPct) {
+              notes.push(`${side} pass ${i + 1}: control drift ${drift.toFixed(2)}% exceeds ${floorPct}% floor`);
+              return false;
+            }
+            return true;
+          });
+          const baseOK = usable('base', basePasses);
+          const headOK = usable('head', headPasses);
 
-          const median = xs => {
-            const s = [...xs].sort((a, b) => a - b);
-            const mid = Math.floor(s.length / 2);
-            return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-          };
+          const inconclusiveAll = status.length > 0 || !sameHarness || badShape ||
+            registry.size === 0 || extra.length > 0 || baseOK.length < 2 || headOK.length < 2;
+
           const values = (passes, key, field) => passes
             .map(p => p.rows.find(r => r.key === key))
             .filter(Boolean).map(r => r[field]);
@@ -720,37 +813,56 @@ jobs:
             const xs = values(passes, key, field);
             return xs.length ? fn(...xs) : NaN;
           };
+          const spread = xs => {
+            const m = median(xs);
+            return xs.length && m > 0 ? 100 * (Math.max(...xs) - Math.min(...xs)) / m : Infinity;
+          };
+          const ratios = (passes, key) => passes.map(p => {
+            const r = p.rows.find(x => x.key === key);
+            const c = controlOf(p);
+            return r && c && c.median_ms > 0 ? r.median_ms / c.median_ms : NaN;
+          }).filter(Number.isFinite);
 
           const rows = [];
+          const cacheStates = [...new Set([...basePasses, ...headPasses]
+            .flatMap(p => p.rows.map(r => r.cache)))];
           for (const key of [...expected]) {
             const spec = registry.get(key);
             const baseRow = basePasses[0].rows.find(r => r.key === key);
             const limiter = (spec && spec.limiter) || (baseRow && baseRow.limiter) || '-';
-            const a = values(basePasses, key, 'median_ms');
-            const b = values(headPasses, key, 'median_ms');
+            const cache = (baseRow && baseRow.cache) || '-';
+            const a = values(baseOK, key, 'median_ms');
+            const b = values(headOK, key, 'median_ms');
             if (!a.length || !b.length) {
-              rows.push(`| ${key} | - | - | - | - | - | ${limiter} | inconclusive |`);
+              rows.push(`| ${key} | - | - | - | - | - | - | - | - | - | ${limiter} | ${cache} | inconclusive |`);
               continue;
             }
             const am = median(a), bm = median(b);
-            const amin = extreme(basePasses, key, 'min_ms', Math.min);
-            const amax = extreme(basePasses, key, 'max_ms', Math.max);
-            const bmin = extreme(headPasses, key, 'min_ms', Math.min);
-            const bmax = extreme(headPasses, key, 'max_ms', Math.max);
-            const wa = values(basePasses, key, 'work');
-            const wb = values(headPasses, key, 'work');
-            const ea = values(basePasses, key, 'errs');
-            const eb = values(headPasses, key, 'errs');
+            const amin = extreme(baseOK, key, 'min_ms', Math.min);
+            const amax = extreme(baseOK, key, 'max_ms', Math.max);
+            const bmin = extreme(headOK, key, 'min_ms', Math.min);
+            const bmax = extreme(headOK, key, 'max_ms', Math.max);
+            const wa = values(baseOK, key, 'work');
+            const wb = values(headOK, key, 'work');
+            const ea = values(baseOK, key, 'errs');
+            const eb = values(headOK, key, 'errs');
             let workMismatch = !wa.length || !wb.length || median(wa) !== median(wb) ||
               !ea.length || !eb.length || median(ea) !== median(eb);
             // Worktree removal drops a git status call by design.
             if (key === 'worktree-remove') workMismatch = false;
             const overlap = amax >= bmin && bmax >= amin;
+            const relation = overlap ? 'overlap' : 'separate';
             const delta = am === 0 ? 0 : 100 * (bm - am) / am;
-            const verdict = (overlap || workMismatch || inconclusiveAll || !registry.has(key))
+            const maxSpread = Math.max(spread(a), spread(b));
+            const decisive = Math.abs(delta) >= floorPct && Math.abs(delta) > maxSpread;
+            const verdict = (workMismatch || inconclusiveAll || !registry.has(key))
               ? 'inconclusive'
-              : delta <= -2 ? 'gain' : delta >= 2 ? 'regression' : 'flat';
-            rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}% | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${limiter} | ${verdict} |`);
+              : !decisive ? 'flat'
+              : delta <= -floorPct ? 'gain' : 'regression';
+            const ra = median(ratios(baseOK, key));
+            const rb = median(ratios(headOK, key));
+            const ratioDelta = Number.isFinite(ra) && ra !== 0 ? 100 * (rb - ra) / ra : NaN;
+            rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}% | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${relation} | ${fmt(ra)} | ${fmt(rb)} | ${fmt(ratioDelta, 2)}% | ${limiter} | ${cache} | ${verdict} |`);
           }
 
           const marker = '<!-- beacon-pr-perf -->';
@@ -758,16 +870,21 @@ jobs:
             marker,
             '### Advisory perf comparison, base vs head',
             '',
-            'A B B A B A passes on two detached worktrees at the merge base and the real head SHA.',
-            'Canonical rows come from the harness output; names and limiter text come from the registry on the base ref.',
-            'Times are in ms. Work and errs are counts. Advisory data only: it adds no required check and does not gate merge.',
+            'Five alternating passes per side (B A A B B A A B B A) on two detached worktrees at the merge base and the real head SHA.',
+            'One uncounted compile-only warmup per tree precedes the passes; measurement runs on one CPU from Cpus_allowed_list via taskset.',
+            'Canonical rows come from the harness output; names, limiter text and the noise floor come from the registry on the base ref.',
+            `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}.`,
+            'Times are in ms. Work and errs are counts. Ratios divide each plan by the pure json-control row in the same pass.',
+            'Advisory data only: it adds no required check and does not gate merge.',
             '',
-            '| plan / metric | base | head | delta | base range | head range | limiter | verdict |',
-            '| --- | --- | --- | --- | --- | --- | --- | --- |',
-            ...(rows.length ? rows : ['| no comparable rows | - | - | - | - | - | - | inconclusive |']),
+            '| plan / metric | base | head | delta | base range | head range | range relation | base/control | head/control | ratio delta | limiter | cache | verdict |',
+            '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+            ...(rows.length ? rows : ['| no comparable rows | - | - | - | - | - | - | - | - | - | - | - | inconclusive |']),
             '',
             ...(notes.length ? ['Parser notes:', '', ...notes.map(n => `- ${n}`), ''] : []),
-            'Overlapping ranges or different work counts are inconclusive, not a gain.',
+            `A verdict needs an absolute delta of at least ${floorPct}% and greater than the larger within-side spread; otherwise the row is flat.`,
+            'Range relation is supporting text; overlapping ranges no longer decide a verdict by themselves.',
+            `Cache states recorded from canonical rows: ${cacheStates.join(', ') || '-'}.`,
             status.length ? `Aborted passes: ${status.join(', ')}.` : 'No aborted passes.',
             'Raw logs and per-side CSVs are in the artifact.',
           ].join('\n');
@@ -811,6 +928,164 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
+
+  # Both trees are the same SHA here, so every observed delta is machine noise.
+  # The published floor lets PR comments reject a false regression.
+  perf-noise-floor:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, x64, perf]
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check out one SHA as both trees
+        id: trees
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          git worktree add --detach "$RUNNER_TEMP/perf-base" "$SHA"
+          git worktree add --detach "$RUNNER_TEMP/perf-head" "$SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Run five no-change passes per side
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/perf-base.txt"
+          : > "$RUNNER_TEMP/perf-head.txt"
+          : > "$RUNNER_TEMP/floor-status"
+          allowed="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+          cpu="${allowed%%,*}"
+          cpu="${cpu%%-*}"
+          if [[ -z "$cpu" ]]; then
+            echo "no allowed CPU in Cpus_allowed_list" >> "$RUNNER_TEMP/floor-status"
+            cpu=0
+          fi
+          echo "pinned measurement CPU: $cpu"
+          for tree in perf-base perf-head; do
+            (cd "$RUNNER_TEMP/$tree" && go test -vet=off -run '^$' -bench '^$' ./internal/bench/) \
+              || echo "warmup $tree" >> "$RUNNER_TEMP/floor-status"
+          done
+          run_side() {
+            local side="$1" dir="$2"
+            {
+              echo "== pass $side =="
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench 'BenchmarkReconcileTickCounts|BenchmarkBaseRedCheck|BenchmarkBaseRedBlockFanout' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkSQLiteSnapshot$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkPlannerSelectInjectedChecker$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkSpawnPrompt$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkHotPaths$' -benchtime=5x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" go test ./internal/infra/workspace/ -run '^TestGitWorktreeRemoveLatencyAlternating$' -count=1 -v) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BENCH_TICKS=1001 BENCH_ROUNDS=5 node internal/bench/run_watcher_bench.js) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+            } 2>&1 | tee -a "$RUNNER_TEMP/perf-$side.txt"
+          }
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side base "$RUNNER_TEMP/perf-base"
+
+      - name: Calibrate the noise floor
+        continue-on-error: true
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const temp = process.env.RUNNER_TEMP;
+          const prefix = 'beacon-perf: ';
+          const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
+          const median = xs => {
+            const s = [...xs].sort((a, b) => a - b);
+            const mid = Math.floor(s.length / 2);
+            return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+          };
+          const side = name => {
+            const out = new Map();
+            for (const line of fs.readFileSync(`${temp}/perf-${name}.txt`, 'utf8').split(/\r?\n/)) {
+              if (!line.startsWith(prefix)) continue;
+              let row;
+              try { row = JSON.parse(line.slice(prefix.length)); } catch (e) { continue; }
+              if (!row || fields.some(f => !(f in row))) continue;
+              if (!out.has(row.key)) out.set(row.key, []);
+              out.get(row.key).push(row.median_ms);
+            }
+            const med = new Map();
+            for (const [key, values] of out) med.set(key, median(values));
+            return med;
+          };
+          const base = side('base'), head = side('head');
+          const deltas = [];
+          for (const [key, a] of base) {
+            const b = head.get(key);
+            if (Number.isFinite(a) && Number.isFinite(b) && a > 0) {
+              deltas.push(Math.abs(100 * (b - a) / a));
+            }
+          }
+          deltas.sort((a, b) => a - b);
+          const index = Math.min(deltas.length - 1, Math.ceil(0.95 * deltas.length) - 1);
+          const observed = deltas.length ? deltas[Math.max(0, index)] : 0;
+          const floorPct = Math.max(2, Math.ceil(observed * 10) / 10);
+          const doc = {
+            floorPct,
+            samples: deltas.length,
+            quantile: 0.95,
+            sha: process.env.GITHUB_SHA,
+            source: 'no-change-control',
+          };
+          fs.writeFileSync(`${temp}/noise-floor.json`, JSON.stringify(doc, null, 2) + '\n');
+          console.log(`calibrated noise floor ${floorPct}% from ${deltas.length} plans`);
+          NODE
+
+      - name: Publish bench-noise-floor
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-noise-floor
+          path: ${{ runner.temp }}/noise-floor.json
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: ignore
 
   perf-nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
