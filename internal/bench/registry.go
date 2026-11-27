@@ -26,6 +26,16 @@ type Spec struct {
 	ThresholdPct float64 `json:"thresholdPct"`
 }
 
+// prHarnessLimiters are the limiter strings the advisory two-tree harnesses
+// print in their canonical rows. Those harnesses live outside the bench
+// package, so registry.go owns the strings instead of report.go.
+var prHarnessLimiters = []struct{ key, limiter string }{
+	{"snapshot", "SQLite VM, ListRunEvents sort and JSON reflection"},
+	{"worktree-remove", "git subprocess spawn and worktree metadata"},
+	{"tui-view", "normalizeSnapshot + render"},
+	{"run-watcher-fp", "JSON.stringify character volume"},
+}
+
 // registryDocument is the on-disk shape of the generated JSON. Keeping the
 // specs under a key lets a consumer add document metadata without changing the
 // array shape.
@@ -39,7 +49,7 @@ type registryDocument struct {
 // for each benchmark that reports a median, so the generated JSON has one
 // authoritative source.
 func Registry() []Spec {
-	specs := make([]Spec, 0, len(hotspotOrder)+1+len(snapshotLimiters))
+	specs := make([]Spec, 0, len(hotspotOrder)+1+len(snapshotLimiters)+len(prHarnessLimiters))
 	for _, name := range hotspotOrder {
 		specs = append(specs, Spec{
 			Key:          name,
@@ -72,6 +82,20 @@ func Registry() []Spec {
 			WorkMetric:   work,
 			ErrMetric:    errs,
 			Placement:    PlacementNightly,
+			ThresholdPct: 15,
+		})
+	}
+	// Only the advisory two-tree job runs these harnesses. Their work and
+	// error counts arrive in the canonical row fields, not as named Go
+	// metrics, so the field names are the work and err metrics here.
+	for _, h := range prHarnessLimiters {
+		specs = append(specs, Spec{
+			Key:          h.key,
+			Limiter:      h.limiter,
+			Unit:         "ns",
+			WorkMetric:   "work",
+			ErrMetric:    "errs",
+			Placement:    PlacementPR,
 			ThresholdPct: 15,
 		})
 	}
