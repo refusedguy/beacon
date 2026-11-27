@@ -1,7 +1,7 @@
 ---
 id: T-bca6c83f
 title: Make nightly gate read the registry
-status: available
+status: done
 scope:
     - scripts/check-bench-regression.sh
     - scripts/bench-e2e.sh
