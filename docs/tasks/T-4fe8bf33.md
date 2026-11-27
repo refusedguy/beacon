@@ -1,7 +1,7 @@
 ---
 id: T-4fe8bf33
 title: Sync UI benchmark state maps with production view
-status: available
+status: done
 scope:
     - internal/bench/ui_bench.js
 priority: 99
