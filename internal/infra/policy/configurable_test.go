@@ -66,6 +66,41 @@ func TestEvaluateDeclaredSkipAcceptsSkippedRequiredCheck(t *testing.T) {
 	}
 }
 
+func TestEvaluateCancelledAndSkippedRequiredChecks(t *testing.T) {
+	cases := []struct {
+		name            string
+		state           core.CheckState
+		workflowSkipped bool
+		want            core.Verdict
+	}{
+		{"cancelled", core.CheckCancelled, false, core.VerdictWait},
+		{"cancelled with declared workflow skip", core.CheckCancelled, true, core.VerdictWait},
+		{"skipped with declared workflow skip", core.CheckSkipped, true, core.VerdictMerge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{RequiredCheckSource: fakeCheckSource{names: []string{"build"}}}
+			obs := core.Observation{
+				PRState:         "open",
+				WorkflowSkipped: tc.workflowSkipped,
+				Checks:          []core.CheckResult{{Name: "build", State: tc.state}},
+			}
+			got := New(cfg).Evaluate(obs)
+			if got.Verdict != tc.want {
+				t.Fatalf("verdict = %s, want %s (reason %q)", got.Verdict, tc.want, got.Reason)
+			}
+			if tc.want == core.VerdictWait {
+				if got.Criterion != "required_checks" {
+					t.Fatalf("criterion = %q, want %q", got.Criterion, "required_checks")
+				}
+				if !strings.Contains(got.Reason, "build ("+string(tc.state)+")") {
+					t.Fatalf("reason = %q, want the %s check named", got.Reason, tc.state)
+				}
+			}
+		})
+	}
+}
+
 func TestEvaluateEmptyRequiredChecksGreenReturnsMerge(t *testing.T) {
 	cfg := Config{}
 	obs := core.Observation{
