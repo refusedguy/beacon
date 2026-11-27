@@ -185,7 +185,8 @@ func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 	var keysBuf []core.ScopePath
 	for i, r := range runs {
 		for _, claim := range r.Scope {
-			idx.exact[claim] = appendUnique(idx.exact[claim], i)
+			exactKey := core.ScopePath(claim.Value())
+			idx.exact[exactKey] = appendUnique(idx.exact[exactKey], i)
 			keys := claimDirKeys(keysBuf, claim)
 			keysBuf = keys
 			for _, key := range keys {
@@ -239,7 +240,7 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 			allRuns()
 			continue
 		}
-		for _, i := range idx.exact[claim] {
+		for _, i := range idx.exact[core.ScopePath(claim.Value())] {
 			add(i)
 		}
 		keys := claimDirKeys(idx.keys, claim)
@@ -283,9 +284,10 @@ func (idx *activeScopeIndex) matching(t core.Task) []int {
 // claimDirKeys returns the directory keys under which a claim is indexed: the
 // claim's own value as a directory, then each literal ancestor directory. A
 // wildcard segment stops the walk because later segments are not fixed paths.
-// Every key is a prefix of the claim value, so slicing the value avoids a
-// strings.Split slice, a builder and its intermediate prefix strings. The
-// caller passes a reusable dst, so a claim costs no key-slice allocation.
+// Every key is a bare prefix of the claim value with no kind tag, so slicing
+// the value avoids a strings.Split slice, a builder, its intermediate prefix
+// strings and the per-key "d:" concatenation. The caller passes a reusable
+// dst, so a claim costs no key-slice and no key-string allocation.
 func claimDirKeys(dst []core.ScopePath, claim core.ScopePath) []core.ScopePath {
 	out := dst[:0]
 	value := claim.Value()
@@ -298,7 +300,7 @@ func claimDirKeys(dst []core.ScopePath, claim core.ScopePath) []core.ScopePath {
 		if strings.ContainsAny(value[start:end], "*?") {
 			return out
 		}
-		out = append(out, core.ScopeDir(value[:end]))
+		out = append(out, core.ScopePath(value[:end]))
 		if rel < 0 {
 			return out
 		}
