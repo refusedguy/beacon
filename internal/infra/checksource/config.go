@@ -3,6 +3,7 @@ package checksource
 
 import (
 	"context"
+	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -28,4 +29,17 @@ func (c Config) Names(ctx context.Context) ([]string, error) {
 		return c.Fallback.Names(ctx)
 	}
 	return nil, nil
+}
+
+// NamesDescription names the configured source for a dry-run trace. It does
+// not call the fallback, so an explain path cannot block on provider I/O just
+// to describe where required checks come from.
+func (c Config) NamesDescription() string {
+	if len(c.Explicit) > 0 {
+		return "config: " + strings.Join(c.Explicit, ", ")
+	}
+	if c.Fallback != nil {
+		return "provider fallback"
+	}
+	return "none configured"
 }
