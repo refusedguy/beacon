@@ -1,7 +1,7 @@
 ---
 id: T-caa84f12
 title: Wire new benchmarks into advisory job
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 depends:
