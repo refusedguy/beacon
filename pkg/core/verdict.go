@@ -17,6 +17,8 @@ const (
 	CheckPending CheckState = "pending"
 	// CheckSkipped means the check was skipped.
 	CheckSkipped CheckState = "skipped"
+	// CheckCancelled means the check was cancelled before it finished.
+	CheckCancelled CheckState = "cancelled"
 )
 
 // CheckResult is one CI check. StartedAt and CompletedAt are zero when the
