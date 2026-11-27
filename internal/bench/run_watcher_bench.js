@@ -4,6 +4,9 @@ import { performance } from "node:perf_hooks"
 import { createRunChangeWatcher, snapshotFingerprint } from "../../.opencode/plugins/beacon-project/run_watcher.js"
 import { joinKey, normalizeSnapshot } from "../../.opencode/plugins/beacon-project/ui/ui_model.js"
 const TICKS = +(process.env.BENCH_TICKS ?? 1001), ROUNDS = +(process.env.BENCH_ROUNDS ?? 5)
+// CACHE names the policy the measurement ran under; an unset variable is
+// reported as "unset" so every canonical row carries the field.
+const CACHE = process.env.BEACON_BENCH_CACHE || "unset"
 const run = (id, state) => ({ id, task_id: `T-${id}`, state, head_sha: "abcdef0123456789", updated_at: "2026-11-27T10:00:00Z", detail: "x".repeat(240) })
 const shared = { queue: [], metrics: { dispatch_count: 25 }, daemon: { PID: 42 }, base_incident: { ID: "INC-1" } }
 const snapAt = (t) => ({ ...shared, active: [run("run-1", t < 400 ? "running" : "waiting_ci"), run("run-2", "running")], recent: t > 700 ? [run("run-4", "merged")] : [] })
@@ -54,4 +57,5 @@ console.log(`beacon-perf: ${JSON.stringify({
   work: p.snapshots + p.norm + p.emissions,
   errs: p.errs,
   limiter: "JSON.stringify character volume",
+  cache: CACHE,
 })}`)

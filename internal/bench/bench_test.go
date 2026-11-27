@@ -86,7 +86,7 @@ func timed(name string, fn func() (int64, int64)) sample {
 }
 
 // canonicalFields is the fixed payload shared by every perf harness.
-var canonicalFields = []string{"key", "median_ms", "min_ms", "max_ms", "work", "errs", "limiter"}
+var canonicalFields = []string{"key", "median_ms", "min_ms", "max_ms", "work", "errs", "limiter", "cache"}
 
 // perfRowsFrom reads canonical rows from a report and rejects a prefix line
 // that is not one JSON object with exactly the shared field set.
@@ -127,8 +127,22 @@ func TestCanonicalPerfRowFields(t *testing.T) {
 	}
 	row := rows[0]
 	if row.Key != nameJournal || row.MedianMS != 2 || row.MinMS != 1 || row.MaxMS != 3 ||
-		row.Work != 7 || row.Errs != 0 || row.Limiter != limiters[nameJournal] {
-		t.Fatalf("canonical row = %+v, want %s 2/1/3 7/0 %q", row, nameJournal, limiters[nameJournal])
+		row.Work != 7 || row.Errs != 0 || row.Limiter != limiters[nameJournal] || row.Cache == "" {
+		t.Fatalf("canonical row = %+v, want %s 2/1/3 7/0 %q with a cache state", row, nameJournal, limiters[nameJournal])
+	}
+}
+
+func TestCanonicalPerfRowCacheState(t *testing.T) {
+	t.Setenv("BEACON_BENCH_CACHE", "warm")
+	warm := perfRowsFrom(t, perfLine(nameJournal, 2*time.Millisecond, time.Millisecond, 3*time.Millisecond, 7, 0, limiters[nameJournal]))
+	if len(warm) != 1 || warm[0].Cache != "warm" {
+		t.Fatalf("cache row with BEACON_BENCH_CACHE=warm = %+v, want cache=warm", warm)
+	}
+
+	t.Setenv("BEACON_BENCH_CACHE", "")
+	unset := perfRowsFrom(t, perfLine(nameJournal, 2*time.Millisecond, time.Millisecond, 3*time.Millisecond, 7, 0, limiters[nameJournal]))
+	if len(unset) != 1 || unset[0].Cache != "unset" {
+		t.Fatalf("cache row without BEACON_BENCH_CACHE = %+v, want cache=unset", unset)
 	}
 }
 

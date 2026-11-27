@@ -1051,6 +1051,10 @@ func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
 	// Keep the test as the harness and print the canonical row alongside the
 	// human line. The status count stays in the human line only: the canonical
 	// payload has a fixed field set shared by every harness.
+	cache := os.Getenv("BEACON_BENCH_CACHE")
+	if cache == "" {
+		cache = "unset"
+	}
 	row := struct {
 		Key      string  `json:"key"`
 		MedianMS float64 `json:"median_ms"`
@@ -1059,6 +1063,7 @@ func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
 		Work     int64   `json:"work"`
 		Errs     int64   `json:"errs"`
 		Limiter  string  `json:"limiter"`
+		Cache    string  `json:"cache"`
 	}{
 		Key:      "worktree-remove",
 		MedianMS: walls[len(walls)/2] * 1000,
@@ -1067,6 +1072,7 @@ func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
 		Work:     int64(works[len(works)/2]),
 		Errs:     int64(errs),
 		Limiter:  "git subprocess spawn and worktree metadata",
+		Cache:    cache,
 	}
 	if data, err := json.Marshal(row); err == nil {
 		fmt.Printf("beacon-perf: %s\n", data)

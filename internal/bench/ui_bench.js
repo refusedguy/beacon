@@ -55,6 +55,10 @@ function envInt(name, fallback, min) {
 const ITERATIONS = envInt("BENCH_ITERATIONS", 2000, 1)
 const WARMUP = envInt("BENCH_WARMUP", 0, 0)
 
+// CACHE names the policy the measurement ran under. An unset variable is
+// reported as "unset" so every canonical row carries the field.
+const CACHE = process.env.BEACON_BENCH_CACHE || "unset"
+
 // The hash pins the fixture shape. Any edit to the seed or fixture rows
 // changes the hash and fails the run before the harness prints a number.
 const EXPECTED_FIXTURE_HASH = "8b649f17d1b4b680"
@@ -347,4 +351,5 @@ console.log(`beacon-perf: ${JSON.stringify({
   work: before.sink && after.sink ? 1 : 0,
   errs: 0,
   limiter: "normalizeSnapshot + render",
+  cache: CACHE,
 })}`)
