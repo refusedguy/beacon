@@ -16,14 +16,22 @@ import (
 
 // Telegram sends notifications through the Telegram Bot API.
 type Telegram struct {
-	Token  string
-	ChatID string
-	HTTP   *http.Client
+	Token    string
+	ChatID   string
+	HTTP     *http.Client
+	endpoint string
 }
 
-// NewTelegram builds a notifier for a bot token and chat.
+// NewTelegram builds a notifier for a bot token and chat. The endpoint is
+// built once here because the token and its PathEscape cannot change on the
+// send path.
 func NewTelegram(token, chatID string) *Telegram {
-	return &Telegram{Token: token, ChatID: chatID, HTTP: &http.Client{Timeout: 10 * time.Second}}
+	return &Telegram{
+		Token:    token,
+		ChatID:   chatID,
+		HTTP:     &http.Client{Timeout: 10 * time.Second},
+		endpoint: "https://api.telegram.org/bot" + url.PathEscape(token) + "/sendMessage",
+	}
 }
 
 // Enabled reports whether a token and chat id are configured.
@@ -39,8 +47,7 @@ func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
 		"chat_id": t.ChatID,
 		"text":    text,
 	})
-	endpoint := "https://api.telegram.org/bot" + url.PathEscape(t.Token) + "/sendMessage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}

@@ -163,6 +163,32 @@ func TestTelegramDisabled(t *testing.T) {
 	}
 }
 
+func TestTelegramEndpointBuiltOnce(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	target, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := NewTelegram(benchToken, benchChatID)
+	n.HTTP = srv.Client()
+	n.HTTP.Transport = rewriteTransport{base: n.HTTP.Transport, target: target}
+	// Mutating the token after construction must not rebuild the endpoint.
+	n.Token = "another-token"
+	if err := n.Notify(context.Background(), benchNotification); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	want := "/bot" + url.PathEscape(benchToken) + "/sendMessage"
+	if path != want {
+		t.Fatalf("request path = %q, want %q", path, want)
+	}
+}
+
 func TestTelegramStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no", http.StatusBadRequest)
