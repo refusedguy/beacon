@@ -3,7 +3,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
-  PANEL_NAME, beaconStatusDefinition, collectTransitionToasts,
+  PANEL_NAME, beaconStatusDefinition, blockedGroupKeys, collectTransitionToasts,
   createDetailMount, createLineMount, createSidebarMount, detailModel, launchSourceText,
   metricsLine, normalizeRun, queueGroups, queueLineItems, queueRows, shortTaskID, sidebarModel, taskTree, truncate,
 } from "./ui.js"
@@ -400,6 +400,17 @@ test("one snapshot queue reuses a tree across the header and the rows", () => {
   assert.notEqual(taskTree([...queue]), tree, "a new snapshot builds a new index")
   assert.deepEqual(queueRows(queue, null, {}, tree), queueRows(queue, null, {}))
   assert.deepEqual(queueLineItems(queue, null, {}, tree), queueLineItems(queue, null, {}))
+})
+
+test("blocked keys and rows come from one shared queue grouping", () => {
+  const queue = [
+    { id: "T-BLOCK", title: "Blocker", status: "done", priority: 9 },
+    { id: "T-1", title: "Task one", status: "waiting_deps", priority: 5, depends_on: ["T-BLOCK"] },
+  ]
+  const prepared = queueGroups(queue)
+  assert.deepEqual(prepared.blockedKeys, ["T-BLOCK"])
+  assert.deepEqual(prepared.blockedKeys, blockedGroupKeys(queue))
+  assert.deepEqual(queueLineItems(queue, null, {}, null, prepared), queueLineItems(queue, null, {}))
 })
 
 test("truncation stays identical for repeated strings across widths", () => {
