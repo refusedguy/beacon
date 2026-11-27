@@ -122,6 +122,11 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 		return nil
 	}
 	taskSyncCache.Delete(s.db)
+	return s.writeTasks(ctx, tasks, fp)
+}
+
+// writeTasks commits one full replacement of the task and dependency tables.
+func (s *Store) writeTasks(ctx context.Context, tasks []core.Task, fp string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -133,49 +138,69 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks`); err != nil {
 		return err
 	}
-	taskInsert, err := tx.PrepareContext(ctx, `
-INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	taskInsert, depInsert, err := prepareTaskInserts(ctx, tx)
 	if err != nil {
 		return err
 	}
 	defer taskInsert.Close()
-	depInsert, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO task_deps(task_id, depends_on) VALUES (?,?)`)
-	if err != nil {
-		return err
-	}
 	defer depInsert.Close()
 	for _, t := range tasks {
-		scope, err := json.Marshal(t.Scope)
-		if err != nil {
+		if err := insertTask(ctx, taskInsert, depInsert, t); err != nil {
 			return err
-		}
-		plan, err := json.Marshal(t.Plan)
-		if err != nil {
-			return err
-		}
-		status := string(t.Status)
-		if status == "" {
-			status = statusAvailable
-		}
-		kind := string(t.Kind)
-		if kind == "" {
-			kind = "task"
-		}
-		if _, err := taskInsert.ExecContext(ctx, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
-			kind, string(t.Parent), t.BaseBranch, string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
-			return err
-		}
-		for _, dep := range t.DependsOn {
-			if _, err := depInsert.ExecContext(ctx, string(t.ID), string(dep)); err != nil {
-				return err
-			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	taskSyncCache.Store(s.db, fp)
+	return nil
+}
+
+// prepareTaskInserts prepares the two INSERT statements once for the whole
+// replacement. The caller owns both statements and closes them after the loop.
+func prepareTaskInserts(ctx context.Context, tx *sql.Tx) (*sql.Stmt, *sql.Stmt, error) {
+	taskInsert, err := tx.PrepareContext(ctx, `
+INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return nil, nil, err
+	}
+	depInsert, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO task_deps(task_id, depends_on) VALUES (?,?)`)
+	if err != nil {
+		_ = taskInsert.Close()
+		return nil, nil, err
+	}
+	return taskInsert, depInsert, nil
+}
+
+// insertTask writes one card and its dependencies through the prepared
+// statements, applying the same defaults SyncTasks has always applied.
+func insertTask(ctx context.Context, taskInsert, depInsert *sql.Stmt, t core.Task) error {
+	scope, err := json.Marshal(t.Scope)
+	if err != nil {
+		return err
+	}
+	plan, err := json.Marshal(t.Plan)
+	if err != nil {
+		return err
+	}
+	status := string(t.Status)
+	if status == "" {
+		status = statusAvailable
+	}
+	kind := string(t.Kind)
+	if kind == "" {
+		kind = "task"
+	}
+	if _, err := taskInsert.ExecContext(ctx, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
+		kind, string(t.Parent), t.BaseBranch, string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
+		return err
+	}
+	for _, dep := range t.DependsOn {
+		if _, err := depInsert.ExecContext(ctx, string(t.ID), string(dep)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
