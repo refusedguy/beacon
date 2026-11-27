@@ -1,7 +1,7 @@
 ---
 id: T-eba33ec6
 title: Align Go cache-dependency-path across all jobs
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 depends:
