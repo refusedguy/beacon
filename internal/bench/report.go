@@ -86,6 +86,15 @@ var hotspotOrder = []string{
 // one of the ten alternating hotspots, so it gets its own report line.
 const namePrompt = "prompt-build"
 
+// nameAssembly names the in-memory snapshot assembly benchmark. It exercises
+// status.go and metrics.go without SQLite reads or HTTP encoding, so a change
+// in either production file has its own deciding advisory row.
+const nameAssembly = "snapshot-assembly-in-memory"
+
+// limiterAssembly names the resource that bounds in-memory assembly. It lives
+// here beside the key so the registry and the benchmark cannot drift apart.
+const limiterAssembly = "groupHistory map growth + makeRunSnapshot field copy"
+
 // limiters name the resource that bounds each hotspot. The dossier explains
 // why each one is the limiter and points at the annotated production code.
 var limiters = map[string]string{

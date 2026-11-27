@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -20,10 +21,8 @@ import (
 // store errors. The limiter is map growth in groupHistory and field copying in
 // makeRunSnapshot.
 
-const (
-	nameAssembly    = "snapshot-assembly-in-memory"
-	limiterAssembly = "groupHistory map growth + makeRunSnapshot field copy"
-)
+// nameAssembly and limiterAssembly live in report.go beside the other
+// canonical keys, so the registry and this benchmark cannot drift apart.
 
 // assemblyFixture holds the rows the stub store serves. Sizes come from the
 // shared fixture constants, so base and head assemble the same amount of work.
@@ -43,6 +42,32 @@ func newAssemblyFixture() assemblyFixture {
 	events := assemblyEvents(active, recent)
 	ids := runIDs(append(append([]*core.Run{}, active...), recent...))
 	decisions := decisionFixtures(fixtureDecisions, ids)
+	// Blocked reconcile decisions fold into metrics.go's bounded blocked map
+	// and give status.go blocked reasons to carry into run snapshots. Without
+	// them a status or metrics variant would be measured on a path that never
+	// visits either branch. The Repo field is set on the service below for the
+	// same reason: makeRunSnapshot uses it for the PR link.
+	blockedReasons := []string{
+		"gate failed: flaky check",
+		"base_red: main is red",
+		"rebase attempts exhausted",
+		"idle: no agent response",
+	}
+	for i, reason := range blockedReasons {
+		run := active[i%len(active)]
+		decisions = append(decisions, app.Decision{
+			At:       fixtureNow.Add(time.Duration(i) * time.Minute),
+			CycleID:  fmt.Sprintf("cycle-blocked-%02d", i),
+			Kind:     "reconcile.decision",
+			RunID:    string(run.ID),
+			TaskID:   string(run.TaskID),
+			PRNumber: run.PRNumber,
+			Verdict:  string(core.VerdictBlocked),
+			Action:   "blocked",
+			Reason:   reason,
+			Fields:   map[string]any{"attempt": i + 1},
+		})
+	}
 	counts := []app.DecisionCount{
 		{Kind: "dispatch.candidates", Verdict: "ready", Count: 12},
 		{Kind: "dispatch.skip", Verdict: "wait", Count: 7},
@@ -231,7 +256,22 @@ func BenchmarkSnapshotAssemblyInMemory(b *testing.B) {
 	b.StopTimer()
 
 	median := medianDuration(durations)
-	printAssemblyReport(os.Stdout, median, work, errs)
+	min, max := median, median
+	for _, d := range durations {
+		if d < min {
+			min = d
+		}
+		if d > max {
+			max = d
+		}
+	}
+	// Keep both lines off stdout: testing.B writes its result line there when
+	// this function returns, so benchstat would drop this benchmark and its
+	// B/op and allocs/op columns. CI merges stderr into the perf log.
+	var report bytes.Buffer
+	printAssemblyReport(&report, median, work, errs)
+	printPerfRow(&report, nameAssembly, median, min, max, work, errs, limiterAssembly)
+	_, _ = os.Stderr.Write(report.Bytes())
 	b.ReportMetric(float64(median.Nanoseconds()), nameAssembly+"-median-ns")
 	b.ReportMetric(float64(work), nameAssembly+"-work")
 	b.ReportMetric(float64(errs), nameAssembly+"-errs")

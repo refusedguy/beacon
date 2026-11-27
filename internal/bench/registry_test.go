@@ -83,6 +83,7 @@ func TestRegistryPRBenchSpecs(t *testing.T) {
 		{"base-red-block", baseRedBlockLimiter},
 		{"planner-select-injected-checker", plannerSelectLimiter},
 		{"dispatch-prompt", dispatchPromptLimiter},
+		{nameAssembly, limiterAssembly},
 	} {
 		spec, ok := byKey[tc.key]
 		if !ok {
@@ -111,6 +112,7 @@ func TestRegistryPRBenchSpecs(t *testing.T) {
 var harnessSources = []string{
 	"report.go",
 	"snapshot_bench_test.go",
+	"snapshot_assembly_bench_test.go",
 	"ui_bench.js",
 	"run_watcher_bench.js",
 	"../infra/workspace/git_worktree_test.go",

@@ -223,6 +223,15 @@
       "thresholdPct": 15
     },
     {
+      "key": "snapshot-assembly-in-memory",
+      "limiter": "groupHistory map growth + makeRunSnapshot field copy",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
       "key": "json-control",
       "limiter": "encoding/json reflection over a fixed struct",
       "unit": "ns",

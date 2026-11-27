@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -217,6 +218,50 @@ func TestCanonicalRowsOnePerSnapshotPhase(t *testing.T) {
 	}
 }
 
+// emitHotPathsReport writes the human report to w. Benchmarks pass stderr:
+// testing.B writes its result line to stdout when the benchmark function
+// returns, so a report on stdout lands on that line and benchstat drops
+// BenchmarkHotPaths together with its B/op and allocs/op columns. Buffering
+// also keeps the canonical rows in the report intact.
+func emitHotPathsReport(w io.Writer, sums []summary, total time.Duration, iterations int) {
+	var buf bytes.Buffer
+	printReport(&buf, sums, total, iterations)
+	_, _ = buf.WriteTo(w)
+}
+
+func TestHotPathsReportStaysOffResultLine(t *testing.T) {
+	sums := withShares(summarize([]sample{
+		{name: nameCard, d: 2 * time.Millisecond, work: 10},
+		{name: nameWire, d: time.Millisecond, work: 3},
+	}), 3*time.Millisecond)
+	var out bytes.Buffer
+	emitHotPathsReport(&out, sums, 3*time.Millisecond, 1)
+	text := out.String()
+	if !strings.Contains(text, "hot paths:") || !strings.Contains(text, "end-to-end median:") {
+		t.Fatalf("buffered report is incomplete:\n%s", text)
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "Benchmark") {
+			t.Fatalf("report emitted a benchmark result line: %q", line)
+		}
+	}
+	if rows := perfRowsFrom(t, text); len(rows) != len(sums) {
+		t.Fatalf("buffered report has %d canonical rows, want %d:\n%s", len(rows), len(sums), text)
+	}
+}
+
+// The call site matters as much as the buffering. A report written to stdout
+// is the original defect, so keep the stderr call visible to the test.
+func TestHotPathsBenchmarkReportsToStderr(t *testing.T) {
+	data, err := os.ReadFile("bench_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "emitHotPathsReport(os.Stderr,") {
+		t.Error("BenchmarkHotPaths must emit its buffered report to os.Stderr")
+	}
+}
+
 func withShares(sums []summary, total time.Duration) []summary {
 	out := make([]summary, len(sums))
 	copy(out, sums)
@@ -272,7 +317,7 @@ func BenchmarkHotPaths(b *testing.B) {
 	sums := summarize(samples)
 	total := endToEnd(sums)
 	sums = withShares(sums, total)
-	printReport(os.Stdout, sums, total, b.N)
+	emitHotPathsReport(os.Stderr, sums, total, b.N)
 	for _, s := range sums {
 		b.ReportMetric(float64(s.Median.Nanoseconds()), s.Name+"-median-ns")
 		b.ReportMetric(float64(s.Min.Nanoseconds()), s.Name+"-min-ns")
