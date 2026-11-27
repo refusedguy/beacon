@@ -200,20 +200,34 @@ export const blockedGroupKeys = (queue = [], tree = null) => queueGroups(queue, 
 // rest collapse into a "+N more" line so Recent stays inside the sidebar.
 export const QUEUE_CHILD_LIMIT = 3
 
+// A blocked group header names both sides of the wait. Queue titles already
+// come from readTitle upstream, so an id that resolves to a queued card uses
+// that title and an id outside the queue keeps its short form. Each side is
+// capped before it joins the row, so the host cannot clip the arrow from the
+// middle of the rendered text.
+export const GROUP_TITLE_WIDTH = 12
+const groupTitle = (id, byID) => str(byID.get(id)?.title) || shortTaskID(id)
+
 // A null blockedOpen keeps the flat legacy rows for pure callers that never
 // drive the toggle. With a map, only groups marked true expand.
 export function queueLineItems(queue = [], hidden = null, blockedOpen = null, tree = null) {
-  const { groups, order, blockers, parentOf, childrenOf, isEpic, idOf } = queueGroups(queue, hidden, tree)
+  const { groups, order, blockers, parentOf, childrenOf, isEpic, idOf, tree: index } = queueGroups(queue, hidden, tree)
   const rows = []
   for (const key of order) {
     if (rows.length) rows.push(spacerItem())
     const members = groups.get(key)
     if (key) {
       const expanded = blockedOpen == null || blockedOpen[key] === true
+      const first = members[0]
+      const taskID = idOf?.get(first) ?? str(first?.id)
+      const name = [
+        truncate(groupTitle(taskID, index.byID), GROUP_TITLE_WIDTH),
+        truncate(groupTitle(key, index.byID), GROUP_TITLE_WIDTH),
+      ].join(" → ")
       rows.push({
         marker: expanded ? "▼" : "▶",
-        name: `blocked by ${shortTaskID(key)} · ${countLabel(members.length, "task", "tasks")}`,
-        status: "", color: "muted", kind: "queue-blocker", depID: key,
+        name, status: countLabel(members.length, "task", "tasks"),
+        color: "muted", kind: "queue-blocker", depID: key,
         blockedKey: key, action: `blocked:${key}`,
       })
       if (!expanded) continue

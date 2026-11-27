@@ -120,8 +120,8 @@ test("three tasks sharing a blocker get one header and three title rows", () => 
   const items = sidebarModel(snap, null, NOW, open).listItems
   const headers = items.filter((i) => i.kind === "queue-blocker")
   assert.equal(headers.length, 1)
-  assert.deepEqual([headers[0].name, headers[0].depID, headers[0].action],
-    ["blocked by 19651f36-01 · 3 tasks", blocker, `blocked:${blocker}`])
+  assert.deepEqual([headers[0].name, headers[0].status, headers[0].depID, headers[0].action],
+    ["Task A → 19651f36-01", "3 tasks", blocker, `blocked:${blocker}`])
   assert.deepEqual(items.filter((i) => i.kind === "queue-title").map((i) => i.name), ["Task A", "Task B", "Task C"])
   assert.equal(items.some((i) => i.kind === "queue-dep"), false, "dependencies are headers, not repeated rows")
   assert.equal(items.filter((i) => i.kind === "queue-title").every((i) => !i.name.includes("19651f36")), true)
@@ -143,8 +143,8 @@ test("different blockers get separate headers and priority sits in the right col
     ],
   }
   const items = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true }).listItems
-  assert.deepEqual(items.filter((i) => i.kind === "queue-blocker").map((i) => i.name), [
-    "blocked by BLOCK-1 · 1 task", "blocked by BLOCK-2 · 1 task",
+  assert.deepEqual(items.filter((i) => i.kind === "queue-blocker").map((i) => [i.name, i.status]), [
+    ["Task A → BLOCK-1", "1 task"], ["Task B → BLOCK-2", "1 task"],
   ])
   assert.deepEqual(items.filter((i) => i.kind === "queue-title").map((i) => [i.marker, i.name, i.status]), [
     ["◌", "Task A", "P5 · 2 deps"], ["◌", "Task B", "P4 · 1 dep"], ["○", "Task C", "P3"],
@@ -165,10 +165,10 @@ test("an expanded epic keeps its children under one blocker header and Recent vi
   }
   const open = { active: true, queue: true, recent: true }
   const closed = sidebarModel(snap, null, NOW, open, {}).listItems
-  assert.deepEqual(closed.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 1 task"])
+  assert.deepEqual(closed.filter((i) => i.kind === "queue-blocker").map((i) => [i.name, i.status]), [["Harness epic → T-BLOCK", "1 task"]])
   assert.equal(closed.find((i) => i.kind === "queue-status" && i.cardID === epicID).name, "epic · 2 children")
   const expanded = sidebarModel(snap, null, NOW, open, { [epicID]: true }).listItems
-  assert.deepEqual(expanded.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 3 tasks"])
+  assert.deepEqual(expanded.filter((i) => i.kind === "queue-blocker").map((i) => [i.name, i.status]), [["Harness epic → T-BLOCK", "3 tasks"]])
   assert.deepEqual(expanded.filter((i) => i.kind === "queue-title").map((i) => i.name),
     ["Harness epic", "Child one", "Child two"])
   assert.ok(expanded.some((i) => i.recent === true && i.runID === "r1"), "Recent stays clickable")
@@ -186,7 +186,7 @@ test("long blocker IDs are short in the header and child deps are not repeated",
   }
   const items = sidebarModel(snap, null, NOW, { active: true, queue: true, recent: true }).listItems
   assert.equal(items.some((i) => i.kind === "queue-dep"), false, "child IDs in depends are not drawn twice")
-  assert.deepEqual(items.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 3 tasks"])
+  assert.deepEqual(items.filter((i) => i.kind === "queue-blocker").map((i) => [i.name, i.status]), [["Harness epic → T-BLOCK", "3 tasks"]])
   assert.equal(shortTaskID("T-20261124-51f36-01"), "51f36-01", "the date prefix is dropped, not the ID middle cut")
   assert.equal(shortTaskID("T-2"), "T-2")
   assert.equal(shortTaskID(""), "-")
@@ -318,7 +318,8 @@ test("a blocked group click expands only that group and the Queue toggle expands
   const headerA = h.findItem(sidebar, (i) => i.kind === "queue-blocker" && i.depID === "T-BLOCK-A")
   assert.ok(headerA, "the blocked header is in the sidebar")
   assert.equal(headerA.item.marker, "▶", "the group starts collapsed")
-  assert.equal(headerA.item.name, "blocked by T-BLOCK-A · 2 tasks", "the count stays in the header")
+  assert.equal(headerA.item.name, "Alpha one → T-BLOCK-A", "both sides of the wait stay in the header")
+  assert.equal(headerA.item.status, "2 tasks", "the count stays in the header")
   assert.equal(h.findItem(sidebar, (i) => i.kind === "queue-title"), null, "no task title shows at startup")
 
   headerA.props.onMouseDown()

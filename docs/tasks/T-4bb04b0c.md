@@ -1,7 +1,7 @@
 ---
 id: T-4bb04b0c
 title: Show task and blocker titles in blocked queue groups
-status: available
+status: in_progress
 scope:
     - .opencode/plugins/beacon-project/ui/ui_view.js
     - .opencode/plugins/beacon-project/ui/ui_alerts.js
