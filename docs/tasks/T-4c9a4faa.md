@@ -1,7 +1,7 @@
 ---
 id: T-4c9a4faa
 title: Fix advisory perf measurement path completely
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
     - internal/infra/shared/workflow.go
