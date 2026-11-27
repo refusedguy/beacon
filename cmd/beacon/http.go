@@ -471,10 +471,18 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 			nextID = n
 		}
 	}
-	// The id buffer is reused across frames. A 24-byte array holds "id: "
-	// plus the 19 digits of the largest int64 plus the newline, so no frame
-	// write allocates.
+	// One buffer per connection carries the id line and a pre-encoded frame.
+	// A 24-byte array holds "id: " plus the 19 digits of the largest int64
+	// plus the newline. The slice keeps its capacity between frames, so the
+	// steady state writes a whole frame with one rw.Write and no allocation.
 	var idBuf [24]byte
+	frameBuf := idBuf[:0]
+	writeFrame := func(body []byte) {
+		nextID++
+		frameBuf = appendSSEID(frameBuf[:0], nextID)
+		frameBuf = append(frameBuf, body...)
+		_, _ = rw.Write(frameBuf)
+	}
 	writeID := func() {
 		nextID++
 		_, _ = rw.Write(appendSSEID(idBuf[:0], nextID))
@@ -485,16 +493,14 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case frame := <-frames:
-			writeID()
-			_, _ = rw.Write(frame)
+			writeFrame(frame)
 			flusher.Flush()
 		case pr := <-changes:
 			writeID()
 			writeSSE(rw, "pr_changed", wirePRChanged{PR: pr})
 			flusher.Flush()
 		case frame := <-pings:
-			writeID()
-			_, _ = rw.Write(frame)
+			writeFrame(frame)
 			flusher.Flush()
 		}
 	}

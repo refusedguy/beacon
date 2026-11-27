@@ -345,6 +345,65 @@ func TestHarnessFramesReachEveryMonitorOverHTTP(t *testing.T) {
 	t.Logf("harness frame over HTTP: %q", recorder.Body.String())
 }
 
+// writeCountingRecorder counts raw Write calls while keeping the recorder body.
+// The SSE handler writes one id line and one body per frame before V2, so the
+// count distinguishes the two forms without changing the wire bytes.
+type writeCountingRecorder struct {
+	*httptest.ResponseRecorder
+	mu     sync.Mutex
+	writes int
+}
+
+func (r *writeCountingRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	r.writes++
+	r.mu.Unlock()
+	return r.ResponseRecorder.Write(p)
+}
+
+func (r *writeCountingRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.writes
+}
+
+// TestSSEFrameUsesOneWritePerPreEncodedFrame proves the id line and a
+// pre-encoded harness frame leave the handler in a single Write. The bytes keep
+// the documented shape, with the id line before the event and data lines.
+func TestSSEFrameUsesOneWritePerPreEncodedFrame(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := make(chan core.HarnessEvent)
+	frames := newEventFrames(src, json.Marshal)
+	go frames.run(ctx)
+
+	api := &apiServer{token: []byte("secret"), frames: frames, changes: newChangeSubscribers()}
+	rec := &writeCountingRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		api.events(rec, req)
+		close(done)
+	}()
+
+	src <- core.HarnessEvent{RunID: "r1", Kind: "progress"}
+	deadline := time.Now().Add(2 * time.Second)
+	for rec.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := rec.count(); got != 1 {
+		t.Fatalf("writes for one harness frame = %d, want 1", got)
+	}
+	body := rec.Body.String()
+	if !strings.HasPrefix(body, "id: 1\nevent: harness\n") {
+		t.Fatalf("frame = %q, want the id line before the harness frame", body)
+	}
+}
+
 // TestCombinedHarnessAndPRChangeReachOneMonitor drives a harness event and a
 // PR change from their sources in one tick and asserts one connected monitor
 // receives both frames with the documented notification shapes. The harness
