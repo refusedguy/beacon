@@ -124,9 +124,45 @@ func parentEpicID(id core.TaskID) core.TaskID {
 	return core.TaskID(s[:i])
 }
 
+// tickCacheKey carries one tick's reads through context. Reconciliation asks
+// the same questions many times on a single tick: which epic owns a task,
+// what branch a run targets and whether the base is red. The cache lets every
+// path on the tick share one source read and one read per distinct base branch.
+type tickCacheKey struct{}
+
+type tickCache struct {
+	tree      core.TaskTree
+	treeReady bool
+	base      map[string]core.BaseStatus
+}
+
+func withTickCache(ctx context.Context) context.Context {
+	if cacheFrom(ctx) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, tickCacheKey{}, &tickCache{base: make(map[string]core.BaseStatus)})
+}
+
+func cacheFrom(ctx context.Context) *tickCache {
+	c, _ := ctx.Value(tickCacheKey{}).(*tickCache)
+	return c
+}
+
 // taskTree indexes one source read. Every relation question in reconciliation
 // goes through it, so the parent field is read once instead of scanning IDs.
+// A tick cache turns the read into one per tick rather than one per question.
 func (r *Reconciler) taskTree(ctx context.Context) core.TaskTree {
+	if c := cacheFrom(ctx); c != nil && c.treeReady {
+		return c.tree
+	}
+	tree := r.loadTaskTree(ctx)
+	if c := cacheFrom(ctx); c != nil {
+		c.tree, c.treeReady = tree, true
+	}
+	return tree
+}
+
+func (r *Reconciler) loadTaskTree(ctx context.Context) core.TaskTree {
 	if r.Source == nil {
 		return core.NewTaskTree(nil)
 	}
@@ -135,6 +171,25 @@ func (r *Reconciler) taskTree(ctx context.Context) core.TaskTree {
 		return core.NewTaskTree(nil)
 	}
 	return core.NewTaskTree(tasks)
+}
+
+// baseStatus returns the status of branch, reading SCM at most once per
+// distinct branch on a tick. checkBaseRed and checkBaseRecovery often inspect
+// the same branch during one tick, so the second read reuses the first result.
+func (r *Reconciler) baseStatus(ctx context.Context, branch string) (core.BaseStatus, error) {
+	if c := cacheFrom(ctx); c != nil {
+		if status, ok := c.base[branch]; ok {
+			return status, nil
+		}
+	}
+	status, err := r.SCM.BaseBranchStatus(ctx, branch)
+	if err != nil {
+		return core.BaseStatus{}, err
+	}
+	if c := cacheFrom(ctx); c != nil {
+		c.base[branch] = status
+	}
+	return status, nil
 }
 
 func (r *Reconciler) taskByID(ctx context.Context, id core.TaskID) (core.Task, bool) {
@@ -256,8 +311,14 @@ func (r *Reconciler) openEpicPR(ctx context.Context, epic core.Task) error {
 // guardEpicReview applies the epic's review mode before a merge. The LLM
 // reviewer starts once per observed commit and reports through approval.
 func (r *Reconciler) guardEpicReview(ctx context.Context, run *core.Run, obs core.Observation) (bool, error) {
-	epic, ok := r.epicTask(ctx, run.TaskID)
-	if !ok {
+	epic, isEpic := r.epicTask(ctx, run.TaskID)
+	return r.guardEpicReviewTask(ctx, epic, isEpic, run, obs)
+}
+
+// guardEpicReviewTask is the review gate for a caller that already looked up
+// the epic on the shared tree. It avoids a second lookup on the merge path.
+func (r *Reconciler) guardEpicReviewTask(ctx context.Context, epic core.Task, isEpic bool, run *core.Run, obs core.Observation) (bool, error) {
+	if !isEpic {
 		return true, nil
 	}
 	mode := epic.RequireReview
@@ -302,14 +363,15 @@ func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs 
 }
 
 func (r *Reconciler) mergeIfReviewed(ctx context.Context, run *core.Run, obs core.Observation, decision core.MergeDecision) (core.MergeDecision, error) {
-	ok, err := r.guardEpicReview(ctx, run, obs)
+	epic, isEpic := r.epicTask(ctx, run.TaskID)
+	ok, err := r.guardEpicReviewTask(ctx, epic, isEpic, run, obs)
 	if err != nil {
 		return decision, err
 	}
 	if !ok {
 		return core.MergeDecision{Verdict: core.VerdictWait, Reason: "epic review pending"}, nil
 	}
-	return decision, r.merge(ctx, run, obs)
+	return decision, r.merge(ctx, run, obs, isEpic)
 }
 
 // finalizeExternal closes a run whose PR was merged or closed outside Beacon.
