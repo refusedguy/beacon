@@ -1,7 +1,7 @@
 ---
 id: T-a3fbc566
 title: '[bench] Dispatcher start-failure cleanup'
-status: in_progress
+status: done
 scope:
     - internal/bench/dispatch_failure_bench_test.go
 priority: 87
