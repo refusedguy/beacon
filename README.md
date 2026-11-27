@@ -7,7 +7,7 @@ Beacon is a controller for parallel AI agent work. It picks non-overlapping task
 Beacon works in any git project. These steps install the binary, write the config, and check the setup.
 
 1. Install the binary with `bash scripts/install-beacon.sh`. The script builds `beacon` into `$BEACON_INSTALL_DIR/beacon`. `BEACON_INSTALL_DIR` defaults to `~/.local/bin`. When the repo has `go.mod` and `cmd/beacon`, the script also refreshes `.opencode/bin/beacon` and writes its build hash. Add `~/.local/bin` to PATH if the script warns about it.
-2. Run `beacon init`. The wizard reads the origin remote and base branch, detects the stack, and writes `.beacon/config.yaml`. It creates `docs/tasks/.gitkeep`, appends safe `.beacon` entries to `.gitignore`, generates or extends `opencode.json`, and deploys `.opencode/plugins/beacon-project/`. Pass `--yes` to accept the defaults without a prompt.
+2. Run `beacon init` in the project root. The wizard reads the origin remote and base branch, detects the stack, and writes `.beacon/config.yaml` to the current directory. It prompts for confirmation when a terminal is available. Pass `--yes` to accept the defaults without a terminal prompt. It creates `docs/tasks/.gitkeep`, appends safe `.beacon` entries to `.gitignore`, generates or extends `opencode.json`, and deploys `.opencode/plugins/beacon-project/`.
 3. Export `GITHUB_TOKEN` or `GITLAB_TOKEN` for SCM access. The config loader defaults `scm.token_env` to `GITHUB_TOKEN` (`internal/infra/config/config.go:358`, `internal/infra/config/config.go:249`). The OpenCode harness reads `harness.token_env`, then `harness.token` (`cmd/beacon/main.go:402`, `harnesses/opencode/opencode.go:34`). No production code reads `BEACON_OPENCODE_TOKEN`; `beacon init` only prints it as a hint (`cmd/beacon/init.go:136`).
 4. Run `beacon doctor`. It prints an `[OK]`, `[WARN]`, or `[FAIL]` line per check and exits 1 if any check fails. Fix every FAIL line before dispatching. When the tools or the status panel do not appear, this one command names the missing prerequisite and its fix.
 5. Restart the OpenCode TUI and the MCP daemon once. They load the new `opencode.json` and plugin at startup.
@@ -63,7 +63,7 @@ beacon serve
 
 The record also carries `pid`, `started_at`, `root`, `heartbeat`, `heartbeat_age_seconds`, and an `error` object with `at`, `kind` and `message` when a fatal error was stored (`cmd/beacon/lock.go:157-166`). `beacon doctor` reports the same liveness as a `[OK]` or `[WARN]` line (`cmd/beacon/doctor.go:324-336`). A `lock`, `state` or `reconciler` kind in `daemon-error.json` means an MCP process tried to own the daemon role and failed (`cmd/beacon/mcp.go:39-58`).
 
-To restart, stop the daemon, run `bash scripts/build-beacon.sh` after Go code changes, start `beacon serve`, then restart the MCP daemon and the OpenCode TUI once. Each start generates a fresh 48-character hex token and writes the loopback address, token and PID to `.beacon/connection.json` (`cmd/beacon/lock.go:108-120`, `cmd/beacon/serve.go:39-44`). Clients must read the current token after every restart; the old value is replaced. The file is gitignored (`cmd/beacon/init_config.go:182`).
+To restart, stop the daemon, run `bash scripts/build-beacon.sh` after Go code changes, start `beacon serve`, then restart the MCP daemon and the OpenCode TUI once. Each start generates a fresh 48-character hex token and writes the loopback address, token and PID to `.beacon/connection.json` (`cmd/beacon/lock.go:108-120`, `cmd/beacon/serve.go:39-44`). `BEACON_API_ADDR` sets the loopback address and defaults to `127.0.0.1:7432`. Clients must read the current token after every restart; the old value is replaced. The file is gitignored (`cmd/beacon/init_config.go:182`).
 
 ## Layout
 
@@ -85,19 +85,30 @@ Dependencies point from `cmd` to `internal/infra` to `internal/app` to `pkg/core
 ## Commands
 
 ```sh
-beacon init                         # configure any git project
+beacon init [--yes]                 # set up the current git project; --yes skips the prompt
 beacon doctor                       # check the setup, exit 1 on FAIL
-beacon dispatch 20                  # start up to 20 non-overlapping tasks
-beacon serve                        # reconciler, queue, webhook and loopback API
+beacon dispatch [n]                 # start up to n tasks; n defaults to 1 and 0 starts none
+beacon serve                        # daemon; writes address and token to .beacon/connection.json
 beacon mcp                          # ten MCP tools over stdio
-beacon status                       # print active runs
+beacon status                       # print active runs as JSON
 beacon status --snapshot --recent-limit 5 --decisions-limit 20
-beacon gc                           # remove worktrees that no active run uses
+beacon status --recent              # recently finished runs as a bare JSON array
+beacon status --daemon              # daemon liveness and heartbeat age
+beacon control --action approve --run-id <id> --sha <sha>
+beacon gc                           # remove unused worktrees; silent on success
 ```
 
-`beacon status --snapshot` bounds history by default: 20 recent runs, 20 decisions per run, and 100 run-less decisions. Metric totals come from SQL aggregates, so limiting the payload does not change the counters. The `--recent-limit` and `--decisions-limit` flags tighten the snapshot without a rebuild.
+`--config` selects config.yaml for the read and run commands, including `status`, `control`, `dispatch` and `serve`. `init` ignores `--config` and always writes `.beacon/config.yaml` to the current directory.
 
-`beacon gc` calls `ForceRemove` on every worktree directory that no active run owns (`cmd/beacon/commands.go:189-227`). `ForceRemove` runs `git worktree remove --force` and deletes the branch without a clean check, so uncommitted work in an unused worktree is discarded (`internal/infra/workspace/git_worktree.go:468-482`, `pkg/core/errors.go:51-54`). Inspect those directories before running `gc`.
+`beacon control` requires `--action` and `--run-id`. The verbs are approve, unblock, cancel, retry, nudge and watch. `--sha` is the observed SHA used by approve. `--pr` is required for watch and binds the run to that pull request. `--message` is required for nudge. `--json` is deprecated and ignored; control always prints `{"ok":true,...}`. The other actions print the same shape with their own action and run ID.
+
+`beacon status` prints active runs as JSON. `--snapshot` returns one batched object with runs, bounded history and metric totals. `--recent` returns a bare JSON array of recently finished runs. `--daemon` returns daemon liveness and heartbeat age instead of runs. `--snapshot` bounds history by default: 20 recent runs, 20 decisions per run, and 100 run-less decisions. Metric totals come from SQL aggregates, so limiting the payload does not change the counters. The `--recent-limit` and `--decisions-limit` flags tighten the snapshot without a rebuild.
+
+`beacon dispatch [n]` starts up to n non-overlapping tasks, each in its own worktree. n defaults to 1. 0 is accepted and starts no tasks. A value that is not an integer returns the scan error. The command prints one JSON result.
+
+`beacon serve` reads its listen address from `BEACON_API_ADDR`, which defaults to `127.0.0.1:7432`. That variable is the only way to change the address. On start it writes the address, a fresh token and its PID to `.beacon/connection.json`. It prints nothing on success.
+
+`beacon gc` calls `ForceRemove` on every worktree directory that no active run owns (`cmd/beacon/commands.go:189-227`). It prints nothing on success and only writes removal errors to stderr. `ForceRemove` runs `git worktree remove --force` and deletes the branch without a clean check, so uncommitted work in an unused worktree is discarded (`internal/infra/workspace/git_worktree.go:468-482`, `pkg/core/errors.go:51-54`). Inspect those directories before running `gc`.
 
 ## MCP tools
 
