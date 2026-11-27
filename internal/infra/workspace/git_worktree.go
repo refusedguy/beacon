@@ -471,7 +471,10 @@ func (g *GitWorktree) refresh(ctx context.Context) {
 	if g.Refresher == nil {
 		return
 	}
-	if err := g.Refresher.RefreshWorktrees(ctx); err != nil {
+	// The removal or cleanup is already decided when the refresh runs. A
+	// cancelled caller must not skip the editor cleanup, so detach from its
+	// cancellation while keeping its values.
+	if err := g.Refresher.RefreshWorktrees(context.WithoutCancel(ctx)); err != nil {
 		slog.Warn("worktree refresh failed", "error", err)
 	}
 }
