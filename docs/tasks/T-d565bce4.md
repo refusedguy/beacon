@@ -1,7 +1,7 @@
 ---
 id: T-d565bce4
 title: 'P2: Cut planner scope-key allocations'
-status: available
+status: done
 scope:
     - internal/app/planner.go
     - internal/app/planner_test.go
