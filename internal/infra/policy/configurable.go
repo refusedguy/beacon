@@ -217,14 +217,15 @@ func evaluateChecks(names []string, o core.Observation) (core.Verdict, string) {
 	if o.AllRequiredPass(names) {
 		return core.VerdictNoop, ""
 	}
-	if o.WorkflowSkipped {
-		if _, failed := o.Failure(names...); !failed {
-			return core.VerdictNoop, ""
-		}
-	}
 	passed := func(state string) bool {
-		return state == string(core.CheckSuccess) ||
-			(state == string(core.CheckSkipped) && o.WorkflowSkipped)
+		switch core.CheckState(state) {
+		case core.CheckSuccess:
+			return true
+		case core.CheckSkipped:
+			return o.WorkflowSkipped
+		default:
+			return false
+		}
 	}
 	var notPassed []string
 	for _, want := range names {
@@ -235,12 +236,15 @@ func evaluateChecks(names []string, o core.Observation) (core.Verdict, string) {
 				break
 			}
 		}
+		if o.WorkflowSkipped && state == "missing" {
+			continue
+		}
 		if !passed(state) {
 			notPassed = append(notPassed, want+" ("+state+")")
 		}
 	}
 	if len(notPassed) == 0 {
-		return core.VerdictWait, "required checks are not green"
+		return core.VerdictNoop, ""
 	}
 	return core.VerdictWait, "required checks not passed: " + strings.Join(notPassed, ", ")
 }

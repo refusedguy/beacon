@@ -361,11 +361,12 @@ func checkState(c *github.CheckRun) core.CheckState {
 		return core.CheckPending
 	}
 	switch strings.ToLower(c.GetConclusion()) {
-	case "success", "neutral", "skipped", "cancelled":
-		if conclusion := strings.ToLower(c.GetConclusion()); conclusion == "skipped" || conclusion == "cancelled" {
-			return core.CheckSkipped
-		}
+	case "success", "neutral":
 		return core.CheckSuccess
+	case "skipped":
+		return core.CheckSkipped
+	case "cancelled":
+		return core.CheckCancelled
 	case "":
 		return core.CheckPending
 	default:
