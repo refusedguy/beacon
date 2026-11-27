@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1002,4 +1003,49 @@ func TestGitWorktreeForceRemoveReportsBranchDeleteFailure(t *testing.T) {
 	if !errors.Is(err, branchErr) {
 		t.Fatalf("ForceRemove() error = %v, want the branch delete failure", err)
 	}
+}
+
+func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock measurement")
+	}
+	ctx := context.Background()
+	const passes = 5
+	walls := make([]float64, 0, passes)
+	works := make([]int, 0, passes)
+	statuses := make([]int, 0, passes)
+	errs := 0
+	for i := 1; i <= passes; i++ {
+		wt, _ := newTestGitWorktree(t)
+		ws, err := wt.Create(ctx, core.Task{ID: core.TaskID(fmt.Sprintf("T-RM-LAT-%d", i))})
+		if err != nil {
+			t.Fatalf("Create() pass %d: %v", i, err)
+		}
+		calls, statusCalls := 0, 0
+		wt.commandHook = func(_ string, args []string) error {
+			calls++
+			if len(args) > 0 && args[0] == "status" {
+				statusCalls++
+			}
+			return nil
+		}
+		start := time.Now()
+		err = wt.Remove(ctx, ws)
+		wall := time.Since(start).Seconds()
+		walls = append(walls, wall)
+		works = append(works, calls)
+		statuses = append(statuses, statusCalls)
+		runErrs := 0
+		if err != nil {
+			runErrs = 1
+			errs++
+		}
+		t.Logf("run %d: wall=%.3fs work=%d status=%d errs=%d", i, wall, calls, statusCalls, runErrs)
+	}
+	sort.Float64s(walls)
+	sort.Ints(works)
+	sort.Ints(statuses)
+	fmt.Printf("worktree-remove: median=%.3fs range=%.3fs-%.3fs work=%d status=%d errs=%d limiter=git subprocess spawn and worktree metadata\n",
+		walls[len(walls)/2], walls[0], walls[len(walls)-1],
+		works[len(works)/2], statuses[len(statuses)/2], errs)
 }
