@@ -77,11 +77,33 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := ensureOperationResults(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 
 // Close closes the database handle.
 func (s *Store) Close() error { return s.db.Close() }
+
+// operationResultsDDL is the durable half of the MCP mutation journal. A row
+// holds the JSON result payload on success and the error text on failure, so a
+// retry after a restart receives the original outcome.
+const operationResultsDDL = `CREATE TABLE IF NOT EXISTS operation_results (
+  operation_id TEXT PRIMARY KEY,
+  payload TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+)`
+
+// ensureOperationResults adds the journal table to every state database,
+// including one opened before the table existed. It runs outside the schema
+// version marker so an already prepared database gains the table on open.
+func ensureOperationResults(db *sql.DB) error {
+	_, err := db.Exec(operationResultsDDL)
+	return err
+}
 
 // runColumns lists the run fields stored in one row.
 const runColumns = `id, task_id, state, pr_number, head_sha, observed_sha, observed_base_sha, session_id,
@@ -423,6 +445,33 @@ func scanRun(row scanner) (*core.Run, error) {
 	r.CreatedAt = time.Unix(0, created).UTC()
 	r.UpdatedAt = time.Unix(0, updated).UTC()
 	return &r, nil
+}
+
+// SaveOperation stores the outcome of one idempotent mutation. An empty
+// errText records success; a non-empty one records the failure so a retry
+// receives the original error instead of running the mutation again. The first
+// record wins: a late racing writer cannot replace a stored outcome.
+func (s *Store) SaveOperation(ctx context.Context, id, payload, errText string) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT OR IGNORE INTO operation_results (operation_id, payload, error, created_at)
+VALUES (?,?,?,?)`, id, payload, errText, nowUnix())
+	return err
+}
+
+// LoadOperation returns the stored payload and error text for id. found is
+// false when no operation with that id has completed.
+func (s *Store) LoadOperation(ctx context.Context, id string) (payload, errText string, found bool, err error) {
+	var storedPayload, storedError string
+	err = s.db.QueryRowContext(ctx,
+		`SELECT payload, error FROM operation_results WHERE operation_id=?`, id).
+		Scan(&storedPayload, &storedError)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return storedPayload, storedError, true, nil
 }
 
 // ClaimDelivery records key and reports whether this call inserted it.

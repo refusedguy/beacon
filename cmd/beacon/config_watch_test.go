@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -356,6 +357,148 @@ func TestConfigReloadUpdatesRequiredChecks(t *testing.T) {
 	decision := p.Evaluate(obs)
 	if decision.Verdict != core.VerdictWait || decision.Criterion != "required_checks" {
 		t.Fatalf("verdict = %+v, want required_checks wait", decision)
+	}
+}
+
+// writeWatchRepo writes a complete config under <root>/.beacon and a CI
+// workflow under <root>/.github/workflows. Required-check resolution derives
+// the project root from the config path, so both files must share a root.
+func writeWatchRepo(t *testing.T, mode, workflow string) (configPath, workflowPath string) {
+	t.Helper()
+	root := t.TempDir()
+	beaconDir := filepath.Join(root, ".beacon")
+	if err := os.MkdirAll(beaconDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath = filepath.Join(beaconDir, "config.yaml")
+	body := fmt.Sprintf("state_db: %s\nworkspace_dir: %s\nbase_branch: main\n"+
+		"task_source:\n  provider: markdown\n  dir: %s\n"+
+		"scm:\n  provider: github\n  owner: owner\n  repo: repo\n"+
+		"harness:\n  provider: opencode\n  endpoint: http://127.0.0.1:1\n  model: model-a\n  token: worker-token\n"+
+		"merge:\n  required_checks_mode: %s\n",
+		filepath.Join(root, "state.db"), filepath.Join(root, "worktrees"), root, mode)
+	writeWatchFile(t, configPath, body)
+
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workflowPath = filepath.Join(dir, "ci.yml")
+	writeWatchFile(t, workflowPath, workflow)
+	return configPath, workflowPath
+}
+
+// TestConfigReloadWatchesWorkflowJobRename confirms a ci.yml job rename
+// refreshes live required checks without a config edit or a harness restart.
+// The watcher hashes workflow files alongside the config file, and only the
+// policy changes in the live snapshot.
+func TestConfigReloadWatchesWorkflowJobRename(t *testing.T) {
+	const oldWorkflow = "name: CI\njobs:\n" +
+		"  build:\n    runs-on: ubuntu-latest\n" +
+		"  vet:\n    runs-on: ubuntu-latest\n"
+	path, workflowPath := writeWatchRepo(t, config.RequiredChecksWorkflow, oldWorkflow)
+	cw, _ := newTestWatcher(t, path)
+	before := cw.live.Load()
+	if want := []string{"build", "vet"}; !reflect.DeepEqual(before.cfg.Merge.RequiredChecks, want) {
+		t.Fatalf("initial required checks = %v, want %v", before.cfg.Merge.RequiredChecks, want)
+	}
+	p := &reloadablePolicy{live: &cw.live}
+	signal := before.relay.reloadSignal()
+
+	const newWorkflow = "name: CI\njobs:\n" +
+		"  verify:\n    runs-on: ubuntu-latest\n" +
+		"  test:\n    runs-on: ubuntu-latest\n"
+	writeWatchFile(t, workflowPath, newWorkflow)
+	if !cw.reload() {
+		t.Fatal("workflow-only change did not apply")
+	}
+
+	state := cw.live.Load()
+	if want := []string{"test", "verify"}; !reflect.DeepEqual(state.cfg.Merge.RequiredChecks, want) {
+		t.Fatalf("required checks after rename = %v, want %v", state.cfg.Merge.RequiredChecks, want)
+	}
+	obs := core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "test", State: core.CheckSuccess},
+		{Name: "verify", State: core.CheckSuccess},
+	}}
+	if got := p.Evaluate(obs); got.Verdict != core.VerdictMerge {
+		t.Fatalf("policy verdict after rename = %+v, want merge", got)
+	}
+	if got := p.Evaluate(core.Observation{PRState: "open", Checks: []core.CheckResult{
+		{Name: "build", State: core.CheckSuccess},
+		{Name: "vet", State: core.CheckSuccess},
+	}}); got.Verdict != core.VerdictWait || !strings.Contains(got.Reason, "verify") {
+		t.Fatalf("old check names still satisfy the policy: %+v", got)
+	}
+	if state.harness != before.harness {
+		t.Fatal("workflow-only change rebuilt the harness")
+	}
+	if state.policy == before.policy {
+		t.Fatal("workflow-only change did not refresh the policy")
+	}
+	if state.relay != before.relay || before.relay.reloadSignal() != signal {
+		t.Fatal("workflow-only change replaced the relay or broadcast a reload")
+	}
+	if state.generation != before.generation+1 {
+		t.Fatalf("generation = %d, want %d", state.generation, before.generation+1)
+	}
+}
+
+// TestConfigReloadWorkflowChangeLeavesManualChecks confirms that a workflow
+// rename in manual mode leaves the explicit list and the live state untouched.
+func TestConfigReloadWorkflowChangeLeavesManualChecks(t *testing.T) {
+	const oldWorkflow = "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n"
+	path, workflowPath := writeWatchRepo(t, config.RequiredChecksManual, oldWorkflow)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWatchFile(t, path, string(body)+"  required_checks: [deploy]\n")
+	cw, _ := newTestWatcher(t, path)
+	before := cw.live.Load()
+	signal := before.relay.reloadSignal()
+	if want := []string{"deploy"}; !reflect.DeepEqual(before.cfg.Merge.RequiredChecks, want) {
+		t.Fatalf("manual required checks = %v, want %v", before.cfg.Merge.RequiredChecks, want)
+	}
+
+	writeWatchFile(t, workflowPath, "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n")
+	if cw.reload() {
+		t.Fatal("workflow-only change in manual mode applied a reload")
+	}
+	state := cw.live.Load()
+	if state != before {
+		t.Fatal("workflow-only change in manual mode swapped live state")
+	}
+	if want := []string{"deploy"}; !reflect.DeepEqual(state.cfg.Merge.RequiredChecks, want) {
+		t.Fatalf("manual required checks changed to %v, want %v", state.cfg.Merge.RequiredChecks, want)
+	}
+	if state.harness != before.harness || state.policy != before.policy || state.relay != before.relay {
+		t.Fatal("workflow-only change in manual mode replaced a service")
+	}
+	if before.relay.reloadSignal() != signal {
+		t.Fatal("workflow-only change in manual mode broadcast a reload")
+	}
+}
+
+// TestConfigReloadWorkflowChangeKeepsPreviousOnInvalidConfig confirms the
+// invalid-config guard still holds when a workflow edit also changes the
+// watch hash.
+func TestConfigReloadWorkflowChangeKeepsPreviousOnInvalidConfig(t *testing.T) {
+	const oldWorkflow = "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n"
+	path, workflowPath := writeWatchRepo(t, config.RequiredChecksWorkflow, oldWorkflow)
+	cw, _ := newTestWatcher(t, path)
+	before := cw.live.Load()
+
+	writeWatchFile(t, workflowPath, "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n")
+	writeWatchFile(t, path, "harness: [unclosed\n")
+	if cw.reload() {
+		t.Fatal("invalid config applied alongside a workflow change")
+	}
+	if got := cw.live.Load(); got != before {
+		t.Fatal("invalid config replaced the live state")
+	}
+	if want := []string{"build"}; !reflect.DeepEqual(before.cfg.Merge.RequiredChecks, want) {
+		t.Fatalf("live required checks = %v, want %v", before.cfg.Merge.RequiredChecks, want)
 	}
 }
 
