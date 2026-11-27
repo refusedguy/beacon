@@ -14,13 +14,14 @@ import (
 // repeated here instead of reusing perfRow for the same reason.
 
 const (
-	controlPrefix  = "beacon-perf: "
-	controlKey     = "json-control"
-	controlLimiter = "encoding/json reflection over a fixed struct"
+	controlPrefix     = "beacon-perf: "
+	controlKey        = "json-control"
+	controlLimiter    = "encoding/json reflection over a fixed struct"
+	controlInnerIters = 2000
 
 	// Work and errs are constants. The control reports wall clock alone so a
 	// Beacon hotspot can be compared against it as a ratio.
-	controlWork = 1
+	controlWork = controlInnerIters
 	controlErrs = 0
 )
 
@@ -41,6 +42,10 @@ var controlFixture = controlPlan{
 	Tags:   []string{"alpha", "beta", "gamma"},
 }
 
+// controlSink holds the last marshaled payload so the compiler cannot drop the
+// inner loop as dead code.
+var controlSink []byte
+
 // controlRow is the canonical payload shared by every perf harness, declared
 // locally so the control has no dependency on a Beacon package.
 type controlRow struct {
@@ -60,8 +65,12 @@ type controlRow struct {
 func BenchmarkJSONControl(b *testing.B) {
 	start := time.Now()
 	for i := 0; i < b.N; i++ {
-		if _, err := json.Marshal(controlFixture); err != nil {
-			b.Fatal(err)
+		for j := 0; j < controlInnerIters; j++ {
+			data, err := json.Marshal(controlFixture)
+			if err != nil {
+				b.Fatal(err)
+			}
+			controlSink = data
 		}
 	}
 	ms := float64(time.Since(start)) / float64(time.Millisecond)
