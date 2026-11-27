@@ -1,7 +1,7 @@
 ---
 id: T-df77d6ed
 title: 'P5: Populate HotPaths allocation columns and snapshot assembly row'
-status: available
+status: in_progress
 scope:
   - internal/bench/report.go
   - internal/bench/bench_test.go

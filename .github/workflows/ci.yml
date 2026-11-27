@@ -557,6 +557,9 @@ jobs:
                 -bench '^BenchmarkHotPaths$' -benchtime=5x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkSnapshotAssemblyInMemory$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && taskset -c "$cpu" go test ./internal/infra/workspace/ -run '^TestGitWorktreeRemoveLatencyAlternating$' -count=1 -v) \
@@ -584,39 +587,84 @@ jobs:
           run_side head "$RUNNER_TEMP/perf-head"
           run_side base "$RUNNER_TEMP/perf-base"
 
-      # printReport writes to stdout while testing.B is still emitting the
-      # result line. The report text lands on that line and benchstat drops
-      # BenchmarkHotPaths together with its B/op and allocs/op columns. Put the
-      # report back on its own lines and give the timing row its benchmark name.
-      - name: Repair HotPaths benchmark lines
+      # The benchmarks now write their reports to stderr, so the result lines
+      # benchstat reads are clean and no post-processing is needed. The
+      # allocation columns still depend on the CSV parser, so pin its shape
+      # with a golden benchstat file and the very functions the comment builder
+      # uses. The parser is extracted between markers instead of copied.
+      - name: Golden compare.csv parser test
         continue-on-error: true
         run: |
           node - <<'NODE'
+          const assert = require('assert');
           const fs = require('fs');
-          const temp = process.env.RUNNER_TEMP;
-          for (const side of ['base', 'head']) {
-            const path = `${temp}/perf-${side}.txt`;
-            let lines;
-            try { lines = fs.readFileSync(path, 'utf8').split(/\r?\n/); }
-            catch (e) { console.log(`cannot read ${path}: ${e.message}`); continue; }
-            const out = [];
-            let hotPaths = false;
-            for (const line of lines) {
-              if (/^BenchmarkHotPaths[ \t]+hot paths:/.test(line)) {
-                hotPaths = true;
-                out.push(line.replace(/^BenchmarkHotPaths[ \t]+/, ''));
-                continue;
-              }
-              if (hotPaths && /^\s+\d+\s+[0-9.eE+-]+\s+ns\/op\b/.test(line) &&
-                  line.includes('B/op') && line.includes('allocs/op')) {
-                out.push(`BenchmarkHotPaths\t${line.replace(/^\s+/, '')}`);
-                hotPaths = false;
-                continue;
-              }
-              out.push(line);
-            }
-            fs.writeFileSync(path, out.join('\n'));
-          }
+          const os = require('os');
+          const path = require('path');
+          const source = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+          const begin = '// advisory-parser:begin';
+          const finish = '// advisory-parser:end';
+          const start = source.indexOf(begin);
+          const end = source.indexOf(finish);
+          assert.ok(start >= 0 && end > start, 'parser markers are missing');
+          const parser = source.slice(start + begin.length, end)
+            .split('\n').map(line => line.replace(/^\s+/, '')).join('\n');
+          const load = new Function('fs', 'notes',
+            parser + '\nreturn { readCompareCSV, benchNameMatches, metricOf };');
+          const notes = [];
+          const { readCompareCSV, benchNameMatches, metricOf } = load(fs, notes);
+          // Two benchstat config tables per unit, as emitted by -format csv.
+          // The base table uses perf-base.txt and the head table perf-head.txt.
+          const golden = `
+          ,perf-base.txt
+          ,ns/op,CI
+          HotPaths-8,19000000,2%
+          SQLiteSnapshot-8,2100000,1%
+          SnapshotAssemblyInMemory-8,900000,1%
+          geomean,3000000,1%
+          ,perf-head.txt
+          ,ns/op,CI
+          HotPaths-8,18500000,2%
+          SQLiteSnapshot-8,2000000,1%
+          SnapshotAssemblyInMemory-8,850000,1%
+          ,perf-base.txt
+          ,B/op,CI
+          HotPaths-8,18490738,1%
+          SQLiteSnapshot-8,900000,1%
+          SnapshotAssemblyInMemory-8,1500000,1%
+          ,perf-head.txt
+          ,B/op,CI
+          HotPaths-8,18000000,1%
+          SQLiteSnapshot-8,880000,1%
+          SnapshotAssemblyInMemory-8,1400000,1%
+          ,perf-base.txt
+          ,allocs/op,CI
+          HotPaths-8,2200,1%
+          SQLiteSnapshot-8,120,1%
+          SnapshotAssemblyInMemory-8,90,1%
+          ,perf-head.txt
+          ,allocs/op,CI
+          HotPaths-8,2100,1%
+          SQLiteSnapshot-8,110,1%
+          SnapshotAssemblyInMemory-8,80,1%
+          `.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n';
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beacon-golden-'));
+          const csv = path.join(dir, 'compare.csv');
+          fs.writeFileSync(csv, golden);
+          const metrics = readCompareCSV(csv);
+          assert.strictEqual(benchNameMatches('HotPaths-8', 'HotPaths'), true);
+          assert.strictEqual(benchNameMatches('HotPaths-8/extra', 'HotPaths'), true);
+          assert.strictEqual(benchNameMatches('SnapshotAssemblyInMemory-8', 'HotPaths'), false);
+          const eq = (got, want, label) => assert.deepStrictEqual(got, want,
+            `${label}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+          // The ten HotPaths plans share one allocation row.
+          eq(metricOf(metrics, 'card-parse', 'B/op'), { old: 18490738, next: 18000000 }, 'HotPaths B/op');
+          eq(metricOf(metrics, 'harness-spawn', 'allocs/op'), { old: 2200, next: 2100 }, 'HotPaths allocs/op');
+          eq(metricOf(metrics, 'sqlite-snapshot', 'allocs/op'), { old: 120, next: 110 }, 'snapshot allocs/op');
+          eq(metricOf(metrics, 'snapshot-assembly-in-memory', 'B/op'), { old: 1500000, next: 1400000 }, 'assembly B/op');
+          eq(metricOf(metrics, 'snapshot-assembly-in-memory', 'ns/op'), { old: 900000, next: 850000 }, 'assembly ns/op');
+          assert.strictEqual(metricOf(metrics, 'unwired-key', 'B/op'), null);
+          assert.strictEqual(metrics.get('ns/op').has('geomean'), false);
+          console.log('golden compare.csv parser test passed');
           NODE
 
       - name: Write per-side CSV and comparison
@@ -696,6 +744,7 @@ jobs:
           const notes = [];
           const allocDropPct = 5;
 
+          // advisory-parser:begin
           const readLines = path => {
             try { return fs.readFileSync(path, 'utf8').split(/\r?\n/); }
             catch (e) { notes.push(`cannot read ${path}: ${e.message}`); return []; }
@@ -773,6 +822,7 @@ jobs:
             'reconcile-tick-counts': 'ReconcileTickCounts',
             'base-red-check': 'BaseRedCheck',
             'base-red-block': 'BaseRedBlockFanout',
+            'snapshot-assembly-in-memory': 'SnapshotAssemblyInMemory',
             'json-control': 'JSONControl',
             'http-frame-emission': 'HTTPFramesEmission',
             'go-tui-view': 'GoTUIView',
@@ -814,6 +864,7 @@ jobs:
             return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
           };
           const fmt = (x, digits = 3) => Number.isFinite(x) ? x.toFixed(digits) : '-';
+          // advisory-parser:end
 
           // Names, limiter text and the noise policy come from the registry on
           // the base ref. A fork PR cannot rewrite these inputs.
@@ -1255,6 +1306,9 @@ jobs:
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkHotPaths$' -benchtime=5x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkSnapshotAssemblyInMemory$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
