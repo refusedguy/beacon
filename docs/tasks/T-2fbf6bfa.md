@@ -1,7 +1,7 @@
 ---
 id: T-2fbf6bfa
 title: Fix architecture boundary violations in core and TUI
-status: available
+status: done
 scope:
     - ui/tui/sse.go
     - ui/tui/api.go

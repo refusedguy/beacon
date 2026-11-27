@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"os"
+	"strings"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -81,13 +82,27 @@ func outcomeForRun(run *core.Run) dispatchOutcome {
 	}
 }
 
+// normalizeLaunchSource maps caller metadata onto the neutral tokens core
+// accepts. Vendor names stay at this boundary so core never learns a product's
+// name. Unknown values pass through and resolve to daemon in core.
+func normalizeLaunchSource(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "opencode":
+		return string(core.LaunchMCP)
+	case "tui":
+		return string(core.LaunchUI)
+	default:
+		return raw
+	}
+}
+
 // dispatchCaller reads the launch source and agent from MCP metadata. A call
 // through this tool is an MCP launch unless a caller declares another source,
 // as the CLI does when it forwards through the same transport.
 func dispatchCaller(req *msdk.CallToolRequest) (core.LaunchSource, string) {
 	source := core.LaunchMCP
 	if raw := metaString(req, "beacon/launchSource", "beacon/launch_source", "ai.opencode/launchSource"); raw != "" {
-		source = core.ParseLaunchSource(raw)
+		source = core.ParseLaunchSource(normalizeLaunchSource(raw))
 	}
 	return source, metaString(req, "beacon/agent", "ai.opencode/agent")
 }

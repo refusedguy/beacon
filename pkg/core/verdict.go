@@ -60,41 +60,19 @@ func CIWallSeconds(checks []CheckResult) int64 {
 	return int64(end.Sub(start).Seconds())
 }
 
-// PRState is the state a provider reports for a pull request. GitHub and
-// GitLab use different tokens for an open request, so callers classify state
-// through IsClosed and IsMerged instead of comparing raw strings.
+// PRState is a provider-neutral pull request state. Each SCM adapter maps its
+// provider's raw tokens onto these outcomes before building an Observation, so
+// no provider vocabulary lives in core.
 type PRState string
 
-const (
-	// PROpen is GitHub's open pull request state.
-	PROpen PRState = "open"
-	// PROpened is GitLab's open merge request state.
-	PROpened PRState = "opened"
-	// PRClosed is a pull request closed without a merge.
-	PRClosed PRState = "closed"
-	// PRMerged is a pull request closed by a merge.
-	PRMerged PRState = "merged"
-	// PRLocked is a closed and locked pull request.
-	PRLocked PRState = "locked"
-)
-
-// IsClosed reports whether s is a final state. Closed, merged and locked pull
+// IsClosed reports whether s is a final state. Closed, merged and locked
 // requests are final; an open or unknown state is not.
-func (s PRState) IsClosed() bool {
-	switch strings.ToLower(string(s)) {
-	case string(PRClosed), string(PRMerged), string(PRLocked):
-		return true
-	default:
-		return false
-	}
-}
+func (s PRState) IsClosed() bool { return DecideFinalState(string(s)).Closed }
 
 // IsMerged reports whether s is a merged pull request.
-func (s PRState) IsMerged() bool {
-	return strings.ToLower(string(s)) == string(PRMerged)
-}
+func (s PRState) IsMerged() bool { return DecideFinalState(string(s)).Merged }
 
-// FinalState is the shared classification of a provider's pull request state.
+// FinalState is the shared, provider-neutral classification of a pull request.
 type FinalState struct {
 	// Closed reports whether the request is closed, merged or locked.
 	Closed bool
@@ -102,12 +80,19 @@ type FinalState struct {
 	Merged bool
 }
 
-// DecideFinalState classifies a raw provider state once for every final-state
+// DecideFinalState classifies a normalized state once for every final-state
 // handler. Open, unknown and empty states are not final, so no handler can
-// finalize a pull request Beacon still treats as open.
+// finalize a pull request Beacon still treats as open. SCM adapters own the
+// mapping from a provider's raw tokens to these outcomes.
 func DecideFinalState(raw string) FinalState {
-	state := PRState(raw)
-	return FinalState{Closed: state.IsClosed(), Merged: state.IsMerged()}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "merged":
+		return FinalState{Closed: true, Merged: true}
+	case "closed", "locked":
+		return FinalState{Closed: true}
+	default:
+		return FinalState{}
+	}
 }
 
 // Observation is a provider snapshot of a pull request at one point in time.

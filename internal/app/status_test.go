@@ -491,9 +491,11 @@ func TestLaunchSourceCoversMCPCLIUIAndDaemon(t *testing.T) {
 		raw  string
 		want core.LaunchSource
 	}{
-		{"mcp", core.LaunchMCP}, {"opencode", core.LaunchMCP},
-		{"cli", core.LaunchCLI}, {"ui", core.LaunchUI}, {"tui", core.LaunchUI},
+		{"mcp", core.LaunchMCP},
+		{"cli", core.LaunchCLI}, {"ui", core.LaunchUI},
 		{"daemon", core.LaunchDaemon}, {"", core.LaunchDaemon}, {"token-abc", core.LaunchDaemon},
+		// Vendor tokens are normalized at the MCP boundary; core stays neutral.
+		{"opencode", core.LaunchDaemon}, {"tui", core.LaunchDaemon},
 	}
 	for _, tc := range cases {
 		if got := core.ParseLaunchSource(tc.raw); got != tc.want {
