@@ -122,6 +122,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		run.PRNumber = pr
 	}
 	defer r.Decisions.logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
+	// Classify a final PR state before any approval lookup or policy decision.
+	// A merged or closed PR is final even when a provider call fails, so the
+	// run can close without waiting on unrelated signals.
 	if core.DecideFinalState(obs.PRState).Closed {
 		return core.MergeDecision{Verdict: core.VerdictWait, Reason: "pull request " + obs.PRState}, r.finalizeExternal(ctx, run, obs)
 	}
@@ -137,8 +140,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 // applyAndSave applies e and persists the run. A non-zero obs notes both the
 // head and base SHA; the zero value leaves the recorded observation untouched.
 func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Event, obs core.Observation) error {
-	if err := run.Apply(e); err != nil {
-		return err
+	if e.Kind != "" {
+		if err := run.Apply(e); err != nil {
+			return err
+		}
 	}
 	if obs.HeadSHA != "" || obs.BaseSHA != "" {
 		run.NoteObservation(obs.HeadSHA, obs.BaseSHA)
@@ -259,7 +264,9 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 		return fmt.Errorf("wake: %w", err)
 	}
 	r.Decisions.logTransitionWake(ctx, run.ID, obs.PRNumber, "woke")
-	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed, Reason: reason}, obs)
+	// The fix request has been delivered. The new waiting-ci run must not keep
+	// showing the old failure as its current reason.
+	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed}, obs)
 }
 
 // hasAgentSlot delegates the wake decision to the injected AgentSlots policy.

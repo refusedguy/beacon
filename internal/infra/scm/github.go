@@ -140,6 +140,11 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		Conflict: conflict,
 	}
 
+	// A closed or merged PR is final. Do not let a failed check, approval or
+	// compare call hide the final state and freeze its run in waiting_ci.
+	if core.DecideFinalState(state).Closed {
+		return o, nil
+	}
 	base := p.GetBase().GetRef()
 	if base == "" {
 		base = g.base
@@ -217,7 +222,10 @@ func (g *GitHub) fetchSignals(ctx context.Context, pr int, sha, base string) git
 	return out
 }
 
-// checks returns the check runs for commit sha.
+// checks returns the check runs for commit sha. GitHub lists every attempt of
+// a named check on a SHA, so a cancelled earlier attempt must not shadow a
+// later success. Keep the newest attempt per name by completion time, breaking
+// ties by start time, and map a cancelled conclusion to skipped.
 func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, error) {
 	checkRuns, err := paginate(g.br, func(opts *github.ListOptions) ([]*github.CheckRun, *github.Response, error) {
 		res, resp, err := g.Client.Checks.ListCheckRunsForRef(ctx, g.Owner, g.Repo, sha, &github.ListCheckRunsOptions{
@@ -231,8 +239,16 @@ func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, er
 	if err != nil {
 		return nil, err
 	}
-	var out []core.CheckResult
+	latest := make(map[string]*github.CheckRun, len(checkRuns))
 	for _, c := range checkRuns {
+		name := c.GetName()
+		prev := latest[name]
+		if prev == nil || checkRunNewer(c, prev) {
+			latest[name] = c
+		}
+	}
+	out := make([]core.CheckResult, 0, len(latest))
+	for _, c := range latest {
 		out = append(out, core.CheckResult{
 			Name:        c.GetName(),
 			State:       checkState(c),
@@ -244,14 +260,25 @@ func (g *GitHub) checks(ctx context.Context, sha string) ([]core.CheckResult, er
 	return out, nil
 }
 
+// checkRunNewer reports whether c is a later attempt than prev. Completion time
+// orders attempts; a still-running attempt is newer than a completed one only
+// when it started later, so a new attempt after a red one wins.
+func checkRunNewer(c, prev *github.CheckRun) bool {
+	ct, pt := c.GetCompletedAt().Time, prev.GetCompletedAt().Time
+	if !ct.Equal(pt) {
+		return ct.After(pt)
+	}
+	return c.GetStartedAt().Time.After(prev.GetStartedAt().Time)
+}
+
 // checkState maps a GitHub check run to a core.CheckState.
 func checkState(c *github.CheckRun) core.CheckState {
 	if c.GetStatus() != "completed" {
 		return core.CheckPending
 	}
 	switch strings.ToLower(c.GetConclusion()) {
-	case "success", "neutral", "skipped":
-		if c.GetConclusion() == "skipped" {
+	case "success", "neutral", "skipped", "cancelled":
+		if conclusion := strings.ToLower(c.GetConclusion()); conclusion == "skipped" || conclusion == "cancelled" {
 			return core.CheckSkipped
 		}
 		return core.CheckSuccess

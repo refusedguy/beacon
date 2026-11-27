@@ -171,7 +171,9 @@ func activeTaskStates(ctx context.Context, store any, ids []string) (map[string]
 			if err != nil {
 				return nil, err
 			}
-			if run != nil {
+			// A terminal run is authoritative: its PR was merged, closed or
+			// cancelled. It must not act as a phantom in-flight blocker.
+			if run != nil && !run.State.Terminal() {
 				active[id] = run.State
 			}
 		}

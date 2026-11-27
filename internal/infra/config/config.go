@@ -30,6 +30,14 @@ const DefaultMaxAutoRebases = app.DefaultMaxAutoRebases
 // never passed through Load.
 const defaultPollInterval = 30 * time.Second
 
+// Concurrency defaults shared by ApplyDefaults and defaults. Both paths must
+// raise the same number of in-flight runs and active agents when a config
+// leaves the values unset.
+const (
+	DefaultMaxInFlight     = 20
+	DefaultMaxActiveAgents = 4
+)
+
 // DefaultWorkerInstructions is prepended to worker spawn prompts when the
 // operator does not configure harness.worker_instructions. It combines the
 // shared weak-machine verification rule with the MCP-only tool rule, and stays
@@ -252,8 +260,32 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
 	ApplyDefaults(&c)
+	if err := validateRequiredCheckFallback(&c, path); err != nil {
+		return c, fmt.Errorf("config %s: %w", path, err)
+	}
 	resolveRequiredChecks(&c, path)
 	return c, nil
+}
+
+// validateRequiredCheckFallback rejects manual check names that GitHub never
+// reports as a standalone check. A stale fallback that names a matrix parent
+// or a reusable workflow's inner job would wait forever for a check that no
+// workflow emits. The check is skipped when the project has no workflows, so
+// a standalone config keeps its explicit list.
+func validateRequiredCheckFallback(c *Config, path string) error {
+	if len(c.Merge.RequiredChecks) == 0 {
+		return nil
+	}
+	unreportable := make(map[string]bool)
+	for _, name := range shared.DetectUnreportableJobNames(projectRootFromConfigPath(path)) {
+		unreportable[name] = true
+	}
+	for _, name := range c.Merge.RequiredChecks {
+		if unreportable[name] {
+			return fmt.Errorf("merge.required_checks contains %q, a name GitHub never reports", name)
+		}
+	}
+	return nil
 }
 
 // ApplyDefaults fills unset scalar settings. Load and beacon init both call
@@ -276,10 +308,10 @@ func ApplyDefaults(c *Config) {
 		c.Merge.MaxAutoRebases = DefaultMaxAutoRebases
 	}
 	if c.Concurrency.MaxInFlight <= 0 {
-		c.Concurrency.MaxInFlight = 20
+		c.Concurrency.MaxInFlight = DefaultMaxInFlight
 	}
-	if c.Concurrency.MaxActiveAgents < 0 {
-		c.Concurrency.MaxActiveAgents = 0
+	if c.Concurrency.MaxActiveAgents <= 0 {
+		c.Concurrency.MaxActiveAgents = DefaultMaxActiveAgents
 	}
 	if c.OnBaseRed.Mode == "" {
 		c.OnBaseRed.Mode = "spawn_fixer"
@@ -353,7 +385,7 @@ func defaults() Config {
 		BaseBranch:   "main",
 		PollInterval: "30s",
 		interval:     defaultPollInterval,
-		Concurrency:  Concurrency{MaxInFlight: 20, MaxActiveAgents: 4},
+		Concurrency:  Concurrency{MaxInFlight: DefaultMaxInFlight, MaxActiveAgents: DefaultMaxActiveAgents},
 		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
 		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
 		Harness:      Harness{WorkerInstructions: DefaultWorkerInstructions},

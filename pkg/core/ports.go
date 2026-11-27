@@ -126,6 +126,14 @@ type MergePolicy interface {
 	Evaluate(Observation) MergeDecision
 }
 
+// RequiredCheckPolicy is the optional capability a policy may expose to name
+// the checks a merge must pass. Decide uses it to scope the failure invariant:
+// a failed optional check must not block a merge. A policy without the
+// capability keeps the conservative all-checks behavior.
+type RequiredCheckPolicy interface {
+	RequiredChecks() ([]string, bool)
+}
+
 // RequiredCheckSource supplies the names of checks a merge must pass. Policy
 // reads names through this port, so it does not depend on where they come from:
 // an explicit config list, a CI workflow file and a future provider's check
