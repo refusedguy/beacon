@@ -29,6 +29,14 @@ const (
 	deepActive    = 1000
 	deepRecent    = 20
 	deepSeed      = 20261126
+
+	// Smoke sizes keep the same seed and modulo distributions as the deep
+	// fixture, so one bounded PR pass reads a fixed amount of work in seconds.
+	smokeRuns      = 2000
+	smokeDecisions = 10000
+	smokeEvents    = 40000
+	smokeActive    = 200
+	smokeRecent    = 20
 )
 
 // snapshotEnv holds one seeded state database and the ids a snapshot reads.
@@ -57,11 +65,19 @@ func deepSize(name string, fallback int) int {
 // measures seconds, not minutes, on the benchmark machine.
 func newSnapshotEnv(b *testing.B) *snapshotEnv {
 	b.Helper()
-	runs := deepSize("BEACON_DEEP_RUNS", deepRuns)
-	decisions := deepSize("BEACON_DEEP_DECISIONS", deepDecisions)
-	events := deepSize("BEACON_DEEP_EVENTS", deepEvents)
-	active := deepSize("BEACON_DEEP_ACTIVE", deepActive)
-	recent := deepSize("BEACON_DEEP_RECENT", deepRecent)
+	fallbackRuns, fallbackDecisions, fallbackEvents := deepRuns, deepDecisions, deepEvents
+	fallbackActive, fallbackRecent := deepActive, deepRecent
+	if smokeMode() {
+		fallbackRuns, fallbackDecisions, fallbackEvents = smokeRuns, smokeDecisions, smokeEvents
+		fallbackActive, fallbackRecent = smokeActive, smokeRecent
+	}
+	// deepSize reads the environment first, so explicit BEACON_DEEP_* values
+	// still win over the smoke fallback.
+	runs := deepSize("BEACON_DEEP_RUNS", fallbackRuns)
+	decisions := deepSize("BEACON_DEEP_DECISIONS", fallbackDecisions)
+	events := deepSize("BEACON_DEEP_EVENTS", fallbackEvents)
+	active := deepSize("BEACON_DEEP_ACTIVE", fallbackActive)
+	recent := deepSize("BEACON_DEEP_RECENT", fallbackRecent)
 	if active > runs {
 		active = runs
 	}
@@ -221,35 +237,49 @@ type snapshotSample struct {
 // BenchmarkSQLiteSnapshot is the repeatable deep-snapshot command. It reports
 // the median and range of a full snapshot read at 500k decisions, 100k runs
 // and 2M run events, with work and error counts from the final pass.
+//
+// CI runs a bounded smoke pass with BEACON_BENCH_SMOKE=1 and -benchtime=1x:
+//
+//	BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' -bench '^BenchmarkSQLiteSnapshot$' -benchtime=1x -count=1 -benchmem ./internal/bench/
+//
+// Smoke mode uses smaller fixture sizes, skips the warm pass and both
+// profiles, and still prints the sizes actually used so base and head can be
+// checked for identical work. The seed, modulo distributions, report and
+// counts stay the same.
 func BenchmarkSQLiteSnapshot(b *testing.B) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	e := newSnapshotEnv(b)
-	_, _ = runSnapshotQueries(e) // warm page cache and prepared plans
+	if !smokeMode() {
+		_, _ = runSnapshotQueries(e) // warm page cache and prepared plans
+	}
 
 	// Profiles start after the fixture and warmup so they describe the timed
-	// snapshot loop rather than millions of fixture inserts.
+	// snapshot loop rather than millions of fixture inserts. Smoke mode skips
+	// them so one bounded pass stays well under the CI limit.
 	var cpuFile, heapFile *os.File
-	var err error
-	if path := os.Getenv("BEACON_DEEP_CPUPROFILE"); path != "" {
-		cpuFile, err = os.Create(path)
-		if err != nil {
-			b.Fatal(err)
+	if !smokeMode() {
+		var err error
+		if path := os.Getenv("BEACON_DEEP_CPUPROFILE"); path != "" {
+			cpuFile, err = os.Create(path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := pprof.StartCPUProfile(cpuFile); err != nil {
+				b.Fatal(err)
+			}
+			defer func() {
+				pprof.StopCPUProfile()
+				_ = cpuFile.Close()
+			}()
 		}
-		if err := pprof.StartCPUProfile(cpuFile); err != nil {
-			b.Fatal(err)
+		if path := os.Getenv("BEACON_DEEP_MEMPROFILE"); path != "" {
+			heapFile, err = os.Create(path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = heapFile.Close() }()
 		}
-		defer func() {
-			pprof.StopCPUProfile()
-			_ = cpuFile.Close()
-		}()
-	}
-	if path := os.Getenv("BEACON_DEEP_MEMPROFILE"); path != "" {
-		heapFile, err = os.Create(path)
-		if err != nil {
-			b.Fatal(err)
-		}
-		defer func() { _ = heapFile.Close() }()
 	}
 
 	b.ResetTimer()
