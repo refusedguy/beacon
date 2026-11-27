@@ -1,7 +1,6 @@
 package core
 
 import (
-	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -39,21 +38,66 @@ func PRFromText(s string) int {
 	return n
 }
 
+// writeInt appends a decimal integer without boxing it through fmt. The
+// scratch array holds the digits on the stack until Builder.Write copies them.
+func writeInt(b *strings.Builder, n int) {
+	var digits [20]byte
+	b.Write(strconv.AppendInt(digits[:0], int64(n), 10))
+}
+
 // WakeText renders the correction prompt used by the ACP and CLI harnesses.
 func WakeText(w WakeContext) string {
-	return fmt.Sprintf("Beacon correction for run %s, PR #%d, head %s.\nReason: %s\n%s\nFix the issue, push and %s\n",
-		w.RunID, w.PRNumber, w.HeadSHA, w.Reason, w.Excerpt, OpenPRAndWatchInstruction)
+	var b strings.Builder
+	b.Grow(len("Beacon correction for run ") + len(w.RunID) + len(", PR #") + 20 +
+		len(", head ") + len(w.HeadSHA) + len(".\nReason: ") + len(w.Reason) +
+		len("\n") + len(w.Excerpt) + len("\nFix the issue, push and ") +
+		len(OpenPRAndWatchInstruction) + len("\n"))
+	b.WriteString("Beacon correction for run ")
+	b.WriteString(string(w.RunID))
+	b.WriteString(", PR #")
+	writeInt(&b, w.PRNumber)
+	b.WriteString(", head ")
+	b.WriteString(w.HeadSHA)
+	b.WriteString(".\nReason: ")
+	b.WriteString(w.Reason)
+	b.WriteByte('\n')
+	b.WriteString(w.Excerpt)
+	b.WriteString("\nFix the issue, push and ")
+	b.WriteString(OpenPRAndWatchInstruction)
+	b.WriteByte('\n')
+	return b.String()
 }
 
 // WakeTextLimited renders a correction prompt that carries retry counters and
 // caps the excerpt. A non-positive limit keeps the full excerpt.
 func WakeTextLimited(w WakeContext, limit int) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "correction run=%s pr=%d head=%s rebase=%d fix=%d\n",
-		w.RunID, w.PRNumber, w.HeadSHA, w.RebaseTry, w.FixTry)
-	fmt.Fprintf(&b, "reason: %s\n", w.Reason)
+	excerpt := ""
 	if w.Excerpt != "" {
-		fmt.Fprintf(&b, "excerpt: %s\n", TruncateExcerpt(w.Excerpt, limit))
+		excerpt = TruncateExcerpt(w.Excerpt, limit)
+	}
+	var b strings.Builder
+	b.Grow(len("correction run=") + len(w.RunID) + len(" pr=") + 20 +
+		len(" head=") + len(w.HeadSHA) + len(" rebase=") + 20 + len(" fix=") + 20 +
+		len("\nreason: ") + len(w.Reason) + len("\nexcerpt: ") + len(excerpt) +
+		len("\n") + len("fix the issue, push, ") +
+		len(OpenPRAndWatchInstruction))
+	b.WriteString("correction run=")
+	b.WriteString(string(w.RunID))
+	b.WriteString(" pr=")
+	writeInt(&b, w.PRNumber)
+	b.WriteString(" head=")
+	b.WriteString(w.HeadSHA)
+	b.WriteString(" rebase=")
+	writeInt(&b, w.RebaseTry)
+	b.WriteString(" fix=")
+	writeInt(&b, w.FixTry)
+	b.WriteString("\nreason: ")
+	b.WriteString(w.Reason)
+	b.WriteByte('\n')
+	if w.Excerpt != "" {
+		b.WriteString("excerpt: ")
+		b.WriteString(excerpt)
+		b.WriteByte('\n')
 	}
 	b.WriteString("fix the issue, push, " + OpenPRAndWatchInstruction)
 	return b.String()
