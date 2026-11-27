@@ -553,6 +553,7 @@ func main() {
 	root.AddCommand(newDoctorCommand(configPath))
 	root.AddCommand(newDispatchCommand(configPath, wire))
 	root.AddCommand(newStatusCommand(configPath))
+	root.AddCommand(newReportCommand(configPath))
 	root.AddCommand(newExplainCommand(configPath, wire))
 	root.AddCommand(newControlCommand(configPath, wire))
 	root.AddCommand(newMCPCommand(configPath))
