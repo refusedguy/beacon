@@ -4,9 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -337,24 +336,27 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 	}
 }
 
-// reconcileActivePRs fans active pull requests out with a bounded group. A
+// reconcileActivePRs fans active pull requests out with a bounded semaphore. A
 // single slow SCM observe no longer holds up every other PR on the tick. Each
 // reconcile still runs through safeReconcile, so one bad PR cannot stop the
-// others or return an error to the group.
+// others. The wait covers every goroutine even when a slot blocks on a slow PR.
 func (r *Reconciler) reconcileActivePRs(ctx context.Context, runs []*core.Run) {
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(reconcileFanout)
+	sem := make(chan struct{}, reconcileFanout)
+	var wg sync.WaitGroup
 	for _, run := range runs {
 		if run.PRNumber <= 0 {
 			continue
 		}
 		pr := run.PRNumber
-		g.Go(func() error {
-			r.safeReconcile(gctx, pr)
-			return nil
-		})
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			r.safeReconcile(ctx, pr)
+		}()
 	}
-	_ = g.Wait()
+	wg.Wait()
 }
 
 func (r *Reconciler) safeReconcile(ctx context.Context, pr int) {
