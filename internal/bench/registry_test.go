@@ -2,6 +2,7 @@ package bench
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"regexp"
 	"strconv"
@@ -133,6 +134,80 @@ func TestRegistryKeysResolveToEmittedMetrics(t *testing.T) {
 				t.Errorf("metric %q for key %q is not emitted by any benchmark", metric, spec.Key)
 			}
 		}
+	}
+}
+
+// TestRegistryControlSpec ties the registry's control entry to the constants
+// in the control benchmark. The control stays independent of Beacon code, so
+// this cross-check keeps the registry the owner of its name and limiter text.
+func TestRegistryControlSpec(t *testing.T) {
+	if controlSpecKey != controlKey || controlSpecLimiter != controlLimiter {
+		t.Fatal("registry control name or limiter drifted from the benchmark")
+	}
+	var control Spec
+	for _, spec := range Registry() {
+		if spec.Key == controlKey {
+			control = spec
+		}
+	}
+	if control.Key == "" {
+		t.Fatalf("registry has no spec for control key %q", controlKey)
+	}
+	if control.Limiter != controlLimiter {
+		t.Errorf("control limiter = %q, want %q", control.Limiter, controlLimiter)
+	}
+	if control.Placement != PlacementBoth {
+		t.Errorf("control placement = %q, want %q", control.Placement, PlacementBoth)
+	}
+	if control.Unit != "ns" || control.WorkMetric != "work" || control.ErrMetric != "errs" {
+		t.Errorf("control metrics = %q, %q, %q; want ns, work, errs", control.Unit, control.WorkMetric, control.ErrMetric)
+	}
+	if control.ThresholdPct <= 0 {
+		t.Errorf("control threshold = %v, want positive", control.ThresholdPct)
+	}
+}
+
+// TestRegistryNoiseBlock proves the generated document carries a top-level
+// noise block whose fields are owned by DefaultNoisePolicy in registry.go.
+func TestRegistryNoiseBlock(t *testing.T) {
+	data, err := EncodeRegistry()
+	if err != nil {
+		t.Fatalf("encode registry: %v", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("decode registry: %v", err)
+	}
+	raw, ok := doc["noise"]
+	if !ok {
+		t.Fatal("registry document has no noise block")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("decode noise block: %v", err)
+	}
+	want := []string{"defaultFloorPct", "maxAgeHours", "minSamples", "quantile"}
+	if len(fields) != len(want) {
+		t.Fatalf("noise block has %d fields, want %d: %s", len(fields), len(want), raw)
+	}
+	for _, name := range want {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("noise block is missing %q: %s", name, raw)
+		}
+	}
+	var got NoisePolicy
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode noise policy: %v", err)
+	}
+	if got != DefaultNoisePolicy() {
+		t.Errorf("noise policy = %+v, want %+v", got, DefaultNoisePolicy())
+	}
+	policy := DefaultNoisePolicy()
+	if policy.DefaultFloorPct <= 0 || policy.MaxAgeHours <= 0 || policy.MinSamples <= 0 {
+		t.Errorf("noise policy has a non-positive field: %+v", policy)
+	}
+	if policy.Quantile <= 0 || policy.Quantile >= 1 {
+		t.Errorf("noise quantile = %v, want between 0 and 1", policy.Quantile)
 	}
 }
 

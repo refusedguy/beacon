@@ -36,11 +36,42 @@ var prHarnessLimiters = []struct{ key, limiter string }{
 	{"run-watcher-fp", "JSON.stringify character volume"},
 }
 
+// The pure control benchmark owns no Beacon code, so its canonical name and
+// limiter string are declared here. The registry is their single owner; the
+// drift test cross-checks them against the control's local constants.
+const (
+	controlSpecKey     = "json-control"
+	controlSpecLimiter = "encoding/json reflection over a fixed struct"
+)
+
+// NoisePolicy is the calibration policy for the advisory comparison. A floor
+// is calibrated from no-change samples; until enough recent samples exist the
+// consumer uses DefaultFloorPct.
+type NoisePolicy struct {
+	DefaultFloorPct float64 `json:"defaultFloorPct"`
+	MaxAgeHours     int     `json:"maxAgeHours"`
+	MinSamples      int     `json:"minSamples"`
+	Quantile        float64 `json:"quantile"`
+}
+
+// DefaultNoisePolicy returns the policy the registry publishes. One week of
+// nightly no-change samples is enough for the high quantile, with a five
+// sample minimum before a calibrated floor replaces the default.
+func DefaultNoisePolicy() NoisePolicy {
+	return NoisePolicy{
+		DefaultFloorPct: 2,
+		MaxAgeHours:     168,
+		MinSamples:      5,
+		Quantile:        0.95,
+	}
+}
+
 // registryDocument is the on-disk shape of the generated JSON. Keeping the
 // specs under a key lets a consumer add document metadata without changing the
 // array shape.
 type registryDocument struct {
-	Specs []Spec `json:"specs"`
+	Noise NoisePolicy `json:"noise"`
+	Specs []Spec      `json:"specs"`
 }
 
 // Registry returns the typed benchmark registry in report order. The name
@@ -49,7 +80,7 @@ type registryDocument struct {
 // for each benchmark that reports a median, so the generated JSON has one
 // authoritative source.
 func Registry() []Spec {
-	specs := make([]Spec, 0, len(hotspotOrder)+1+len(snapshotLimiters)+len(prHarnessLimiters))
+	specs := make([]Spec, 0, len(hotspotOrder)+2+len(snapshotLimiters)+len(prHarnessLimiters))
 	for _, name := range hotspotOrder {
 		specs = append(specs, Spec{
 			Key:          name,
@@ -99,13 +130,29 @@ func Registry() []Spec {
 			ThresholdPct: 15,
 		})
 	}
+	// The control emits fixed work and errs in the canonical row fields, so
+	// those field names are its work and err metrics. Both pipelines read the
+	// control row: the advisory job compares ratios to it, the nightly gate
+	// rejects a pass when it moves.
+	specs = append(specs, Spec{
+		Key:          controlSpecKey,
+		Limiter:      controlSpecLimiter,
+		Unit:         "ns",
+		WorkMetric:   "work",
+		ErrMetric:    "errs",
+		Placement:    PlacementBoth,
+		ThresholdPct: 15,
+	})
 	return specs
 }
 
 // EncodeRegistry renders Registry() as the committed JSON document. The
 // generator and the drift test both call it, so the wire format has one owner.
 func EncodeRegistry() ([]byte, error) {
-	data, err := json.MarshalIndent(registryDocument{Specs: Registry()}, "", "  ")
+	data, err := json.MarshalIndent(registryDocument{
+		Noise: DefaultNoisePolicy(),
+		Specs: Registry(),
+	}, "", "  ")
 	if err != nil {
 		return nil, err
 	}
