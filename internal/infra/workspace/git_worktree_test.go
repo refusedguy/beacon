@@ -1030,6 +1030,37 @@ func TestGitWorktreeRemoveCleanPathLimitsGitCalls(t *testing.T) {
 	}
 }
 
+func TestGitWorktreeRemoveDirtyPathClassifiesWithOneProbe(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-RM-DIRTY"})
+	if err != nil {
+		t.Fatalf("wt.Create(ctx, core.Task{ID: \"T-RM-DIRTY\"}): %v", err)
+	}
+	dirty := filepath.Join(ws.Path, "agent.txt")
+	if err := os.WriteFile(dirty, []byte("agent work\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(dirty, ...): %v", err)
+	}
+	var calls [][]string
+	wt.commandHook = func(_ string, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	err = wt.Remove(ctx, ws)
+	if core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("Remove() error = %v, want CodeConflict for a dirty worktree", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("Remove() ran %d git commands on a dirty path, want 2: %v", len(calls), calls)
+	}
+	if calls[0][0] != "worktree" || calls[1][0] != "status" {
+		t.Fatalf("Remove() probe order = %v, want worktree remove then status", calls)
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Fatalf("agent file removed by a rejected Remove(): %v", err)
+	}
+}
+
 func TestGitWorktreeRemoveLatencyAlternating(t *testing.T) {
 	if testing.Short() {
 		t.Skip("wall-clock measurement")
