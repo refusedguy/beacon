@@ -555,8 +555,14 @@ func (w *wiring) close() { _ = w.store.Close() }
 
 func main() {
 	slog.SetDefault(shared.NewLogger(envOr("BEACON_LOG_LEVEL", "")))
-	root := &cobra.Command{Use: "beacon", Short: "Parallel AI agent controller"}
-	configPath := root.PersistentFlags().String("config", "", "path to config.yaml")
+	root := &cobra.Command{
+		Use:   "beacon",
+		Short: "Parallel AI agent controller",
+		Long: `beacon turns task cards into pull requests with parallel coding agents.
+--config selects config.yaml for the read and run commands. The default is .beacon/config.yaml.
+--config does not apply to init, which always writes .beacon/config.yaml to the current directory.`,
+	}
+	configPath := root.PersistentFlags().String("config", "", "config file for read and run commands (init ignores it and writes to the current directory)")
 
 	root.AddCommand(newInitCommand())
 	root.AddCommand(newDoctorCommand(configPath))
