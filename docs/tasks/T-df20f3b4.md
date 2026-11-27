@@ -1,7 +1,7 @@
 ---
 id: T-df20f3b4
 title: '[bench] Planner skip and broad-claim paths'
-status: available
+status: done
 scope:
     - internal/bench/planner_paths_bench_test.go
 priority: 89
