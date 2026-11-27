@@ -1,7 +1,7 @@
 ---
 id: T-dcce7df3
 title: 'Q1: Remove redundant patch card reparse'
-status: available
+status: done
 scope:
     - internal/infra/tasksource/cardindex.go
     - internal/infra/tasksource/markdown.go

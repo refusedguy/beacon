@@ -724,6 +724,43 @@ func TestCardIndexStateChangeThroughMarkdown(t *testing.T) {
 	}
 }
 
+// TestCardIndexPatchedStatusMatchesFreshParse covers the status-only reuse
+// path. A card with no status line gets one inserted on patch; the task folded
+// back into the index must still equal a fresh parse of the rewritten text.
+func TestCardIndexPatchedStatusMatchesFreshParse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-NOSTAT.md")
+	content := "---\nid: T-NOSTAT\ntitle: No status\nkind: task\n---\n# T-NOSTAT. Body\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(path): %v", err)
+	}
+	store := CardStore{Dir: dir}
+	resetCardIndex(dir)
+
+	if err := store.indexedPatchStatus(context.Background(), "T-NOSTAT", "in_progress"); err != nil {
+		t.Fatalf("indexedPatchStatus: %v", err)
+	}
+	c, err := store.indexedFind("T-NOSTAT")
+	if err != nil {
+		t.Fatalf("indexedFind: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("os.ReadFile(path): %v", err)
+	}
+	fresh, ok, hasFM := parseCardFields(string(b), path)
+	if !ok {
+		t.Fatal("written card no longer parses")
+	}
+	want := card{path: path, task: fresh, content: string(b), hasFM: hasFM}
+	if !reflect.DeepEqual(c, want) {
+		t.Fatalf("indexed card differs from fresh parse:\nindexed = %+v\nfresh   = %+v", c, want)
+	}
+	if c.task.Status != core.TaskClaimed {
+		t.Fatalf("status = %q, want in_progress normalized to claimed", c.task.Status)
+	}
+}
+
 // BenchmarkCardStoreStateChangesOneScan runs 500 state changes over 20,000
 // cards. The index is built once per iteration and reused by every change.
 // Each returned card must match a fresh parse of the file it came from.
