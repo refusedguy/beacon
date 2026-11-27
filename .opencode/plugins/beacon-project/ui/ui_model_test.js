@@ -124,6 +124,33 @@ test("readCard keeps body titles and scopes stable across repeated reads", () =>
   }
 })
 
+test("readCard caches a parsed card until its file stamp changes", () => {
+  const path = "/cache/docs/tasks/T-100.md"
+  const body = "---\nid: T-100\ntitle: Cached\nstatus: ready\n---\nScope: pkg/a.go\nGoal: work.\n"
+  let reads = 0
+  let info = { mtimeMs: 1000, size: body.length }
+  const deps = {
+    existsSync: (p) => p === path,
+    readFileSync: () => { reads++; return body },
+    statSync: () => info,
+  }
+  const first = ui.readCard("/cache", "T-100", deps)
+  assert.equal(first.title, "Cached")
+  assert.equal(first.scope, "pkg/a.go")
+  assert.equal(reads, 1)
+  assert.equal(ui.readCard("/cache", "T-100", deps).title, "Cached")
+  assert.equal(reads, 1, "an unchanged stat reuses the parsed card without a file read")
+
+  info = { mtimeMs: 2000, size: body.length }
+  assert.equal(ui.readCard("/cache", "T-100", deps).scope, "pkg/a.go")
+  assert.equal(reads, 2, "a new mtime forces exactly one fresh read")
+
+  const injected = { existsSync: deps.existsSync, readFileSync: deps.readFileSync }
+  ui.readCard("/cache", "T-100", injected)
+  ui.readCard("/cache", "T-100", injected)
+  assert.equal(reads, 4, "an injected readFileSync without statSync bypasses the cache")
+})
+
 test("parseSnapshot tolerates null, empty and malformed output", () => {
   assert.deepEqual(parseSnapshot("null"), {})
   assert.deepEqual(parseSnapshot(""), {})

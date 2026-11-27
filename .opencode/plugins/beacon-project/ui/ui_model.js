@@ -1,7 +1,7 @@
 // Data model, CLI transport and RPC schema for the Beacon panels. Sources load
 // TUI peers lazily in setup so `node --test` can import this module alone.
 import { execFile as nodeExecFile } from "node:child_process"
-import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
+import { existsSync as fsExistsSync, readFileSync as fsReadFileSync, statSync as fsStatSync } from "node:fs"
 import { join, relative, resolve } from "node:path"
 import { promisify } from "node:util"
 import { beaconCommand } from "../mcp/mcp.js"
@@ -274,12 +274,31 @@ const CARD_META_FIELD_RE = /^([A-Za-z_][\w-]*):\s*(.*?)\s*$/
 const CARD_BODY_FIELD_RE = /^([A-Za-z_][\w-]*):\s*(.+?)\s*$/gim
 const BEACON_BRANCH_RE = /^beacon\/(.+)$/
 
+// Parsed cards are cached by path and validated with a cheap stat, so a poll
+// that re-reads an unchanged card does no file read and no regex work. The
+// cache is bounded: a session can visit many cards but never all task files.
+const CARD_CACHE_LIMIT = 512
+const cardCache = new Map()
 // Read a card from docs/tasks. A missing or unreadable file returns null so
 // the caller fails closed instead of showing a stale SQLite queue row.
 export function readCard(root, id, deps = {}) {
   const cardID = str(id)
   if (!CARD_ID_RE.test(cardID)) return null
   const path = join(root, "docs", "tasks", `${cardID}.md`)
+  // An injected readFileSync with no statSync is a test double on a fake path
+  // that cannot be stat'ed. Bypass the cache so its reads stay observable. With
+  // no injection the real fs statSync validates the cache in production.
+  const stat = deps.readFileSync === undefined ? (deps.statSync ?? fsStatSync) : deps.statSync
+  const cacheable = typeof stat === "function"
+  let stamp = null
+  if (cacheable) {
+    try {
+      const info = stat(path) ?? {}
+      stamp = `${info.mtimeMs ?? info.mtime ?? 0}:${info.size ?? 0}`
+    } catch { return null }
+    const hit = cardCache.get(path)
+    if (hit && hit.stamp === stamp) return hit.card
+  }
   let body
   try {
     if (!(deps.existsSync ?? fsExistsSync)(path)) return null
@@ -302,12 +321,17 @@ export function readCard(root, id, deps = {}) {
     if (bodyFields[name] === undefined) bodyFields[name] = found[2]
   }
   const field = (name) => text(name) || bodyFields[name.toLowerCase()] || ""
-  return {
+  const card = {
     id: cardID, title: text("title") || cardID, priority: text("priority"), status: text("status"),
     kind: text("kind") || "task", scope: field("scope"), depends: field("depends") || field("depends_on"), meta,
     parent: (field("epic") || (BEACON_BRANCH_RE.exec(field("base_branch"))?.[1] ?? "")).trim(),
     path, relativePath: relative(root, path), body: rest.replace(/^\r?\n/, "").split(/\r?\n/).slice(0, CARD_BODY_LINES).join("\n"),
   }
+  if (cacheable) {
+    if (cardCache.size >= CARD_CACHE_LIMIT) cardCache.delete(cardCache.keys().next().value)
+    cardCache.set(path, { stamp, card })
+  }
+  return card
 }
 export const readTitle = (root, taskID, deps = {}) => readCard(root, taskID, deps)?.title || str(taskID)
 const cardIsPending = (root, id, deps = {}) => {
@@ -430,9 +454,21 @@ class RpcStatusSource {
   }
   #rpc() { return this.ctx.client.rpc(BeaconStatusRpc) }
   async snapshot(limits = this.limits) {
-    return normalizeSnapshot(await this.#rpc().snapshot(limits ?? {}, {
+    const value = await this.#rpc().snapshot(limits ?? {}, {
       location: tuiLocation(this.ctx), signal: AbortSignal.timeout(this.timeout),
-    }))
+    })
+    // The RPC server reads through CliStatusSource, which already normalizes
+    // every run and marks it with an attempt. Skip that work on a normal wire
+    // result and normalize only a raw payload from a test double or older peer.
+    let raw = false
+    for (const group of [value?.active, value?.recent]) {
+      if (!Array.isArray(group)) continue
+      for (const run of group) {
+        if (run && !Object.hasOwn(run, "attempt")) { raw = true; break }
+      }
+      if (raw) break
+    }
+    return raw ? normalizeSnapshot(value) : value
   }
   async control(input) {
     return this.#rpc().control(input, { signal: AbortSignal.timeout(this.timeout) })
