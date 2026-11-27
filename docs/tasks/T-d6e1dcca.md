@@ -7,6 +7,7 @@ scope:
   - internal/bench/registry.go
   - internal/bench/registry_test.go
   - docs/perf/bench-registry.json
+  - .github/workflows/ci.yml
 priority: 15
 kind: task
 require_review: llm
