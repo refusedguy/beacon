@@ -22,3 +22,5 @@
 // editing production files. The mirrors are annotated with their source
 // locations. See docs/perf/dossier.md for the protocol and the captured runs.
 package bench
+
+// Baseline measurement run.
