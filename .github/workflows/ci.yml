@@ -21,8 +21,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  warm-cache:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
+
+      - name: Build root module
+        run: go build ./...
+
+      - name: Build ACP harness module
+        working-directory: harnesses/acp
+        run: go build ./...
+
+      - name: Build OpenCode harness module
+        working-directory: harnesses/opencode
+        run: go build ./...
+
+      - name: Build TUI module
+        working-directory: ui/tui
+        run: |
+          go build ./...
+          rm -f tui
+
+      - name: Compile root test packages with race
+        run: go test -race -run '^$' ./cmd/... ./internal/app/... ./internal/infra/... ./internal/bench/... . ./pkg/...
+
+      - name: Compile ACP test packages with race
+        working-directory: harnesses/acp
+        run: go test -race -run '^$' ./...
+
+      - name: Compile OpenCode test packages with race
+        working-directory: harnesses/opencode
+        run: go test -race -run '^$' ./...
+
+      - name: Compile TUI test packages with race
+        working-directory: ui/tui
+        run: go test -race -run '^$' ./...
+
   verify:
     if: github.event_name != 'schedule'
+    needs: warm-cache
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -107,6 +155,7 @@ jobs:
 
   test-modules:
     if: github.event_name != 'schedule'
+    needs: warm-cache
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -231,6 +280,7 @@ jobs:
 
   perf-smoke:
     if: github.event_name != 'schedule'
+    needs: warm-cache
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
