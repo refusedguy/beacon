@@ -116,6 +116,22 @@ func TestTelegramCanonicalRow(t *testing.T) {
 	}
 }
 
+func TestTelegramPayloadByteIdentical(t *testing.T) {
+	for _, text := range []string{"", "plain", `{"quoted":"value"}`, "line\nbreak"} {
+		want, err := json.Marshal(map[string]string{"chat_id": benchChatID, "text": text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := json.Marshal(telegramPayload{ChatID: benchChatID, Text: text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("struct payload = %s, map payload = %s", got, want)
+		}
+	}
+}
+
 func TestTelegramNotifyPayload(t *testing.T) {
 	expected, err := json.Marshal(map[string]string{
 		"chat_id": benchChatID,

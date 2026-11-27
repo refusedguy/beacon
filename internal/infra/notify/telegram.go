@@ -37,16 +37,21 @@ func NewTelegram(token, chatID string) *Telegram {
 // Enabled reports whether a token and chat id are configured.
 func (t *Telegram) Enabled() bool { return t.Token != "" && t.ChatID != "" }
 
+// telegramPayload encodes the two fields the Bot API accepts. A tagged struct
+// marshals without the reflection and map allocation a map[string]string
+// needs, and emits the same bytes in the same field order.
+type telegramPayload struct {
+	ChatID string `json:"chat_id"`
+	Text   string `json:"text"`
+}
+
 // Notify sends n as a Telegram message.
 func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
 	if !t.Enabled() {
 		return nil
 	}
 	text := redact.Redact(fmt.Sprintf("beacon [%s] %s: %s", n.RunID, n.Subject, n.Body))
-	payload, _ := json.Marshal(map[string]string{
-		"chat_id": t.ChatID,
-		"text":    text,
-	})
+	payload, _ := json.Marshal(telegramPayload{ChatID: t.ChatID, Text: text})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
