@@ -170,16 +170,7 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 	if core.DecideFinalState(state).Closed {
 		return o, nil
 	}
-	// Compare from the base commit the PR object names. A branch ref fails
-	// when the base branch was deleted, while the commit is still addressable.
-	base := p.GetBase().GetSHA()
-	if base == "" {
-		base = p.GetBase().GetRef()
-	}
-	if base == "" {
-		base = g.base
-	}
-	signals := g.fetchSignals(ctx, pr, sha, base)
+	signals := g.fetchSignals(ctx, pr, sha, compareBase(p, g.base))
 
 	// Report hard failures in the original call order so callers see the same
 	// first error. Capped reads are kept and marked incomplete instead.
@@ -209,21 +200,50 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		failed.add("reviews", errCappedRead)
 	}
 	o.Approvals = signals.approvals
-	for _, l := range p.Labels {
-		o.Labels = append(o.Labels, l.GetName())
-	}
-	if signals.compareErr != nil {
-		failed.add("compare", compareFailure(signals.compareErr))
-	} else if signals.cmp != nil {
-		// A dirty state with no commits ahead of the base is a stale flag,
-		// not a conflict. Leaving it set dispatches an agent instead of a
-		// branch update, so conflict is part of the observed state identity.
-		o.Conflict = crossCheckConflict(p, signals.cmp)
-		o.Behind = signals.cmp.GetBehindBy() > 0
-		o.BaseSHA = signals.cmp.GetBaseCommit().GetSHA()
-	}
+	o.Labels = observationLabels(p.Labels)
+	applyCompare(&o, p, signals, &failed)
 	failed.apply(&o)
 	return o, nil
+}
+
+// observationLabels copies the provider labels into the observation.
+func observationLabels(labels []*github.Label) []string {
+	if len(labels) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		out = append(out, label.GetName())
+	}
+	return out
+}
+
+// compareBase returns the base commit to compare against. The commit in the PR
+// object stays addressable after the base branch is deleted, unlike its ref.
+func compareBase(p *github.PullRequest, fallback string) string {
+	if sha := p.GetBase().GetSHA(); sha != "" {
+		return sha
+	}
+	if ref := p.GetBase().GetRef(); ref != "" {
+		return ref
+	}
+	return fallback
+}
+
+// applyCompare records the comparison and cross-checks the provider conflict
+// flag. A dirty state with no commits ahead of the base is stale, not a
+// conflict, and must not dispatch an agent in place of a branch update.
+func applyCompare(o *core.Observation, p *github.PullRequest, signals githubSignals, failed *observationErrors) {
+	if signals.compareErr != nil {
+		failed.add("compare", compareFailure(signals.compareErr))
+		return
+	}
+	if signals.cmp == nil {
+		return
+	}
+	o.Conflict = crossCheckConflict(p, signals.cmp)
+	o.Behind = signals.cmp.GetBehindBy() > 0
+	o.BaseSHA = signals.cmp.GetBaseCommit().GetSHA()
 }
 
 // observeWorkflowSkipped reads the changed files and records a capped read on
