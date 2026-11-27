@@ -35,6 +35,18 @@ func newCardLocalBench(b *testing.B) *cardLocalBench {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		b.Fatal(err)
 	}
+	// Cards declare these scope targets. Creating them once outside the timed
+	// loop turns every per-patch lookup into a positive stat instead of a
+	// negative dentry lookup that depends on the host cache.
+	if err := os.MkdirAll(filepath.Join(root, "pkg", "core"), 0o755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pkg", "core", "run.go"), []byte("package core\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "internal", "app"), 0o755); err != nil {
+		b.Fatal(err)
+	}
 	ids := make([]core.TaskID, 0, cardLocalCards)
 	for i := 0; i < cardLocalCards; i++ {
 		id := core.TaskID(fmt.Sprintf("T-%04d", i))

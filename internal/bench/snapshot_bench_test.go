@@ -39,6 +39,21 @@ const (
 	smokeRecent    = 20
 )
 
+// deepDBFlags pins the SQLite settings that change page-cache and WAL work.
+// cache_size is negative, so its magnitude is a fixed KiB limit. Autocheckpoint
+// stays off until seeding finishes and the explicit checkpoint below runs.
+const deepDBFlags = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-65536)&_pragma=wal_autocheckpoint(0)&_pragma=temp_store(MEMORY)"
+
+// deepTmpDir keeps the seeded database on tmpfs when the machine has it. A
+// fixed filesystem removes dentry and page-cache variance between base and
+// head. Machines without tmpfs fall back to the OS temp directory.
+func deepTmpDir() string {
+	if info, err := os.Stat("/dev/shm"); err == nil && info.IsDir() {
+		return "/dev/shm"
+	}
+	return os.TempDir()
+}
+
 // snapshotEnv holds one seeded state database and the ids a snapshot reads.
 type snapshotEnv struct {
 	ctx       context.Context
@@ -85,7 +100,7 @@ func newSnapshotEnv(b *testing.B) *snapshotEnv {
 		recent = runs - active
 	}
 
-	dir, err := os.MkdirTemp("", "beacon-deep-snapshot-")
+	dir, err := os.MkdirTemp(deepTmpDir(), "beacon-deep-snapshot-")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -97,7 +112,7 @@ func newSnapshotEnv(b *testing.B) *snapshotEnv {
 	}
 	b.Cleanup(func() { _ = store.Close() })
 
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?"+deepDBFlags)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -174,6 +189,16 @@ FROM seq`)
 
 	if err := tx.Commit(); err != nil {
 		b.Fatal(err)
+	}
+	// Move every seeded page out of the WAL before the first timed read. A
+	// checkpoint at a fixed point keeps the warm pass and the timed passes
+	// reading the same file state.
+	var busy, log, checkpointed int
+	if err := db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &log, &checkpointed); err != nil {
+		b.Fatal(err)
+	}
+	if busy != 0 {
+		b.Fatalf("wal_checkpoint(TRUNCATE) reported %d busy pages", busy)
 	}
 }
 

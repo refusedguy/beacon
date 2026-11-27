@@ -110,25 +110,27 @@ const subscriberBuffer = 16
 // produces the SSE frame bytes, and every subscriber gets the same bytes.
 type eventFrames struct {
 	mu      sync.Mutex
-	subs    map[chan []byte]struct{}
+	subs    []chan []byte
 	marshal func(any) ([]byte, error)
 }
 
 func newEventFrames(marshal func(any) ([]byte, error)) *eventFrames {
-	return &eventFrames{
-		subs:    make(map[chan []byte]struct{}),
-		marshal: marshal,
-	}
+	return &eventFrames{marshal: marshal}
 }
 
 func (f *eventFrames) subscribe() (chan []byte, func()) {
 	ch := make(chan []byte, subscriberBuffer)
 	f.mu.Lock()
-	f.subs[ch] = struct{}{}
+	f.subs = append(f.subs, ch)
 	f.mu.Unlock()
 	return ch, func() {
 		f.mu.Lock()
-		delete(f.subs, ch)
+		for i, sub := range f.subs {
+			if sub == ch {
+				f.subs = append(f.subs[:i], f.subs[i+1:]...)
+				break
+			}
+		}
 		f.mu.Unlock()
 	}
 }
@@ -145,7 +147,7 @@ func (f *eventFrames) deliver(ev core.HarnessEvent) ([]byte, int64, int64) {
 	frame := fmt.Appendf(nil, "event: harness\ndata: %s\n\n", b)
 	var delivered, dropped int64
 	f.mu.Lock()
-	for ch := range f.subs {
+	for _, ch := range f.subs {
 		select {
 		case ch <- frame:
 			delivered++
@@ -176,25 +178,27 @@ func (c *runsCache) invalidate() {
 // the broadcast.
 type changeSubscribers struct {
 	mu       sync.Mutex
-	subs     map[chan int]struct{}
+	subs     []chan int
 	snapshot *runsCache
 }
 
 func newChangeSubscribers() *changeSubscribers {
-	return &changeSubscribers{
-		subs:     make(map[chan int]struct{}),
-		snapshot: &runsCache{},
-	}
+	return &changeSubscribers{snapshot: &runsCache{}}
 }
 
 func (s *changeSubscribers) subscribe() (chan int, func()) {
 	ch := make(chan int, subscriberBuffer)
 	s.mu.Lock()
-	s.subs[ch] = struct{}{}
+	s.subs = append(s.subs, ch)
 	s.mu.Unlock()
 	return ch, func() {
 		s.mu.Lock()
-		delete(s.subs, ch)
+		for i, sub := range s.subs {
+			if sub == ch {
+				s.subs = append(s.subs[:i], s.subs[i+1:]...)
+				break
+			}
+		}
 		s.mu.Unlock()
 	}
 }
@@ -205,7 +209,7 @@ func (s *changeSubscribers) deliver(pr int) (int64, int64) {
 	s.snapshot.invalidate()
 	var delivered, dropped int64
 	s.mu.Lock()
-	for ch := range s.subs {
+	for _, ch := range s.subs {
 		select {
 		case ch <- pr:
 			delivered++

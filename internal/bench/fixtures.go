@@ -39,6 +39,24 @@ const (
 	fixtureSeed      = 20261125
 )
 
+// fixtureNow is the fixed clock behind every seeded timestamp. Snapshot
+// assembly injects it through SnapshotService.Now so generated-at fields and
+// derived durations cannot drift with the wall clock.
+var fixtureNow = time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+// terminalRuns returns copies of runs in a terminal state. Snapshot duration
+// fields then stop at UpdatedAt instead of extending to the injected clock.
+// The copies keep every field the snapshot reads, so work counts stay fixed.
+func terminalRuns(runs []*core.Run) []*core.Run {
+	out := make([]*core.Run, 0, len(runs))
+	for _, run := range runs {
+		fixed := *run
+		fixed.State = core.RunMerged
+		out = append(out, &fixed)
+	}
+	return out
+}
+
 func seeded() *rand.Rand {
 	return rand.New(rand.NewSource(fixtureSeed))
 }
@@ -63,7 +81,7 @@ func runFixtures(n int) []*core.Run {
 		core.RunNeedsAgentFix, core.RunBlocked, core.RunMerged, core.RunClosed,
 	}
 	out := make([]*core.Run, 0, n)
-	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	now := fixtureNow
 	for i := 0; i < n; i++ {
 		run := &core.Run{
 			ID:            core.RunID(fmt.Sprintf("run-%04d", i)),
@@ -130,7 +148,7 @@ func decisionFixtures(n int, runIDs []string) []app.Decision {
 	kinds := []string{"dispatch", "reconcile", "control"}
 	verdicts := []string{"ready", "retry", "keep_working"}
 	out := make([]app.Decision, 0, n)
-	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	now := fixtureNow
 	for i := 0; i < n; i++ {
 		id := ""
 		if i%4 != 0 {

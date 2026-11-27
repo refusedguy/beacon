@@ -197,6 +197,10 @@ type SnapshotService struct {
 	OrphanDecisionsLimit int
 	Repo                 string
 	Daemon               *DaemonSnapshot
+	// Now supplies the snapshot generation time. A nil Now reads the wall
+	// clock, which keeps production behavior unchanged. Benchmarks inject a
+	// fixed clock so durations and encoded bytes stay identical across passes.
+	Now func() time.Time
 }
 
 // Snapshot returns active and recent runs with their timelines, decisions and
@@ -238,6 +242,9 @@ func (s SnapshotService) Snapshot(ctx context.Context) (*Snapshot, error) {
 	}
 	timeline, histories := groupHistory(events, decisions)
 	now := time.Now().UTC()
+	if s.Now != nil {
+		now = s.Now().UTC()
+	}
 	daemon := s.Daemon
 	if daemon == nil {
 		daemon = &DaemonSnapshot{State: "absent"}

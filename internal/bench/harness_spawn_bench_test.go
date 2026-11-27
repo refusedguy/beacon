@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/refusedguy/beacon/harnesses/opencode"
 	"github.com/refusedguy/beacon/pkg/core"
@@ -18,10 +16,10 @@ import (
 // prompt and deferred move without a slow fixture.
 const spawnCount = 10
 
-// spawnHarnessBench holds one OpenCode harness pointed at a loopback server.
+// spawnHarnessBench holds one OpenCode harness on an in-process transport.
 // Counters are read before and after each batch so every row reports the
-// requests it served. The move channel lets the caller wait for deferred setup
-// after the benchmark timer stops.
+// requests it served. The move channel carries one token per deferred move,
+// so the caller can count them after the benchmark timer stops.
 type spawnHarnessBench struct {
 	harness    *opencode.Harness
 	ctx        context.Context
@@ -36,39 +34,37 @@ type spawnHarnessBench struct {
 func newSpawnHarnessBench(b *testing.B) *spawnHarnessBench {
 	b.Helper()
 	var creates, models, moves, prompts, unexpected, next atomic.Int64
-	moved := make(chan struct{}, spawnCount*2)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
+	// One warm batch plus one batch per timed iteration. The channel is large
+	// enough that a deferred move never blocks the transport.
+	moved := make(chan struct{}, (b.N+1)*spawnCount)
+	transport := stubRoundTripper(func(req *http.Request) (*http.Response, error) {
+		p := req.URL.Path
 		switch {
-		case r.Method == http.MethodPost && p == "/api/session":
+		case req.Method == http.MethodPost && p == "/api/session":
 			creates.Add(1)
 			id := fmt.Sprintf("ses_%d", next.Add(1))
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"id":%q}`, id)
-		case r.Method == http.MethodPost && strings.HasSuffix(p, "/model"):
+			return stubJSON(req, http.StatusOK, fmt.Sprintf(`{"id":%q}`, id)), nil
+		case req.Method == http.MethodPost && strings.HasSuffix(p, "/model"):
 			models.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{}`))
-		case r.Method == http.MethodPost && strings.HasSuffix(p, "/move"):
+			return stubJSON(req, http.StatusOK, `{}`), nil
+		case req.Method == http.MethodPost && strings.HasSuffix(p, "/move"):
 			moves.Add(1)
-			select {
-			case moved <- struct{}{}:
-			default:
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{}`))
-		case r.Method == http.MethodPost && strings.HasSuffix(p, "/prompt"):
+			moved <- struct{}{}
+			return stubJSON(req, http.StatusOK, `{}`), nil
+		case req.Method == http.MethodPost && strings.HasSuffix(p, "/prompt"):
 			prompts.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"delivery":"steer"}`))
+			return stubJSON(req, http.StatusOK, `{"delivery":"steer"}`), nil
 		default:
 			unexpected.Add(1)
-			http.NotFound(w, r)
+			return stubJSON(req, http.StatusNotFound, `{"message":"not found"}`), nil
 		}
-	}))
-	b.Cleanup(srv.Close)
+	})
 	return &spawnHarnessBench{
-		harness:    opencode.New(opencode.Config{Endpoint: srv.URL, Model: "bench-model"}),
+		harness: opencode.New(opencode.Config{
+			Endpoint: "http://bench.invalid",
+			Model:    "bench-model",
+			Client:   &http.Client{Transport: transport},
+		}),
 		ctx:        context.Background(),
 		creates:    &creates,
 		models:     &models,
@@ -113,16 +109,11 @@ func runHarnessSpawn(h *spawnHarnessBench) (int64, int64) {
 	return work, errs
 }
 
-// waitSpawnMoves waits for the deferred moves after the timer stops. A bounded
-// deadline keeps a stalled loopback server from hanging the benchmark.
+// waitSpawnMoves consumes one token per deferred move after the timer stops.
+// Counting the channel removes the wall-clock deadline and makes a short run
+// wait for exactly the moves it requested.
 func waitSpawnMoves(h *spawnHarnessBench, want int64) {
-	deadline := time.NewTimer(10 * time.Second)
-	defer deadline.Stop()
-	for h.moves.Load() < want {
-		select {
-		case <-h.moved:
-		case <-deadline.C:
-			return
-		}
+	for i := int64(0); i < want; i++ {
+		<-h.moved
 	}
 }
