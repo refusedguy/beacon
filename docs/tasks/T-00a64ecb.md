@@ -1,7 +1,7 @@
 ---
 id: T-00a64ecb
 title: 'A8: JS plugin sidebar cost'
-status: done
+status: available
 scope:
     - .opencode/plugins/beacon-project/ui/ui_model.js
     - .opencode/plugins/beacon-project/ui/ui_alerts.js
