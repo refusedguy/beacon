@@ -1,7 +1,7 @@
 ---
 id: T-da58dba7
 title: 'M2: fix advisory parser, cache export and noise-floor runner in ci.yml'
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 priority: 39
