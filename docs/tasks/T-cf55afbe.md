@@ -10,7 +10,7 @@ scope:
     - docs/perf/bench-registry.json
     - .github/workflows/ci.yml
 depends:
-    - T-df77d6ed
+  - T-c2c020fc
 priority: 4
 kind: task
 require_review: llm
