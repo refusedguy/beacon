@@ -847,6 +847,29 @@ func TestPingFrameWireShape(t *testing.T) {
 	}
 }
 
+// TestAppendHarnessFrameMatchesWriteSSE pins the direct frame build against
+// writeSSE, the documented SSE writer, so the allocation cut cannot change the
+// bytes a monitor receives. Escaping cases are included because json.Marshal
+// escapes those characters inside the data line.
+func TestAppendHarnessFrameMatchesWriteSSE(t *testing.T) {
+	for _, we := range []core.WireEvent{
+		{},
+		{ID: 7, Type: "progress", RunID: "r1", At: "2026-01-02T03:04:05Z"},
+		{ID: 9, Type: "quoted \"kind\"", RunID: "run\nid", At: "<at>"},
+	} {
+		body, err := json.Marshal(we)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorder := httptest.NewRecorder()
+		writeSSE(recorder, "harness", we)
+		want := recorder.Body.String()
+		if got := string(appendHarnessFrame(nil, body)); got != want {
+			t.Fatalf("appendHarnessFrame(%+v) = %q, want %q", we, got, want)
+		}
+	}
+}
+
 // BenchmarkPingFrame measures the keepalive payload construction per tick.
 func BenchmarkPingFrame(b *testing.B) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
