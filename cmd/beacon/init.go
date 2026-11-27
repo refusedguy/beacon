@@ -46,8 +46,12 @@ type initOptions struct {
 func newInitCommand() *cobra.Command {
 	f := &initFlags{}
 	cmd := &cobra.Command{
-		Use:   "init",
-		Short: "Set up Beacon in any git project",
+		Use:   "init [--yes]",
+		Short: "Set up Beacon in the current git project (prompts in a terminal; --yes accepts defaults)",
+		Long: `init writes .beacon/config.yaml and the project plugin into the current directory.
+It reads the origin remote and base branch, then asks for confirmation when a terminal is available.
+Pass --yes or --non-interactive to accept the defaults without a prompt.
+--config does not apply to init; the config is always written to the current directory.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			f.weakPCSet = cmd.Flags().Changed("weak-pc")
 			return runInit(f)
@@ -61,8 +65,8 @@ func newInitCommand() *cobra.Command {
 	cmd.Flags().StringVar(&f.harnessEndpoint, "harness-endpoint", "", "OpenCode HTTP endpoint")
 	cmd.Flags().StringVar(&f.pluginDir, "plugin-dir", "", "source directory for the project plugin")
 	cmd.Flags().BoolVar(&f.force, "force", false, "overwrite existing config")
-	cmd.Flags().BoolVar(&f.nonInteractive, "non-interactive", false, "use defaults without prompting")
-	cmd.Flags().BoolVar(&f.yes, "yes", false, "accept defaults without prompting")
+	cmd.Flags().BoolVar(&f.nonInteractive, "non-interactive", false, "use defaults without a terminal prompt")
+	cmd.Flags().BoolVar(&f.yes, "yes", false, "accept the defaults without a terminal prompt")
 	cmd.Flags().BoolVar(&f.weakPC, "weak-pc", true, "use targeted test instructions for a weak PC")
 	cmd.Flags().BoolVar(&f.skipPlugin, "skip-plugin", false, "do not deploy the project plugin")
 	return cmd
