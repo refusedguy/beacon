@@ -1560,9 +1560,34 @@ func (s *gatedSCM) Observe(ctx context.Context, pr int) (core.Observation, error
 	return core.Observation{PRNumber: pr, HeadSHA: "sha2", PRState: "open"}, nil
 }
 
+// lockedStore serializes the fake store methods a concurrent reconcile tick
+// touches. The shared fake store maps are not safe for parallel Safe calls.
+type lockedStore struct {
+	*fakeStore
+	mu sync.Mutex
+}
+
+func (s *lockedStore) Save(ctx context.Context, run *core.Run) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.Save(ctx, run)
+}
+
+func (s *lockedStore) FindByPR(ctx context.Context, pr int) (*core.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.FindByPR(ctx, pr)
+}
+
+func (s *lockedStore) Approved(ctx context.Context, id core.RunID, sha string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.Approved(ctx, id, sha)
+}
+
 func TestReconcileActivePRsBoundsFanout(t *testing.T) {
 	ctx := context.Background()
-	store := newFakeStore()
+	store := &lockedStore{fakeStore: newFakeStore()}
 	const count = 8
 	runs := make([]*core.Run, 0, count)
 	for i := 1; i <= count; i++ {
