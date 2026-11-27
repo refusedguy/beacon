@@ -26,8 +26,14 @@ import {
 
 // STATE_BAR_COLOR and STATE_BAR_LETTER are private to ui_view.js. These two
 // maps are copied verbatim so the mirror builds the same bar.
-const STATE_BAR_COLOR = Object.freeze({ running: "success", waiting_ci: "info", blocked: "error", merged: "success" })
-const STATE_BAR_LETTER = Object.freeze({ running: "R", waiting_ci: "C", blocked: "B", merged: "M" })
+const STATE_BAR_COLOR = Object.freeze({
+  pending: "muted", running: "success", waiting_ci: "info", needs_rebase: "warning",
+  needs_agent_fix: "warning", blocked: "error", merged: "action", closed: "muted",
+})
+const STATE_BAR_LETTER = Object.freeze({
+  pending: "P", running: "R", waiting_ci: "C", needs_rebase: "E",
+  needs_agent_fix: "F", blocked: "B", merged: "M", closed: "X",
+})
 
 const SEED = 20261125
 const NOW = Date.parse("2026-11-25T10:00:00Z")
@@ -123,7 +129,7 @@ function recentFromViewWith(view, active) {
 }
 function recentFromView(view) { return recentFromViewWith(view, activeFromView(view)) }
 function stateBarFromView(view, active, recent) {
-  const counts = { running: 0, waiting_ci: 0, blocked: 0, merged: 0 }
+  const counts = Object.fromEntries(STATE_BAR_KEYS.map((key) => [key, 0]))
   for (const run of [...active, ...recent]) {
     const state = str(run.state).toLowerCase()
     if (Object.hasOwn(counts, state)) counts[state] += 1
