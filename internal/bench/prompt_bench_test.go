@@ -4,6 +4,7 @@ import (
 	"os"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // TestPromptBuildWorkStable pins the property the checkpoint asks for. Two
@@ -35,6 +36,7 @@ func BenchmarkSpawnPrompt(b *testing.B) {
 	_, _ = runPromptBuild(tasks)
 
 	b.ReportAllocs()
+	start := time.Now()
 	b.ResetTimer()
 	var work, errs int64
 	for i := 0; i < b.N; i++ {
@@ -43,8 +45,13 @@ func BenchmarkSpawnPrompt(b *testing.B) {
 		errs += e
 	}
 	b.StopTimer()
+	elapsed := time.Since(start)
 
 	printPromptReport(os.Stdout, work, errs, len(tasks), b.N)
 	b.ReportMetric(float64(work), namePrompt+"-work")
 	b.ReportMetric(float64(errs), namePrompt+"-errs")
+	// The fixture is fixed, so the prompt bytes per build are the same on
+	// every side of a no-change comparison. One row covers the whole run.
+	printPerfRow(os.Stdout, "dispatch-prompt", elapsed, elapsed, elapsed,
+		work/int64(b.N), errs, dispatchPromptLimiter)
 }
