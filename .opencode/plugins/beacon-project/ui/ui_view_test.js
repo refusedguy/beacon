@@ -4,7 +4,7 @@ import assert from "node:assert/strict"
 import { NOW, makeRun } from "./ui_test_helpers.js"
 import * as ui from "./ui.js"
 const {
-  DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, PANEL_NAME, REASON_WIDTH,
+  DECISION_LIMIT, DETAIL_OPEN, EMPTY_SNAPSHOT, GROUP_TITLE_WIDTH, PANEL_NAME, REASON_WIDTH,
   SIDEBAR_OPEN, STATE_BAR_WIDTH, cleanErrorMessage, compactReason, detailActions, detailCommand,
   detailLines, detailModel, elapsed, mergedReason, metricsLine, normalizeRun, phaseLabel, renderSnapshotLines,
   runLineItems, runTotalTime, sidebarModel, stateBarItem, truncate,
@@ -473,14 +473,62 @@ test("blocked groups start collapsed and Recent stays reachable", () => {
   const epicOpen = {}
   const items = ui.sidebarModel(snap, null, NOW, queueOpen(), epicOpen, ui.blockedOpenFrom(epicOpen)).listItems
   const headers = items.filter((i) => i.kind === "queue-blocker")
-  assert.deepEqual(headers.map((i) => [i.marker, i.name]), [
-    ["▶", "blocked by T-BLOCK-A · 2 tasks"], ["▶", "blocked by T-BLOCK-B · 1 task"],
+  assert.deepEqual(headers.map((i) => [i.marker, i.name, i.status]), [
+    ["▶", "Alpha one → T-BLOCK-A", "2 tasks"], ["▶", "Beta one → T-BLOCK-B", "1 task"],
   ])
   assert.equal(items.some((i) => i.kind === "queue-title"), false, "collapsed groups hide their task titles")
   assert.equal(items.some((i) => i.kind === "queue-dep"), false, "a dependency ID is never a repeated row")
   assert.ok(items.some((i) => i.sectionKey === "recent"), "Recent stays in the sidebar")
   assert.ok(items.some((i) => i.recent === true && i.runID === "r1"), "Recent stays clickable")
   assert.equal(items[items.findIndex((i) => i.sectionKey === "recent") - 1].kind, "spacer")
+})
+
+test("three blocked group headers name both sides by title", () => {
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      { id: "T-BLOCK-A", title: "Harness boot", status: "done", priority: 9, dependsOn: [] },
+      { id: "T-BLOCK-B", title: "Docs gap", status: "done", priority: 8, dependsOn: [] },
+      { id: "T-BLOCK-C", title: "Queue UI", status: "done", priority: 7, dependsOn: [] },
+      { id: "T-1", title: "Share links", status: "waiting_deps", priority: 5, dependsOn: ["T-BLOCK-A"] },
+      { id: "T-2", title: "Sidebar", status: "waiting_deps", priority: 4, dependsOn: ["T-BLOCK-B"] },
+      { id: "T-3", title: "Wire RPC", status: "waiting_deps", priority: 3, dependsOn: ["T-BLOCK-C"] },
+    ],
+  }
+  const items = ui.sidebarModel(snap, null, NOW, queueOpen(), {}, {}).listItems
+  const headers = items.filter((i) => i.kind === "queue-blocker")
+  assert.equal(headers.length, 3)
+  assert.deepEqual(headers.map((i) => [i.name, i.status]), [
+    ["Share links → Harness boot", "1 task"],
+    ["Sidebar → Docs gap", "1 task"],
+    ["Wire RPC → Queue UI", "1 task"],
+  ])
+  const lines = items.map((i) => [i.marker, i.name, i.status].filter((x) => x !== "" && x != null).join(" "))
+  for (const [task, blocker] of [
+    ["Share links", "Harness boot"], ["Sidebar", "Docs gap"], ["Wire RPC", "Queue UI"],
+  ]) {
+    assert.ok(lines.some((line) => line.includes(task) && line.includes(blocker)),
+      `the collapsed header names both ${task} and ${blocker}`)
+  }
+  assert.equal(items.some((i) => i.kind === "queue-title" && ["Share links", "Sidebar", "Wire RPC"].includes(i.name)), false,
+    "the blocked groups stay collapsed")
+})
+
+test("a long blocked group title is capped from the end on both sides", () => {
+  const snap = {
+    active: [], recent: [],
+    queue: [
+      { id: "T-BLOCK", title: "Fix gap in AGENTS.md", status: "done", priority: 9, dependsOn: [] },
+      { id: "T-1", title: "Add share links to the operator sidebar", status: "waiting_deps", priority: 5, dependsOn: ["T-BLOCK"] },
+    ],
+  }
+  const header = ui.sidebarModel(snap, null, NOW, queueOpen(), {}, {}).listItems
+    .find((i) => i.kind === "queue-blocker")
+  const task = truncate("Add share links to the operator sidebar", GROUP_TITLE_WIDTH)
+  const blocker = truncate("Fix gap in AGENTS.md", GROUP_TITLE_WIDTH)
+  assert.equal(header.name, `${task} → ${blocker}`)
+  assert.ok(task.endsWith("…") && blocker.endsWith("…"), "each caption is clipped at the end")
+  assert.ok(header.name.length <= 2 * GROUP_TITLE_WIDTH + 3, "the row still fits")
 })
 
 test("expanding one blocked group leaves the others collapsed", () => {
@@ -537,11 +585,11 @@ test("an epic inside an expanded blocked group still collapses its children", ()
   const open = queueOpen()
   const view = (map) => ui.sidebarModel(snap, null, NOW, open, map, ui.blockedOpenFrom(map)).listItems
   const collapsed = view({ "blocked:T-BLOCK": true })
-  assert.deepEqual(collapsed.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 1 task"])
+  assert.deepEqual(collapsed.filter((i) => i.kind === "queue-blocker").map((i) => [i.name, i.status]), [["Harness epic → T-BLOCK", "1 task"]])
   assert.ok(collapsed.some((i) => i.kind === "queue-title" && i.cardID === epicID))
   assert.equal(collapsed.some((i) => i.cardID === `${epicID}-01`), false, "children of a collapsed epic stay hidden")
   const expanded = view({ "blocked:T-BLOCK": true, [epicID]: true })
-  assert.deepEqual(expanded.filter((i) => i.kind === "queue-blocker").map((i) => i.name), ["blocked by T-BLOCK · 3 tasks"])
+  assert.deepEqual(expanded.filter((i) => i.kind === "queue-blocker").map((i) => [i.name, i.status]), [["Harness epic → T-BLOCK", "3 tasks"]])
   assert.deepEqual(expanded.filter((i) => i.kind === "queue-title").map((i) => i.name), ["Harness epic", "Child one", "Child two"])
 })
 
