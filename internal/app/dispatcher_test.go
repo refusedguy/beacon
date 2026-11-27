@@ -496,6 +496,26 @@ func TestDispatchWithoutWorkerInstructionsKeepsStockPrompt(t *testing.T) {
 	}
 }
 
+func TestSpawnPromptHeaderFormat(t *testing.T) {
+	withBase := BuildSpawnPrompt(core.Task{
+		ID: "T-HDR", Title: "Header task", BaseBranch: "beacon/T-EPIC",
+	}, "run-hdr", "/ws/T-HDR", "")
+	wantWith := "Run ID: run-hdr\nTask: T-HDR (Header task)\nWorkspace: /ws/T-HDR\n" +
+		"BaseBranch: beacon/T-EPIC\nOpen the pull request against beacon/T-EPIC, not the default branch.\n"
+	if !strings.HasPrefix(withBase, wantWith) {
+		t.Fatalf("prompt header = %q, want prefix %q", withBase, wantWith)
+	}
+
+	plain := BuildSpawnPrompt(core.Task{ID: "T-PLAIN", Title: "Plain task"}, "run-plain", "/ws/plain", "")
+	wantPlain := "Run ID: run-plain\nTask: T-PLAIN (Plain task)\nWorkspace: /ws/plain\nImplement the task, "
+	if !strings.HasPrefix(plain, wantPlain) {
+		t.Fatalf("plain prompt header = %q, want prefix %q", plain, wantPlain)
+	}
+	if strings.Contains(plain, "BaseBranch:") {
+		t.Fatalf("plain prompt gained a base branch: %q", plain)
+	}
+}
+
 func TestSpawnPromptRequiresPrePRFormatAndTestCheck(t *testing.T) {
 	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
 	d := newInstructionDispatcher(h, "")
