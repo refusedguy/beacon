@@ -355,12 +355,29 @@ func checkRunNewer(c, prev *github.CheckRun) bool {
 	return c.GetStartedAt().Time.After(prev.GetStartedAt().Time)
 }
 
-// checkState maps a GitHub check run to a core.CheckState.
+// terminalConclusion reports whether conclusion is one GitHub records for a
+// finished check run. An empty conclusion means the run has not settled.
+func terminalConclusion(conclusion string) bool {
+	switch conclusion {
+	case "success", "neutral", "skipped", "cancelled", "failure",
+		"timed_out", "action_required", "stale", "startup_failure":
+		return true
+	default:
+		return false
+	}
+}
+
+// checkState maps a GitHub check run to a core.CheckState. A check can carry a
+// terminal conclusion while its status still reads in_progress when a workflow
+// is cancelled mid-flight. The conclusion settles the check in that case so a
+// stale run does not park the PR in waiting_ci. A cancelled conclusion stays
+// distinct from skipped and keeps blocking.
 func checkState(c *github.CheckRun) core.CheckState {
-	if c.GetStatus() != "completed" {
+	conclusion := strings.ToLower(c.GetConclusion())
+	if c.GetStatus() != "completed" && !terminalConclusion(conclusion) {
 		return core.CheckPending
 	}
-	switch strings.ToLower(c.GetConclusion()) {
+	switch conclusion {
 	case "success", "neutral":
 		return core.CheckSuccess
 	case "skipped":

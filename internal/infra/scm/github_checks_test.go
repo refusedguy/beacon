@@ -92,3 +92,55 @@ func TestCheckRunNewerUsesCompletionTime(t *testing.T) {
 		t.Fatal("older attempt must not win")
 	}
 }
+
+func TestCheckStateSettlesInProgressWithTerminalConclusion(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     string
+		conclusion string
+		want       core.CheckState
+	}{
+		{"in progress with success settles", "in_progress", "success", core.CheckSuccess},
+		{"in progress with failure settles", "in_progress", "failure", core.CheckFailure},
+		{"in progress with cancelled still blocks", "in_progress", "cancelled", core.CheckCancelled},
+		{"in progress with skipped settles", "in_progress", "skipped", core.CheckSkipped},
+		{"in progress without conclusion stays pending", "in_progress", "", core.CheckPending},
+	}
+	for _, tc := range cases {
+		c := &github.CheckRun{
+			Status:     github.String(tc.status),
+			Conclusion: github.String(tc.conclusion),
+		}
+		if got := checkState(c); got != tc.want {
+			t.Errorf("%s: checkState = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestGitHubChecksLaterAttemptWinsOverStaleInProgress(t *testing.T) {
+	base := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	g := ghChecksServer(t, []*github.CheckRun{
+		{
+			Name:        github.String("vet"),
+			Status:      github.String("in_progress"),
+			Conclusion:  github.String("success"),
+			CompletedAt: &github.Timestamp{Time: base},
+		},
+		{
+			Name:        github.String("vet"),
+			Status:      github.String("completed"),
+			Conclusion:  github.String("failure"),
+			CompletedAt: &github.Timestamp{Time: base.Add(time.Minute)},
+		},
+	})
+	checks, err := g.checks(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("g.checks: %v", err)
+	}
+	if len(checks) != 1 {
+		t.Fatalf("checks = %+v, want one vet check", checks)
+	}
+	if checks[0].State != core.CheckFailure {
+		t.Fatalf("vet = %s, want failure from the later real attempt", checks[0].State)
+	}
+}
