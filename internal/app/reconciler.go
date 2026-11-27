@@ -116,9 +116,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		return core.MergeDecision{}, err
 	}
 	obs.PRNumber = pr
+	// The run is fresh from the store, so the check slice and a missing PR
+	// number are the only fields this observation can change. Skip the write
+	// when neither moved; later transition writes still carry the same run.
+	changed := run.PRNumber == 0 || !sameChecks(run.Checks, obs.Checks)
+	if run.PRNumber == 0 {
+		run.PRNumber = pr
+	}
 	run.Checks = obs.Checks
-	if err := r.Store.Save(ctx, run); err != nil {
-		return core.MergeDecision{}, err
+	if changed {
+		if err := r.Store.Save(ctx, run); err != nil {
+			return core.MergeDecision{}, err
+		}
 	}
 	defer r.Decisions.logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
 	if core.DecideFinalState(obs.PRState).Closed {
@@ -130,9 +139,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		obs.Approvals++
 	}
 	decision = r.Policy.Evaluate(obs)
-	if run.PRNumber == 0 {
-		run.PRNumber = pr
-	}
 	return r.applyDecision(ctx, run, obs, decision)
 }
 
