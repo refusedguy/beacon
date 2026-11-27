@@ -58,13 +58,26 @@ func TestGitHubChecksKeepsNewestAttemptPerName(t *testing.T) {
 	}
 }
 
-func TestCheckStateMapsCancelledToSkipped(t *testing.T) {
-	c := &github.CheckRun{
-		Status:     github.String("completed"),
-		Conclusion: github.String("cancelled"),
+func TestCheckStateKeepsCancelledDistinctFromSkipped(t *testing.T) {
+	cases := []struct {
+		conclusion string
+		want       core.CheckState
+	}{
+		{"success", core.CheckSuccess},
+		{"neutral", core.CheckSuccess},
+		{"skipped", core.CheckSkipped},
+		{"cancelled", core.CheckCancelled},
+		{"", core.CheckPending},
+		{"failure", core.CheckFailure},
 	}
-	if got := checkState(c); got != core.CheckSkipped {
-		t.Fatalf("checkState(cancelled) = %s, want %s", got, core.CheckSkipped)
+	for _, tc := range cases {
+		c := &github.CheckRun{
+			Status:     github.String("completed"),
+			Conclusion: github.String(tc.conclusion),
+		}
+		if got := checkState(c); got != tc.want {
+			t.Errorf("checkState(%q) = %s, want %s", tc.conclusion, got, tc.want)
+		}
 	}
 }
 
