@@ -3,15 +3,16 @@ id: T-df77d6ed
 title: 'P5: Populate HotPaths allocation columns and snapshot assembly row'
 status: available
 scope:
-    - internal/bench/report.go
-    - internal/bench/bench_test.go
-    - internal/bench/registry.go
-    - internal/bench/registry_test.go
-    - docs/perf/bench-registry.json
-    - .github/workflows/ci.yml
+  - internal/bench/report.go
+  - internal/bench/bench_test.go
+  - internal/bench/registry.go
+  - internal/bench/registry_test.go
+  - docs/perf/bench-registry.json
 priority: 14
 kind: task
 require_review: llm
+depends:
+  - T-d6e1dcca
 ---
 
 Goal: make B/op and allocs/op visible for the ten HotPaths keys so allocation-only wins can be judged.

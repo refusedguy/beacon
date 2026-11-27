@@ -3,14 +3,15 @@ id: T-d6e1dcca
 title: 'P4: Wire real base-red counters into advisory'
 status: available
 scope:
-    - internal/bench/reconcile_bench_test.go
-    - internal/bench/registry.go
-    - internal/bench/registry_test.go
-    - docs/perf/bench-registry.json
-    - .github/workflows/ci.yml
+  - internal/bench/reconcile_bench_test.go
+  - internal/bench/registry.go
+  - internal/bench/registry_test.go
+  - docs/perf/bench-registry.json
 priority: 15
 kind: task
 require_review: llm
+depends:
+  - T-0f2cdb4d
 ---
 
 Goal: make the base-red call reductions measurable so a reconcile optimization can earn gain (calls reduced).
