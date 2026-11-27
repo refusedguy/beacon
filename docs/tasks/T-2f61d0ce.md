@@ -1,7 +1,7 @@
 ---
 id: T-2f61d0ce
 title: Settle in_progress check runs with a terminal conclusion
-status: available
+status: done
 scope:
     - internal/infra/scm/github.go
     - internal/infra/scm/github_checks_test.go
