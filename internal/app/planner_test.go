@@ -626,10 +626,29 @@ func TestClaimDirKeys(t *testing.T) {
 		{"trailing slash", core.ScopeDir("a/b/"), []core.ScopePath{core.ScopeDir("a"), core.ScopeDir("a/b")}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := claimDirKeys(tc.scope); !equalPaths(got, tc.want) {
+			if got := claimDirKeys(nil, tc.scope); !equalPaths(got, tc.want) {
 				t.Fatalf("claimDirKeys(%q) = %v, want %v", tc.scope, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestClaimDirKeysReusesBufferWithoutChangingKeys(t *testing.T) {
+	scopes := []core.ScopePath{
+		core.ScopeFile("a/b/c.go"),
+		core.ScopePattern("*/b.go"),
+		core.ScopePattern("a/*/c.go"),
+		core.ScopeDir("x/y/"),
+		core.ScopeFile("one.go"),
+	}
+	var buf []core.ScopePath
+	for _, scope := range scopes {
+		got := claimDirKeys(buf, scope)
+		buf = got
+		want := claimDirKeys(nil, scope)
+		if !equalPaths(got, want) {
+			t.Fatalf("claimDirKeys with reused buffer for %q = %v, want %v", scope, got, want)
+		}
 	}
 }
 
