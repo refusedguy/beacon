@@ -27,12 +27,23 @@ const decisions = (id) => Array.from({ length: DECISIONS }, (_, i) => ({
 const checks = (id) => Array.from({ length: CHECKS }, (_, i) => ({
   name: `check-${i}`, state: "success", duration_seconds: i + 1, head_sha: `sha-${id}-${i}`,
 }))
-const run = (id, state) => ({
-  id, task_id: `T-${id}`, state, head_sha: "abcdef0123456789",
-  updated_at: "2026-11-27T10:00:00Z",
-  durations: { waiting_ci_seconds: 12, running_seconds: 3 },
-  timeline: timeline(id), decisions: decisions(id), checks: checks(id),
-})
+// Build each run's static payload once. Every tick still returns a fresh run
+// object so the watcher sees the same states and timestamps, but CI does not
+// spend its measurement budget rebuilding 1760 nested objects per tick.
+const fixtures = new Map()
+const run = (id, state) => {
+  let base = fixtures.get(id)
+  if (!base) {
+    base = {
+      id, task_id: `T-${id}`, head_sha: "abcdef0123456789",
+      updated_at: "2026-11-27T10:00:00Z",
+      durations: { waiting_ci_seconds: 12, running_seconds: 3 },
+      timeline: timeline(id), decisions: decisions(id), checks: checks(id),
+    }
+    fixtures.set(id, base)
+  }
+  return { ...base, state }
+}
 const shared = {
   queue: Array.from({ length: QUEUE }, (_, i) => ({
     id: `T-${i}`, title: `Card ${i}`, kind: "task", priority: i, status: "ready", depends_on: [],
