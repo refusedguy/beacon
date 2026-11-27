@@ -1,7 +1,7 @@
 ---
 id: T-ee3ca0c6
 title: '[bench] Status CLI path benchmark'
-status: in_progress
+status: done
 scope:
     - cmd/beacon/status_cli_bench_test.go
 priority: 81
