@@ -619,11 +619,11 @@ func TestClaimDirKeys(t *testing.T) {
 		scope core.ScopePath
 		want  []core.ScopePath
 	}{
-		{"single file", core.ScopeFile("one.go"), []core.ScopePath{core.ScopeDir("one.go")}},
-		{"nested path", core.ScopeFile("a/b/c.go"), []core.ScopePath{core.ScopeDir("a"), core.ScopeDir("a/b"), core.ScopeDir("a/b/c.go")}},
+		{"single file", core.ScopeFile("one.go"), []core.ScopePath{"one.go"}},
+		{"nested path", core.ScopeFile("a/b/c.go"), []core.ScopePath{"a", "a/b", "a/b/c.go"}},
 		{"leading wildcard", core.ScopePattern("*/b.go"), nil},
-		{"inner wildcard", core.ScopePattern("a/*/c.go"), []core.ScopePath{core.ScopeDir("a")}},
-		{"trailing slash", core.ScopeDir("a/b/"), []core.ScopePath{core.ScopeDir("a"), core.ScopeDir("a/b")}},
+		{"inner wildcard", core.ScopePattern("a/*/c.go"), []core.ScopePath{"a"}},
+		{"trailing slash", core.ScopeDir("a/b/"), []core.ScopePath{"a", "a/b"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := claimDirKeys(nil, tc.scope); !equalPaths(got, tc.want) {
