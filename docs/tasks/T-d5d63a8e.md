@@ -1,7 +1,7 @@
 ---
 id: T-d5d63a8e
 title: Show attempt-aware CI state in detail panel
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_view.js
     - .opencode/plugins/beacon-project/ui/ui_model.js
