@@ -22,7 +22,9 @@ concurrency:
 
 jobs:
   verify:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -80,25 +82,33 @@ jobs:
         run: node --import ./.opencode/plugins/beacon-project/test_support/register_plugin_doubles.js --test ".opencode/plugins/beacon-project/**/*_test.js"
 
   build:
+    if: github.event_name != 'schedule'
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - run: echo "build passed in verify"
 
   vet:
+    if: github.event_name != 'schedule'
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - run: echo "vet passed in verify"
 
   lint:
+    if: github.event_name != 'schedule'
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - run: echo "lint passed in verify"
 
   test-modules:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -143,12 +153,15 @@ jobs:
         run: go test -race -shuffle=on ${{ matrix.packages }}
 
   test:
+    if: github.event_name != 'schedule'
     needs: test-modules
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - run: echo "all module suites passed"
 
   plugin-tui-smoke:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -178,6 +191,7 @@ jobs:
         run: bash scripts/plugin-tui-smoke.sh
 
   perf-smoke:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
