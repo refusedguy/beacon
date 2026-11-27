@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -66,11 +65,13 @@ func (c *runsCache) snapshot(ctx context.Context, status apiStatus) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(core.NewWireRuns(runs)); err != nil {
+	// Marshal writes the same bytes as Encoder.Encode. Appending the newline
+	// here avoids an Encoder and a bytes.Buffer on every generation.
+	b, err := json.Marshal(core.NewWireRuns(runs))
+	if err != nil {
 		return nil, err
 	}
-	c.body = buf.Bytes()
+	c.body = append(b, '\n')
 	return c.body, nil
 }
 
@@ -223,11 +224,15 @@ func (p *pingBroadcaster) subscribe() (<-chan []byte, func()) {
 // pingFrame builds one keepalive frame per tick. Each monitor writes these same
 // bytes after its own SSE id line.
 func pingFrame(now time.Time) []byte {
-	b, err := json.Marshal(wirePing{Time: now.UTC().Format(time.RFC3339)})
-	if err != nil {
-		return nil
-	}
-	return fmt.Appendf(nil, "event: ping\ndata: %s\n\n", b)
+	// An RFC3339 UTC timestamp contains only digits, '-', 'T', ':', '.' and
+	// 'Z', so it needs no JSON escaping. Building the payload directly skips
+	// the json.Marshal allocation. The bytes match wirePing exactly.
+	ts := now.UTC().Format(time.RFC3339)
+	frame := make([]byte, 0, len(ts)+32)
+	frame = append(frame, "event: ping\ndata: {\"time\":\""...)
+	frame = append(frame, ts...)
+	frame = append(frame, "\"}\n\n"...)
+	return frame
 }
 
 // run broadcasts one ping per tick. A full subscriber channel is skipped so a
@@ -448,9 +453,13 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 			nextID = n
 		}
 	}
+	// The id buffer is reused across frames. A 24-byte array holds "id: "
+	// plus the 19 digits of the largest int64 plus the newline, so no frame
+	// write allocates.
+	var idBuf [24]byte
 	writeID := func() {
 		nextID++
-		_, _ = fmt.Fprintf(rw, "id: %d\n", nextID)
+		_, _ = rw.Write(appendSSEID(idBuf[:0], nextID))
 	}
 
 	for {
@@ -484,12 +493,26 @@ type wirePing struct {
 	Time string `json:"time"`
 }
 
+// appendSSEID appends one SSE id line to dst. Reusing the caller's buffer
+// keeps the per-frame write allocation free.
+func appendSSEID(dst []byte, id int64) []byte {
+	dst = append(dst, "id: "...)
+	dst = strconv.AppendInt(dst, id, 10)
+	return append(dst, '\n')
+}
+
 func writeSSE(rw http.ResponseWriter, event string, payload any) {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	_, _ = fmt.Fprintf(rw, "event: %s\ndata: %s\n\n", event, b)
+	frame := make([]byte, 0, len(event)+len(b)+16)
+	frame = append(frame, "event: "...)
+	frame = append(frame, event...)
+	frame = append(frame, "\ndata: "...)
+	frame = append(frame, b...)
+	frame = append(frame, "\n\n"...)
+	_, _ = rw.Write(frame)
 }
 
 func writeJSON(rw http.ResponseWriter, v any) {
