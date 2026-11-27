@@ -1,7 +1,7 @@
 ---
 id: T-9a52aeea
 title: '[bench] Decision lookup deduplication'
-status: available
+status: done
 scope:
     - internal/bench/reconcile_decision_bench_test.go
 priority: 84
