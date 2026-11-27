@@ -94,7 +94,7 @@ func withShares(sums []summary, total time.Duration) []summary {
 }
 
 // BenchmarkHotPaths is the single repeatable command for the whole dossier.
-// One pass runs all six hotspots, so the shares describe one end-to-end pass.
+// One pass runs all ten hotspots, so the shares describe one end-to-end pass.
 //
 // CI runs a bounded smoke pass with BEACON_BENCH_SMOKE=1 and -benchtime=1x:
 //
@@ -107,6 +107,10 @@ func BenchmarkHotPaths(b *testing.B) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	e := newEnv(b)
+	scm := newSCMObserveHarness(b)
+	cards := newCardLocalBench(b)
+	snapshot := newHTTPSnapshotBench(b, e)
+	spawn := newSpawnHarnessBench(b)
 	if !smokeMode() {
 		warmup(e)
 	}
@@ -119,8 +123,17 @@ func BenchmarkHotPaths(b *testing.B) {
 		samples = append(samples, timed(nameRedact, func() (int64, int64) { return runRedact(e) }))
 		samples = append(samples, timed(nameJournal, func() (int64, int64) { return runJournal(e) }))
 		samples = append(samples, timed(nameFanout, func() (int64, int64) { return runFanout(e) }))
+		samples = append(samples, timed(nameSCM, func() (int64, int64) { return runSCMObserve(scm) }))
+		samples = append(samples, timed(nameCardLocal, func() (int64, int64) { return runCardStoreLocalScan(cards) }))
+		samples = append(samples, timed(nameHTTPSnapshot, func() (int64, int64) { return runHTTPSnapshotAssembly(snapshot) }))
+		samples = append(samples, timed(nameSpawn, func() (int64, int64) { return runHarnessSpawn(spawn) }))
 	}
 	b.StopTimer()
+	waitSpawnMoves(spawn, int64(b.N*spawnCount))
+	if got := spawn.moves.Load(); got != int64(b.N*spawnCount) {
+		b.Errorf("harness spawn deferred moves = %d, want %d", got, b.N*spawnCount)
+	}
+	b.ReportMetric(float64(snapshot.bytes), nameHTTPSnapshot+"-body-bytes")
 	sums := summarize(samples)
 	total := endToEnd(sums)
 	sums = withShares(sums, total)

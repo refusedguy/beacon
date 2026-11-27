@@ -9,29 +9,40 @@ import (
 
 // Hotspot names are fixed so every report has the same row order.
 const (
-	nameSQLite  = "sqlite-snapshot"
-	nameCard    = "card-parse"
-	nameWire    = "wire-encode"
-	nameRedact  = "redaction"
-	nameJournal = "mcp-journal"
-	nameFanout  = "sse-fanout"
+	nameSQLite       = "sqlite-snapshot"
+	nameCard         = "card-parse"
+	nameWire         = "wire-encode"
+	nameRedact       = "redaction"
+	nameJournal      = "mcp-journal"
+	nameFanout       = "sse-fanout"
+	nameSCM          = "scm-observe"
+	nameCardLocal    = "card-local-parse"
+	nameHTTPSnapshot = "http-snapshot-assembly"
+	nameSpawn        = "harness-spawn"
 )
 
-var hotspotOrder = []string{nameSQLite, nameCard, nameWire, nameRedact, nameJournal, nameFanout}
+var hotspotOrder = []string{
+	nameSQLite, nameCard, nameWire, nameRedact, nameJournal, nameFanout,
+	nameSCM, nameCardLocal, nameHTTPSnapshot, nameSpawn,
+}
 
 // namePrompt names the standalone prompt benchmark. Prompt construction is not
-// one of the six alternating hotspots, so it gets its own report line.
+// one of the ten alternating hotspots, so it gets its own report line.
 const namePrompt = "prompt-build"
 
 // limiters name the resource that bounds each hotspot. The dossier explains
 // why each one is the limiter and points at the annotated production code.
 var limiters = map[string]string{
-	nameSQLite:  "indexed snapshot reads + WAL pages",
-	nameCard:    "yaml.Unmarshal + line scan",
-	nameWire:    "encoding/json reflection",
-	nameRedact:  "regexp pass chain",
-	nameJournal: "mutex + indexed LRU",
-	nameFanout:  "json.Marshal + subscriber maps + slow-view drop",
+	nameSQLite:       "indexed snapshot reads + WAL pages",
+	nameCard:         "yaml.Unmarshal + line scan",
+	nameWire:         "encoding/json reflection",
+	nameRedact:       "regexp pass chain",
+	nameJournal:      "mutex + indexed LRU",
+	nameFanout:       "json.Marshal + subscriber maps + slow-view drop",
+	nameSCM:          "loopback PR + compare + checks + files round trips",
+	nameCardLocal:    "yaml.Unmarshal + per-scope os.Stat",
+	nameHTTPSnapshot: "groupHistory + json reflection",
+	nameSpawn:        "loopback create + model POST + deferred move",
 }
 
 type sample struct {
