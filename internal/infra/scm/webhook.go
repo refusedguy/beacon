@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -82,10 +83,30 @@ func selectPayloadAdapter(h http.Header) payloadAdapter {
 	return nil
 }
 
-// Webhook pushes PR numbers to a reconciler channel without polling.
+const (
+	webhookDedupeTTL = 5 * time.Minute
+	maxWebhookDedupe = 4096
+)
+
+// Webhook pushes PR numbers to a reconciler channel without polling. A
+// delivery is claimed before it is sent, so a retried provider event cannot
+// start a second reconcile burst while the first is still draining.
 type Webhook struct {
 	Secret  string
 	Changes chan<- int
+
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+// deliveryKey prefers the provider's delivery ID. GitLab has no equivalent
+// header, so the body hash stands in for one.
+func deliveryKey(r *http.Request, body []byte) string {
+	if id := r.Header.Get("X-GitHub-Delivery"); id != "" {
+		return "delivery:" + id
+	}
+	sum := sha256.Sum256(body)
+	return "body:" + hex.EncodeToString(sum[:])
 }
 
 func (w *Webhook) Handler() http.Handler {
@@ -113,27 +134,72 @@ func (w *Webhook) Handler() http.Handler {
 			http.Error(rw, "bad json", http.StatusBadRequest)
 			return
 		}
-		if n > 0 && w.Changes != nil {
-			w.deliver(n)
+		if n <= 0 || w.Changes == nil {
+			rw.WriteHeader(http.StatusAccepted)
+			return
 		}
-		rw.WriteHeader(http.StatusAccepted)
+		key := deliveryKey(r, body)
+		if !w.claim(key) {
+			rw.WriteHeader(http.StatusAccepted)
+			return
+		}
+		select {
+		case w.Changes <- n:
+			rw.WriteHeader(http.StatusAccepted)
+		default:
+			// A full channel means the reconciler is busy. Tell the provider
+			// to retry instead of accepting a delivery we dropped.
+			w.release(key)
+			rw.Header().Set("Retry-After", "1")
+			http.Error(rw, "reconciler busy", http.StatusServiceUnavailable)
+		}
 	})
 }
 
-// deliver hands n to the reconciler, waiting at most two seconds when the
-// channel is full. The non-blocking send first keeps the common case free of a
-// timer allocation; only a full channel pays for a stoppable timer.
-func (w *Webhook) deliver(n int) {
-	select {
-	case w.Changes <- n:
-		return
-	default:
+// claim reserves key for one delivery. It is the only place that writes seen,
+// so two concurrent copies of the same webhook cannot both pass.
+func (w *Webhook) claim(key string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pruneLocked()
+	if _, ok := w.seen[key]; ok {
+		return false
 	}
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	select {
-	case w.Changes <- n:
-	case <-timer.C:
+	if w.seen == nil {
+		w.seen = make(map[string]time.Time)
+	}
+	w.seen[key] = time.Now()
+	return true
+}
+
+// release drops a claim whose delivery was not accepted, so a provider retry
+// can still deliver it once the reconciler has room.
+func (w *Webhook) release(key string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.seen, key)
+}
+
+func (w *Webhook) pruneLocked() {
+	if len(w.seen) == 0 {
+		return
+	}
+	now := time.Now()
+	for key, at := range w.seen {
+		if now.Sub(at) > webhookDedupeTTL {
+			delete(w.seen, key)
+		}
+	}
+	for len(w.seen) >= maxWebhookDedupe {
+		var oldest string
+		var at time.Time
+		first := true
+		for key, claimed := range w.seen {
+			if first || claimed.Before(at) {
+				oldest, at, first = key, claimed, false
+			}
+		}
+		delete(w.seen, oldest)
 	}
 }
 
