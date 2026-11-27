@@ -7,7 +7,7 @@ scope:
     - internal/infra/sqlite/tasks.go
     - internal/app/reconciler_test.go
 depends:
-    - T-? none
+  - T-df77d6ed
 priority: 15
 kind: task
 require_review: llm
