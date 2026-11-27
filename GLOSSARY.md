@@ -14,6 +14,23 @@ A predicate over file paths. A scope names a file, a directory subtree, a glob o
 
 One execution of a task. A work run owns a worktree, a branch, a harness session, attempt counters and at most one pull request. Its state moves from pending through running and waiting states to merged or closed.
 
+## Run states and actions
+
+A work run has eight states (`pkg/core/run.go:15-32`). The table lists every event each state accepts and the state that event produces, from the transition table in `pkg/core/run.go:117-124`. An event not listed for a state is rejected.
+
+| State | Accepted events and next state | Operator action |
+| --- | --- | --- |
+| `pending` | `start` → `running`; `cancel` → `closed` | Wait for the worker to start, or cancel to close. |
+| `running` | `pr_registered`, `checks_pending`, `checks_passed` → `waiting_ci`; `checks_failed` → `needs_agent_fix`; `behind` → `needs_rebase`; `block` → `blocked`; `cancel` → `closed`; `merged` → `merged` | Bind the PR with `beacon_watch_pr`, then watch checks. |
+| `waiting_ci` | `checks_pending`, `checks_passed` → `waiting_ci`; `checks_failed` → `needs_agent_fix`; `behind` → `needs_rebase`; `block` → `blocked`; `cancel` → `closed`; `merged` → `merged` | Wait for checks; re-read runs after each event. |
+| `needs_rebase` | `rebased` → `waiting_ci`; `rebase_failed` → `needs_agent_fix`; `block` → `blocked`; `cancel` → `closed` | Let the reconciler rebase, or send the run to an agent fixer. |
+| `needs_agent_fix` | `agent_fixed`, `checks_passed` → `waiting_ci`; `block` → `blocked`; `cancel` → `closed`; `merged` → `merged` | Let the fixer session finish and open its PR. |
+| `blocked` | `unblock` → `waiting_ci`; `cancel` → `closed` | Resolve the base incident, then use `beacon_control {"action":"unblock"}` or `retry`. |
+| `merged` | none; terminal | No action. |
+| `closed` | none; terminal | Inspect `reason`, then `beacon_control {"action":"retry"}` to re-arm if needed (`internal/app/control.go:288-315`). |
+
+`merged` and `closed` are the terminal states (`pkg/core/run.go:35`). `running` and `needs_agent_fix` are the states that expect an active agent session (`pkg/core/run.go:41`). `blocked` is reported by `RunState.Blocked` (`pkg/core/run.go:38`).
+
 ## Verdict
 
 The outcome of the merge decision chain for a work run: `wait`, `merge`, `needs_rebase`, `needs_agent_fix`, `blocked` or `noop`. A verdict describes what happens next, not what has already happened.
@@ -44,7 +61,7 @@ A recorded failure of checks on the base branch. An incident holds a signature o
 
 ## AgentHarness
 
-The adapter that starts, steers and stops agent sessions. The harness turns a work run into a session in the agent's own environment and reports session events back to the controller. `harnesses/opencode` is the current implementation.
+The adapter that starts, steers and stops agent sessions. The harness turns a work run into a session in the agent's own environment and reports session events back to the controller. `harnesses/opencode` drives OpenCode over HTTP and SSE; `harnesses/acp` drives an executable over stdio (`go.work:3-8`, `harnesses/acp/`).
 
 ## TaskSource
 
