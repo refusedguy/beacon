@@ -6,11 +6,13 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**.md'
+      - '!AGENTS.md'
   pull_request:
     types: [opened, synchronize, reopened, labeled]
     paths-ignore:
       - 'docs/**'
       - '**.md'
+      - '!AGENTS.md'
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
@@ -23,8 +25,84 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # One shared filter feeds every gate. Output names are pinned here so a typo
+  # in a consumer cannot silently turn into a skipped job.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go-core: ${{ steps.all.outputs.go_core || steps.filter.outputs.go_core }}
+      go-acp: ${{ steps.all.outputs.go_acp || steps.filter.outputs.go_acp }}
+      go-opencode: ${{ steps.all.outputs.go_opencode || steps.filter.outputs.go_opencode }}
+      go-tui: ${{ steps.all.outputs.go_tui || steps.filter.outputs.go_tui }}
+      plugin: ${{ steps.all.outputs.plugin || steps.filter.outputs.plugin }}
+      smoke: ${{ steps.all.outputs.smoke || steps.filter.outputs.smoke }}
+      perf: ${{ steps.all.outputs.perf || steps.filter.outputs.perf }}
+      shared: ${{ steps.all.outputs.shared || steps.filter.outputs.shared }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Scheduled and manually started runs have no diff to filter. Every
+      # output is true there so the nightly and the full suite always run.
+      - name: Enable all paths for scheduled and manual runs
+        id: all
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          for key in go_core go_acp go_opencode go_tui plugin smoke perf shared; do
+            echo "${key}=true" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        with:
+          filters: |
+            go_core:
+              - 'cmd/**'
+              - 'internal/**'
+              - 'pkg/**'
+              - 'arch_test.go'
+              - 'go.mod'
+              - 'go.sum'
+            go_acp:
+              - 'harnesses/acp/**'
+            go_opencode:
+              - 'harnesses/opencode/**'
+            go_tui:
+              - 'ui/tui/**'
+            plugin:
+              - '.opencode/plugins/beacon-project/**'
+              - 'opencode.json'
+              - 'scripts/plugin-tui-smoke.sh'
+              - '.github/workflows/ci.yml'
+            smoke:
+              - 'scripts/bench-e2e.sh'
+              - 'internal/bench/**'
+              - '.github/workflows/ci.yml'
+            perf:
+              - 'scripts/check-bench-regression.sh'
+              - 'internal/bench/**'
+              - 'docs/perf/**'
+              - '.github/workflows/ci.yml'
+            shared:
+              - 'AGENTS.md'
+              - 'go.work'
+              - 'go.work.sum'
+              - '.github/workflows/ci.yml'
+
   warm-cache:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: >-
+      github.event_name != 'schedule' &&
+      github.event_name != 'workflow_dispatch' &&
+      (needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs['go-core'] == 'true' ||
+       needs.changes.outputs['go-acp'] == 'true' ||
+       needs.changes.outputs['go-opencode'] == 'true' ||
+       needs.changes.outputs['go-tui'] == 'true' ||
+       needs.changes.outputs.smoke == 'true')
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -71,8 +149,16 @@ jobs:
         run: go test -race -run '^$' ./...
 
   verify:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
-    needs: warm-cache
+    if: >-
+      github.event_name != 'schedule' &&
+      github.event_name != 'workflow_dispatch' &&
+      (needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs['go-core'] == 'true' ||
+       needs.changes.outputs['go-acp'] == 'true' ||
+       needs.changes.outputs['go-opencode'] == 'true' ||
+       needs.changes.outputs['go-tui'] == 'true' ||
+       needs.changes.outputs.plugin == 'true')
+    needs: [changes, warm-cache]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -89,6 +175,10 @@ jobs:
       - name: Build root module
         run: go build ./...
 
+      - name: Build ACP harness module
+        working-directory: harnesses/acp
+        run: go build ./...
+
       - name: Build OpenCode harness module
         working-directory: harnesses/opencode
         run: go build ./...
@@ -99,7 +189,10 @@ jobs:
           go build ./...
           rm -f tui
 
-      - name: Vet root module
+      # Root govet runs once inside golangci-lint. The wrapper modules are
+      # separate modules, so their vet steps stay explicit and acp joins them.
+      - name: Vet ACP harness module
+        working-directory: harnesses/acp
         run: go vet ./...
 
       - name: Vet OpenCode harness module
@@ -117,9 +210,6 @@ jobs:
         uses: golangci/golangci-lint-action@v9.3.0
         with:
           version: v2.15
-
-      - name: Production file size advisory
-        run: bash scripts/ci-advisory.sh
 
       - name: Plugin syntax check
         run: |
@@ -156,48 +246,76 @@ jobs:
       - run: echo "lint passed in verify"
 
   test-modules:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
-    needs: warm-cache
+    if: >-
+      github.event_name != 'schedule' &&
+      github.event_name != 'workflow_dispatch' &&
+      (needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs['go-core'] == 'true' ||
+       needs.changes.outputs['go-acp'] == 'true' ||
+       needs.changes.outputs['go-opencode'] == 'true' ||
+       needs.changes.outputs['go-tui'] == 'true' ||
+       needs.changes.outputs.smoke == 'true')
+    needs: [changes, warm-cache]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
           - module: root command
+            filter: go-core
             dir: .
             packages: ./cmd/...
             race: true
           - module: root app
+            filter: go-core
             dir: .
             packages: ./internal/app/...
             race: true
           - module: root infra
+            filter: go-core
             dir: .
             packages: ./internal/infra/...
             race: true
           - module: root bench
+            filter: go-core
             dir: .
             packages: ./internal/bench/...
             race: true
-          - module: root core
+            smoke: true
+          - module: root dot
+            filter: go-core
             dir: .
-            packages: . ./pkg/...
+            packages: .
+            race: false
+            verbose: true
+          - module: root core
+            filter: go-core
+            dir: .
+            packages: ./pkg/...
             race: false
           - module: acp
+            filter: go-acp
             dir: harnesses/acp
             packages: ./...
             race: false
           - module: opencode
+            filter: go-opencode
             dir: harnesses/opencode
             packages: ./...
             race: true
           - module: tui
+            filter: go-tui
             dir: ui/tui
             packages: ./...
             race: true
     steps:
       - uses: actions/checkout@v4
+
+      # The module name joins the common dependency hash, so each leg restores
+      # the cache it wrote instead of racing four other legs for one key.
+      - name: Set per-leg cache key
+        run: printf '%s\n' '${{ matrix.module }}' > ci-cache-key.txt
 
       - uses: actions/setup-go@v5
         with:
@@ -206,10 +324,35 @@ jobs:
           cache-dependency-path: |
             go.sum
             ui/tui/go.sum
+            ci-cache-key.txt
 
       - name: Test ${{ matrix.module }} module
+        if: needs.changes.outputs.shared == 'true' || needs.changes.outputs[matrix.filter] == 'true'
         working-directory: ${{ matrix.dir }}
-        run: go test ${{ matrix.race && '-race' || '' }} -shuffle=on ${{ matrix.packages }}
+        run: |
+          set -o pipefail
+          go test ${{ matrix.race && '-race' || '' }} ${{ matrix.verbose && '-v' || '' }} -shuffle=on ${{ matrix.packages }} 2>&1 | tee test-output.txt
+
+      # Advisory annotations come from the same test run, not a second go test.
+      - name: Advisory annotations
+        if: matrix.module == 'root dot' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs[matrix.filter] == 'true')
+        run: |
+          while IFS= read -r line; do
+            case "$line" in
+              *ADVISORY:*)
+                message="${line#*ADVISORY:}"
+                message="${message#"${message%%[![:space:]]*}"}"
+                printf '::warning::%s\n' "$message"
+                ;;
+            esac
+          done < test-output.txt
+
+      # perf-smoke had no timing gate and recompiled the bench binary on a
+      # fresh runner. It runs inside the root bench leg now. No timing gate is
+      # added here: CI timing stays on the perf runner.
+      - name: Bounded benchmark smoke
+        if: matrix.smoke && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.smoke == 'true')
+        run: timeout 30s bash scripts/bench-e2e.sh --smoke
 
   test:
     if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
@@ -220,7 +363,11 @@ jobs:
       - run: echo "all module suites passed"
 
   plugin-tui-smoke:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: >-
+      github.event_name != 'schedule' &&
+      github.event_name != 'workflow_dispatch' &&
+      (needs.changes.outputs.shared == 'true' || needs.changes.outputs.plugin == 'true')
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -249,33 +396,14 @@ jobs:
       - name: Boot OpenCode TUI with the Beacon plugin
         run: bash scripts/plugin-tui-smoke.sh
 
-  perf-smoke:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
-    needs: warm-cache
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
-
-      # No timing gate. A slow runner fails this step, not the pull request.
-      - name: Bounded benchmark smoke
-        run: timeout 30s bash scripts/bench-e2e.sh --smoke
-
   perf-pr-advisory:
-    # Publishes head-only numbers for a labeled PR. Never gates merge.
+    # Two-tree, alternating comparison for a labeled PR. It never gates merge,
+    # adds no required Criterion name, and always exits zero.
     if: >-
       github.event_name == 'pull_request' &&
       contains(github.event.pull_request.labels.*.name, 'perf')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     continue-on-error: true
     permissions:
       contents: read
@@ -296,22 +424,199 @@ jobs:
             go.sum
             ui/tui/go.sum
 
-      # One cache key, shared with the warm-cache job via cache-dependency-path.
-      - name: Warm the build
-        continue-on-error: true
-        run: go build ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
-      - name: Head-only smoke benchmark
+      - name: Install benchstat
         continue-on-error: true
-        run: bash scripts/bench-e2e.sh --smoke perf-pr.log
+        run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
 
-      - name: Upload raw perf log
+      - name: Build two detached worktrees
+        id: trees
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.event.pull_request.base.sha }}"
+          HEAD_REF="${{ github.event.pull_request.head.sha }}"
+          git fetch origin "$BASE_REF" || true
+          BASE="$(git merge-base "$BASE_REF" "$HEAD_REF")"
+          git worktree add --detach "$RUNNER_TEMP/perf-base" "$BASE"
+          git worktree add --detach "$RUNNER_TEMP/perf-head" "$HEAD_REF"
+          # Harness changes must be identical on both sides. Production code
+          # stays at its own tree's revision.
+          while IFS= read -r path; do
+            case "$path" in
+              internal/bench/*|.opencode/plugins/beacon-project/*|docs/perf/*)
+                if [[ -f "$RUNNER_TEMP/perf-head/$path" ]]; then
+                  mkdir -p "$RUNNER_TEMP/perf-base/$(dirname "$path")"
+                  cp "$RUNNER_TEMP/perf-head/$path" "$RUNNER_TEMP/perf-base/$path"
+                fi
+                ;;
+            esac
+          done < <(git diff --name-only "$BASE" "$HEAD_REF")
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Run A B B A B passes
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/perf-base.txt"
+          : > "$RUNNER_TEMP/perf-head.txt"
+          run_side() {
+            local side="$1" dir="$2"
+            {
+              echo "== pass $side =="
+              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkPlannerSelectInjectedChecker$' -benchtime=1x -count=1 ./internal/bench/)
+              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkSpawnPrompt$' -benchtime=1x -count=1 ./internal/bench/)
+              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkHotPaths$' -benchtime=1x -count=1 ./internal/bench/)
+              (cd "$dir" && BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js)
+            } 2>&1 | tee -a "$RUNNER_TEMP/perf-$side.txt"
+          }
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side head "$RUNNER_TEMP/perf-head"
+          run_side base "$RUNNER_TEMP/perf-base"
+          run_side head "$RUNNER_TEMP/perf-head"
+
+      - name: Write per-side CSV and comparison
+        run: |
+          set -euo pipefail
+          mkdir -p perf-results
+          benchstat="$(go env GOPATH)/bin/benchstat"
+          "$benchstat" -format csv "$RUNNER_TEMP/perf-base.txt" > perf-results/base.csv
+          "$benchstat" -format csv "$RUNNER_TEMP/perf-head.txt" > perf-results/head.csv
+          "$benchstat" -format csv "$RUNNER_TEMP/perf-base.txt" "$RUNNER_TEMP/perf-head.txt" \
+            > perf-results/compare.csv
+
+      # One comment per PR. Ranges that overlap are reported as inconclusive,
+      # so a noisy head run cannot be presented as a gain.
+      - name: Build comparison comment
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const temp = process.env.RUNNER_TEMP;
+          const sides = {
+            base: fs.readFileSync(`${temp}/perf-base.txt`, 'utf8'),
+            head: fs.readFileSync(`${temp}/perf-head.txt`, 'utf8'),
+          };
+          const wanted = ['planner-select', 'prompt-build', 'mcp-journal',
+            'redaction', 'wire-encode', 'tui-view'];
+          const limiters = {
+            'mcp-journal': 'mutex + indexed LRU',
+            'redaction': 'regexp pass chain',
+            'wire-encode': 'encoding/json reflection',
+            'tui-view': 'normalizeSnapshot + render',
+            'planner-select': 'injected overlap checker',
+            'prompt-build': 'strings.Builder + prompt bytes',
+          };
+          const values = { base: {}, head: {} };
+          const ranges = { base: {}, head: {} };
+          for (const side of ['base', 'head']) {
+            for (const line of sides[side].split(/\r?\n/)) {
+              const bench = line.match(/^Benchmark(\S+?)(?:-\d+)?\s+(\d+)\s+([\d.]+) ns\/op(.*)$/);
+              if (bench) {
+                const key = bench[1] === 'PlannerSelectInjectedChecker' ? 'planner-select'
+                  : bench[1] === 'SpawnPrompt' ? 'prompt-build' : null;
+                if (key) {
+                  (values[side][key] ||= []).push(Number(bench[3]) / 1e6);
+                  const allocs = bench[4].match(/([\d.]+)\s+B\/op/);
+                  if (allocs) (values[side][`${key}-bytes`] ||= []).push(Number(allocs[1]));
+                  const count = bench[4].match(/([\d.]+)\s+allocs\/op/);
+                  if (count) (values[side][`${key}-allocs`] ||= []).push(Number(count[1]));
+                  if (key === 'planner-select') {
+                    const checks = bench[4].match(/([\d.]+)\s+checks-per-select/);
+                    if (checks) (values[side]['planner-select-work'] ||= []).push(Number(checks[1]));
+                  }
+                }
+                for (const metric of ['median-ns', 'work', 'errs']) {
+                  // go test prints a custom metric as "<value> <name>".
+                  const re = new RegExp(`([\\d.]+)\\s+(\\S+?)-${metric}(?=\\s|$)`, 'g');
+                  let found;
+                  while ((found = re.exec(bench[4])) !== null) {
+                    const name = found[2];
+                    if (!['mcp-journal', 'redaction', 'wire-encode', 'prompt-build'].includes(name)) continue;
+                    const key = metric === 'median-ns' ? name : `${name}-${metric}`;
+                    const value = metric === 'median-ns' ? Number(found[1]) / 1e6 : Number(found[1]);
+                    (values[side][key] ||= []).push(value);
+                  }
+                }
+                continue;
+              }
+              const tui = line.match(/^production: median ([\d.]+) ms, range ([\d.]+) to ([\d.]+) ms/);
+              if (tui) {
+                (values[side]['tui-view'] ||= []).push(Number(tui[1]));
+                ranges[side]['tui-view'] = [Number(tui[2]), Number(tui[3])];
+              }
+              const counted = line.match(/^work counted in every round: (yes|NO)/);
+              if (counted) (values[side]['tui-view-work'] ||= []).push(counted[1] === 'yes' ? 1 : 0);
+            }
+          }
+          const median = xs => {
+            const sorted = [...xs].sort((a, b) => a - b);
+            return sorted[Math.floor(sorted.length / 2)];
+          };
+          const rows = [];
+          for (const plan of wanted) {
+            const keys = [plan];
+            if (plan === 'planner-select' || plan === 'prompt-build') keys.push(`${plan}-bytes`, `${plan}-allocs`);
+            if (['planner-select', 'prompt-build', 'mcp-journal', 'redaction', 'wire-encode', 'tui-view'].includes(plan)) {
+              keys.push(`${plan}-work`);
+            }
+            if (['prompt-build', 'mcp-journal', 'redaction', 'wire-encode'].includes(plan)) keys.push(`${plan}-errs`);
+            const wa = values.base[`${plan}-work`] || [];
+            const wb = values.head[`${plan}-work`] || [];
+            const workMismatch = !wa.length || !wb.length || median(wa) !== median(wb);
+            for (const key of keys) {
+              const a = values.base[key] || [];
+              const b = values.head[key] || [];
+              if (!a.length || !b.length) continue;
+              const am = median(a), bm = median(b);
+              const amin = ranges.base[key] ? ranges.base[key][0] : Math.min(...a);
+              const amax = ranges.base[key] ? ranges.base[key][1] : Math.max(...a);
+              const bmin = ranges.head[key] ? ranges.head[key][0] : Math.min(...b);
+              const bmax = ranges.head[key] ? ranges.head[key][1] : Math.max(...b);
+              const delta = am === 0 ? 0 : 100 * (bm - am) / am;
+              const overlap = amax >= bmin && bmax >= amin;
+              const verdict = (overlap || workMismatch) ? 'inconclusive'
+                : delta <= -2 ? 'gain' : delta >= 2 ? 'regression' : 'flat';
+              const limiterKey = Object.keys(limiters)
+                .filter(k => key.startsWith(k))
+                .sort((a, b) => b.length - a.length)[0];
+              rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}% | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${limiterKey ? limiters[limiterKey] : '-'} | ${verdict} |`);
+            }
+          }
+          const marker = '<!-- beacon-pr-perf -->';
+          const body = [
+            marker,
+            '### Advisory perf comparison, base vs head',
+            '',
+            'A B B A B passes on two detached worktrees at the merge base and the real head SHA.',
+            'Times are in ms for ns/op rows and in ms for median rows; work and errs are counts.',
+            'Advisory data only. It adds no required check and does not gate merge.',
+            '',
+            '| plan / metric | base | head | delta | base range | head range | limiter | verdict |',
+            '| --- | --- | --- | --- | --- | --- | --- | --- |',
+            ...(rows.length ? rows : ['| no comparable rows | - | - | - | - | - | - | inconclusive |']),
+            '',
+            'Overlapping ranges or different work counts are inconclusive, not a gain.',
+            'Raw logs and per-side CSVs are in the artifact.',
+          ].join('\n');
+          fs.mkdirSync('perf-results', { recursive: true });
+          fs.writeFileSync('perf-results/comment.md', body + '\n');
+          NODE
+
+      - name: Upload comparison artifacts
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: perf-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: perf-pr.log
+          name: perf-compare-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            perf-results/
+            ${{ runner.temp }}/perf-base.txt
+            ${{ runner.temp }}/perf-head.txt
           retention-days: 7
           if-no-files-found: ignore
 
@@ -323,36 +628,10 @@ jobs:
           script: |
             const fs = require('fs');
             const marker = '<!-- beacon-pr-perf -->';
-            const logPath = 'perf-pr.log';
-            const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
-            const rows = [];
-            let inTable = false;
-            for (const line of log.split(/\r?\n/)) {
-              if (/\bmedian\b.*\bwork\b.*\berrs\b.*\blimiter\b/.test(line)) {
-                inTable = true;
-                rows.push(line);
-              } else if (inTable && line.trim() !== '') {
-                rows.push(line);
-              } else if (inTable) {
-                inTable = false;
-              }
-            }
-            const report = rows.length
-              ? rows.join('\n')
-              : '(no benchmark rows produced; see the raw log artifact)';
-            const body = [
-              marker,
-              '### Advisory perf smoke (head only)',
-              '',
-              'Advisory data only. It adds no required check and does not gate merge.',
-              '',
-              '```text',
-              report,
-              '```',
-              '',
-              'Raw log artifact: `perf-pr-' + context.issue.number + '-' +
-                context.payload.pull_request.head.sha + '` (7 day retention).',
-            ].join('\n');
+            const path = 'perf-results/comment.md';
+            const body = fs.existsSync(path)
+              ? fs.readFileSync(path, 'utf8')
+              : marker + '\n### Advisory perf comparison\n\nNo comparable rows; see the artifact.';
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -360,13 +639,9 @@ jobs:
             });
             const existing = comments.find(c => c.body && c.body.includes(marker));
             if (existing) {
-              await github.rest.issues.updateComment({
-                owner, repo, comment_id: existing.id, body,
-              });
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
             } else {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number, body,
-              });
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
   perf-nightly:
@@ -414,6 +689,13 @@ jobs:
           run-id: ${{ steps.previous.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # A missing baseline made the old job green by omission. Fail visibly.
+      - name: Require a baseline
+        if: steps.baseline.outcome != 'success'
+        run: |
+          echo "::error::Nightly baseline is missing; refusing a green run without a comparison."
+          exit 1
+
       - name: Install benchstat
         if: steps.baseline.outcome == 'success'
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
@@ -432,7 +714,13 @@ jobs:
           "$benchstat" bench-baseline/current.txt bench-results/current.txt > bench-results/compare.txt
           "$benchstat" -format csv bench-baseline/current.txt bench-results/current.txt \
             > bench-results/compare.csv 2> bench-results/compare-warnings.txt
+          # The 2 percent noise floor and the 15/20 percent limits live in the
+          # script; it also rejects a baseline far above the recorded medians.
           bash scripts/check-bench-regression.sh bench-results/compare.csv
+
+      - name: Full ten-plan suite on manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: bash scripts/bench-e2e.sh --full
 
       - name: Upload benchstat artifacts
         if: steps.compare.outcome == 'success' || steps.compare.outcome == 'failure'
