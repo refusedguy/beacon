@@ -385,7 +385,7 @@ func groupHistory(events []RunEvent, decisions []Decision) (map[string][]RunEven
 
 // makeRunSnapshot builds one run's wire view. prBaseURL is the PR URL prefix
 // computed once per snapshot, so a run only appends its number to it.
-func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time, prBaseURL ...string) RunSnapshot {
+func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time, prBaseURL string) RunSnapshot {
 	events := timeline[string(run.ID)]
 	if events == nil {
 		events = []RunEvent{}
@@ -395,8 +395,8 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		decisions = []Decision{}
 	}
 	link := ""
-	if len(prBaseURL) > 0 && run.PRNumber > 0 {
-		link = prBaseURL[0] + strconv.Itoa(run.PRNumber)
+	if prBaseURL != "" && run.PRNumber > 0 {
+		link = prBaseURL + strconv.Itoa(run.PRNumber)
 	}
 	return RunSnapshot{
 		ID: string(run.ID), TaskID: string(run.TaskID), State: string(run.State),
