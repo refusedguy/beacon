@@ -422,30 +422,34 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	// The editor can hold a stale row even when git refuses to remove the
 	// worktree. Defer the refresh so a failed removal still cleans it up.
 	defer g.refresh(ctx)
-	// A directory removed outside this method is not dirty. It still needs the
-	// editor registration refreshed, so skip the clean check but keep going.
-	clean := true
-	if _, err := os.Stat(ws.Path); err == nil {
-		var checkErr error
-		clean, checkErr = g.Clean(ctx, ws)
-		if checkErr != nil {
-			return checkErr
+	// Git checks cleanliness inside worktree remove and leaves a dirty worktree
+	// untouched. Trying the removal first avoids a separate status call on the
+	// common clean path.
+	_, removeErr := g.run(ctx, "worktree", "remove", ws.Path)
+	if removeErr == nil {
+		if ws.Branch != "" {
+			return g.deleteBranch(ctx, ws.Branch, false)
 		}
-	} else if !os.IsNotExist(err) {
+		return nil
+	}
+	// A directory removed outside this method needs no clean check. Keep the
+	// git error as the result and let the deferred refresh clear the editor.
+	if _, err := os.Stat(ws.Path); os.IsNotExist(err) {
+		return removeErr
+	} else if err != nil {
 		return err
+	}
+	// A failed removal may mean dirt or a broken git registration. Ask git once
+	// to tell the cases apart so a dirty worktree keeps its old conflict error
+	// and every other failure keeps the original git error.
+	clean, cleanErr := g.Clean(ctx, ws)
+	if cleanErr != nil {
+		return core.JoinWith(removeErr, "check worktree before removal", cleanErr)
 	}
 	if !clean {
 		return core.WorkspaceConflict(ws.Path)
 	}
-	if _, err := g.run(ctx, "worktree", "remove", ws.Path); err != nil {
-		return err
-	}
-	if ws.Branch != "" {
-		if err := g.deleteBranch(ctx, ws.Branch, false); err != nil {
-			return err
-		}
-	}
-	return nil
+	return removeErr
 }
 
 // deleteBranch deletes the local branch with -d for a safe delete or -D for a
