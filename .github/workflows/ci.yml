@@ -481,7 +481,7 @@ jobs:
           while IFS= read -r path; do
             case "$path" in
               internal/bench/ui_bench.js) continue ;;
-              internal/bench/*|docs/perf/*)
+              internal/bench/*|docs/perf/*|internal/infra/workspace/git_worktree_test.go)
                 if [[ -f "$RUNNER_TEMP/perf-head/$path" ]]; then
                   mkdir -p "$RUNNER_TEMP/perf-base/$(dirname "$path")"
                   cp "$RUNNER_TEMP/perf-head/$path" "$RUNNER_TEMP/perf-base/$path"
@@ -503,15 +503,25 @@ jobs:
             {
               echo "== pass $side =="
               (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench 'BenchmarkReconcileTickCounts|BenchmarkBaseRedCheck|BenchmarkBaseRedBlockFanout' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkSQLiteSnapshot$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkPlannerSelectInjectedChecker$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkSpawnPrompt$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
-              (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+              (cd "$dir" && BEACON_BENCH_SMOKE=1 GOMAXPROCS=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkHotPaths$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && go test ./internal/infra/workspace/ -run '^TestGitWorktreeRemoveLatencyAlternating$' -count=1 -v) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && BENCH_TICKS=1001 BENCH_ROUNDS=5 node internal/bench/run_watcher_bench.js) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
             } 2>&1 | tee -a "$RUNNER_TEMP/perf-$side.txt"
           }
@@ -548,8 +558,16 @@ jobs:
           const statusPath = `${temp}/perf-status`;
           const status = fs.existsSync(statusPath)
             ? fs.readFileSync(statusPath, 'utf8').trim() : '';
+          // go test prints custom metrics as "<value> <name>". Only wired
+          // benchmark rows are parsed from that tail.
+          const metricNames = ['mcp-journal', 'redaction', 'wire-encode', 'prompt-build',
+            'snapshot', 'reconcile-tick-counts', 'base-red-check', 'base-red-block',
+            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
           const wanted = ['planner-select', 'prompt-build', 'mcp-journal',
-            'redaction', 'wire-encode', 'tui-view'];
+            'redaction', 'wire-encode', 'tui-view',
+            'reconcile-tick-counts', 'base-red-check', 'base-red-block',
+            'snapshot', 'worktree-remove', 'run-watcher-fp', 'run-watcher-fp-chars',
+            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
           const limiters = {
             'mcp-journal': 'mutex + indexed LRU',
             'redaction': 'regexp pass chain',
@@ -557,6 +575,31 @@ jobs:
             'tui-view': 'normalizeSnapshot + render',
             'planner-select': 'injected overlap checker',
             'prompt-build': 'strings.Builder + prompt bytes',
+            'reconcile-tick-counts': 'Source.ListAvailable + SQLite Get',
+            'base-red-check': 'Source.ListAvailable I/O',
+            'base-red-block': 'SCM.Observe round trips',
+            'snapshot': 'SQLite VM, ListRunEvents sort and JSON reflection',
+            'worktree-remove': 'git subprocess spawn and worktree metadata',
+            'run-watcher-fp': 'JSON.stringify character volume',
+            'scm-observe': 'loopback PR + compare + checks + files round trips',
+            'card-local-parse': 'yaml.Unmarshal + per-scope os.Stat',
+            'http-snapshot-assembly': 'groupHistory + json reflection',
+            'harness-spawn': 'loopback create + model POST + deferred move',
+          };
+          const workPlans = ['planner-select', 'prompt-build', 'mcp-journal',
+            'redaction', 'wire-encode', 'tui-view', 'snapshot', 'worktree-remove',
+            'run-watcher-fp', 'reconcile-tick-counts', 'base-red-check', 'base-red-block',
+            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
+          const errPlans = ['prompt-build', 'mcp-journal', 'redaction', 'wire-encode',
+            'snapshot', 'worktree-remove', 'run-watcher-fp',
+            'reconcile-tick-counts', 'base-red-check', 'base-red-block',
+            'scm-observe', 'card-local-parse', 'http-snapshot-assembly', 'harness-spawn'];
+          const durationMS = raw => {
+            const n = Number.parseFloat(raw);
+            if (raw.endsWith('ns')) return n / 1e6;
+            if (raw.endsWith('µs') || raw.endsWith('us')) return n / 1e3;
+            if (raw.endsWith('ms')) return n;
+            return n * 1e3;
           };
           const values = { base: {}, head: {} };
           const ranges = { base: {}, head: {} };
@@ -583,14 +626,56 @@ jobs:
                   let found;
                   while ((found = re.exec(bench[4])) !== null) {
                     const name = found[2];
-                    if (!['mcp-journal', 'redaction', 'wire-encode', 'prompt-build'].includes(name)) continue;
-                    const key = metric === 'median-ns' ? name : `${name}-${metric}`;
+                    if (!metricNames.includes(name)) continue;
+                    const metricKey = metric === 'median-ns' ? name : `${name}-${metric}`;
                     const value = metric === 'median-ns' ? Number(found[1]) / 1e6 : Number(found[1]);
-                    (values[side][key] ||= []).push(value);
+                    (values[side][metricKey] ||= []).push(value);
+                  }
+                }
+                for (const metric of ['lists-per-tick', 'observes-per-tick', 'gets-per-tick']) {
+                  const re = new RegExp(`([\\d.]+)\\s+(\\S+?)-${metric}(?=\\s|$)`, 'g');
+                  let found;
+                  while ((found = re.exec(bench[4])) !== null) {
+                    if (!['reconcile-tick-counts', 'base-red-check', 'base-red-block'].includes(found[2])) continue;
+                    (values[side][`${found[2]}-${metric}`] ||= []).push(Number(found[1]));
                   }
                 }
                 continue;
               }
+              // The deep snapshot prints its own summary with a real min and
+              // max, so its range is not inferred from the sampled medians.
+              const snap = line.match(/^sqlite snapshot deep: median=(\S+) .* min=(\S+) max=(\S+) range=(\S+) work=(\d+) errs=(\d+)/);
+              if (snap) ranges[side]['snapshot'] = [durationMS(snap[2]), durationMS(snap[3])];
+              const wt = line.match(/^worktree-remove: median=([\d.]+)s range=([\d.]+)s-([\d.]+)s work=(\d+) status=(\d+) errs=(\d+)/);
+              if (wt) {
+                (values[side]['worktree-remove'] ||= []).push(Number(wt[1]));
+                (values[side]['worktree-remove-work'] ||= []).push(Number(wt[4]));
+                (values[side]['worktree-remove-status'] ||= []).push(Number(wt[5]));
+                (values[side]['worktree-remove-errs'] ||= []).push(Number(wt[6]));
+                ranges[side]['worktree-remove'] = [Number(wt[2]), Number(wt[3])];
+              }
+              const fp = line.match(/^run-watcher-fp: median ([\d.]+) ms, range ([\d.]+) to ([\d.]+) ms/);
+              if (fp) {
+                (values[side]['run-watcher-fp'] ||= []).push(Number(fp[1]));
+                ranges[side]['run-watcher-fp'] = [Number(fp[2]), Number(fp[3])];
+              }
+              const fpChars = line.match(/^run-watcher-fp-chars: (\d+) characters, range (\d+) to (\d+)/);
+              if (fpChars) {
+                (values[side]['run-watcher-fp-chars'] ||= []).push(Number(fpChars[1]));
+                ranges[side]['run-watcher-fp-chars'] = [Number(fpChars[2]), Number(fpChars[3])];
+              }
+              const fpWork = line.match(/^run-watcher-fp-work: snapshots=(\d+) normalizations=(\d+) emissions=(\d+)/);
+              if (fpWork) {
+                const snapshots = Number(fpWork[1]);
+                const norms = Number(fpWork[2]);
+                const emissions = Number(fpWork[3]);
+                (values[side]['run-watcher-fp-work'] ||= []).push(snapshots + norms + emissions);
+                (values[side]['run-watcher-fp-snapshots'] ||= []).push(snapshots);
+                (values[side]['run-watcher-fp-normalizations'] ||= []).push(norms);
+                (values[side]['run-watcher-fp-emissions'] ||= []).push(emissions);
+              }
+              const fpErrs = line.match(/^run-watcher-fp-errs: (\d+) errors/);
+              if (fpErrs) (values[side]['run-watcher-fp-errs'] ||= []).push(Number(fpErrs[1]));
               const tui = line.match(/^production: median ([\d.]+) ms, range ([\d.]+) to ([\d.]+) ms/);
               if (tui) {
                 (values[side]['tui-view'] ||= []).push(Number(tui[1]));
@@ -608,13 +693,30 @@ jobs:
           for (const plan of wanted) {
             const keys = [plan];
             if (plan === 'planner-select' || plan === 'prompt-build') keys.push(`${plan}-bytes`, `${plan}-allocs`);
-            if (['planner-select', 'prompt-build', 'mcp-journal', 'redaction', 'wire-encode', 'tui-view'].includes(plan)) {
-              keys.push(`${plan}-work`);
+            if (workPlans.includes(plan)) keys.push(`${plan}-work`);
+            if (errPlans.includes(plan)) keys.push(`${plan}-errs`);
+            if (['reconcile-tick-counts', 'base-red-check', 'base-red-block'].includes(plan)) {
+              keys.push(`${plan}-lists-per-tick`, `${plan}-observes-per-tick`, `${plan}-gets-per-tick`);
             }
-            if (['prompt-build', 'mcp-journal', 'redaction', 'wire-encode'].includes(plan)) keys.push(`${plan}-errs`);
+            if (plan === 'worktree-remove') keys.push(`${plan}-status`);
+            if (plan === 'run-watcher-fp') {
+              keys.push(`${plan}-snapshots`, `${plan}-normalizations`, `${plan}-emissions`);
+            }
             const wa = values.base[`${plan}-work`] || [];
             const wb = values.head[`${plan}-work`] || [];
-            const workMismatch = !wa.length || !wb.length || median(wa) !== median(wb);
+            let workMismatch = !wa.length || !wb.length || median(wa) !== median(wb);
+            // Worktree removal is expected to drop a git status call, so base
+            // and head work counts differ by design.
+            if (plan === 'worktree-remove') workMismatch = false;
+            // The plugin fingerprint counts three work actions and errors;
+            // all four must agree before a timing change is trusted.
+            if (plan === 'run-watcher-fp') {
+              workMismatch = ['snapshots', 'normalizations', 'emissions', 'errs'].some(counter => {
+                const a = values.base[`${plan}-${counter}`] || [];
+                const b = values.head[`${plan}-${counter}`] || [];
+                return !a.length || !b.length || median(a) !== median(b);
+              });
+            }
             for (const key of keys) {
               const a = values.base[key] || [];
               const b = values.head[key] || [];
@@ -626,8 +728,19 @@ jobs:
               const bmax = ranges.head[key] ? ranges.head[key][1] : Math.max(...b);
               const delta = am === 0 ? 0 : 100 * (bm - am) / am;
               const overlap = amax >= bmin && bmax >= amin;
-              const verdict = (overlap || workMismatch) ? 'inconclusive'
+              let verdict = (overlap || workMismatch) ? 'inconclusive'
                 : delta <= -2 ? 'gain' : delta >= 2 ? 'regression' : 'flat';
+              // The worktree call row is judged by counts, not wall time.
+              if (plan === 'worktree-remove' && key === 'worktree-remove-work') {
+                const ba = values.base['worktree-remove-work'] || [];
+                const bb = values.head['worktree-remove-work'] || [];
+                const sa = values.base['worktree-remove-status'] || [];
+                const sb = values.head['worktree-remove-status'] || [];
+                const ea = values.base['worktree-remove-errs'] || [];
+                const eb = values.head['worktree-remove-errs'] || [];
+                if (median(ba) === 3 && median(sa) === 1 && median(bb) === 2 && median(sb) === 0
+                  && median(ea) === 0 && median(eb) === 0) verdict = 'calls reduced';
+              }
               const limiterKey = Object.keys(limiters)
                 .filter(k => key.startsWith(k))
                 .sort((a, b) => b.length - a.length)[0];
@@ -640,8 +753,8 @@ jobs:
             '### Advisory perf comparison, base vs head',
             '',
             'A B B A B A passes on two detached worktrees at the merge base and the real head SHA.',
-            'Times are in ms for ns/op rows and in ms for median rows; work and errs are counts.',
-            'Advisory data only. It adds no required check and does not gate merge.',
+            'Times are in ms; worktree-remove is in seconds and run-watcher-fp-chars counts characters.',
+            'Work and errs are counts. Advisory data only: it adds no required check and does not gate merge.',
             '',
             '| plan / metric | base | head | delta | base range | head range | limiter | verdict |',
             '| --- | --- | --- | --- | --- | --- | --- | --- |',
