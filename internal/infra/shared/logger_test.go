@@ -3,6 +3,7 @@ package shared
 import (
 	"bytes"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -78,5 +79,26 @@ func assertRedacted(t *testing.T, got string) {
 	}
 	if !strings.Contains(got, "[REDACTED]") {
 		t.Fatalf("nothing redacted: %s", got)
+	}
+}
+
+func BenchmarkRedactHandler(b *testing.B) {
+	h := redactHandler{slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})}
+	l := slog.New(h)
+	cases := []struct {
+		name  string
+		msg   string
+		attrs []any
+	}{
+		{"clean", "plain message with no secret", []any{slog.String("path", "/tmp/file"), slog.Int("count", 42), slog.Bool("ok", true)}},
+		{"secret message", "token " + testSecret, []any{slog.String("path", "/tmp/file")}},
+		{"secret attr", "plain message", []any{slog.String("token", testSecret), slog.Int("count", 42)}},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				l.Info(tc.msg, tc.attrs...)
+			}
+		})
 	}
 }

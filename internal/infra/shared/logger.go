@@ -29,15 +29,51 @@ func NewLogger(level string) *slog.Logger {
 type redactHandler struct{ slog.Handler }
 
 func (h redactHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.NumAttrs() == 0 && !redact.HasCandidate(r.Message) {
+	msg := redact.Redact(r.Message)
+	changed := msg != r.Message
+	if !changed && r.NumAttrs() > 0 {
+		r.Attrs(func(a slog.Attr) bool {
+			if needsRedact(a) {
+				changed = true
+				return false
+			}
+			return true
+		})
+	}
+	if !changed {
 		return h.Handler.Handle(ctx, r)
 	}
-	nr := slog.NewRecord(r.Time, r.Level, redact.Redact(r.Message), r.PC)
+	nr := slog.NewRecord(r.Time, r.Level, msg, r.PC)
 	r.Attrs(func(a slog.Attr) bool {
 		nr.AddAttrs(redactAttr(a))
 		return true
 	})
 	return h.Handler.Handle(ctx, nr)
+}
+
+// needsRedact reports whether redactAttr could change a. It skips kinds that
+// redactValue leaves untouched and uses the same cheap prefilter as Redact, so
+// a clean record reaches the JSON handler without a rebuilt slog.Record.
+func needsRedact(a slog.Attr) bool {
+	return needsRedactValue(a.Value)
+}
+
+func needsRedactValue(v slog.Value) bool {
+	switch v.Kind() {
+	case slog.KindString:
+		return redact.HasCandidate(v.String())
+	case slog.KindAny:
+		if err, ok := v.Any().(error); ok {
+			return redact.HasCandidate(err.Error())
+		}
+	case slog.KindGroup:
+		for _, a := range v.Group() {
+			if needsRedact(a) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h redactHandler) WithAttrs(attrs []slog.Attr) slog.Handler {

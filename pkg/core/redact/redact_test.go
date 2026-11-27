@@ -67,6 +67,7 @@ var redactCases = []struct {
 	{"short github token", "ghp_short", false, true},
 	{"short google key", "AIzaShort", false, true},
 	{"quoted bearer", `Authorization: Bearer "quoted value"`, false, true},
+	{"bare tokens in labelled value", "token=ghp_abcdefghijklmnopqrstuvwxyz123456 and sk-abcdefghijklmnopqrstuvwxyz", true, true},
 	{"empty", "", false, false},
 }
 
