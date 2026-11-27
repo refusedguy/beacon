@@ -438,22 +438,27 @@ jobs:
         run: |
           set -euo pipefail
           BASE_REF="${{ github.event.pull_request.base.sha }}"
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
           HEAD_REF="${{ github.event.pull_request.head.sha }}"
           git fetch origin "$BASE_REF" || true
+          git fetch origin "$BASE_BRANCH" || true
           BASE="$(git merge-base "$BASE_REF" "$HEAD_REF")"
           git worktree add --detach "$RUNNER_TEMP/perf-base" "$BASE"
           git worktree add --detach "$RUNNER_TEMP/perf-head" "$HEAD_REF"
-          # The UI harness must match on both sides even when a PR changes no
-          # harness file. A labeled PR's merge base can predate the fixed
-          # ui_bench.js, which otherwise aborts the base pass and leaves no
-          # comparable rows. Copy it before the changed-file loop.
-          cp "$RUNNER_TEMP/perf-head/internal/bench/ui_bench.js" \
-            "$RUNNER_TEMP/perf-base/internal/bench/ui_bench.js"
+          # Both trees must run the same known-good UI mirror. Take it from the
+          # PR base branch: the labeled PR's own head can still carry the stale
+          # mirror that aborts the pass. Write it into both worktrees before
+          # the changed-file loop so the loop cannot replace it with head's.
+          git show "origin/$BASE_BRANCH:internal/bench/ui_bench.js" \
+            > "$RUNNER_TEMP/perf-base/internal/bench/ui_bench.js"
+          git show "origin/$BASE_BRANCH:internal/bench/ui_bench.js" \
+            > "$RUNNER_TEMP/perf-head/internal/bench/ui_bench.js"
           # Harness changes must be identical on both sides. Production code
-          # stays at its own tree's revision.
+          # stays at its own tree's revision, so plugin files are never copied.
           while IFS= read -r path; do
             case "$path" in
-              internal/bench/*|.opencode/plugins/beacon-project/*|docs/perf/*)
+              internal/bench/ui_bench.js) continue ;;
+              internal/bench/*|docs/perf/*)
                 if [[ -f "$RUNNER_TEMP/perf-head/$path" ]]; then
                   mkdir -p "$RUNNER_TEMP/perf-base/$(dirname "$path")"
                   cp "$RUNNER_TEMP/perf-head/$path" "$RUNNER_TEMP/perf-base/$path"
@@ -463,23 +468,28 @@ jobs:
           done < <(git diff --name-only "$BASE" "$HEAD_REF")
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
-      - name: Run A B B A B passes
+      - name: Run A B B A B A passes
         continue-on-error: true
         run: |
           set -euo pipefail
           : > "$RUNNER_TEMP/perf-base.txt"
           : > "$RUNNER_TEMP/perf-head.txt"
+          : > "$RUNNER_TEMP/perf-status"
           run_side() {
             local side="$1" dir="$2"
             {
               echo "== pass $side =="
               (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
-                -bench '^BenchmarkPlannerSelectInjectedChecker$' -benchtime=1x -count=1 ./internal/bench/)
+                -bench '^BenchmarkPlannerSelectInjectedChecker$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
-                -bench '^BenchmarkSpawnPrompt$' -benchtime=1x -count=1 ./internal/bench/)
+                -bench '^BenchmarkSpawnPrompt$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
-                -bench '^BenchmarkHotPaths$' -benchtime=1x -count=1 ./internal/bench/)
-              (cd "$dir" && BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js)
+                -bench '^BenchmarkHotPaths$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && BENCH_ITERATIONS=50 BENCH_WARMUP=0 node internal/bench/ui_bench.js) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
             } 2>&1 | tee -a "$RUNNER_TEMP/perf-$side.txt"
           }
           run_side base "$RUNNER_TEMP/perf-base"
@@ -487,6 +497,7 @@ jobs:
           run_side head "$RUNNER_TEMP/perf-head"
           run_side base "$RUNNER_TEMP/perf-base"
           run_side head "$RUNNER_TEMP/perf-head"
+          run_side base "$RUNNER_TEMP/perf-base"
 
       - name: Write per-side CSV and comparison
         continue-on-error: true
@@ -502,6 +513,7 @@ jobs:
       # One comment per PR. Ranges that overlap are reported as inconclusive,
       # so a noisy head run cannot be presented as a gain.
       - name: Build comparison comment
+        continue-on-error: true
         run: |
           node - <<'NODE'
           const fs = require('fs');
@@ -510,6 +522,9 @@ jobs:
             base: fs.readFileSync(`${temp}/perf-base.txt`, 'utf8'),
             head: fs.readFileSync(`${temp}/perf-head.txt`, 'utf8'),
           };
+          const statusPath = `${temp}/perf-status`;
+          const status = fs.existsSync(statusPath)
+            ? fs.readFileSync(statusPath, 'utf8').trim() : '';
           const wanted = ['planner-select', 'prompt-build', 'mcp-journal',
             'redaction', 'wire-encode', 'tui-view'];
           const limiters = {
@@ -556,7 +571,6 @@ jobs:
               const tui = line.match(/^production: median ([\d.]+) ms, range ([\d.]+) to ([\d.]+) ms/);
               if (tui) {
                 (values[side]['tui-view'] ||= []).push(Number(tui[1]));
-                ranges[side]['tui-view'] = [Number(tui[2]), Number(tui[3])];
               }
               const counted = line.match(/^work counted in every round: (yes|NO)/);
               if (counted) (values[side]['tui-view-work'] ||= []).push(counted[1] === 'yes' ? 1 : 0);
@@ -564,7 +578,8 @@ jobs:
           }
           const median = xs => {
             const sorted = [...xs].sort((a, b) => a - b);
-            return sorted[Math.floor(sorted.length / 2)];
+            const mid = Math.floor(sorted.length / 2);
+            return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
           };
           const rows = [];
           for (const plan of wanted) {
@@ -601,7 +616,7 @@ jobs:
             marker,
             '### Advisory perf comparison, base vs head',
             '',
-            'A B B A B passes on two detached worktrees at the merge base and the real head SHA.',
+            'A B B A B A passes on two detached worktrees at the merge base and the real head SHA.',
             'Times are in ms for ns/op rows and in ms for median rows; work and errs are counts.',
             'Advisory data only. It adds no required check and does not gate merge.',
             '',
@@ -610,6 +625,7 @@ jobs:
             ...(rows.length ? rows : ['| no comparable rows | - | - | - | - | - | - | inconclusive |']),
             '',
             'Overlapping ranges or different work counts are inconclusive, not a gain.',
+            status ? `Aborted passes: ${status.split(/\r?\n/).filter(Boolean).join(', ')}.` : 'No aborted passes.',
             'Raw logs and per-side CSVs are in the artifact.',
           ].join('\n');
           fs.mkdirSync('perf-results', { recursive: true });
