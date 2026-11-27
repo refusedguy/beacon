@@ -92,6 +92,29 @@ jobs:
               - 'go.work.sum'
               - '.github/workflows/ci.yml'
 
+  mark-ready:
+    # Ordinary PRs need no operator action to satisfy merge.labels.
+    # Perf PRs are intentionally skipped: their worker sets the label after
+    # the last variant has been measured.
+    if: >-
+      github.event_name == 'pull_request' &&
+      !contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Add ready-to-merge label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['ready-to-merge'],
+            })
+
   warm-cache:
     if: >-
       github.event_name != 'schedule' &&
