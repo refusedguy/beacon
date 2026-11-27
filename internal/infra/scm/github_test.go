@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/go-github/v93/github"
+
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 func ghObserveGitHub(t *testing.T, handler http.Handler) *GitHub {
@@ -499,5 +502,142 @@ func TestUpdateBranchUsesConditionalGet(t *testing.T) {
 	}
 	if gets != 2 || conditional != 1 {
 		t.Fatalf("pull request GETs = %d, conditional = %d; want 2 and 1", gets, conditional)
+	}
+}
+
+func TestGitHubChecksConditionalReadFollowsUpdates(t *testing.T) {
+	const v1, v2 = `"checks-v1"`, `"checks-v2"`
+	revision := 0
+	var calls, conditional int
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !strings.Contains(r.URL.Path, "/check-runs") {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		calls++
+		etag, conclusion := v1, "success"
+		if revision == 1 {
+			etag, conclusion = v2, "failure"
+		}
+		if got := r.Header.Get("If-None-Match"); got == etag {
+			conditional++
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		_, _ = fmt.Fprintf(w, `{"total_count":1,"check_runs":[{"name":"ci","status":"completed","conclusion":%q}]}`, conclusion)
+	}))
+
+	first, err := g.checks(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].State != core.CheckSuccess {
+		t.Fatalf("first checks = %+v, want one success", first)
+	}
+	second, err := g.checks(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].State != core.CheckSuccess {
+		t.Fatalf("cached checks = %+v, want one success", second)
+	}
+	if calls != 2 || conditional != 1 {
+		t.Fatalf("check-runs calls = %d, conditional = %d; want 2 and 1", calls, conditional)
+	}
+
+	revision = 1
+	updated, err := g.checks(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated) != 1 || updated[0].State != core.CheckFailure {
+		t.Fatalf("updated checks = %+v, want one failure", updated)
+	}
+	if calls != 3 {
+		t.Fatalf("check-runs calls = %d, want 3 after a new check run", calls)
+	}
+}
+
+func TestGitHubApprovalsConditionalReadFollowsUpdates(t *testing.T) {
+	const v1, v2 = `"reviews-v1"`, `"reviews-v2"`
+	revision := 0
+	var calls, conditional int
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !strings.HasSuffix(r.URL.Path, "/reviews") {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		calls++
+		etag := v1
+		body := `[]`
+		if revision == 1 {
+			etag = v2
+			body = `[{"id":1,"user":{"login":"alice"},"state":"APPROVED","submitted_at":"2024-01-01T00:00:00Z"}]`
+		}
+		if got := r.Header.Get("If-None-Match"); got == etag {
+			conditional++
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write([]byte(body))
+	}))
+
+	first, err := g.approvals(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 0 {
+		t.Fatalf("approvals = %d, want 0", first)
+	}
+	second, err := g.approvals(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != 0 {
+		t.Fatalf("cached approvals = %d, want 0", second)
+	}
+	if calls != 2 || conditional != 1 {
+		t.Fatalf("reviews calls = %d, conditional = %d; want 2 and 1", calls, conditional)
+	}
+
+	revision = 1
+	updated, err := g.approvals(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 {
+		t.Fatalf("approvals = %d, want 1 after a new review", updated)
+	}
+	if calls != 3 {
+		t.Fatalf("reviews calls = %d, want 3 after a new review", calls)
+	}
+}
+
+func TestGitHubObserveMemoizesCompare(t *testing.T) {
+	var compares int
+	base := ghObserveHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"filename":"docs/a.md"}]`))
+	})
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/compare/") {
+			compares++
+		}
+		base.ServeHTTP(w, r)
+	}))
+
+	for i := 0; i < 2; i++ {
+		if _, err := g.Observe(context.Background(), 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if compares != 1 {
+		t.Fatalf("compare calls = %d, want 1 for two ticks with the same SHAs", compares)
 	}
 }

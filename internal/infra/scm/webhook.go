@@ -88,6 +88,18 @@ const (
 	maxWebhookDedupe = 4096
 )
 
+// verdictEvents are the GitHub event types that can change a merge verdict.
+// Everything else, including ping, issue_comment and label events, only
+// produces reconcile bursts without new signal.
+var verdictEvents = map[string]bool{
+	"pull_request":        true,
+	"pull_request_review": true,
+	"check_run":           true,
+	"check_suite":         true,
+	"status":              true,
+	"push":                true,
+}
+
 // Webhook pushes PR numbers to a reconciler channel without polling. A
 // delivery is claimed before it is sent, so a retried provider event cannot
 // start a second reconcile burst while the first is still draining.
@@ -122,6 +134,10 @@ func (w *Webhook) Handler() http.Handler {
 		}
 		if !w.valid(r, body) {
 			http.Error(rw, "bad signature", http.StatusUnauthorized)
+			return
+		}
+		if event := r.Header.Get("X-GitHub-Event"); event != "" && !verdictEvents[event] {
+			rw.WriteHeader(http.StatusAccepted)
 			return
 		}
 		adapter := selectPayloadAdapter(r.Header)
