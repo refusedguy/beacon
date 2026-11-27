@@ -9,7 +9,7 @@ Beacon works in any git project. These steps install the binary, write the confi
 1. Install the binary with `bash scripts/install-beacon.sh`. The script builds `beacon` into `$BEACON_INSTALL_DIR/beacon`. `BEACON_INSTALL_DIR` defaults to `~/.local/bin`. When the repo has `go.mod` and `cmd/beacon`, the script also refreshes `.opencode/bin/beacon` and writes its build hash. Add `~/.local/bin` to PATH if the script warns about it.
 2. Run `beacon init`. The wizard reads the origin remote and base branch, detects the stack, and writes `.beacon/config.yaml`. It creates `docs/tasks/.gitkeep`, appends safe `.beacon` entries to `.gitignore`, generates or extends `opencode.json`, and deploys `.opencode/plugins/beacon-project/`. Pass `--yes` to accept the defaults without a prompt.
 3. Export `GITHUB_TOKEN` or `GITLAB_TOKEN` for SCM access. The config loader defaults `scm.token_env` to `GITHUB_TOKEN` (`internal/infra/config/config.go:358`, `internal/infra/config/config.go:249`). The OpenCode harness reads `harness.token_env`, then `harness.token` (`cmd/beacon/main.go:402`, `harnesses/opencode/opencode.go:34`). No production code reads `BEACON_OPENCODE_TOKEN`; `beacon init` only prints it as a hint (`cmd/beacon/init.go:136`).
-4. Run `beacon doctor`. It prints an `[OK]`, `[WARN]`, or `[FAIL]` line per check and exits 1 if any check fails. Fix every FAIL line before dispatching.
+4. Run `beacon doctor`. It prints an `[OK]`, `[WARN]`, or `[FAIL]` line per check and exits 1 if any check fails. Fix every FAIL line before dispatching. When the tools or the status panel do not appear, this one command names the missing prerequisite and its fix.
 5. Restart the OpenCode TUI and the MCP daemon once. They load the new `opencode.json` and plugin at startup.
 6. Dispatch the first task with `beacon_dispatch`.
 
@@ -212,11 +212,26 @@ A `Run` carries `id`, `task_id`, `state`, `pr`, `head_sha`, `branch`, `reason` a
 Work through these steps in order when a run stops moving. Stop at the first step that explains the pause.
 
 1. `beacon status --snapshot --recent-limit 5 --decisions-limit 20` returns active runs, bounded history, metric totals and the daemon snapshot in one JSON payload (`cmd/beacon/commands.go:156-165`, `cmd/beacon/commands.go:70-81`). Read each run's `state` and `reason` and the decision records before acting.
-2. `beacon doctor` checks the git repo, config, agents, MCP entry, binary, endpoints and daemon, prints one `[OK]`, `[WARN]` or `[FAIL]` line per check, and exits 1 on a `FAIL` (`cmd/beacon/doctor.go:324-336`, `GLOSSARY.md` term Doctor). Fix every `FAIL` before dispatching.
+2. `beacon doctor` checks the git repo, config, agents, MCP entry, configured command, binary freshness, daemon owner, TUI peers, operator agent and endpoints. It prints one `[OK]`, `[WARN]` or `[FAIL]` line per check and exits 1 on a `FAIL` (`cmd/beacon/doctor.go`, `GLOSSARY.md` term Doctor). Fix every `FAIL` before dispatching. The preflight lines carry the fix on the same line.
 3. `beacon status --daemon` reports the daemon's `state`, PID, heartbeat age and any recorded fatal error (`cmd/beacon/commands.go:138-150`, `cmd/beacon/lock.go:250-282`). A `dead`, `stale`, `invalid` or `unreadable` state means no reconciler is advancing runs; follow the restart procedure in Daemon ownership and restart above.
 4. `beacon_reconcile {"pr": 42}` forces one reconciler tick for that PR and returns the verdict, reason, criterion, state and error (`internal/infra/mcp/server.go:365-381`, `internal/infra/mcp/registry.go:49`). Errors and panics are captured in the result, so the daemon loop keeps running. This tool is orchestrator only.
 
 After a stale worktree conflict, inspect the directory and use `beacon_control {"action":"retry","run_id":"..."}` to re-arm a blocked or closed run rather than dispatching the task again (`internal/app/control.go:288-315`, `pkg/core/run.go:334-342`).
+
+### Preflight for tools and the panel
+
+Run `beacon doctor` from the project root when the ten tools or the status panel do not appear. The preflight lines name the prerequisite and put the manual fix on the same line. A failed prerequisite that blocks tool or panel loading exits 1.
+
+| Prerequisite | What doctor checks | Fix named on failure |
+| --- | --- | --- |
+| MCP config source | `mcp.beacon` or `mcp.servers.beacon` in the root or parent `opencode.json` | Run `beacon init` or add the pooled beacon server entry. The plugin does not register tools. |
+| Configured command | The executable in the active MCP entry, including a `sh -c` wrapper, its `exec` token and its `cwd` | Run `bash scripts/build-beacon.sh`, set `command` to `.opencode/bin/beacon mcp`, then restart the MCP daemon and the TUI. |
+| Binary freshness | `.opencode/bin/beacon.build-sha` against the current hash of the Go sources and module files | Run `bash scripts/build-beacon.sh`, then restart the MCP daemon and the TUI. |
+| Daemon owner | The PID in `daemon.json` and the message in `daemon-error.json` | Read the recorded error, remove the stale record, then start `beacon serve`. |
+| TUI peers | The `supported-cli.json` pin against plugin `peerDependencies`, local peer copies and the installed CLI version | Install the pinned OpenCode CLI, restore the pinned peers, and remove plugin `node_modules` peer copies. |
+| Operator agent | The `build` and `orchestrator` agents and their generated `beacon_*` permissions | Run `beacon init`, then `go generate ./...`. |
+
+Doctor reads these records. It does not rebuild the binary, start a daemon, or change plugin imports. The MCP entry can live in the parent workspace `opencode.json`, since the project plugin only records a config and never attaches or reloads the server.
 
 ## Verify
 
