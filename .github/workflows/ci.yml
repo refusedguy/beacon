@@ -115,62 +115,6 @@ jobs:
               labels: ['ready-to-merge'],
             })
 
-  warm-cache:
-    if: >-
-      github.event_name != 'schedule' &&
-      github.event_name != 'workflow_dispatch' &&
-      (needs.changes.outputs.shared == 'true' ||
-       needs.changes.outputs['go-core'] == 'true' ||
-       needs.changes.outputs['go-acp'] == 'true' ||
-       needs.changes.outputs['go-opencode'] == 'true' ||
-       needs.changes.outputs['go-tui'] == 'true' ||
-       needs.changes.outputs.smoke == 'true')
-    needs: changes
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            ui/tui/go.sum
-
-      - name: Build root module
-        run: go build ./...
-
-      - name: Build ACP harness module
-        working-directory: harnesses/acp
-        run: go build ./...
-
-      - name: Build OpenCode harness module
-        working-directory: harnesses/opencode
-        run: go build ./...
-
-      - name: Build TUI module
-        working-directory: ui/tui
-        run: |
-          go build ./...
-          rm -f tui
-
-      - name: Compile root test packages with race
-        run: go test -race -run '^$' ./cmd/... ./internal/app/... ./internal/infra/... ./internal/bench/... . ./pkg/...
-
-      - name: Compile ACP test packages with race
-        working-directory: harnesses/acp
-        run: go test -race -run '^$' ./...
-
-      - name: Compile OpenCode test packages with race
-        working-directory: harnesses/opencode
-        run: go test -race -run '^$' ./...
-
-      - name: Compile TUI test packages with race
-        working-directory: ui/tui
-        run: go test -race -run '^$' ./...
-
   verify:
     if: >-
       github.event_name != 'schedule' &&
@@ -181,7 +125,7 @@ jobs:
        needs.changes.outputs['go-opencode'] == 'true' ||
        needs.changes.outputs['go-tui'] == 'true' ||
        needs.changes.outputs.plugin == 'true')
-    needs: [changes, warm-cache]
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -278,7 +222,7 @@ jobs:
        needs.changes.outputs['go-opencode'] == 'true' ||
        needs.changes.outputs['go-tui'] == 'true' ||
        needs.changes.outputs.smoke == 'true')
-    needs: [changes, warm-cache]
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -659,11 +603,89 @@ jobs:
           const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
           const controlKey = 'json-control';
           const notes = [];
+          const maxFloorPct = 25;
+          const allocDropPct = 5;
 
           const readLines = path => {
             try { return fs.readFileSync(path, 'utf8').split(/\r?\n/); }
             catch (e) { notes.push(`cannot read ${path}: ${e.message}`); return []; }
           };
+
+          // benchstat writes one CSV table per metric. A config row and a
+          // header row come first; the header puts the unit in column B and
+          // "CI" in column C. With two inputs a data row is name, base center,
+          // base CI, head center, head CI, delta, P.
+          function readCompareCSV(path) {
+            const metrics = new Map();
+            let unit = '';
+            for (const line of readLines(path)) {
+              if (!line.trim()) continue;
+              const cells = [];
+              let field = '', quoted = false;
+              for (let i = 0; i < line.length; i++) {
+                const ch = line[i];
+                if (ch === '"') {
+                  if (quoted && line[i + 1] === '"') { field += '"'; i++; }
+                  else quoted = !quoted;
+                } else if (ch === ',' && !quoted) {
+                  cells.push(field); field = '';
+                } else field += ch;
+              }
+              cells.push(field);
+              if (cells[0] === '') {
+                unit = cells[2] === 'CI' ? cells[1] : '';
+                continue;
+              }
+              if (!unit || cells[0] === 'geomean') continue;
+              const old = Number.parseFloat(cells[1]);
+              const next = Number.parseFloat(cells[3]);
+              if (!Number.isFinite(old) || !Number.isFinite(next)) continue;
+              if (!metrics.has(unit)) metrics.set(unit, new Map());
+              metrics.get(unit).set(cells[0], { old, next });
+            }
+            return metrics;
+          }
+
+          // benchstat strips the Benchmark prefix but keeps a GOMAXPROCS
+          // suffix and any slash-separated parameters.
+          const benchNameMatches = (name, bench) => {
+            const plain = name.replace(/-\d+$/, '');
+            return plain === bench || plain.startsWith(`${bench}/`);
+          };
+          // Allocation counts are per benchmark, not per canonical key. Plans
+          // with a dedicated benchmark map to it; the ten HotPaths plans share
+          // the HotPaths row, which covers the whole pass. Other plans have no
+          // Go allocation metric and leave the columns blank.
+          const allocBench = {
+            'snapshot': 'SQLiteSnapshot',
+            'planner-select-injected-checker': 'PlannerSelectInjectedChecker',
+            'dispatch-prompt': 'SpawnPrompt',
+            'reconcile-tick-counts': 'ReconcileTickCounts',
+            'json-control': 'JSONControl',
+            'http-frame-emission': 'HTTPFramesEmission',
+            'go-tui-view': 'GoTUIView',
+          };
+          const hotPathKeys = new Set([
+            'sqlite-snapshot', 'card-parse', 'wire-encode', 'redaction',
+            'mcp-journal', 'sse-fanout', 'scm-observe', 'card-local-parse',
+            'http-snapshot-assembly', 'harness-spawn',
+          ]);
+          const findMetric = (metrics, unit, bench) => {
+            const table = metrics.get(unit);
+            if (!table) return null;
+            for (const [name, value] of table) {
+              if (benchNameMatches(name, bench)) return value;
+            }
+            return null;
+          };
+          const metricOf = (metrics, key, unit) => {
+            const bench = allocBench[key] || (hotPathKeys.has(key) ? 'HotPaths' : '');
+            return bench ? findMetric(metrics, unit, bench) : null;
+          };
+          const metricDelta = entry => entry && entry.old > 0
+            ? 100 * (entry.next - entry.old) / entry.old : NaN;
+          const fmtCount = x => Number.isFinite(x) ? x.toFixed(0) : '-';
+          const fmtPct = x => Number.isFinite(x) ? `${x >= 0 ? '+' : ''}${x.toFixed(2)}%` : '-';
 
           const median = xs => {
             const s = [...xs].sort((a, b) => a - b);
@@ -700,15 +722,26 @@ jobs:
           // when available and say so when the comparison is uncalibrated.
           let floorPct = defaultFloor;
           let calibrated = false;
-          let floors = null;
+          let floors = null, rawFloors = null;
           try {
             const doc = JSON.parse(fs.readFileSync(`${temp}/bench-noise-floor/noise-floor.json`, 'utf8'));
             if (Number.isFinite(doc.floorPct) && doc.floorPct > 0) {
-              floorPct = Math.max(defaultFloor, doc.floorPct);
+              const published = Math.max(defaultFloor, doc.floorPct);
+              floorPct = Math.min(maxFloorPct, published);
               calibrated = true;
+              if (published > maxFloorPct) {
+                notes.push(`calibrated floor ${published}% clamped to ${maxFloorPct}% for verdicts`);
+              }
             }
+            if (Number.isFinite(doc.rawFloorPct) && doc.rawFloorPct > maxFloorPct) {
+              notes.push(`raw observed floor ${doc.rawFloorPct}% clamped to ${maxFloorPct}% for verdicts`);
+            }
+            if (typeof doc.floorNote === 'string' && doc.floorNote) notes.push(doc.floorNote);
             if (doc.floors && typeof doc.floors === 'object' && !Array.isArray(doc.floors)) {
               floors = doc.floors;
+            }
+            if (doc.rawFloors && typeof doc.rawFloors === 'object' && !Array.isArray(doc.rawFloors)) {
+              rawFloors = doc.rawFloors;
             }
           } catch (e) {
             notes.push(`noise floor uncalibrated; using registry default ${defaultFloor}%`);
@@ -759,6 +792,7 @@ jobs:
 
           const basePasses = parseSide(`${temp}/perf-base.txt`, 'base');
           const headPasses = parseSide(`${temp}/perf-head.txt`, 'head');
+          const allocMetrics = readCompareCSV('perf-results/compare.csv');
           const status = readLines(`${temp}/perf-status`).map(s => s.trim()).filter(Boolean);
           const hashes = readLines(`${temp}/perf-hash`);
           const sameHarness = hashes.length >= 2 &&
@@ -842,9 +876,14 @@ jobs:
             const xs = values(passes, key, field);
             return xs.length ? fn(...xs) : NaN;
           };
+          // Five medians per side, sorted s[0..4]. The inner three decide the
+          // spread so one outlier in s[0] or s[4] cannot force a flat verdict.
           const spread = xs => {
-            const m = median(xs);
-            return xs.length && m > 0 ? 100 * (Math.max(...xs) - Math.min(...xs)) / m : Infinity;
+            const s = [...xs].sort((a, b) => a - b);
+            const m = median(s);
+            if (!s.length || !(m > 0)) return Infinity;
+            if (s.length < 5) return 100 * (s[s.length - 1] - s[0]) / m;
+            return 100 * (s[s.length - 2] - s[1]) / m;
           };
           const ratios = (passes, key) => passes.map(p => {
             const r = p.rows.find(x => x.key === key);
@@ -863,7 +902,7 @@ jobs:
             const a = values(basePasses, key, 'median_ms');
             const b = values(headPasses, key, 'median_ms');
             if (!a.length || !b.length) {
-              rows.push(`| ${key} | - | - | - | - | - | - | - | - | - | ${limiter} | ${cache} | inconclusive |`);
+              rows.push(`| ${key} | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | ${limiter} | ${cache} | inconclusive |`);
               continue;
             }
             const am = median(a), bm = median(b);
@@ -883,26 +922,64 @@ jobs:
             const relation = overlap ? 'overlap' : 'separate';
             const delta = am === 0 ? 0 : 100 * (bm - am) / am;
             const maxSpread = Math.max(spread(a), spread(b));
-            // A calibrated per-key floor wins for this row. Fall back to the
-            // global floor, which already includes the registry default.
-            const perKeyFloor = floors && Number.isFinite(floors[key]) && floors[key] > 0
+            // A calibrated per-key floor wins for this row. Both the global
+            // and per-key floors are capped so one outlier no-change run
+            // cannot raise the verdict threshold above maxFloorPct.
+            const rawPerKey = floors && Number.isFinite(floors[key]) && floors[key] > 0
               ? floors[key] : NaN;
-            const rowFloor = Number.isFinite(perKeyFloor) && perKeyFloor > 0
-              ? perKeyFloor
+            const unbounded = Number.isFinite(rawPerKey) && rawPerKey > 0
+              ? rawPerKey
               : (Number.isFinite(floorPct) && floorPct > 0 ? floorPct : defaultFloor);
-            if (!Number.isFinite(perKeyFloor)) {
+            const rowFloor = Math.min(maxFloorPct, unbounded);
+            if (unbounded > maxFloorPct || (rawFloors && Number.isFinite(rawFloors[key]) &&
+                rawFloors[key] > maxFloorPct)) {
+              notes.push(`${key}: floor clamped to ${maxFloorPct}% for the verdict`);
+            } else if (!Number.isFinite(rawPerKey)) {
               notes.push(`${key}: using uncalibrated floor ${rowFloor}%`);
             }
             const decisive = Math.abs(delta) >= rowFloor && Math.abs(delta) > maxSpread;
-            const verdict = (workMismatch || inconclusiveAll || !registry.has(key))
-              ? 'inconclusive'
-              : !decisive ? 'flat'
-              : delta <= -rowFloor ? 'gain' : 'regression';
+            const errsZero = ea.length > 0 && eb.length > 0 &&
+              ea.every(v => v === 0) && eb.every(v => v === 0);
+            const equalWork = wa.length > 0 && wb.length > 0 && median(wa) === median(wb);
+            const noRise = delta <= rowFloor;
+            const allocEntry = metricOf(allocMetrics, key, 'allocs/op');
+            const bytesEntry = metricOf(allocMetrics, key, 'B/op');
+            const allocDelta = metricDelta(allocEntry);
+            const bytesDelta = metricDelta(bytesEntry);
+            const allocGain = errsZero && noRise && equalWork &&
+              ((Number.isFinite(allocDelta) && allocDelta <= -allocDropPct) ||
+               (Number.isFinite(bytesDelta) && bytesDelta <= -allocDropPct));
+            const callsReduced = key === 'worktree-remove' && errsZero && noRise &&
+              median(wa) === 3 && median(wb) === 2;
+            const counterFalls = key.startsWith('reconcile-') && errsZero && noRise &&
+              equalWork && ['lists-per-tick', 'observes-per-tick', 'gets-per-tick']
+                .some(suffix => {
+                  const bench = allocBench[key] || 'ReconcileTickCounts';
+                  for (const [unit, table] of allocMetrics) {
+                    if (!unit.endsWith(`-${suffix}`)) continue;
+                    for (const [name, value] of table) {
+                      if (benchNameMatches(name, bench) && value.next < value.old) return true;
+                    }
+                  }
+                  return false;
+                });
+            let verdict;
+            if (workMismatch || inconclusiveAll || !registry.has(key)) {
+              verdict = 'inconclusive';
+            } else if (decisive) {
+              verdict = delta <= -rowFloor ? 'gain' : 'regression';
+            } else if (allocGain) {
+              verdict = 'gain (allocs/bytes)';
+            } else if (callsReduced || counterFalls) {
+              verdict = 'gain (calls reduced)';
+            } else {
+              verdict = 'flat';
+            }
             const ra = ratiosUsable ? median(ratios(baseRatio, key)) : NaN;
             const rb = ratiosUsable ? median(ratios(headRatio, key)) : NaN;
             const ratioDelta = Number.isFinite(ra) && ra !== 0 && Number.isFinite(rb)
               ? 100 * (rb - ra) / ra : NaN;
-            rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}% | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${relation} | ${fmt(ra)} | ${fmt(rb)} | ${fmt(ratioDelta, 2)}% | ${limiter} | ${cache} | ${verdict} |`);
+            rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${fmtPct(delta)} | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${relation} | ${fmt(ra)} | ${fmt(rb)} | ${fmt(ratioDelta, 2)}% | ${fmtCount(allocEntry && allocEntry.old)} | ${fmtCount(allocEntry && allocEntry.next)} | ${fmtPct(allocDelta)} | ${fmtCount(bytesEntry && bytesEntry.old)} | ${fmtCount(bytesEntry && bytesEntry.next)} | ${fmtPct(bytesDelta)} | ${limiter} | ${cache} | ${verdict} |`);
           }
 
           const marker = '<!-- beacon-pr-perf -->';
@@ -913,17 +990,19 @@ jobs:
             'Five alternating passes per side (B A A B B A A B B A) on two detached worktrees at the merge base and the real head SHA.',
             'One uncounted compile-only warmup per tree compiles the bench and workspace packages before the passes; measurement runs on one CPU from Cpus_allowed_list via taskset.',
             'Canonical rows come from the harness output; names, limiter text and the noise floor come from the registry on the base ref.',
-            `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}.`,
+            `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}. Verdict floors are capped at ${maxFloorPct}%.`,
             'Times are in ms. Work and errs are counts. Ratios divide each plan by the pure json-control row in the same pass.',
+            'Allocation and counter columns come from perf-results/compare.csv. Go benchmarks report them at benchmark granularity, so the ten HotPaths plans share the HotPaths row.',
             'Advisory data only: it adds no required check and does not gate merge.',
             '',
-            '| plan / metric | base | head | delta | base range | head range | range relation | base/control | head/control | ratio delta | limiter | cache | verdict |',
-            '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
-            ...(rows.length ? rows : ['| no comparable rows | - | - | - | - | - | - | - | - | - | - | - | inconclusive |']),
+            '| plan / metric | base | head | delta | base range | head range | range relation | base/control | head/control | ratio delta | allocs/op base | allocs/op head | allocs/op delta | B/op base | B/op head | B/op delta | limiter | cache | verdict |',
+            '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+            ...(rows.length ? rows : ['| no comparable rows | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | inconclusive |']),
             '',
             ...(notes.length ? ['Parser notes:', '', ...notes.map(n => `- ${n}`), ''] : []),
-            `A verdict needs an absolute delta of at least ${floorPct}% and greater than the larger within-side spread; otherwise the row is flat.`,
-            'Range relation is supporting text; overlapping ranges no longer decide a verdict by themselves.',
+            `A timing verdict needs an absolute delta of at least ${floorPct}% and greater than the larger trimmed within-side spread; otherwise the row is flat.`,
+            `A flat row becomes 'gain (allocs/bytes)' when allocs/op or B/op falls at least ${allocDropPct}% with equal work, zero errors and no median rise beyond the row floor. Worktree removal with work 3 to 2, and reconcile keys with a falling deterministic counter, become 'gain (calls reduced)' under the same error and rise limits.`,
+            'Spread uses the inner three of five medians per side, so one outlier in the lowest or highest sample does not force flat. Range relation is supporting text only.',
             `Cache states recorded from canonical rows: ${cacheStates.join(', ') || '-'}.`,
             status.length ? `Aborted passes: ${status.join(', ')}.` : 'No aborted passes.',
             'Raw logs and per-side CSVs are in the artifact.',
@@ -1087,6 +1166,7 @@ jobs:
           const temp = process.env.RUNNER_TEMP;
           const prefix = 'beacon-perf: ';
           const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
+          const maxFloorPct = 25;
           // Every published floor is at least the registry default.
           let defaultFloor = 2;
           try {
@@ -1126,7 +1206,13 @@ jobs:
           deltas.sort((a, b) => a - b);
           const index = Math.min(deltas.length - 1, Math.ceil(0.95 * deltas.length) - 1);
           const observed = deltas.length ? deltas[Math.max(0, index)] : 0;
-          const floorPct = Math.max(2, Math.ceil(observed * 10) / 10);
+          const rawFloorPct = Math.max(defaultFloor, Math.ceil(observed * 10) / 10);
+          // A single noisy run must not raise the verdict floor above the cap.
+          // The raw value stays in the artifact for diagnosis.
+          const floorPct = Math.min(maxFloorPct, rawFloorPct);
+          const floorNote = rawFloorPct > maxFloorPct
+            ? `raw floor ${rawFloorPct}% clamped to ${maxFloorPct}% for verdicts`
+            : '';
 
           // Per-key floors come from the same no-change passes. Pair the
           // medians by pass index and keep the later row for a 5x duplicate.
@@ -1150,7 +1236,7 @@ jobs:
             const index = Math.min(s.length - 1, Math.ceil(0.95 * s.length) - 1);
             return s[Math.max(0, index)];
           };
-          const floors = {};
+          const floors = {}, rawFloors = {};
           const baseByPass = toPasses('base'), headByPass = toPasses('head');
           const keys = new Set();
           for (const p of [...baseByPass, ...headByPass]) for (const k of p.keys()) keys.add(k);
@@ -1163,18 +1249,23 @@ jobs:
                 perPass.push(Math.abs(100 * (b.median_ms - a.median_ms) / a.median_ms));
               }
             }
-            floors[key] = Math.max(defaultFloor, Math.ceil(quantile95(perPass) * 10) / 10);
+            const raw = Math.max(defaultFloor, Math.ceil(quantile95(perPass) * 10) / 10);
+            rawFloors[key] = raw;
+            floors[key] = Math.min(maxFloorPct, raw);
           }
           const doc = {
             floorPct,
+            rawFloorPct,
+            floorNote,
             floors,
+            rawFloors,
             samples: deltas.length,
             quantile: 0.95,
             sha: process.env.GITHUB_SHA,
             source: 'no-change-control',
           };
           fs.writeFileSync(`${temp}/noise-floor.json`, JSON.stringify(doc, null, 2) + '\n');
-          console.log(`calibrated noise floor ${floorPct}% from ${deltas.length} plans`);
+          console.log(`calibrated noise floor ${floorPct}% (raw ${rawFloorPct}%) from ${deltas.length} plans`);
           NODE
 
       - name: Publish bench-noise-floor
