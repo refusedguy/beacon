@@ -1,7 +1,7 @@
 ---
 id: T-4c86bfc2
 title: '[bench] Core verdict decision benchmark'
-status: available
+status: done
 scope:
     - internal/bench/verdict_bench_test.go
 priority: 90
