@@ -2,11 +2,80 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"sync"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// taskSyncCache holds the fingerprint of the last successful SyncTasks for a
+// database. Dispatch re-reads and rewrites the same cards on every cycle, so a
+// hit skips two DELETEs and one INSERT per card. The handle is the key because
+// two state databases must never share a fingerprint.
+var taskSyncCache sync.Map // map[*sql.DB]string
+
+// taskSyncRow is the canonical form hashed by taskFingerprint. updated_at is
+// stamped at write time and is deliberately excluded.
+type taskSyncRow struct {
+	ID            string
+	Title         string
+	Body          string
+	Status        string
+	Priority      int
+	Scope         string
+	SourceRef     string
+	Kind          string
+	Parent        string
+	BaseBranch    string
+	RequireReview string
+	Plan          string
+	WorkerAgent   string
+	WorkerPrompt  string
+	Depends       []string
+}
+
+// taskFingerprint hashes every field SyncTasks writes. Callers skip a rewrite
+// only when this value matches the last successful sync for the same database.
+func taskFingerprint(tasks []core.Task) (string, error) {
+	h := sha256.New()
+	enc := json.NewEncoder(h)
+	for _, t := range tasks {
+		scope, err := json.Marshal(t.Scope)
+		if err != nil {
+			return "", err
+		}
+		plan, err := json.Marshal(t.Plan)
+		if err != nil {
+			return "", err
+		}
+		status := string(t.Status)
+		if status == "" {
+			status = statusAvailable
+		}
+		kind := string(t.Kind)
+		if kind == "" {
+			kind = "task"
+		}
+		depends := make([]string, len(t.DependsOn))
+		for i, dep := range t.DependsOn {
+			depends[i] = string(dep)
+		}
+		row := taskSyncRow{
+			ID: string(t.ID), Title: t.Title, Body: t.Body, Status: status,
+			Priority: t.Priority, Scope: string(scope), SourceRef: t.SourceRef,
+			Kind: kind, Parent: string(t.Parent), BaseBranch: t.BaseBranch,
+			RequireReview: string(t.RequireReview), Plan: string(plan),
+			WorkerAgent: t.WorkerAgent, WorkerPrompt: t.WorkerPrompt, Depends: depends,
+		}
+		if err := enc.Encode(row); err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 // taskColumns are the epic fields added after the initial tasks table. The
 // schema file stays unchanged so existing state databases keep their data.
@@ -36,11 +105,23 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 	return nil
 }
 
-// SyncTasks replaces the stored cards and dependencies with tasks.
+// SyncTasks replaces the stored cards and dependencies with tasks. An
+// unchanged source snapshot skips the rewrite; SetTaskStatus and any failed
+// transaction clear the cached fingerprint so the next sync starts fresh.
 func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err := s.ensureTaskColumns(ctx); err != nil {
+		taskSyncCache.Delete(s.db)
 		return err
 	}
+	fp, err := taskFingerprint(tasks)
+	if err != nil {
+		taskSyncCache.Delete(s.db)
+		return err
+	}
+	if got, ok := taskSyncCache.Load(s.db); ok && got == fp {
+		return nil
+	}
+	taskSyncCache.Delete(s.db)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -52,6 +133,18 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks`); err != nil {
 		return err
 	}
+	taskInsert, err := tx.PrepareContext(ctx, `
+INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer taskInsert.Close()
+	depInsert, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO task_deps(task_id, depends_on) VALUES (?,?)`)
+	if err != nil {
+		return err
+	}
+	defer depInsert.Close()
 	for _, t := range tasks {
 		scope, err := json.Marshal(t.Scope)
 		if err != nil {
@@ -69,19 +162,21 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 		if kind == "" {
 			kind = "task"
 		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
+		if _, err := taskInsert.ExecContext(ctx, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
 			kind, string(t.Parent), t.BaseBranch, string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
 			return err
 		}
 		for _, dep := range t.DependsOn {
-			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO task_deps(task_id, depends_on) VALUES (?,?)`, string(t.ID), string(dep)); err != nil {
+			if _, err := depInsert.ExecContext(ctx, string(t.ID), string(dep)); err != nil {
 				return err
 			}
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	taskSyncCache.Store(s.db, fp)
+	return nil
 }
 
 // readyTasksQuery selects tasks with no unresolved dependencies. Its status
@@ -106,9 +201,12 @@ WHERE status IN (%s)
   AND id NOT IN (SELECT task_id FROM blocked_chain)
 ORDER BY priority DESC, id`, resolvedTaskStatuses, resolvedTaskStatuses, openTaskStatuses)
 
-// SetTaskStatus sets the status of taskID.
+// SetTaskStatus sets the status of taskID. A local claim is not reflected in
+// the source cards, so the next SyncTasks must rewrite from source instead of
+// trusting the cached fingerprint.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
+	taskSyncCache.Delete(s.db)
 	return err
 }
 

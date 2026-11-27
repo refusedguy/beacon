@@ -1369,3 +1369,102 @@ func TestActiveTaskIDsProjectsOnlyTaskAndState(t *testing.T) {
 		t.Fatalf("ActiveTaskIDs(nil) = %+v, want empty", empty)
 	}
 }
+
+func taskUpdatedAt(t *testing.T, store *Store, id string) int64 {
+	t.Helper()
+	var stamp int64
+	if err := store.db.QueryRow(`SELECT updated_at FROM tasks WHERE id=?`, id).Scan(&stamp); err != nil {
+		t.Fatalf("read updated_at for %s: %v", id, err)
+	}
+	return stamp
+}
+
+// TestSyncTasksFingerprintSkipsUnchangedRewrite checks that a repeated sync of
+// the same source cards leaves stored rows alone, and that a local status write
+// clears the cache so the next sync rebuilds from source.
+func TestSyncTasksFingerprintSkipsUnchangedRewrite(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	tasks := []core.Task{{ID: "T-1", Title: "one", Status: core.TaskAvailable}}
+	if err := store.SyncTasks(ctx, tasks); err != nil {
+		t.Fatalf("first SyncTasks: %v", err)
+	}
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM tasks`); got != 1 {
+		t.Fatalf("fresh sync rows = %d, want 1", got)
+	}
+
+	// A zero stamp makes any rewrite visible without sleeping for a clock tick.
+	if _, err := store.db.ExecContext(ctx, `UPDATE tasks SET updated_at=0`); err != nil {
+		t.Fatalf("zero stamps: %v", err)
+	}
+	if err := store.SyncTasks(ctx, tasks); err != nil {
+		t.Fatalf("unchanged SyncTasks: %v", err)
+	}
+	if stamp := taskUpdatedAt(t, store, "T-1"); stamp != 0 {
+		t.Fatalf("unchanged sync rewrote the row, updated_at=%d", stamp)
+	}
+
+	if err := store.SetTaskStatus(ctx, "T-1", "claimed"); err != nil {
+		t.Fatalf("SetTaskStatus: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE tasks SET updated_at=0`); err != nil {
+		t.Fatalf("zero stamps after status: %v", err)
+	}
+	if err := store.SyncTasks(ctx, tasks); err != nil {
+		t.Fatalf("SyncTasks after status: %v", err)
+	}
+	if stamp := taskUpdatedAt(t, store, "T-1"); stamp == 0 {
+		t.Fatal("status change did not invalidate the sync cache")
+	}
+	var status string
+	if err := store.db.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id='T-1'`).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "available" {
+		t.Fatalf("status after resync = %q, want available", status)
+	}
+}
+
+// TestSyncTasksFingerprintRewritesChangedCards checks that changed source
+// cards survive a cached fingerprint, including their dependencies.
+func TestSyncTasksFingerprintRewritesChangedCards(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if err := store.SyncTasks(ctx, []core.Task{{ID: "T-1", Title: "one", Status: core.TaskAvailable}}); err != nil {
+		t.Fatalf("first SyncTasks: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE tasks SET updated_at=0`); err != nil {
+		t.Fatalf("zero stamps: %v", err)
+	}
+
+	changed := []core.Task{{
+		ID: "T-1", Title: "two", Status: core.TaskAvailable,
+		DependsOn: []core.TaskID{"T-0"},
+	}}
+	if err := store.SyncTasks(ctx, changed); err != nil {
+		t.Fatalf("changed SyncTasks: %v", err)
+	}
+	var title string
+	if err := store.db.QueryRowContext(ctx, `SELECT title FROM tasks WHERE id='T-1'`).Scan(&title); err != nil {
+		t.Fatalf("read title: %v", err)
+	}
+	if title != "two" {
+		t.Fatalf("title = %q, want two", title)
+	}
+	if stamp := taskUpdatedAt(t, store, "T-1"); stamp == 0 {
+		t.Fatal("changed cards did not rewrite the row")
+	}
+	if got := countStoreRows(t, store, `SELECT COUNT(*) FROM task_deps`); got != 1 {
+		t.Fatalf("task_deps rows = %d, want 1", got)
+	}
+}

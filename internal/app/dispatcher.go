@@ -727,9 +727,21 @@ func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
 		len(id) + len(t.ID) + len(t.Title) + len(ws) +
 		len(t.BaseBranch) + len(t.WorkerPrompt) + 256)
 	prependWorkerInstructions(&b, instructions)
-	fmt.Fprintf(&b, "Run ID: %s\nTask: %s (%s)\nWorkspace: %s\n", id, t.ID, t.Title, ws)
+	b.WriteString("Run ID: ")
+	b.WriteString(string(id))
+	b.WriteString("\nTask: ")
+	b.WriteString(string(t.ID))
+	b.WriteString(" (")
+	b.WriteString(t.Title)
+	b.WriteString(")\nWorkspace: ")
+	b.WriteString(ws)
+	b.WriteString("\n")
 	if base := strings.TrimSpace(t.BaseBranch); base != "" {
-		fmt.Fprintf(&b, "BaseBranch: %s\nOpen the pull request against %s, not the default branch.\n", base, base)
+		b.WriteString("BaseBranch: ")
+		b.WriteString(base)
+		b.WriteString("\nOpen the pull request against ")
+		b.WriteString(base)
+		b.WriteString(", not the default branch.\n")
 	}
 	b.WriteString("Implement the task, " + core.OpenPRAndWatchInstruction + "\n")
 	b.WriteString(prePRCheck)
