@@ -77,11 +77,33 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := ensureOperationResults(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 
 // Close closes the database handle.
 func (s *Store) Close() error { return s.db.Close() }
+
+// operationResultsDDL is the durable half of the MCP mutation journal. A row
+// holds the JSON result payload on success and the error text on failure, so a
+// retry after a restart receives the original outcome.
+const operationResultsDDL = `CREATE TABLE IF NOT EXISTS operation_results (
+  operation_id TEXT PRIMARY KEY,
+  payload TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+)`
+
+// ensureOperationResults adds the journal table to every state database,
+// including one opened before the table existed. It runs outside the schema
+// version marker so an already prepared database gains the table on open.
+func ensureOperationResults(db *sql.DB) error {
+	_, err := db.Exec(operationResultsDDL)
+	return err
+}
 
 // runColumns lists the run fields stored in one row.
 const runColumns = `id, task_id, state, pr_number, head_sha, observed_sha, observed_base_sha, session_id,
@@ -425,6 +447,33 @@ func scanRun(row scanner) (*core.Run, error) {
 	return &r, nil
 }
 
+// SaveOperation stores the outcome of one idempotent mutation. An empty
+// errText records success; a non-empty one records the failure so a retry
+// receives the original error instead of running the mutation again. The first
+// record wins: a late racing writer cannot replace a stored outcome.
+func (s *Store) SaveOperation(ctx context.Context, id, payload, errText string) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT OR IGNORE INTO operation_results (operation_id, payload, error, created_at)
+VALUES (?,?,?,?)`, id, payload, errText, nowUnix())
+	return err
+}
+
+// LoadOperation returns the stored payload and error text for id. found is
+// false when no operation with that id has completed.
+func (s *Store) LoadOperation(ctx context.Context, id string) (payload, errText string, found bool, err error) {
+	var storedPayload, storedError string
+	err = s.db.QueryRowContext(ctx,
+		`SELECT payload, error FROM operation_results WHERE operation_id=?`, id).
+		Scan(&storedPayload, &storedError)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return storedPayload, storedError, true, nil
+}
+
 // ClaimDelivery records key and reports whether this call inserted it.
 func (s *Store) ClaimDelivery(ctx context.Context, key string) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO deliveries(key, created_at) VALUES (?, ?)`, key, nowUnix())
@@ -638,6 +687,56 @@ FROM decisions WHERE run_id=? ORDER BY at DESC, id DESC LIMIT 1`, runID)
 	return d, err
 }
 
+// DecisionsSince returns every decision recorded at or after since, oldest
+// first. Unlike ListDecisions it has no per-run cap: the window is bounded by
+// retention and a report needs the whole set for its counts.
+func (s *Store) DecisionsSince(ctx context.Context, since time.Time) ([]app.Decision, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+decisionColumns+` FROM decisions
+WHERE at>=? ORDER BY at, id`, since.UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, func(row scanner) (app.Decision, error) {
+		d, err := scanDecision(row)
+		if err != nil {
+			return app.Decision{}, err
+		}
+		return *d, nil
+	})
+}
+
+// EventsSince returns every run event recorded at or after since, oldest
+// first. The at index serves the range scan.
+func (s *Store) EventsSince(ctx context.Context, since time.Time) ([]app.RunEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, kind, state, at, head_sha, pr_number, reason
+FROM run_events WHERE at>=? ORDER BY at, id`, since.UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, scanRunEvent)
+}
+
+// IncidentsSince returns incidents opened in the window, resolved in the
+// window, or still open. The open set includes incidents created before since,
+// so a shift report can name an incident that crossed the boundary.
+func (s *Store) IncidentsSince(ctx context.Context, since time.Time) ([]*core.BaseIncident, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+incidentColumns+` FROM base_incidents
+WHERE created_at>=? OR resolved_at>=? OR status='open' ORDER BY created_at, id`,
+		since.UnixNano(), since.UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, s.scanIncident)
+}
+
+// RunsSince returns runs that reached a terminal state at or after since and
+// every run still active. The active rows let a report name a run whose
+// activity stopped before the window began.
+func (s *Store) RunsSince(ctx context.Context, since time.Time) ([]*core.Run, error) {
+	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs
+WHERE updated_at>=? OR state NOT IN (`+activeStatesSQL+`) ORDER BY updated_at`, since.UnixNano())
+}
+
 // ListQueueTasks reads local task cards and their unresolved dependencies
 // straight from SQLite. It makes no SCM or task-source calls, so a snapshot
 // stays safe for both markdown and remote task sources.
@@ -739,3 +838,4 @@ var _ app.DecisionLookup = (*Store)(nil)
 var _ app.SnapshotStore = (*Store)(nil)
 var _ app.QueueStore = (*Store)(nil)
 var _ app.IncidentStore = (*Store)(nil)
+var _ app.ReportStore = (*Store)(nil)

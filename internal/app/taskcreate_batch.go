@@ -227,6 +227,12 @@ func rollbackBatch(ctx context.Context, writer CardWriter, store TaskGraphStore,
 	}
 }
 
+// singleCardID returns the id CreateBatch assigns to a one-card batch with the
+// same content. A plain create adopts this id so a retry finds the card.
+func (c *TaskCreator) singleCardID(in CreateTaskInput) core.TaskID {
+	return c.ids().ForBatch(batchSeed([]CreateTaskInput{in}), 0)
+}
+
 // batchIDs assigns a stable ID to each input. An explicit ID wins. An epic
 // without one keeps the derivation Create uses, so an epic made alone or in a
 // batch gets the same ID. Derived IDs depend only on content, never on the day.

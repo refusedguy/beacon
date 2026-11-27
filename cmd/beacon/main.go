@@ -51,6 +51,7 @@ type wiring struct {
 	control     *app.Control
 	status      app.StatusService
 	wait        app.WaitService
+	explain     app.ExplainService
 	taskCreator *app.TaskCreator
 	taskDeleter *app.TaskDeleter
 	taskUpdater *app.TaskUpdater
@@ -331,24 +332,38 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
 	}, infra.store, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
+	explain := app.ExplainService{Store: infra.store, SCM: infra.scm}
+	if traceable, ok := p.(app.ExplainPolicy); ok {
+		explain.Policy = traceable
+	}
 	return &wiring{
 		cfg: cfg, store: infra.store, source: infra.source, harness: h,
 		workspace: infra.workspace, scm: infra.scm, policy: p,
 		changes: infra.changes, dispatcher: disp, control: ctrl,
 		status:      app.StatusService{Store: infra.store},
 		wait:        app.WaitService{Store: infra.store, Interval: time.Second},
+		explain:     explain,
 		taskCreator: creator, taskDeleter: deleter, taskUpdater: updater, recon: recon,
 		reconcile: &app.ReconcileService{Reconciler: recon, Store: infra.store},
 	}
 }
 
 func mergePolicy(cfg config.Config) app.ReconcilerPolicy {
-	// Required checks reach policy only through the source port. Config load
-	// resolves workflow job names into cfg.Merge.RequiredChecks in workflow
-	// mode, and the manual list is the override the source returns on both the
-	// initial load and every watcher reload. SCM adapters can add a fallback
-	// source later without a policy change.
-	source := checksource.Config{Explicit: cfg.Merge.RequiredChecks}
+	// Required checks reach policy only through the source port. Manual mode
+	// uses the configured list. Workflow mode re-reads the workflow on every
+	// evaluation, so a rename at the head changes the required set on the next
+	// tick without a config edit or a daemon restart. The operator's explicit
+	// list is a fallback only when detection finds no names; with neither, the
+	// source returns an error and the policy waits instead of merging.
+	var source core.RequiredCheckSource
+	if cfg.Merge.RequiredChecksMode == config.RequiredChecksWorkflow {
+		source = checksource.Workflow{
+			Root:     cfg.ProjectRoot,
+			Fallback: cfg.Merge.RequiredChecksFallback,
+		}
+	} else {
+		source = checksource.Config{Explicit: cfg.Merge.RequiredChecks}
+	}
 	return policy.New(policy.Config{
 		RequiredCheckSource: source, RequiredApprovals: cfg.Merge.RequiredApprovals,
 		Labels: cfg.Merge.Labels, CommandGate: cfg.Merge.CommandGate,
@@ -385,6 +400,17 @@ func newReconciler(
 		AutoRebase:         cfg.AutoRebase,
 		MaxAutoRebases:     cfg.MaxAutoRebases,
 	}
+}
+
+// Explain forwards the dry-run trace to the policy in the current snapshot.
+// A policy without Explain yields no steps, which the explain service reports
+// as a merge summary with an empty chain instead of panicking.
+func (p *reloadablePolicy) Explain(obs core.Observation) []app.ExplainStep {
+	traceable, ok := (*p.live).Load().policy.(app.ExplainPolicy)
+	if !ok {
+		return nil
+	}
+	return traceable.Explain(obs)
 }
 
 // ReviewRequired forwards the epic review gate from the live policy snapshot.
@@ -529,13 +555,21 @@ func (w *wiring) close() { _ = w.store.Close() }
 
 func main() {
 	slog.SetDefault(shared.NewLogger(envOr("BEACON_LOG_LEVEL", "")))
-	root := &cobra.Command{Use: "beacon", Short: "Parallel AI agent controller"}
-	configPath := root.PersistentFlags().String("config", "", "path to config.yaml")
+	root := &cobra.Command{
+		Use:   "beacon",
+		Short: "Parallel AI agent controller",
+		Long: `beacon turns task cards into pull requests with parallel coding agents.
+--config selects config.yaml for the read and run commands. The default is .beacon/config.yaml.
+--config does not apply to init, which always writes .beacon/config.yaml to the current directory.`,
+	}
+	configPath := root.PersistentFlags().String("config", "", "config file for read and run commands (init ignores it and writes to the current directory)")
 
 	root.AddCommand(newInitCommand())
 	root.AddCommand(newDoctorCommand(configPath))
 	root.AddCommand(newDispatchCommand(configPath, wire))
 	root.AddCommand(newStatusCommand(configPath))
+	root.AddCommand(newReportCommand(configPath))
+	root.AddCommand(newExplainCommand(configPath, wire))
 	root.AddCommand(newControlCommand(configPath, wire))
 	root.AddCommand(newMCPCommand(configPath))
 	root.AddCommand(newServeCommand(configPath))

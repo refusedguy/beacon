@@ -122,6 +122,20 @@ func (l *stringList) UnmarshalYAML(node *yaml.Node) error {
 // cardSchema is the wire shape shared by markdown frontmatter and the fenced
 // YAML block in issue bodies. Both decoders accept every alias, so task_id and
 // owner_files read the same in either format.
+//
+// Schema note. Five groups carry the load: identity (id, task_id); display
+// and lifecycle (title, status, priority, kind, base_branch, require_review);
+// ownership (scope, owner_files); dependencies (depends, depends_on); and epic
+// planning (plan, whose children carry title, body, scope, depends and
+// priority). The aliases are task_id for id, owner_files for scope and
+// depends_on for depends. The flat-line reader also accepts the legacy keys
+// Владелец файлов, Зависимости, Статус, Фаза, Ссылка and ParentTask.
+//
+// Keys outside these groups, including perf: true on existing cards, are
+// ignored rather than rejected. Strict decoding with KnownFields stays off in
+// this card: issue bodies still arrive as v1 flat text, and a strict decode
+// would first need perf added here or removed from every card. Adding it here
+// would turn a label into a load-bearing field, so leave it out.
 type cardSchema struct {
 	ID            string     `yaml:"id"`
 	TaskID        string     `yaml:"task_id"`

@@ -49,6 +49,7 @@ type glNote struct {
 }
 
 type glThread struct {
+	ID       int      `json:"id"`
 	Resolved *bool    `json:"resolved"`
 	Notes    []glNote `json:"notes"`
 }
@@ -80,6 +81,9 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 	if signals.threadsErr == nil {
 		o.UnresolvedThreads = signals.threads
 	}
+	if signals.threadsCapped {
+		failed.add("threads", errCappedRead)
+	}
 	if len(o.UnresolvedThreads) == 0 && mr.BlockingDiscussionsResolved != nil && !*mr.BlockingDiscussionsResolved {
 		o.UnresolvedThreads = []string{"blocking discussions are unresolved"}
 	}
@@ -90,6 +94,12 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 	g.applyObservedChecks(ctx, &o, signals, &failed)
 	failed.add("compare", signals.compareErr)
 	if signals.compareErr == nil {
+		// A provider conflict with no commits ahead of the base is stale.
+		// Keep the cross-checked value in the observation so downstream
+		// decisions see the same conflict state that was verified.
+		if o.Conflict && signals.ahead == 0 {
+			o.Conflict = false
+		}
 		o.Behind = signals.behind
 		o.BaseSHA = signals.baseSHA
 	}
@@ -105,7 +115,10 @@ type gitlabSignals struct {
 	pipeline         glPipeline
 	jobs             []glJob
 	behind           bool
+	ahead            int
 	baseSHA          string
+	threadsCapped    bool
+	jobsCapped       bool
 	threadsErr       error
 	approvalsErr     error
 	pipelineErr      error
@@ -123,7 +136,7 @@ func (g *GitLab) fetchSignals(ctx context.Context, mrIID int, mr glMR, sha strin
 	var group errgroup.Group
 	group.SetLimit(observeParallelLimit)
 	group.Go(func() error {
-		out.threads, out.threadsErr = g.unresolvedThreads(ctx, mrIID)
+		out.threads, out.threadsCapped, out.threadsErr = g.unresolvedThreads(ctx, mrIID)
 		return out.threadsErr
 	})
 	group.Go(func() error {
@@ -137,11 +150,11 @@ func (g *GitLab) fetchSignals(ctx context.Context, mrIID int, mr glMR, sha strin
 		}
 		out.pipeline.ID = mr.HeadPipeline.ID
 		out.pipeline.Status = mr.HeadPipeline.Status
-		out.jobs, out.jobsErr = g.pipelineJobs(ctx, out.pipeline.ID)
+		out.jobs, out.jobsCapped, out.jobsErr = g.pipelineJobsCapped(ctx, out.pipeline.ID)
 		return out.jobsErr
 	})
 	group.Go(func() error {
-		out.behind, out.baseSHA, out.compareErr = g.behind(ctx, mr)
+		out.behind, out.ahead, out.baseSHA, out.compareErr = g.behind(ctx, mr)
 		return out.compareErr
 	})
 	_ = group.Wait()
@@ -161,6 +174,9 @@ func (g *GitLab) applyObservedChecks(ctx context.Context, o *core.Observation, s
 		checks, excerpt := g.checksFromJobs(ctx, s.jobs)
 		applyChecks(o, checks, excerpt, s.pipeline)
 	}
+	if s.jobsCapped {
+		failed.add("jobs", errCappedRead)
+	}
 }
 
 const (
@@ -169,34 +185,48 @@ const (
 )
 
 // getJSONPages walks GitLab's page-number API until a short page or the
-// explicit cap. Callers use it for every list that can exceed one page, so a
-// check or comment page is never silently dropped.
-func getJSONPages[T any](g *GitLab, ctx context.Context, path string, query url.Values) ([]T, error) {
+// explicit cap. It reports capped reads so callers can mark an observation
+// incomplete instead of deciding from a partial list. When id is non-nil,
+// repeated provider IDs from pages that shifted under concurrent writes are
+// collapsed.
+func getJSONPages[T any](g *GitLab, ctx context.Context, path string, query url.Values, id func(T) int64) ([]T, bool, error) {
 	q := url.Values{}
 	for key, values := range query {
 		q[key] = append([]string(nil), values...)
 	}
 	q.Set("per_page", strconv.Itoa(gitlabPageSize))
 	var all []T
+	seen := make(map[int64]bool)
 	for page := 1; page <= maxGitLabPages; page++ {
 		q.Set("page", strconv.Itoa(page))
 		var items []T
 		if err := g.getJSON(ctx, path, q, &items); err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		all = append(all, items...)
+		for _, item := range items {
+			if id != nil {
+				key := id(item)
+				if key != 0 {
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+				}
+			}
+			all = append(all, item)
+		}
 		if len(items) < gitlabPageSize {
-			break
+			return all, false, nil
 		}
 	}
-	return all, nil
+	return all, true, nil
 }
 
-func (g *GitLab) unresolvedThreads(ctx context.Context, mrIID int) ([]string, error) {
+func (g *GitLab) unresolvedThreads(ctx context.Context, mrIID int) ([]string, bool, error) {
 	path := g.mrPath(mrIID) + "/threads"
-	threads, err := getJSONPages[glThread](g, ctx, path, nil)
+	threads, capped, err := getJSONPages[glThread](g, ctx, path, nil, func(t glThread) int64 { return int64(t.ID) })
 	if err != nil {
-		return nil, err
+		return nil, capped, err
 	}
 	var out []string
 	for _, thread := range threads {
@@ -219,7 +249,7 @@ func (g *GitLab) unresolvedThreads(ctx context.Context, mrIID int) ([]string, er
 			out = append(out, redact.Redact(gitlabTail(last, 1200)))
 		}
 	}
-	return out, nil
+	return out, capped, nil
 }
 
 func (g *GitLab) approvals(ctx context.Context, mrIID int, mr glMR) (int, error) {
@@ -249,19 +279,22 @@ func (g *GitLab) approvals(ctx context.Context, mrIID int, mr glMR) (int, error)
 	return len(seen), nil
 }
 
-func (g *GitLab) behind(ctx context.Context, mr glMR) (bool, string, error) {
-	from, to := mr.TargetBranch, mr.SHA
+func (g *GitLab) behind(ctx context.Context, mr glMR) (bool, int, string, error) {
+	// Compare from the base commit carried by the MR. A branch name cannot be
+	// resolved once the base branch is deleted, while the commit remains.
+	from, to := mr.DiffRefs.BaseSHA, mr.SHA
 	if from == "" {
-		from = mr.DiffRefs.BaseSHA
+		from = mr.TargetBranch
 	}
 	if to == "" {
 		to = mr.DiffRefs.HeadSHA
 	}
 	if from == "" || to == "" {
-		return false, "", nil
+		return false, 0, "", nil
 	}
 	path := "/projects/" + g.project() + "/repository/compare"
 	var cmp struct {
+		AheadBy    int `json:"ahead_by"`
 		BehindBy   int `json:"behind_by"`
 		BaseCommit struct {
 			ID string `json:"id"`
@@ -269,9 +302,12 @@ func (g *GitLab) behind(ctx context.Context, mr glMR) (bool, string, error) {
 	}
 	query := url.Values{"from": {from}, "to": {to}}
 	if err := g.getJSON(ctx, path, query, &cmp); err != nil {
-		return false, "", err
+		if core.CodeOf(err) == core.CodeNotFound {
+			return false, 0, "", core.Errorf(core.CodeNotFound, "base commit %s is unavailable", from)
+		}
+		return false, 0, "", err
 	}
-	return cmp.BehindBy > 0, cmp.BaseCommit.ID, nil
+	return cmp.BehindBy > 0, cmp.AheadBy, cmp.BaseCommit.ID, nil
 }
 
 func (g *GitLab) UpdateBranch(ctx context.Context, mrIID int, expectedSHA string) (string, error) {

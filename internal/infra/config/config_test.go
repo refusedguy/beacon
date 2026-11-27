@@ -587,6 +587,15 @@ func writeProjectWorkflow(t *testing.T, root, workflow string) {
 	}
 }
 
+func TestWorkflowFilePathsFollowsConfigRoot(t *testing.T) {
+	path := writeWorkflowConfig(t, "merge:\n  required_checks_mode: workflow\n",
+		"name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n")
+	want := []string{filepath.Join(projectRootFromConfigPath(path), ".github", "workflows", "ci.yml")}
+	if got := WorkflowFilePaths(path); !reflect.DeepEqual(got, want) {
+		t.Fatalf("WorkflowFilePaths = %v, want %v", got, want)
+	}
+}
+
 func TestLoadManualRequiredChecksKeepExplicitList(t *testing.T) {
 	const workflow = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n"
 	for _, mode := range []string{"", RequiredChecksManual} {
@@ -623,6 +632,25 @@ func TestLoadWorkflowRequiredChecksResolveJobNames(t *testing.T) {
 	want := []string{"build", "lint", "vet"}
 	if !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
 		t.Fatalf("required_checks = %v, want %v", c.Merge.RequiredChecks, want)
+	}
+}
+
+func TestLoadWorkflowPreservesExplicitFallback(t *testing.T) {
+	const workflow = "name: CI\njobs:\n  verify:\n    runs-on: ubuntu-latest\n"
+	path := writeWorkflowConfig(t,
+		"merge:\n  required_checks_mode: workflow\n  required_checks: [manual-gate]\n", workflow)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(path): %v", err)
+	}
+	if want := []string{"verify"}; !reflect.DeepEqual(c.Merge.RequiredChecks, want) {
+		t.Fatalf("required_checks = %v, want detected %v", c.Merge.RequiredChecks, want)
+	}
+	if want := []string{"manual-gate"}; !reflect.DeepEqual(c.Merge.RequiredChecksFallback, want) {
+		t.Fatalf("required_checks_fallback = %v, want %v", c.Merge.RequiredChecksFallback, want)
+	}
+	if c.ProjectRoot != projectRootFromConfigPath(path) {
+		t.Fatalf("ProjectRoot = %q, want %q", c.ProjectRoot, projectRootFromConfigPath(path))
 	}
 }
 

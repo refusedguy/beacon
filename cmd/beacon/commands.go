@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -103,8 +104,12 @@ func liveDaemon(cfg config.Config) (*connectionInfo, bool) {
 func newDispatchCommand(configPath *string, fn wireFn) *cobra.Command {
 	return &cobra.Command{
 		Use:   "dispatch [n]",
-		Short: "Start up to n non-overlapping tasks",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Start up to n non-overlapping tasks (default 1; 0 starts none)",
+		Long: `dispatch starts up to n non-overlapping tasks, each in its own worktree.
+n defaults to 1 when omitted. The value must be an integer; 0 is accepted and starts no tasks.
+A value that is not an integer returns the scan error.
+The command prints one JSON result with the started runs.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			n := 1
 			if len(args) == 1 {
@@ -138,8 +143,13 @@ type statusFlags struct {
 func newStatusCommand(configPath *string) *cobra.Command {
 	f := &statusFlags{}
 	cmd := &cobra.Command{
-		Use:   "status",
-		Short: "Print active runs",
+		Use:   "status [--snapshot | --recent | --daemon]",
+		Short: "Print active runs; --snapshot adds history and metrics, --daemon prints liveness",
+		Long: `status prints active runs as JSON.
+--snapshot prints one batched object with runs, bounded history and metric totals.
+--recent prints recently finished runs as a bare JSON array.
+--daemon prints daemon liveness and heartbeat age instead of runs.
+--recent-limit and --decisions-limit cap a snapshot; 0 uses the default.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if f.daemon {
 				cfg, _, err := loadConfig(*configPath)
@@ -186,10 +196,85 @@ func newStatusCommand(configPath *string) *cobra.Command {
 	return cmd
 }
 
+// newExplainCommand traces the merge policy for a pull request. It reads a
+// fresh observation and the stored approval, then prints every check. It has
+// no write path: runs, cards and the provider stay untouched.
+func newExplainCommand(configPath *string, fn wireFn) *cobra.Command {
+	jsonOutput := false
+	cmd := &cobra.Command{
+		Use:   "explain <pr>",
+		Short: "Trace a dry-run verdict for a pull request",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pr, err := strconv.Atoi(args[0])
+			if err != nil || pr <= 0 {
+				return fmt.Errorf("invalid PR number %q", args[0])
+			}
+			w, err := wireCLI(fn, *configPath)
+			if err != nil {
+				return err
+			}
+			defer w.close()
+			result, err := w.explain.Explain(cmd.Context(), pr)
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				return printJSON(result)
+			}
+			fmt.Fprint(cmd.OutOrStdout(), app.FormatExplain(result))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "print a machine readable trace")
+	return cmd
+}
+
+// newReportCommand prints a bounded shift report from the state database. It
+// only reads: the daemon API and the status snapshot keep their shapes.
+func newReportCommand(configPath *string) *cobra.Command {
+	since := ""
+	jsonOutput := false
+	cmd := &cobra.Command{
+		Use:   "report",
+		Short: "Print a bounded report of what happened on a shift",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			window, err := time.ParseDuration(since)
+			if err != nil {
+				return fmt.Errorf("invalid --since %q: %w", since, err)
+			}
+			if window <= 0 {
+				return errors.New("--since must be positive")
+			}
+			_, store, _, err := wireReadOnly(*configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			report, err := (app.ReportService{Store: store}).Report(cmd.Context(), window, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				return printJSON(report)
+			}
+			fmt.Fprint(cmd.OutOrStdout(), app.FormatReport(report))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&since, "since", app.DefaultReportSince.String(), "length of the reporting window, for example 8h or 30m")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "print a machine readable report")
+	return cmd
+}
+
 func newGCCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "gc",
-		Short: "Remove worktrees that no active run uses",
+		Short: "Remove worktrees that no active run uses (silent on success)",
+		Long: `gc removes worktree directories under the configured workspace that no active run owns.
+It prints nothing on success and only writes removal errors to stderr.
+ForceRemove discards uncommitted work in an unused worktree, so inspect those directories first.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, store, wt, err := wireReadOnly(*configPath)
 			if err != nil {
@@ -270,9 +355,16 @@ type controlFlags struct {
 func newControlCommand(configPath *string, fn wireFn) *cobra.Command {
 	f := &controlFlags{}
 	cmd := &cobra.Command{
-		Use:   "control",
-		Short: "Control a run: " + strings.Join(core.ControlActionNames(), ", "),
-		Args:  cobra.NoArgs,
+		Use:   "control --action <verb> --run-id <id> [--sha <sha>] [--pr <n>] [--message <text>]",
+		Short: "Control a run with --action and --run-id; --pr is required for watch",
+		Long: `control applies one action to one run and prints {"ok":true,...} as JSON.
+--action is one of ` + strings.Join(core.ControlActionNames(), ", ") + `.
+--run-id is required.
+--sha is the observed SHA used by approve.
+--pr is required for watch and binds the run to that pull request.
+--message is required for nudge.
+--json is deprecated and ignored; control always prints JSON.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := validateControl(f.action, f.runID, f.message); err != nil {
 				return err
@@ -288,7 +380,7 @@ func newControlCommand(configPath *string, fn wireFn) *cobra.Command {
 	cmd.Flags().StringVar(&f.sha, "sha", "", "observed SHA used by an approve action")
 	cmd.Flags().IntVar(&f.pr, "pr", 0, "PR number bound by a watch action")
 	cmd.Flags().StringVar(&f.message, "message", "", "guidance sent to the worker by a nudge action")
-	cmd.Flags().BoolVar(&f.json, "json", false, "print a machine readable result")
+	cmd.Flags().BoolVar(&f.json, "json", false, "deprecated and ignored; control always prints JSON")
 	return cmd
 }
 
