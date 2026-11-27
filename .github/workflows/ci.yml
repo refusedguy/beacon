@@ -7,6 +7,7 @@ on:
       - 'docs/**'
       - '**.md'
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths-ignore:
       - 'docs/**'
       - '**.md'
@@ -267,6 +268,106 @@ jobs:
       # No timing gate. A slow runner fails this step, not the pull request.
       - name: Bounded benchmark smoke
         run: timeout 30s bash scripts/bench-e2e.sh --smoke
+
+  perf-pr-advisory:
+    # Publishes head-only numbers for a labeled PR. Never gates merge.
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
+
+      # One cache key, shared with the warm-cache job via cache-dependency-path.
+      - name: Warm the build
+        continue-on-error: true
+        run: go build ./...
+
+      - name: Head-only smoke benchmark
+        continue-on-error: true
+        run: bash scripts/bench-e2e.sh --smoke perf-pr.log
+
+      - name: Upload raw perf log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: perf-pr.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Post or update perf comment
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- beacon-pr-perf -->';
+            const logPath = 'perf-pr.log';
+            const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+            const rows = [];
+            let inTable = false;
+            for (const line of log.split(/\r?\n/)) {
+              if (/\bmedian\b.*\bwork\b.*\berrs\b.*\blimiter\b/.test(line)) {
+                inTable = true;
+                rows.push(line);
+              } else if (inTable && line.trim() !== '') {
+                rows.push(line);
+              } else if (inTable) {
+                inTable = false;
+              }
+            }
+            const report = rows.length
+              ? rows.join('\n')
+              : '(no benchmark rows produced; see the raw log artifact)';
+            const body = [
+              marker,
+              '### Advisory perf smoke (head only)',
+              '',
+              'Advisory data only. It adds no required check and does not gate merge.',
+              '',
+              '```text',
+              report,
+              '```',
+              '',
+              'Raw log artifact: `perf-pr-' + context.issue.number + '-' +
+                context.payload.pull_request.head.sha + '` (7 day retention).',
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+            }
 
   perf-nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
