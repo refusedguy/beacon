@@ -276,9 +276,13 @@ const BEACON_BRANCH_RE = /^beacon\/(.+)$/
 
 // Parsed cards are cached by path and validated with a cheap stat, so a poll
 // that re-reads an unchanged card does no file read and no regex work. The
-// cache is bounded: a session can visit many cards but never all task files.
+// stamp folds size and a short hash of the inode metadata. ctime changes on a
+// rewrite even when mtime and size stay inside one tick, so a same-size edit
+// cannot leave a stale card in the cache. The cache is bounded: a session can
+// visit many cards but never all task files.
 const CARD_CACHE_LIMIT = 512
 const cardCache = new Map()
+const cardStamp = (info) => `${info?.size ?? 0}:${fnv1a([info?.mtimeMs ?? info?.mtime ?? 0, info?.ctimeMs ?? 0, info?.ino ?? 0])}`
 // Read a card from docs/tasks. A missing or unreadable file returns null so
 // the caller fails closed instead of showing a stale SQLite queue row.
 export function readCard(root, id, deps = {}) {
@@ -292,8 +296,7 @@ export function readCard(root, id, deps = {}) {
   let stamp = null
   if (typeof stat === "function") {
     try {
-      const info = stat(path) ?? {}
-      stamp = `${info.mtimeMs ?? info.mtime ?? 0}:${info.size ?? 0}`
+      stamp = cardStamp(stat(path))
     } catch {}
   }
   // An injected readFileSync on a fake path can be read but not stat'ed. Read

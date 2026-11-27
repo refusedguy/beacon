@@ -154,6 +154,22 @@ test("readCard caches a parsed card until its file stamp changes", () => {
   assert.equal(reads, 4, "an injected readFileSync without statSync bypasses the cache")
 })
 
+test("readCard invalidates a same-size rewrite that keeps its mtime", () => {
+  const path = "/cache/docs/tasks/T-200.md"
+  const bodyOf = (title) => `---\nid: T-200\ntitle: ${title}\nstatus: ready\n---\nGoal: work.\n`
+  let body = bodyOf("AAAAA")
+  let info = { mtimeMs: 1000, ctimeMs: 1, size: body.length }
+  const deps = {
+    existsSync: (p) => p === path,
+    readFileSync: () => body,
+    statSync: () => info,
+  }
+  assert.equal(ui.readCard("/cache", "T-200", deps).title, "AAAAA")
+  body = bodyOf("BBBBB")
+  info = { mtimeMs: 1000, ctimeMs: 2, size: body.length }
+  assert.equal(ui.readCard("/cache", "T-200", deps).title, "BBBBB", "a same-size rewrite with the same mtime invalidates the card")
+})
+
 test("CLI source keeps title-less card reads at R across snapshots without an injected statSync", async () => {
   const root = mkdtempSync(join(tmpdir(), "beacon-card-counter-"))
   try {
