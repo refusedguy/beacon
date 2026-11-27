@@ -216,13 +216,12 @@ func newActiveScopeIndex(runs []*core.Run) *activeScopeIndex {
 // sized to the live run count, which bounds every index below.
 func (idx *activeScopeIndex) matching(t core.Task) []int {
 	idx.epoch++
-	epoch := idx.epoch
 	out := idx.out[:0]
 	add := func(i int) {
-		if idx.seen[i] == epoch {
+		if idx.seen[i] == idx.epoch {
 			return
 		}
-		idx.seen[i] = epoch
+		idx.seen[i] = idx.epoch
 		out = append(out, i)
 	}
 	allRuns := func() {
