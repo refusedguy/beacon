@@ -1,7 +1,7 @@
 ---
 id: T-a4246bfd
 title: 'P7: Reconcile and sync write cuts'
-status: available
+status: done
 scope:
     - internal/app/reconciler.go
     - internal/infra/sqlite/tasks.go
