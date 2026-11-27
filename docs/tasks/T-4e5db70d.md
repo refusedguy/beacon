@@ -1,7 +1,7 @@
 ---
 id: T-4e5db70d
 title: '[bench] Dispatcher promotion and slot reservation'
-status: available
+status: done
 scope:
     - internal/bench/dispatch_paths_bench_test.go
 priority: 88
