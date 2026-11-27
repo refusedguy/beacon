@@ -468,7 +468,9 @@ class RpcStatusSource {
       }
       if (raw) break
     }
-    return raw ? normalizeSnapshot(value) : value
+    // A payload without a queue still needs normalization: snapshotView and
+    // mergeDispatch read value.queue directly and must never see undefined.
+    return raw || !Array.isArray(value?.queue) ? normalizeSnapshot(value) : value
   }
   async control(input) {
     return this.#rpc().control(input, { signal: AbortSignal.timeout(this.timeout) })
