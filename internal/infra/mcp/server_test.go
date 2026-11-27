@@ -1459,6 +1459,56 @@ func BenchmarkJSONResult(b *testing.B) {
 	})
 }
 
+// BenchmarkDispatchResultEncode compares the typed result the dispatch tool now
+// emits with the map it replaced. Both sides must produce identical bytes. CI
+// runs this five times so the range, not a single run, is reported.
+func BenchmarkDispatchResultEncode(b *testing.B) {
+	runs := make([]*core.Run, 0, 8)
+	for i := 0; i < 8; i++ {
+		runs = append(runs, core.NewRun(fmt.Sprintf("run-%d", i), fmt.Sprintf("T-%d", i), time.Now().UTC()))
+	}
+	failures := []app.DispatchFailure{{TaskID: "T-8", Err: "workspace conflict"}}
+	skipped := []app.SkippedTask{{TaskID: "T-9", Code: app.SkipCode("conflict"), Reason: "overlap"}}
+	summary := make([]dispatchOutcome, 0, len(runs)+len(failures)+len(skipped))
+	for _, run := range runs {
+		summary = append(summary, outcomeForRun(run))
+	}
+	for _, failure := range failures {
+		summary = append(summary, dispatchOutcome{
+			ID: string(failure.TaskID), TaskID: string(failure.TaskID),
+			State: "failed", Reason: failure.Err,
+		})
+	}
+	for _, skip := range skipped {
+		summary = append(summary, dispatchOutcome{
+			ID: string(skip.TaskID), TaskID: string(skip.TaskID),
+			State: "skipped", Reason: skip.Reason,
+		})
+	}
+	typed := dispatchResult{Runs: runs, Failures: failures, Skipped: skipped, Summary: summary}
+	legacy := map[string]any{"runs": runs, "skipped": skipped, "failures": failures, "summary": summary}
+	want, err := json.Marshal(legacy)
+	if err != nil {
+		b.Fatal(err)
+	}
+	got, err := json.Marshal(typed)
+	if err != nil || !bytes.Equal(got, want) {
+		b.Fatalf("typed bytes = %s, want %s, err = %v", got, want, err)
+	}
+	b.Run("map", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchResult = jsonResult(legacy)
+		}
+	})
+	b.Run("struct", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchResult = jsonResult(typed)
+		}
+	})
+}
+
 // BenchmarkOpJournalDuplicate measures the hot path for repeated operation ids:
 // a full journal and a batch of duplicate claims that only touch the LRU.
 func BenchmarkOpJournalDuplicate(b *testing.B) {
