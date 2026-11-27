@@ -38,6 +38,11 @@ var (
 	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	headerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("204"))
+
+	// The footer and the zero-width title never change, so render them once
+	// instead of once per frame rebuild.
+	helpLine  = headerStyle.Render("j/k move  a approve  u unblock  c/x cancel  r retry  q quit")
+	titleLine = headerStyle.Render("Beacon runs\n")
 )
 
 // renderCache holds scratch state that View reuses across frames. It sits
@@ -45,10 +50,11 @@ var (
 // hold the last rendered string and the inputs that produced it, so an
 // unchanged render returns the same string without rebuilding it.
 type renderCache struct {
-	padWidth int
-	pad      string
-	row      []byte
-	keyRuns  []runFrame
+	padWidth     int
+	pad          string
+	styledHeader string
+	row          []byte
+	keyRuns      []runFrame
 
 	frame    string
 	frameKey frameKey
@@ -318,19 +324,20 @@ func (m model) View() string {
 		return cache.frame
 	}
 	var b strings.Builder
-	title := "Beacon runs"
-	header := title + "\n"
-	trailingNewline := false
+	const title = "Beacon runs"
+	headerLines := 1
+	styledHeader := titleLine
 	if m.width > 0 {
 		if cache.padWidth != m.width {
 			cache.padWidth = m.width
 			cache.pad = strings.Repeat(" ", maxInt(0, m.width-len(title)))
+			cache.styledHeader = headerStyle.Render(title + cache.pad)
 		}
-		header = title + cache.pad
-		trailingNewline = true
+		styledHeader = cache.styledHeader
+		headerLines = 2
 	}
-	b.WriteString(headerStyle.Render(header))
-	if trailingNewline {
+	b.WriteString(styledHeader)
+	if headerLines == 2 {
 		b.WriteByte('\n')
 	}
 	if len(m.runs) == 0 {
@@ -346,7 +353,7 @@ func (m model) View() string {
 	}
 	// Grow once for the header, the visible rows and the footer so the
 	// builder does not reallocate while writing the frame.
-	b.Grow(len(header) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + 80)
+	b.Grow(len(styledHeader) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + 80)
 	row := cache.row[:0]
 	for i := start; i < end; i++ {
 		run := m.runs[i]
@@ -378,7 +385,7 @@ func (m model) View() string {
 		b.WriteString(m.status)
 	}
 	b.WriteString("\n")
-	b.WriteString(headerStyle.Render("j/k move  a approve  u unblock  c/x cancel  r retry  q quit"))
+	b.WriteString(helpLine)
 	frame := b.String()
 	cache.rememberFrame(m.width, m.cursor, m.status, m.failed, m.runs, frame)
 	return frame
