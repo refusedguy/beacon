@@ -1,4 +1,10 @@
 {
+  "noise": {
+    "defaultFloorPct": 2,
+    "maxAgeHours": 168,
+    "minSamples": 5,
+    "quantile": 0.95
+  },
   "specs": [
     {
       "key": "sqlite-snapshot",
@@ -160,6 +166,15 @@
       "workMetric": "work",
       "errMetric": "errs",
       "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "json-control",
+      "limiter": "encoding/json reflection over a fixed struct",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "both",
       "thresholdPct": 15
     }
   ]

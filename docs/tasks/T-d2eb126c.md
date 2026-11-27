@@ -1,7 +1,7 @@
 ---
 id: T-d2eb126c
 title: Add noise policy and control key to registry
-status: available
+status: done
 scope:
     - internal/bench/registry.go
     - internal/bench/registry_test.go
