@@ -40,12 +40,21 @@ var (
 	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("204"))
 )
 
+// helpText is the fixed key legend. It is rendered once per cache because its
+// bytes never change between frames.
+const helpText = "j/k move  a approve  u unblock  c/x cancel  r retry  q quit"
+
 // renderCache holds scratch state that View reuses across frames. It sits
-// behind a pointer so copies of model share the same buffer.
+// behind a pointer so copies of model share the same buffer. The styled header
+// is keyed by terminal width; the legend and the last frame size are stable.
 type renderCache struct {
-	padWidth int
-	pad      string
-	row      []byte
+	headerWidth int
+	headerSet   bool
+	header      string
+	footerSet   bool
+	footer      string
+	row         []byte
+	size        int
 }
 
 // model is the Bubble Tea state for the run monitor.
@@ -238,27 +247,34 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the run list and status line. The header padding and the row
-// scratch buffer are reused across frames; the rendered text is unchanged.
+// View renders the run list and status line. It reuses the styled header, the
+// key legend, the row scratch buffer and the last frame's size hint. The
+// rendered bytes are unchanged.
 func (m model) View() string {
 	cache := m.render
 	if cache == nil {
 		cache = &renderCache{}
 	}
-	var b strings.Builder
-	title := "Beacon runs"
-	header := title + "\n"
-	trailingNewline := false
-	if m.width > 0 {
-		if cache.padWidth != m.width {
-			cache.padWidth = m.width
-			cache.pad = strings.Repeat(" ", maxInt(0, m.width-len(title)))
-		}
-		header = title + cache.pad
-		trailingNewline = true
+	if !cache.footerSet {
+		cache.footer = headerStyle.Render(helpText)
+		cache.footerSet = true
 	}
-	b.WriteString(headerStyle.Render(header))
-	if trailingNewline {
+	title := "Beacon runs"
+	if !cache.headerSet || cache.headerWidth != m.width {
+		cache.headerWidth = m.width
+		if m.width > 0 {
+			cache.header = headerStyle.Render(title + strings.Repeat(" ", maxInt(0, m.width-len(title))))
+		} else {
+			cache.header = headerStyle.Render(title + "\n")
+		}
+		cache.headerSet = true
+	}
+	var b strings.Builder
+	if cache.size > 0 {
+		b.Grow(cache.size)
+	}
+	b.WriteString(cache.header)
+	if m.width > 0 {
 		b.WriteByte('\n')
 	}
 	if len(m.runs) == 0 {
@@ -303,7 +319,8 @@ func (m model) View() string {
 		b.WriteString(m.status)
 	}
 	b.WriteString("\n")
-	b.WriteString(headerStyle.Render("j/k move  a approve  u unblock  c/x cancel  r retry  q quit"))
+	b.WriteString(cache.footer)
+	cache.size = b.Len()
 	return b.String()
 }
 

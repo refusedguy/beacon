@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -706,6 +707,132 @@ func BenchmarkViewFiveRuns(b *testing.B) {
 		b.ReportMetric(5, "rows/op")
 		for i := 0; i < b.N; i++ {
 			benchViewOut = fixtures[i&1].View()
+		}
+	})
+}
+
+// TestViewCacheFollowsWidthChanges pins header invalidation. The cached styled
+// header must be rebuilt when the terminal width changes, including a switch
+// back to zero width.
+func TestViewCacheFollowsWidthChanges(t *testing.T) {
+	m := viewModel(80, 1, benchmarkFiveRuns("ready"), "loaded 5 run(s)", false)
+	for _, width := range []int{80, 0, 41, 80, 5, 0} {
+		m.width = width
+		want := viewBaseline(m)
+		for frame := 0; frame < 2; frame++ {
+			if got := m.View(); got != want {
+				t.Fatalf("width %d frame %d: View differs from baseline:\ngot:\n%s\nwant:\n%s", width, frame, got, want)
+			}
+		}
+	}
+}
+
+// perFrameCache is the scratch state View held before the header, legend and
+// size-hint cache. Keeping it in the test lets the benchmark isolate that cut.
+type perFrameCache struct {
+	padWidth int
+	pad      string
+	row      []byte
+}
+
+// viewPerFrame mirrors View before the cache cut. It still reuses the row
+// buffer and the header padding, so only the repeated style renders and the
+// builder growth differ from the current View.
+func viewPerFrame(m model, cache *perFrameCache) string {
+	var b strings.Builder
+	title := "Beacon runs"
+	header := title + "\n"
+	trailingNewline := false
+	if m.width > 0 {
+		if cache.padWidth != m.width {
+			cache.padWidth = m.width
+			cache.pad = strings.Repeat(" ", maxInt(0, m.width-len(title)))
+		}
+		header = title + cache.pad
+		trailingNewline = true
+	}
+	b.WriteString(headerStyle.Render(header))
+	if trailingNewline {
+		b.WriteByte('\n')
+	}
+	if len(m.runs) == 0 {
+		b.WriteString("no runs\n")
+	}
+	start := 0
+	if m.cursor >= visibleRows {
+		start = m.cursor - visibleRows + 1
+	}
+	end := start + visibleRows
+	if end > len(m.runs) {
+		end = len(m.runs)
+	}
+	row := cache.row[:0]
+	for i := start; i < end; i++ {
+		run := m.runs[i]
+		row = row[:0]
+		writeField(&row, run.ID, visibleRowWidth)
+		row = append(row, ' ')
+		writeField(&row, run.State, 16)
+		row = append(row, " pr="...)
+		writeField(&row, strconv.Itoa(run.PR), 5)
+		row = append(row, ' ')
+		row = append(row, truncate(run.TaskID, visibleRowWidth)...)
+		if run.Reason != "" {
+			row = append(row, ' ')
+			row = append(row, truncate(run.Reason, 32)...)
+		}
+		cache.row = row
+		if i == m.cursor {
+			b.WriteString(cursorStyle.Render("> " + string(row)))
+		} else {
+			b.WriteString("  ")
+			b.Write(row)
+		}
+		b.WriteByte('\n')
+	}
+	b.WriteString("\n")
+	if m.failed {
+		b.WriteString(errorStyle.Render(m.status))
+	} else {
+		b.WriteString(m.status)
+	}
+	b.WriteString("\n")
+	b.WriteString(headerStyle.Render(helpText))
+	return b.String()
+}
+
+var benchCacheOut string
+
+// BenchmarkViewCache alternates two five-row snapshots on each side. Both
+// sides render five rows and identical bytes; the rows/op metric makes a
+// shortcut that skipped rows visible in the report.
+func BenchmarkViewCache(b *testing.B) {
+	fixtures := [2]model{
+		viewModel(80, 0, benchmarkFiveRuns("waiting_ci"), "loaded 5 run(s)", false),
+		viewModel(80, 3, benchmarkFiveRuns("ready"), "loaded 5 run(s)", false),
+	}
+	caches := [2]perFrameCache{{}, {}}
+	for i := range fixtures {
+		want := viewBaseline(fixtures[i])
+		if got := viewPerFrame(fixtures[i], &caches[i]); got != want {
+			b.Fatalf("fixture %d per-frame view differs from baseline", i)
+		}
+		if got := fixtures[i].View(); got != want {
+			b.Fatalf("fixture %d cached view differs from baseline", i)
+		}
+	}
+	b.Run("per-frame", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(5, "rows/op")
+		for i := 0; i < b.N; i++ {
+			benchCacheOut = viewPerFrame(fixtures[i&1], &caches[i&1])
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(5, "rows/op")
+		for i := 0; i < b.N; i++ {
+			benchCacheOut = fixtures[i&1].View()
 		}
 	})
 }
