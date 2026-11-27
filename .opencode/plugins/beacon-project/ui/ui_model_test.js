@@ -6,7 +6,7 @@ import * as ui from "./ui.js"
 const {
   BeaconStatusRpc, CHECK_BUCKETS, CliStatusSource, EMPTY_SNAPSHOT, RECENT_LIMIT,
   checkRow, checksSummary, cleanErrorMessage, createCliStatusSource, createStatusSource,
-  defineBeaconStatus, errorMessage, eventKey, joinKey, normalizeRun, normalizeSnapshot,
+  defineBeaconStatus, errorMessage, eventKey, joinKey, normalizeAttempt, normalizeRun, normalizeSnapshot,
   parseSnapshot, renderSnapshotLines, runChangedPayload, runSignature,
   default: beaconStatus, beaconStatusDefinition,
 } = ui
@@ -30,7 +30,7 @@ test("normalizeRun keeps a missing title empty and reads CI checks", () => {
   assert.equal(run.title, "")
   assert.equal(run.state, "running")
   assert.equal(run.durations.waitingCI, 60)
-  assert.deepEqual(run.checks, [{ name: "ci", state: "success", durationSeconds: 28 }])
+  assert.deepEqual(run.checks, [{ name: "ci", state: "success", durationSeconds: 28, headSHA: "" }])
   assert.equal(normalizeRun({ State: "" }).state, "unknown")
 })
 
@@ -588,4 +588,76 @@ test("a dispatch without run data still reads the snapshot on refresh", async ()
     ["/bin/beacon", "status", "--snapshot"],
   ])
   assert.deepEqual(next.active, [])
+})
+
+test("normalizeRun reads cycle durations and a per-check head SHA", () => {
+  const run = normalizeRun({
+    id: "r-1",
+    durations: {
+      waiting_ci_seconds: 180, waiting_ci_initial_seconds: 120,
+      waiting_ci_rebase_seconds: 60, waiting_ci_fix_seconds: 30,
+      running_seconds: 420, blocked_seconds: 0,
+    },
+    checks: [{ name: "ci", state: "success", head_sha: "abcdef0" }],
+  })
+  assert.deepEqual(run.checks[0].headSHA, "abcdef0")
+  assert.equal(run.durations.waitingCI, 180)
+  assert.equal(run.durations.waitingCIInitial, 120)
+  assert.equal(run.durations.waitingCIRebase, 60)
+  assert.equal(run.durations.waitingCIFix, 30)
+})
+
+test("normalizeAttempt reports no transition as the initial attempt", () => {
+  const run = normalizeRun(makeRun({
+    Durations: { waiting_ci_seconds: 120, running_seconds: 5, blocked_seconds: 0 },
+  }))
+  assert.equal(run.attempt.kind, "initial")
+  assert.equal(run.attempt.number, 1)
+  assert.equal(run.attempt.rebaseStatus, "none")
+  assert.equal(run.attempt.outcome, "")
+  assert.equal(run.attempt.headSHA, "abcdef1234567890")
+})
+
+test("normalizeAttempt names a finished rebase and the head it produced", () => {
+  const run = normalizeRun({
+    id: "r-2", head_sha: "newsha111",
+    rebase_attempts: 1, max_attempts: 12,
+    timeline: [
+      { at: "2026-11-23T10:00:00Z", kind: "start", state: "running", head_sha: "oldsha000" },
+      { at: "2026-11-23T10:02:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "oldsha000" },
+      { at: "2026-11-23T10:10:00Z", kind: "behind", state: "needs_rebase", head_sha: "oldsha000" },
+      { at: "2026-11-23T10:14:00Z", kind: "checks_pending", state: "waiting_ci", head_sha: "newsha111" },
+    ],
+    decisions: [
+      { at: "2026-11-23T10:12:00Z", kind: "transition.rebase", action: "rebased", fields: { attempt: 1, new_sha: "newsha111" } },
+    ],
+  })
+  assert.deepEqual(
+    { kind: run.attempt.kind, number: run.attempt.number, outcome: run.attempt.outcome, status: run.attempt.rebaseStatus, head: run.attempt.headSHA },
+    { kind: "rebase", number: 1, outcome: "rebased", status: "passed", head: "newsha111" },
+  )
+  assert.equal(run.attempt.startedAt, "2026-11-23T10:10:00Z")
+})
+
+test("normalizeAttempt tells a failed rebase from one still running", () => {
+  const failed = normalizeAttempt({
+    rebaseAttempts: 2,
+    timeline: [
+      { at: "2026-11-23T10:00:00Z", kind: "start", state: "running" },
+      { at: "2026-11-23T10:10:00Z", kind: "behind", state: "needs_rebase" },
+    ],
+    decisions: [
+      { at: "2026-11-23T10:11:00Z", kind: "transition.rebase", action: "failed", fields: { attempt: 2, new_sha: "" } },
+    ],
+  })
+  assert.equal(failed.rebaseStatus, "failed")
+  assert.equal(failed.outcome, "failed")
+  const running = normalizeAttempt({
+    timeline: [
+      { at: "2026-11-23T10:00:00Z", kind: "start", state: "running" },
+      { at: "2026-11-23T10:10:00Z", kind: "behind", state: "needs_rebase" },
+    ],
+    decisions: [],
+  })
+  assert.equal(running.rebaseStatus, "running")
 })

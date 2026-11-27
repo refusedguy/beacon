@@ -62,8 +62,44 @@ export const SIDEBAR_TITLE_WIDTH = 29
 export const truncateSidebarTitle = (value) => truncate(value, SIDEBAR_TITLE_WIDTH)
 const ageOf = (run, now) => { const t = Math.max(timeOf(run?.updatedAt), timeOf(run?.createdAt)); return t ? elapsed(now - t) : "" }
 const tookOf = (run) => { const a = timeOf(run?.createdAt), b = timeOf(run?.updatedAt); return a && b ? elapsed(b - a) : "" }
-export function phaseLabel(run, now = Date.now()) {
+const numberOrZero = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : 0 }
+export const shortSHA = (value) => { const sha = str(value); return sha ? sha.slice(0, 7) : "-" }
+const lastChecksPending = (timeline) => [...timeline].reverse().find((e) => str(e?.kind).toLowerCase() === "checks_pending")
+
+// A rebase or fix transition starts a new attempt. The cumulative buckets keep
+// counting from the first start, so the live phase uses the cycle buckets that
+// measure only the current round.
+export function phaseDurations(run, now = Date.now()) {
   const d = run.durations ?? {}
+  const cumulative = {
+    waitingCI: numberOrZero(d.waitingCI), running: numberOrZero(d.running), blocked: numberOrZero(d.blocked),
+  }
+  const attempt = run.attempt ?? {}
+  if (attempt.kind !== "rebase" && attempt.kind !== "fix") return { ...cumulative, scoped: false }
+  const waitingCI = attempt.kind === "rebase" ? numberOrZero(d.waitingCIRebase) : numberOrZero(d.waitingCIFix)
+  const running = attempt.startedAt && str(run?.state).toLowerCase() === "running"
+    ? Math.max(0, now - timeOf(attempt.startedAt)) / 1000 : cumulative.running
+  return { waitingCI, running, blocked: cumulative.blocked, scoped: true, cumulative }
+}
+
+// Checks can outlive the head they measured. After a rebase the run carries a
+// new head before the next observation replaces the old green checks.
+export function checksForRun(run) {
+  const all = run.checks ?? []
+  const head = str(run?.sha)
+  if (!head) return { checks: all, stale: [] }
+  const observed = str(lastChecksPending(run.timeline ?? [])?.sha)
+  const checks = [], stale = []
+  for (const check of all) {
+    const checkHead = str(check?.headSHA)
+    const current = checkHead ? checkHead === head : !observed || observed === head
+    ;(current ? checks : stale).push(check)
+  }
+  return { checks, stale }
+}
+
+export function phaseLabel(run, now = Date.now()) {
+  const d = phaseDurations(run, now)
   const state = str(run.state).toLowerCase()
   const phase = state === "waiting_ci" ? ["CI wait", d.waitingCI]
     : state === "blocked" ? ["block", d.blocked]
@@ -304,9 +340,9 @@ export function detailActions(run) {
   actions.push("copy")
   return actions
 }
-function phaseSummary(run) {
-  const d = run.durations ?? {}
-  return `Run ${shortTaskID(run.id)} · Coding ${elapsed((d.running ?? 0) * 1000)} · CI wait ${elapsed((d.waitingCI ?? 0) * 1000)} · Blocked ${elapsed((d.blocked ?? 0) * 1000)}`
+function phaseSummary(run, now) {
+  const d = phaseDurations(run, now)
+  return `Run ${shortTaskID(run.id)} · Coding ${elapsed(d.running * 1000)} · CI wait ${elapsed(d.waitingCI * 1000)} · Blocked ${elapsed(d.blocked * 1000)}`
 }
 export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_OPEN) {
   if (!run) return {
@@ -331,10 +367,11 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     row({ marker: "", name: reason || "No reason recorded", status: "", kind: "reason",
       color: problem ? "error" : "base" })
   }
-  const checks = run.checks ?? []
-  header("CI Checks", "checks", checksSummary(checks))
+  const { checks, stale } = checksForRun(run)
+  header("CI Checks", "checks", stale.length ? `pending for ${shortSHA(run.sha)}` : checksSummary(checks, run.checks?.ciWallSeconds))
   if (isOpen("checks")) {
-    if (!checks.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "check" })
+    if (stale.length) row({ marker: "", name: `Checks pending for head ${shortSHA(run.sha)}`, status: "", color: "warning", kind: "check" })
+    if (!checks.length && !stale.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "check" })
     else checks.forEach((c) => row(checkRow(c)))
   }
   header("Timeline", "timeline")
@@ -353,8 +390,16 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     const launch = launchOf(run)
     if (launch) row({ marker: key("Launch"), name: [launch, str(run.agentIdentity ?? run.agent_identity)].filter(Boolean).join(" · "), status: "", color: "base", kind: "tech" })
     row({ marker: key("Head SHA"), name: run.sha || "-", status: "", color: "base", kind: "tech" })
-    const attempts = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
-    row({ marker: key("Attempts"), name: attempts, status: "", color: "base", kind: "tech" })
+    const attempt = run.attempt ?? {}
+    const head = shortSHA(attempt.headSHA || run.sha)
+    const attemptName = `#${attempt.number || 1}${attempt.kind && attempt.kind !== "initial" ? ` ${attempt.kind}` : ""}`
+      + `${attempt.outcome ? ` · ${attempt.outcome}` : ""} · head ${head}`
+    row({ marker: key("Attempts"), name: attemptName, status: "", color: "base", kind: "tech" })
+    row({ marker: key("Rebase"), name: attempt.rebaseStatus || "none", status: "", color: "base", kind: "tech" })
+    const counters = `Rebase ${run.rebaseAttempts ?? 0}/${run.maxAttempts || "?"} · Fix ${run.fixAttempts ?? 0}/${run.maxAttempts || "?"}`
+    row({ marker: key("Counters"), name: counters, status: "", color: "muted", kind: "tech" })
+    const totals = phaseDurations(run, now)
+    if (totals.scoped) row({ marker: key("Total time"), name: `Coding ${elapsed(totals.cumulative.running * 1000)} · CI wait ${elapsed(totals.cumulative.waitingCI * 1000)} · Blocked ${elapsed(totals.cumulative.blocked * 1000)}`, status: "", color: "muted", kind: "tech" })
     const all = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
     const decisions = all.slice(-DECISION_LIMIT)
     if (all.length > decisions.length) row({ marker: "", name: `... ${all.length - decisions.length} earlier decisions`, status: "", color: "muted", kind: "decision" })
@@ -371,7 +416,7 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     branch: run.branch || "-",
     title: str(run.title) || str(run.taskID) || "-",
     task: run.taskID || "-",
-    phase: phaseSummary(run),
+    phase: phaseSummary(run, now),
     nextStep: nextStepLine(run),
     fixer: run.isFixer ? "FIXER" : "",
     actions: detailActions(run),
