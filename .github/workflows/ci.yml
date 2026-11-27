@@ -690,11 +690,15 @@ jobs:
           // when available and say so when the comparison is uncalibrated.
           let floorPct = defaultFloor;
           let calibrated = false;
+          let floors = null;
           try {
             const doc = JSON.parse(fs.readFileSync(`${temp}/bench-noise-floor/noise-floor.json`, 'utf8'));
             if (Number.isFinite(doc.floorPct) && doc.floorPct > 0) {
               floorPct = Math.max(defaultFloor, doc.floorPct);
               calibrated = true;
+            }
+            if (doc.floors && typeof doc.floors === 'object' && !Array.isArray(doc.floors)) {
+              floors = doc.floors;
             }
           } catch (e) {
             notes.push(`noise floor uncalibrated; using registry default ${defaultFloor}%`);
@@ -869,11 +873,21 @@ jobs:
             const relation = overlap ? 'overlap' : 'separate';
             const delta = am === 0 ? 0 : 100 * (bm - am) / am;
             const maxSpread = Math.max(spread(a), spread(b));
-            const decisive = Math.abs(delta) >= floorPct && Math.abs(delta) > maxSpread;
+            // A calibrated per-key floor wins for this row. Fall back to the
+            // global floor, which already includes the registry default.
+            const perKeyFloor = floors && Number.isFinite(floors[key]) && floors[key] > 0
+              ? floors[key] : NaN;
+            const rowFloor = Number.isFinite(perKeyFloor) && perKeyFloor > 0
+              ? perKeyFloor
+              : (Number.isFinite(floorPct) && floorPct > 0 ? floorPct : defaultFloor);
+            if (!Number.isFinite(perKeyFloor)) {
+              notes.push(`${key}: using uncalibrated floor ${rowFloor}%`);
+            }
+            const decisive = Math.abs(delta) >= rowFloor && Math.abs(delta) > maxSpread;
             const verdict = (workMismatch || inconclusiveAll || !registry.has(key))
               ? 'inconclusive'
               : !decisive ? 'flat'
-              : delta <= -floorPct ? 'gain' : 'regression';
+              : delta <= -rowFloor ? 'gain' : 'regression';
             const ra = ratiosUsable ? median(ratios(baseRatio, key)) : NaN;
             const rb = ratiosUsable ? median(ratios(headRatio, key)) : NaN;
             const ratioDelta = Number.isFinite(ra) && ra !== 0 && Number.isFinite(rb)
@@ -1053,6 +1067,15 @@ jobs:
           const temp = process.env.RUNNER_TEMP;
           const prefix = 'beacon-perf: ';
           const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
+          // Every published floor is at least the registry default.
+          let defaultFloor = 2;
+          try {
+            const reg = JSON.parse(fs.readFileSync('docs/perf/bench-registry.json', 'utf8'));
+            const d = reg.noise && reg.noise.defaultFloorPct;
+            if (Number.isFinite(d) && d > 0) defaultFloor = d;
+          } catch (e) {
+            // The 2 percent fallback matches the registry default.
+          }
           const median = xs => {
             const s = [...xs].sort((a, b) => a - b);
             const mid = Math.floor(s.length / 2);
@@ -1084,8 +1107,47 @@ jobs:
           const index = Math.min(deltas.length - 1, Math.ceil(0.95 * deltas.length) - 1);
           const observed = deltas.length ? deltas[Math.max(0, index)] : 0;
           const floorPct = Math.max(2, Math.ceil(observed * 10) / 10);
+
+          // Per-key floors come from the same no-change passes. Pair the
+          // medians by pass index and keep the later row for a 5x duplicate.
+          const toPasses = name => {
+            const out = [];
+            let pass = null;
+            for (const line of fs.readFileSync(`${temp}/perf-${name}.txt`, 'utf8').split(/\r?\n/)) {
+              if (/^== pass \S+ ==$/.test(line)) { pass = new Map(); out.push(pass); continue; }
+              if (!line.startsWith(prefix)) continue;
+              let row;
+              try { row = JSON.parse(line.slice(prefix.length)); } catch (e) { continue; }
+              if (!row || fields.some(f => !(f in row))) continue;
+              if (!pass) { pass = new Map(); out.push(pass); }
+              pass.set(row.key, row);
+            }
+            return out;
+          };
+          const quantile95 = xs => {
+            if (!xs.length) return 0;
+            const s = [...xs].sort((a, b) => a - b);
+            const index = Math.min(s.length - 1, Math.ceil(0.95 * s.length) - 1);
+            return s[Math.max(0, index)];
+          };
+          const floors = {};
+          const baseByPass = toPasses('base'), headByPass = toPasses('head');
+          const keys = new Set();
+          for (const p of [...baseByPass, ...headByPass]) for (const k of p.keys()) keys.add(k);
+          for (const key of keys) {
+            const perPass = [];
+            const count = Math.min(baseByPass.length, headByPass.length);
+            for (let i = 0; i < count; i++) {
+              const a = baseByPass[i].get(key), b = headByPass[i].get(key);
+              if (a && b && Number.isFinite(a.median_ms) && Number.isFinite(b.median_ms) && a.median_ms > 0) {
+                perPass.push(Math.abs(100 * (b.median_ms - a.median_ms) / a.median_ms));
+              }
+            }
+            floors[key] = Math.max(defaultFloor, Math.ceil(quantile95(perPass) * 10) / 10);
+          }
           const doc = {
             floorPct,
+            floors,
             samples: deltas.length,
             quantile: 0.95,
             sha: process.env.GITHUB_SHA,
