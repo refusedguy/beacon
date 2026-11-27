@@ -283,6 +283,9 @@ const BEACON_BRANCH_RE = /^beacon\/(.+)$/
 const CARD_CACHE_LIMIT = 512
 const cardCache = new Map()
 const cardStamp = (info) => `${info?.size ?? 0}:${fnv1a([info?.mtimeMs ?? info?.mtime ?? 0, info?.ctimeMs ?? 0, info?.ino ?? 0])}`
+// Hand out a fresh card on every read. A caller that edits a title or a meta
+// field must not be able to change what later readers see from the cache.
+const copyCard = (card) => ({ ...card, meta: Object.assign(Object.create(null), card.meta) })
 // Read a card from docs/tasks. A missing or unreadable file returns null so
 // the caller fails closed instead of showing a stale SQLite queue row.
 export function readCard(root, id, deps = {}) {
@@ -303,7 +306,13 @@ export function readCard(root, id, deps = {}) {
   // it directly instead of failing closed, so a test double keeps working.
   if (stamp !== null) {
     const hit = cardCache.get(path)
-    if (hit && hit.stamp === stamp) return hit.card
+    if (hit && hit.stamp === stamp) {
+      // Reinsert the hit so Map order tracks use. Eviction drops the oldest
+      // entry, which is now the least recently read card.
+      cardCache.delete(path)
+      cardCache.set(path, hit)
+      return copyCard(hit.card)
+    }
   }
   let body
   try {
@@ -335,7 +344,7 @@ export function readCard(root, id, deps = {}) {
   }
   if (stamp !== null) {
     if (cardCache.size >= CARD_CACHE_LIMIT) cardCache.delete(cardCache.keys().next().value)
-    cardCache.set(path, { stamp, card })
+    cardCache.set(path, { stamp, card: copyCard(card) })
   }
   return card
 }

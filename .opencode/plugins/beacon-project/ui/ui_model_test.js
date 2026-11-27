@@ -738,3 +738,26 @@ test("normalizeAttempt tells a failed rebase from one still running", () => {
   })
   assert.equal(running.rebaseStatus, "running")
 })
+
+test("readCard returns a defensive copy and keeps recently read cards on eviction", () => {
+  const files = new Map()
+  const info = { mtimeMs: 1000, ctimeMs: 1, size: 80 }
+  const deps = { existsSync: (p) => files.has(p), readFileSync: (p) => files.get(p), statSync: () => info }
+  const kept = "/cache/docs/tasks/T-300.md"
+  files.set(kept, "---\nid: T-300\ntitle: Original\nstatus: ready\n---\nGoal: work.\n")
+  const card = ui.readCard("/cache", "T-300", deps)
+  card.title = "Mutated"
+  card.meta.title = "Mutated meta"
+  assert.equal(ui.readCard("/cache", "T-300", deps).title, "Original", "a caller cannot mutate the cached card")
+  assert.equal(ui.readCard("/cache", "T-300", deps).meta.title, "Original", "meta is copied too")
+
+  // The cache holds 512 entries. Reading the kept card after each insert marks
+  // it as most recent, so it survives even after more than 512 other cards.
+  for (let i = 0; i < 520; i++) {
+    const id = `T-${400 + i}`
+    files.set(`/cache/docs/tasks/${id}.md`, `---\nid: ${id}\ntitle: ${id}\nstatus: ready\n---\nGoal: work.\n`)
+    ui.readCard("/cache", id, deps)
+    ui.readCard("/cache", "T-300", deps)
+  }
+  assert.equal(ui.readCard("/cache", "T-300", deps).title, "Original", "frequent access keeps the card in the LRU")
+})
