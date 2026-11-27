@@ -2,12 +2,29 @@ package mcp
 
 import (
 	"context"
+	"strings"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// controlMessageKey carries the nudge message across the remote boundary. The
+// Remote function signature predates the message field, so the wire adapter
+// reads it from the call context instead of dropping it.
+type controlMessageKey struct{}
+
+func withControlMessage(ctx context.Context, message string) context.Context {
+	return context.WithValue(ctx, controlMessageKey{}, message)
+}
+
+// ControlMessage returns the message bound by the MCP control tool. The
+// loopback adapter uses it to build its request body.
+func ControlMessage(ctx context.Context) string {
+	message, _ := ctx.Value(controlMessageKey{}).(string)
+	return message
+}
 
 // ControlArgs is the input schema for beacon_control. RunIDs is optional;
 // when present it replaces RunID and the call returns one result per id.
@@ -32,7 +49,18 @@ type controlBatch struct {
 }
 
 func registerControl(s *msdk.Server, sv Services) {
-	msdk.AddTool(s, catalogTool("beacon_control"), func(ctx context.Context, _ *msdk.CallToolRequest, a ControlArgs) (*msdk.CallToolResult, any, error) {
+	msdk.AddTool(s, catalogTool("beacon_control"), func(ctx context.Context, req *msdk.CallToolRequest, a ControlArgs) (*msdk.CallToolResult, any, error) {
+		action := core.ParseControlAction(a.Action)
+		if !action.Valid() {
+			return nil, nil, core.Errorf(core.CodeInvalidInput, "unknown action %q", a.Action)
+		}
+		if a.RunID != "" && a.RunIDs != nil {
+			return nil, nil, core.Errorf(core.CodeInvalidInput, "run_id and run_ids cannot be combined")
+		}
+		if action == core.ControlNudge && strings.TrimSpace(a.Message) == "" {
+			return nil, nil, core.Errorf(core.CodeInvalidInput, "message is required for nudge")
+		}
+		ctx = app.WithControlActor(ctx, metaString(req, "beacon/agent", "ai.opencode/agent"))
 		if a.RunIDs == nil {
 			if err := applyControl(ctx, sv, a.Action, a.RunID, a.PR, a.SHA, a.Message); err != nil {
 				return nil, nil, err
@@ -48,7 +76,7 @@ func registerControl(s *msdk.Server, sv Services) {
 // are sent sequentially and each id keeps its own outcome.
 func applyControl(ctx context.Context, sv Services, action, id string, pr int, sha, message string) error {
 	if sv.Remote != nil {
-		return sv.Remote(ctx, action, id, pr, sha)
+		return sv.Remote(withControlMessage(ctx, message), action, id, pr, sha)
 	}
 	if err := requireService("control service", sv.Control); err != nil {
 		return err
@@ -83,5 +111,12 @@ func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToo
 		}
 		results = append(results, item)
 	}
-	return jsonResult(controlBatch{Action: a.Action, Results: results}), nil, nil
+	result := jsonResult(controlBatch{Action: a.Action, Results: results})
+	for _, item := range results {
+		if item.Status == "error" {
+			result.IsError = true
+			break
+		}
+	}
+	return result, nil, nil
 }
