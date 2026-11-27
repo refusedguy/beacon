@@ -103,9 +103,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - module: root command and infra
+          - module: root command
             dir: .
-            packages: ./cmd/... ./internal/...
+            packages: ./cmd/...
+          - module: root app
+            dir: .
+            packages: ./internal/app/...
+          - module: root infra
+            dir: .
+            packages: ./internal/infra/...
+          - module: root bench
+            dir: .
+            packages: ./internal/bench/...
           - module: root core
             dir: .
             packages: . ./pkg/...
