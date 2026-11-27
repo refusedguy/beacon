@@ -232,6 +232,15 @@
       "thresholdPct": 15
     },
     {
+      "key": "telegram-notify",
+      "limiter": "redact regexp chain + json.Marshal + loopback POST",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
       "key": "json-control",
       "limiter": "encoding/json reflection over a fixed struct",
       "unit": "ns",

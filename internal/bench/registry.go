@@ -49,12 +49,18 @@ const (
 	dispatchPromptLimiter = "strings.Builder + prompt bytes"
 )
 
+// telegramNotifyLimiter names the resource that bounds the Telegram send path.
+// It lives here beside the key so the registry and the benchmark cannot drift
+// apart. The benchmark prints this string in its canonical row.
+const telegramNotifyLimiter = "redact regexp chain + json.Marshal + loopback POST"
+
 // prBenchLimiters are the canonical keys and limiter strings published by the
 // in-package benchmarks. They run only in the advisory two-tree job, so their
 // registry placement is pr. reconcile-tick-counts keeps a green base as the
 // no-red regression guard; the two base-red keys run on a red base so their
 // own counters can earn a calls-reduced verdict. The assembly row covers
-// status.go and metrics.go work without SQLite or HTTP noise.
+// status.go and metrics.go work without SQLite or HTTP noise. The telegram row
+// covers the redact, marshal and POST chain on the notification send path.
 var prBenchLimiters = []struct{ key, limiter string }{
 	{"reconcile-tick-counts", reconcileTickLimiter},
 	{"base-red-check", baseRedCheckLimiter},
@@ -62,6 +68,7 @@ var prBenchLimiters = []struct{ key, limiter string }{
 	{"planner-select-injected-checker", plannerSelectLimiter},
 	{"dispatch-prompt", dispatchPromptLimiter},
 	{nameAssembly, limiterAssembly},
+	{"telegram-notify", telegramNotifyLimiter},
 }
 
 // The pure control benchmark owns no Beacon code, so its canonical name and
