@@ -103,6 +103,7 @@ type Reconciler struct {
 // Reconcile observes pr once, evaluates the merge policy and applies the
 // verdict to the run bound to that pull request.
 func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.MergeDecision, err error) {
+	ctx = withTickCache(ctx)
 	run, err := r.Store.FindByPR(ctx, pr)
 	if err != nil {
 		return core.MergeDecision{}, err
@@ -148,9 +149,8 @@ func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Eve
 	return r.Store.Save(ctx, run)
 }
 
-func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
+func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation, isEpic bool) error {
 	run.NoteObservation(obs.HeadSHA, obs.BaseSHA)
-	_, isEpic := r.epicTask(ctx, run.TaskID)
 	if !run.IsFixer && !isEpic && run.WorkspacePath != "" {
 		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {
 			return err
@@ -299,33 +299,37 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 			}
 			r.HandleHarnessEvent(ctx, event)
 		case <-ticker.C:
+			// Every read on this tick shares one task tree and one base status
+			// per branch. safeReconcile sees the same cache, so the several
+			// relation checks across all PRs read the source only once.
+			tickCtx := withTickCache(ctx)
 			// Retention runs on this fixed schedule rather than on ListActive,
 			// so status, dispatch and MCP reads stay free of DELETE statements.
 			// Cleanup is best effort: a failed prune must not stop the tick.
 			if pruner, ok := r.Store.(stalePruner); ok {
-				if _, err := pruner.PruneStale(ctx, 0); err != nil {
+				if _, err := pruner.PruneStale(tickCtx, 0); err != nil {
 					slog.Warn("prune stale delivery rows", "error", err)
 				}
 			}
-			if err := r.checkBaseRecovery(ctx); err != nil {
+			if err := r.checkBaseRecovery(tickCtx); err != nil {
 				slog.Error("base recovery", "error", err)
 			}
-			if err := r.reconcileEpics(ctx); err != nil {
+			if err := r.reconcileEpics(tickCtx); err != nil {
 				slog.Error("reconcile epics", "error", err)
 			}
-			runs, err := r.Store.ListActive(ctx)
+			runs, err := r.Store.ListActive(tickCtx)
 			if err != nil {
 				slog.Error("list runs", "error", err)
 				continue
 			}
-			r.reconcileOrphanRunning(ctx, runs)
+			r.reconcileOrphanRunning(tickCtx, runs)
 			for _, run := range runs {
 				if run.PRNumber > 0 {
-					r.safeReconcile(ctx, run.PRNumber)
+					r.safeReconcile(tickCtx, run.PRNumber)
 				}
 			}
 			if r.Promoter != nil {
-				if _, err := r.Promoter.PromotePending(ctx); err != nil {
+				if _, err := r.Promoter.PromotePending(tickCtx); err != nil {
 					slog.Error("promote pending", "error", err)
 				}
 			}

@@ -52,7 +52,7 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 	if baseBranch == "" {
 		return nil
 	}
-	base, err := r.SCM.BaseBranchStatus(ctx, baseBranch)
+	base, err := r.baseStatus(ctx, baseBranch)
 	if err != nil {
 		return err
 	}
@@ -112,8 +112,17 @@ func (r *Reconciler) blockRunsOnRedBaseNames(ctx context.Context, in *core.BaseI
 		if r.baseBranchForTree(tree, other) != baseBranch {
 			continue
 		}
-		otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
-		if err != nil || !intersects(failedNames(otherObs.Checks), baseFailed) {
+		// Each active run already persisted its checks on its last reconcile.
+		// Reuse them and spend an observe round trip only when none were kept.
+		checks := other.Checks
+		if len(checks) == 0 {
+			otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
+			if err != nil {
+				continue
+			}
+			checks = otherObs.Checks
+		}
+		if !intersects(failedNames(checks), baseFailed) {
 			continue
 		}
 		if err := other.Apply(core.Event{Kind: core.EvBlock, Reason: "base_red"}); err != nil {
@@ -251,7 +260,7 @@ func (r *Reconciler) checkBaseRecovery(ctx context.Context) error {
 		return err
 	}
 	for _, in := range incidents {
-		base, err := r.SCM.BaseBranchStatus(ctx, in.BaseBranch)
+		base, err := r.baseStatus(ctx, in.BaseBranch)
 		if err != nil {
 			slog.Error("base status", "incident", in.ID, "error", err)
 			continue

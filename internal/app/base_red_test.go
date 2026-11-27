@@ -329,6 +329,79 @@ func TestIdleAutoAttachesPRByBranch(t *testing.T) {
 	}
 }
 
+// countingBaseSCM records base status reads so a tick can be checked for one
+// read per distinct branch.
+type countingBaseSCM struct {
+	*fakeSCM
+	baseCalls int
+}
+
+func (s *countingBaseSCM) BaseBranchStatus(ctx context.Context, branch string) (core.BaseStatus, error) {
+	s.baseCalls++
+	return s.fakeSCM.BaseBranchStatus(ctx, branch)
+}
+
+func TestBlockRunsOnRedBaseReusesPersistedChecks(t *testing.T) {
+	ctx := withTickCache(context.Background())
+	store := newFakeStore()
+	other := makeRun("r2", 43, core.RunWaitingCI)
+	other.Checks = []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
+	if err := store.Save(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	log := &callLog{}
+	scm := &fakeSCM{
+		obs: core.Observation{PRNumber: 43, Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}}},
+		log: log,
+	}
+	r := &Reconciler{Store: store, SCM: scm, BaseBranch: "main"}
+	in := &core.BaseIncident{ID: "inc-1"}
+	baseFailed := failedNames([]core.CheckResult{{Name: "ci", State: core.CheckFailure}})
+	if err := r.blockRunsOnRedBaseNames(ctx, in, "main", baseFailed); err != nil {
+		t.Fatal(err)
+	}
+	if store.runs["r2"].State != core.RunBlocked {
+		t.Fatalf("run with persisted failing checks not blocked: %s", store.runs["r2"].State)
+	}
+	for _, entry := range log.items {
+		if entry == "observe" {
+			t.Fatal("observed a run whose checks were already persisted")
+		}
+	}
+}
+
+func TestBaseStatusMemoizedWithinTick(t *testing.T) {
+	ctx := withTickCache(context.Background())
+	store := newFakeStore()
+	store.incidents["one"] = &core.BaseIncident{ID: "inc-1", Signature: "one", BaseBranch: "main", Status: "open"}
+	store.incidents["two"] = &core.BaseIncident{ID: "inc-2", Signature: "two", BaseBranch: "main", Status: "open"}
+	scm := &countingBaseSCM{fakeSCM: &fakeSCM{base: core.BaseStatus{BaseBranch: "main"}}}
+	r := &Reconciler{Store: store, SCM: scm, BaseBranch: "main"}
+	if err := r.checkBaseRecovery(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if scm.baseCalls != 1 {
+		t.Fatalf("BaseBranchStatus called %d times, want 1", scm.baseCalls)
+	}
+}
+
+func TestReconcileReadsSourceOnceOnRedBase(t *testing.T) {
+	r, source, _ := redBaseTreeReconciler(t, 4, 1)
+	r.Policy = fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictNeedsAgentFix, Reason: "ci failed"}}
+	r.SCM = &fakeSCM{
+		obs: core.Observation{PRNumber: 1, HeadSHA: "sha2",
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckFailure}}},
+		base: redBase(),
+	}
+	r.BaseRedMode = "notify_orchestrator"
+	if _, err := r.Reconcile(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if source.lists != 1 {
+		t.Fatalf("ListAvailable called %d times, want 1", source.lists)
+	}
+}
+
 func TestIntersectsOnSortedNames(t *testing.T) {
 	tests := []struct {
 		name string
