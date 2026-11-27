@@ -155,6 +155,10 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("runs migration: %w", err)
 	}
+	if err := ensureTaskColumns(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("tasks migration: %w", err)
+	}
 	if err := backfillRunEvents(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("run events migration: %w", err)

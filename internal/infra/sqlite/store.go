@@ -605,9 +605,6 @@ FROM decisions WHERE run_id=? ORDER BY at DESC, id DESC LIMIT 1`, runID)
 // straight from SQLite. It makes no SCM or task-source calls, so a snapshot
 // stays safe for both markdown and remote task sources.
 func (s *Store) ListQueueTasks(ctx context.Context) ([]app.QueueTask, error) {
-	if err := s.ensureTaskColumns(ctx); err != nil {
-		return nil, err
-	}
 	queueQuery, queueArgs := inQuery(`SELECT id, title, priority FROM tasks
 WHERE status IN (%s)
   AND id NOT IN (SELECT task_id FROM runs WHERE state NOT IN (%s))

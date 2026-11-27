@@ -20,15 +20,16 @@ var taskColumns = []struct{ name, ddl string }{
 	{"worker_prompt", "worker_prompt TEXT NOT NULL DEFAULT ''"},
 }
 
-// ensureTaskColumns adds epic columns to an older tasks table.
-func (s *Store) ensureTaskColumns(ctx context.Context) error {
-	present, err := presentColumns(ctx, s.db, "tasks")
+// ensureTaskColumns adds epic columns to an older tasks table. Open runs it
+// once, so snapshot reads never issue a PRAGMA table_info for the task schema.
+func ensureTaskColumns(ctx context.Context, db *sql.DB) error {
+	present, err := presentColumns(ctx, db, "tasks")
 	if err != nil {
 		return err
 	}
 	for _, col := range taskColumns {
 		if !present[col.name] {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE tasks ADD COLUMN `+col.ddl); err != nil {
+			if _, err := db.ExecContext(ctx, `ALTER TABLE tasks ADD COLUMN `+col.ddl); err != nil {
 				return err
 			}
 		}
@@ -38,7 +39,7 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 
 // SyncTasks replaces the stored cards and dependencies with tasks.
 func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
-	if err := s.ensureTaskColumns(ctx); err != nil {
+	if err := ensureTaskColumns(ctx, s.db); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -114,9 +115,6 @@ func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status st
 
 // ListReadyTasks returns the available tasks whose dependencies are resolved.
 func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
-	if err := s.ensureTaskColumns(ctx); err != nil {
-		return nil, err
-	}
 	rows, err := s.db.QueryContext(ctx, readyTasksQuery, readyTasksArgs...)
 	if err != nil {
 		return nil, err
