@@ -1,7 +1,7 @@
 ---
 id: T-0f2cdb4d
 title: 'P1: Harden advisory parser trust and floor calibration'
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 priority: 18
