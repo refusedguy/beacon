@@ -118,8 +118,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	}
 	obs.PRNumber = pr
 	run.Checks = obs.Checks
-	if err := r.Store.Save(ctx, run); err != nil {
-		return core.MergeDecision{}, err
+	if run.PRNumber == 0 {
+		run.PRNumber = pr
 	}
 	defer r.Decisions.logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
 	if core.DecideFinalState(obs.PRState).Closed {
@@ -131,9 +131,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		obs.Approvals++
 	}
 	decision = r.Policy.Evaluate(obs)
-	if run.PRNumber == 0 {
-		run.PRNumber = pr
-	}
 	return r.applyDecision(ctx, run, obs, decision)
 }
 

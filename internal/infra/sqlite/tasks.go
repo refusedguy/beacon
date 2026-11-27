@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sync"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -39,18 +40,58 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 }
 
 // syncCache holds the fingerprint of the last successful SyncTasks for one
-// database. Store is defined outside this card's scope, so the cache is keyed
-// by the open *sql.DB. A reopened database starts cold under a new key.
+// database file. Two handles on the same file share the entry, so a sync seen
+// by the daemon is also seen by a CLI process in the same process.
 type syncCache struct {
 	mu          sync.Mutex
 	fingerprint []byte
 }
 
-var syncCaches sync.Map // map[*sql.DB]*syncCache
+var syncCaches sync.Map // map[string]*syncCache
 
-func cacheForDB(db *sql.DB) *syncCache {
-	v, _ := syncCaches.LoadOrStore(db, &syncCache{})
-	return v.(*syncCache)
+// dbPaths resolves the main file behind each handle once. Store is defined
+// outside this card's scope, so it cannot record the path it was opened with;
+// PRAGMA database_list is the only way to read it from an open handle.
+var dbPaths sync.Map // map[*sql.DB]string
+
+func pathForDB(ctx context.Context, db *sql.DB) (string, error) {
+	if v, ok := dbPaths.Load(db); ok {
+		return v.(string), nil
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA database_list`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	path := ""
+	for rows.Next() {
+		var seq int
+		var name, file string
+		if err := rows.Scan(&seq, &name, &file); err != nil {
+			return "", err
+		}
+		if name == "main" {
+			path = file
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if path == "" {
+		path = fmt.Sprintf("handle:%p", db)
+	}
+	actual, _ := dbPaths.LoadOrStore(db, path)
+	return actual.(string), nil
+}
+
+func cacheForDB(ctx context.Context, db *sql.DB) (*syncCache, error) {
+	path, err := pathForDB(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	v, _ := syncCaches.LoadOrStore(path, &syncCache{})
+	return v.(*syncCache), nil
 }
 
 // syncFingerprint encodes every field SyncTasks persists. core.Task exports
@@ -135,7 +176,10 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err != nil {
 		return err
 	}
-	cache := cacheForDB(s.db)
+	cache, err := cacheForDB(ctx, s.db)
+	if err != nil {
+		return err
+	}
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if bytes.Equal(cache.fingerprint, fp) {
@@ -190,15 +234,31 @@ WHERE status IN (%s)
   AND id NOT IN (SELECT task_id FROM blocked_chain)
 ORDER BY priority DESC, id`, resolvedTaskStatuses, resolvedTaskStatuses, openTaskStatuses)
 
-// SetTaskStatus sets the status of taskID. The write changes a stored card, so
-// the last SyncTasks fingerprint no longer describes the table.
+// SetTaskStatus sets the status of taskID. A write that matched no row leaves
+// the table unchanged, so it keeps the last SyncTasks fingerprint.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
-	cache := cacheForDB(s.db)
-	cache.mu.Lock()
-	cache.fingerprint = nil
-	cache.mu.Unlock()
-	return err
+	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	path, err := pathForDB(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	if v, ok := syncCaches.Load(path); ok {
+		cache := v.(*syncCache)
+		cache.mu.Lock()
+		cache.fingerprint = nil
+		cache.mu.Unlock()
+	}
+	return nil
 }
 
 // ListReadyTasks returns the available tasks whose dependencies are resolved.
