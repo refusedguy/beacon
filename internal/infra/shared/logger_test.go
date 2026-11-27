@@ -2,10 +2,12 @@ package shared
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testSecret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
@@ -78,5 +80,41 @@ func assertRedacted(t *testing.T, got string) {
 	}
 	if !strings.Contains(got, "[REDACTED]") {
 		t.Fatalf("nothing redacted: %s", got)
+	}
+}
+
+// nopHandler swallows records so allocation counts measure redactHandler only.
+type nopHandler struct{}
+
+func (nopHandler) Enabled(context.Context, slog.Level) bool  { return true }
+func (nopHandler) Handle(context.Context, slog.Record) error { return nil }
+func (nopHandler) WithAttrs([]slog.Attr) slog.Handler        { return nopHandler{} }
+func (nopHandler) WithGroup(string) slog.Handler             { return nopHandler{} }
+
+func cleanRecord() slog.Record {
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "plain message", 0)
+	r.AddAttrs(slog.String("key", "value"), slog.Int("count", 42))
+	return r
+}
+
+func TestRedactHandlerCleanPathAllocations(t *testing.T) {
+	h := redactHandler{nopHandler{}}
+	r := cleanRecord()
+	ctx := context.Background()
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = h.Handle(ctx, r)
+	})
+	if allocs != 0 {
+		t.Fatalf("clean log allocated %v times, want 0", allocs)
+	}
+}
+
+func BenchmarkRedactHandler(b *testing.B) {
+	h := redactHandler{nopHandler{}}
+	r := cleanRecord()
+	ctx := context.Background()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = h.Handle(ctx, r)
 	}
 }
