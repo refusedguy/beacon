@@ -231,3 +231,56 @@ func TestSelectPayloadAdapterRejectsUnknownProvider(t *testing.T) {
 		t.Fatal("unknown provider selected an adapter")
 	}
 }
+
+func TestWebhookDuplicateDeliveryProducesOneObserve(t *testing.T) {
+	body := `{"action":"synchronize","number":42,"pull_request":{"number":42}}`
+	ch := make(chan int, 4)
+	w := &Webhook{Secret: webhookSecret, Changes: ch}
+	headers := map[string]string{
+		"X-Hub-Signature-256": githubSignature(webhookSecret, []byte(body)),
+		"X-GitHub-Event":      "pull_request",
+		"X-GitHub-Delivery":   "delivery-1",
+	}
+	for i := 0; i < 3; i++ {
+		if rw := serve(w, http.MethodPost, body, headers); rw.Code != http.StatusAccepted {
+			t.Fatalf("delivery %d status = %d, want 202", i, rw.Code)
+		}
+	}
+	if len(ch) != 1 {
+		t.Fatalf("emissions = %d, want 1 for three copies of one delivery", len(ch))
+	}
+	if got := <-ch; got != 42 {
+		t.Fatalf("emitted %d, want 42", got)
+	}
+}
+
+func TestWebhookIgnoresEventsThatCannotChangeVerdict(t *testing.T) {
+	body := `{"number":42,"pull_request":{"number":42}}`
+	ch := make(chan int, 4)
+	w := &Webhook{Secret: webhookSecret, Changes: ch}
+	for _, event := range []string{"ping", "issue_comment", "label", "star"} {
+		rw := serve(w, http.MethodPost, body, map[string]string{
+			"X-Hub-Signature-256": githubSignature(webhookSecret, []byte(body)),
+			"X-GitHub-Event":      event,
+			"X-GitHub-Delivery":   "delivery-" + event,
+		})
+		if rw.Code != http.StatusAccepted {
+			t.Fatalf("%s status = %d, want 202", event, rw.Code)
+		}
+	}
+	if len(ch) != 0 {
+		t.Fatalf("emissions = %d, want 0 for verdict-irrelevant events", len(ch))
+	}
+
+	rw := serve(w, http.MethodPost, body, map[string]string{
+		"X-Hub-Signature-256": githubSignature(webhookSecret, []byte(body)),
+		"X-GitHub-Event":      "check_run",
+		"X-GitHub-Delivery":   "delivery-check-run",
+	})
+	if rw.Code != http.StatusAccepted {
+		t.Fatalf("check_run status = %d, want 202", rw.Code)
+	}
+	if len(ch) != 1 || <-ch != 42 {
+		t.Fatalf("want one emission for check_run, channel len %d", len(ch))
+	}
+}
