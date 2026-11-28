@@ -66,6 +66,15 @@ type RunSnapshot struct {
 	Checks            []CheckSnapshot `json:"checks"`
 }
 
+// RunExplainData is the narrow read behind status --explain. It holds one run,
+// its timeline and its newest decision. CI checks live on the run itself, so a
+// single read returns every fact the explanation needs.
+type RunExplainData struct {
+	Run      *core.Run
+	Events   []RunEvent
+	Decision *Decision
+}
+
 // Metrics are numeric totals for the whole snapshot.
 type Metrics struct {
 	DispatchCount  int            `json:"dispatch_count"`
