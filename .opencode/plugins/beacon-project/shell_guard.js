@@ -53,6 +53,14 @@ export const SHELL_GUARD_RULES = Object.freeze([
     pattern: /\bnpm\s+run\s+build\b/,
     replacement: "npm run build in CI, or build a single package",
   },
+  {
+    // Role-independent: every agent, including the orchestrator, must read
+    // state through a tool result with generated_at instead of raw sqlite rows.
+    id: "direct state db read",
+    pattern: /\.beacon[\\/]state\.db\b/,
+    replacement: "beacon status --snapshot or beacon report",
+    allAgents: true,
+  },
 ])
 
 const GUARDED_TOOLS = new Set(["bash", "shell", "execute"])
@@ -148,7 +156,7 @@ function compileShellGuardRule(entry, log = console.warn) {
     log(`beacon shell guard: ignoring rule "${id}" with invalid pattern: ${error.message}`)
     return null
   }
-  return Object.freeze({ id, pattern, replacement })
+  return Object.freeze({ id, pattern, replacement, allAgents: entry.allAgents === true })
 }
 
 export function buildShellGuardRules(config = {}, log = console.warn) {
@@ -198,10 +206,13 @@ export async function registerShellGuard(ctx, config = {}, env = process.env) {
   if (typeof ctx?.tool?.hook !== "function") return null
   const mode = guardMode(config, env)
   const rules = buildShellGuardRules(config)
+  // A rule marked allAgents binds every agent, including the orchestrator.
+  // The rest stay worker-only, as the project documents for workers.
+  const universalRules = rules.filter((rule) => rule.allAgents === true)
   try {
     return await ctx.tool.hook("execute.before", (event) => {
-      if (!guardAppliesToAgent(event, config)) return
-      const hit = findShellGuardHit(event?.tool, event?.input, rules)
+      const appliesToAgent = guardAppliesToAgent(event, config)
+      const hit = findShellGuardHit(event?.tool, event?.input, appliesToAgent ? rules : universalRules)
       if (!hit) return
       const message = `${hit.id} is blocked here. Use ${hit.replacement}.`
       console.warn(message)

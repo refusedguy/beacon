@@ -22,9 +22,16 @@ const (
 	refreshDebounce = 200 * time.Millisecond
 )
 
-// pingEvent is the daemon's keepalive event. It carries no run state, so it
-// never schedules a refresh.
-const pingEvent = "ping"
+// pingEvent, resyncEventType and gapEventType are notifications that carry no
+// run state but still require a runs read. A ping proves the connection is
+// alive, a resync says a queue dropped a frame, and a gap says a reconnect
+// could not replay. All three converge within one poll interval.
+const (
+	pingEvent       = "ping"
+	resyncEventType = "resync"
+	resyncEvent     = resyncEventType
+	gapEventType    = "gap"
+)
 
 // blankPad supplies the spaces used to right-pad fixed-width row fields. Row
 // padding never exceeds visibleRowWidth, so one literal serves every row.
@@ -225,14 +232,12 @@ func (m model) reload() tea.Cmd {
 	}
 }
 
-// onRefresh coalesces a burst of notifications into one runs read. A ping is
-// dropped because it carries no state. Every other event advances the shared
-// generation; after the debounce window only the newest generation performs a
-// read, so no notification is lost and one GET serves the whole burst.
+// onRefresh coalesces a burst of notifications into one runs read. Every
+// notification, including ping and resync, advances the shared generation.
+// After the debounce window only the newest generation performs a read, so a
+// dropped frame or a quiet connection converges within one poll interval and
+// one GET serves the whole burst.
 func (m model) onRefresh(ev Event) (tea.Model, tea.Cmd) {
-	if ev.Type == pingEvent {
-		return m, nil
-	}
 	gen := m.refreshGen.Add(1)
 	genPtr := m.refreshGen
 	wait := m.debounce

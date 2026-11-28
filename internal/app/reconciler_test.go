@@ -486,6 +486,44 @@ func TestReconcileMergeWithoutParentSkipsNotification(t *testing.T) {
 	}
 }
 
+func TestDuplicateMergeClaimStillMarksCardDone(t *testing.T) {
+	r, store, _, _, _ := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	store.deliveries["merge:42:sha2"] = true
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatalf(`r.Reconcile(context.Background(), 42): %v`, err)
+	}
+	if got := store.taskStatus["T-1"]; got != "done" {
+		t.Fatalf("task status = %q, want done after a duplicate delivery claim", got)
+	}
+}
+
+func TestExternalMergeWithFailedCompleteStillMarksCardDone(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	if err := store.Save(ctx, makeRun("r-ext", 42, core.RunWaitingCI)); err != nil {
+		t.Fatalf(`store.Save(ctx, makeRun("r-ext", 42, core.RunWaitingCI)): %v`, err)
+	}
+	src := &fakeSource{completeErr: errors.New("card publish failed")}
+	r := &Reconciler{
+		Store:   store,
+		SCM:     &fakeSCM{obs: core.Observation{PRNumber: 42, HeadSHA: "sha9", PRState: "merged"}},
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge}},
+		Harness: &fakeHarness{}, Source: src, Workspace: &fakeWorkspace{},
+	}
+
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatalf(`r.Reconcile(ctx, 42): %v`, err)
+	}
+	if len(src.complete) != 0 {
+		t.Fatalf("complete = %v, want no successful Complete after a publish failure", src.complete)
+	}
+	if got := store.taskStatus["T-1"]; got != "done" {
+		t.Fatalf("task status = %q, want done after a failed Complete", got)
+	}
+}
+
 func TestReconcileWaitingCIToMerge(t *testing.T) {
 	r, store, scm, h, src := newReconciler(t, core.VerdictMerge,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})

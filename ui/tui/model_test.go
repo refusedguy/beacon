@@ -318,29 +318,44 @@ func TestUnknownEventFallsBackToReload(t *testing.T) {
 	}
 }
 
-// TestPingDoesNotScheduleRefresh proves the daemon's keepalive is dropped
-// before a refresh is scheduled. A ping carries no run state, so it neither
-// advances the generation nor issues a read.
-func TestPingDoesNotScheduleRefresh(t *testing.T) {
+// TestPingAndResyncScheduleRefresh proves that a keepalive or a gap marker
+// forces a runs read. A connection that fell behind converges within one poll
+// interval even when no run event arrives.
+func TestPingAndResyncScheduleRefresh(t *testing.T) {
 	f := newDeltaFixture(t, "run-ping")
 	m, _ := loadedModel(t, NewClient(f.server.URL, "tok"))
 	base := f.getCount()
 	gen := m.refreshGen.Load()
 
-	for _, msg := range []tea.Msg{
-		refreshMsg{event: Event{ID: 1, Type: "ping"}},
-		Event{ID: 2, Type: "ping"},
-	} {
-		next, cmd := m.Update(msg)
-		if cmd != nil {
-			t.Fatalf("ping must not schedule a refresh, got %v", cmd)
+	var cmds []tea.Cmd
+	for _, typ := range []string{pingEvent, resyncEventType, reconnectEventType} {
+		next, cmd := m.Update(Event{Type: typ})
+		if cmd == nil {
+			t.Fatalf("%s did not schedule a refresh", typ)
 		}
-		if got := next.(model).refreshGen.Load(); got != gen {
-			t.Fatalf("ping advanced generation to %d, want %d", got, gen)
+		got := next.(model).refreshGen.Load()
+		if got <= gen {
+			t.Fatalf("%s left generation at %d, want an advance from %d", typ, got, gen)
+		}
+		gen = got
+		cmds = append(cmds, cmd)
+	}
+
+	reads := 0
+	for i, cmd := range cmds {
+		msg, ok := cmd().(runsMsg)
+		if !ok {
+			t.Fatalf("refresh %d returned %T, want runsMsg", i, msg)
+		}
+		if !msg.stale {
+			reads++
 		}
 	}
-	if got := f.getCount(); got != base {
-		t.Fatalf("pings caused %d runs GETs, want %d", got, base)
+	if reads != 1 {
+		t.Fatalf("burst issued %d runs reads, want 1", reads)
+	}
+	if got := f.getCount(); got != base+1 {
+		t.Fatalf("burst caused %d total runs GETs, want %d", got, base+1)
 	}
 }
 

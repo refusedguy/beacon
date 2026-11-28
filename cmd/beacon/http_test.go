@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,21 @@ func connectSSE(t *testing.T, srv *httptest.Server, token string) (*bufio.Scanne
 		cancel()
 		resp.Body.Close()
 	}
+}
+
+// frameID returns the id line value of a complete SSE frame.
+func frameID(frame []byte) string {
+	line, _, _ := strings.Cut(string(frame), "\n")
+	return strings.TrimPrefix(line, "id: ")
+}
+
+// framePR extracts the pr value from a pr_changed frame.
+func framePR(frame []byte) int {
+	text := string(frame)
+	_, text, _ = strings.Cut(text, `"pr":`)
+	text, _, _ = strings.Cut(text, "}")
+	n, _ := strconv.Atoi(text)
+	return n
 }
 
 // sseData reads frames until an event with the given name and returns its data.
@@ -131,8 +147,8 @@ func TestChangeSubscribersDropsSlowClientWithoutBlockingOthers(t *testing.T) {
 		src <- i
 		select {
 		case got := <-fast:
-			if got != i {
-				t.Fatalf("fast subscriber got %d, want %d", got, i)
+			if pr := framePR(got); pr != i {
+				t.Fatalf("fast subscriber got %d, want %d", pr, i)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("fast subscriber stalled at change %d", i)
@@ -240,23 +256,35 @@ func TestHarnessEventEncodedOnceForAllMonitors(t *testing.T) {
 		t.Fatalf("marshaller errors = %d, want 0", errorCount)
 	}
 
-	recorder := httptest.NewRecorder()
-	writeSSE(recorder, "harness", core.NewWireEvent(ev))
-	want := recorder.Body.String()
 	delivered := 0
 	for i, received := range got {
 		if len(received) == 0 {
 			t.Fatalf("monitor %d received no frames", i)
 		}
 		for j, frame := range received {
-			if string(frame) != want {
-				t.Fatalf("monitor %d frame %d = %q, want %q", i, j, frame, want)
+			parts := strings.SplitN(string(frame), "\ndata: ", 2)
+			if len(parts) != 2 {
+				t.Fatalf("monitor %d frame %d = %q, want a data line", i, j, frame)
+			}
+			if strings.Contains(parts[1], `"reason"`) {
+				// A slow monitor has an older frame replaced by a resync marker.
+				continue
+			}
+			var wire core.WireEvent
+			if err := json.Unmarshal([]byte(strings.TrimSuffix(parts[1], "\n\n")), &wire); err != nil {
+				t.Fatalf("monitor %d frame %d payload %q: %v", i, j, parts[1], err)
+			}
+			if wire.Type != ev.Kind || wire.RunID != string(ev.RunID) || wire.ID == 0 || wire.At == "" {
+				t.Fatalf("monitor %d frame %d = %+v, want kind %q run %q with id and time", i, j, wire, ev.Kind, ev.RunID)
+			}
+			if id := frameID(frame); id != fmt.Sprint(wire.ID) {
+				t.Fatalf("monitor %d frame %d envelope id %q, payload id %d", i, j, id, wire.ID)
 			}
 			delivered++
 		}
 	}
-	t.Logf("%d events to %d monitors: %d encodes, %d errors, %d identical frames delivered (%d bytes each)",
-		total, monitors, encodeCount, errorCount, delivered, len(want))
+	t.Logf("%d events to %d monitors: %d encodes, %d errors, %d frames delivered",
+		total, monitors, encodeCount, errorCount, delivered)
 }
 
 // TestEventFramesDropsSlowSubscriber makes the lossy monitor policy explicit.
@@ -326,23 +354,21 @@ func TestHarnessFramesReachEveryMonitorOverHTTP(t *testing.T) {
 	}()
 
 	ev := core.HarnessEvent{RunID: "r1", Kind: "done"}
-	recorder := httptest.NewRecorder()
-	writeSSE(recorder, "harness", core.NewWireEvent(ev))
-	lines := strings.Split(recorder.Body.String(), "\n")
-	if len(lines) < 2 || lines[0] != "event: harness" {
-		t.Fatalf("unexpected wire frame %q", recorder.Body.String())
-	}
-	want := strings.TrimPrefix(lines[1], "data: ")
 
 	for rep := 0; rep < 2; rep++ {
 		src <- ev
 		for i, stream := range streams {
-			if got := sseData(t, stream, "harness"); got != want {
-				t.Fatalf("repetition %d monitor %d data = %q, want %q", rep, i, got, want)
+			data := sseData(t, stream, "harness")
+			var wire core.WireEvent
+			if err := json.Unmarshal([]byte(data), &wire); err != nil {
+				t.Fatalf("repetition %d monitor %d payload %q: %v", rep, i, data, err)
+			}
+			if wire.Type != ev.Kind || wire.RunID != string(ev.RunID) || wire.ID == 0 || wire.At == "" {
+				t.Fatalf("repetition %d monitor %d payload = %+v", rep, i, wire)
 			}
 		}
 	}
-	t.Logf("harness frame over HTTP: %q", recorder.Body.String())
+	t.Logf("harness frames over HTTP carry one id in envelope and payload")
 }
 
 // TestCombinedHarnessAndPRChangeReachOneMonitor drives a harness event and a
@@ -376,20 +402,9 @@ func TestCombinedHarnessAndPRChangeReachOneMonitor(t *testing.T) {
 	ev := core.HarnessEvent{RunID: "r-combined", Kind: "progress"}
 	const pr = 73
 
-	// Both expected frames go through the documented SSE writer, so the data
-	// lines below are the wire shape a monitor is promised.
-	expect := func(event string, payload any) string {
-		t.Helper()
-		recorder := httptest.NewRecorder()
-		writeSSE(recorder, event, payload)
-		lines := strings.Split(recorder.Body.String(), "\n")
-		if len(lines) < 2 || lines[0] != "event: "+event {
-			t.Fatalf("unexpected wire frame %q", recorder.Body.String())
-		}
-		return strings.TrimPrefix(lines[1], "data: ")
-	}
-	wantHarness := expect("harness", core.NewWireEvent(ev))
-	wantPR := expect("pr_changed", map[string]int{"pr": pr})
+	// Both frames go through the same id source, so the envelope id and the
+	// payload id agree for the harness event and the PR change has its own id.
+	wantPR := fmt.Sprintf(`{"pr":%d}`, pr)
 
 	// Drive both sources before reading either frame. The SSE handler may write
 	// them in either order, so collect by event name instead of reading in a
@@ -415,8 +430,12 @@ func TestCombinedHarnessAndPRChangeReachOneMonitor(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("SSE stream closed before both frames: got %v, err %v", got, stream.Err())
 	}
-	if got["harness"] != wantHarness {
-		t.Fatalf("harness data = %q, want %q", got["harness"], wantHarness)
+	var wire core.WireEvent
+	if err := json.Unmarshal([]byte(got["harness"]), &wire); err != nil {
+		t.Fatalf("harness payload %q: %v", got["harness"], err)
+	}
+	if wire.Type != ev.Kind || wire.RunID != string(ev.RunID) || wire.ID == 0 || wire.At == "" {
+		t.Fatalf("harness payload = %+v, want kind %q run %q with id and time", wire, ev.Kind, ev.RunID)
 	}
 	if got["pr_changed"] != wantPR {
 		t.Fatalf("pr_changed data = %q, want %q", got["pr_changed"], wantPR)
@@ -828,10 +847,108 @@ func TestHTTPControlAcceptsKnownActionAndRejectsUnknownAction(t *testing.T) {
 // work inside the timed loop.
 var httpBenchSink []byte
 
+// readFrame reads one complete SSE frame, including its id line.
+func readFrame(t *testing.T, stream *bufio.Scanner) string {
+	t.Helper()
+	var b strings.Builder
+	for stream.Scan() {
+		line := stream.Text()
+		if line == "" {
+			return b.String()
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	t.Fatalf("SSE stream closed before a blank line: %v", stream.Err())
+	return ""
+}
+
+// TestSSEIdentityAndGapSignaling proves that one id is assigned at observation
+// time, that it appears in both the envelope and the payload, that a reconnect
+// gets a gap instead of a replay, and that a dropped frame becomes a resync.
+func TestSSEIdentityAndGapSignaling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	harnessSrc := make(chan core.HarnessEvent)
+	ids := newStreamID()
+	frames := newEventFrames(harnessSrc, json.Marshal)
+	frames.ids = ids
+	go frames.run(ctx)
+	changes := newChangeSubscribers()
+	changes.ids = ids
+	api := &apiServer{token: []byte("secret"), ids: ids, frames: frames, changes: changes}
+	srv := httptest.NewServer(api.handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Last-Event-ID", "999")
+	streamCtx, stop := context.WithCancel(ctx)
+	req = req.WithContext(streamCtx)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stop(); resp.Body.Close() }()
+	scanner := bufio.NewScanner(resp.Body)
+
+	gap := readFrame(t, scanner)
+	if !strings.Contains(gap, "event: gap\n") || !strings.Contains(gap, `"reason":"reconnect"`) {
+		t.Fatalf("reconnect frame = %q, want a gap marker", gap)
+	}
+	gapID, _ := strconv.ParseInt(frameID([]byte(gap)), 10, 64)
+	if gapID <= 0 {
+		t.Fatalf("gap frame has no id: %q", gap)
+	}
+
+	harnessSrc <- core.HarnessEvent{RunID: "r1", Kind: "progress"}
+	frame := readFrame(t, scanner)
+	parts := strings.SplitN(frame, "data: ", 2)
+	if len(parts) != 2 {
+		t.Fatalf("harness frame = %q, want a data line", frame)
+	}
+	var wire core.WireEvent
+	if err := json.Unmarshal([]byte(strings.TrimSpace(parts[1])), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.ID <= gapID || wire.At == "" {
+		t.Fatalf("harness payload = %+v, want a later id and a timestamp", wire)
+	}
+	if got := frameID([]byte(frame)); got != fmt.Sprint(wire.ID) {
+		t.Fatalf("envelope id %q disagrees with payload id %d", got, wire.ID)
+	}
+
+	// A subscriber that never drains has its oldest frame replaced by a resync
+	// marker, so the monitor learns to read runs instead of staying stale.
+	slow, unsubscribe := frames.subscribe()
+	defer unsubscribe()
+	for i := 0; i <= subscriberBuffer; i++ {
+		harnessSrc <- core.HarnessEvent{RunID: "slow", Kind: "tick"}
+	}
+	// Let the broadcaster finish before draining, so the slow channel really
+	// fills instead of being consumed as the events arrive.
+	time.Sleep(50 * time.Millisecond)
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case item := <-slow:
+			if strings.Contains(string(item), "event: resync") && strings.Contains(string(item), `"reason":"gap"`) {
+				return
+			}
+		case <-deadline:
+			t.Fatal("slow subscriber never received a resync marker")
+		}
+	}
+}
+
 // TestPingFrameWireShape pins the direct payload build against the original
 // json.Marshal plus fmt.Appendf shape, so the optimization cannot change bytes.
 func TestPingFrameWireShape(t *testing.T) {
-	for _, now := range []time.Time{
+	for i, now := range []time.Time{
 		time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 11, 27, 8, 43, 23, 123456789, time.UTC),
@@ -840,9 +957,13 @@ func TestPingFrameWireShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := fmt.Sprintf("event: ping\ndata: %s\n\n", body)
-		if got := string(pingFrame(now)); got != want {
-			t.Fatalf("pingFrame(%v) = %q, want %q", now, got, want)
+		id := int64(i + 1)
+		want := appendSSEID(nil, id)
+		want = append(want, "event: ping\ndata: "...)
+		want = append(want, body...)
+		want = append(want, "\n\n"...)
+		if got := pingFrame(id, now); !bytes.Equal(got, want) {
+			t.Fatalf("pingFrame(%d, %v) = %q, want %q", id, now, got, want)
 		}
 	}
 }
@@ -875,7 +996,7 @@ func BenchmarkPingFrame(b *testing.B) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		httpBenchSink = pingFrame(now)
+		httpBenchSink = pingFrame(1, now)
 	}
 }
 

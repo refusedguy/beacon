@@ -233,10 +233,14 @@ export function parseSnapshot(text) {
   try { const v = JSON.parse(String(text)); return v && typeof v === "object" && !Array.isArray(v) ? v : {} } catch { return {} }
 }
 export const runSignature = (run) => joinKey(run.id, run.sha, run.state, run.updatedAt)
-export const runChangedPayload = (run) => Object.freeze({
-  id: str(run.id), sha: str(run.sha), state: str(run.state), at: str(run.updatedAt), key: runSignature(run),
+// An occurrence distinguishes two real transitions whose run values are the
+// same. The watcher supplies a per-subscription sequence, so the same stream
+// produces the same occurrence numbers on every replay.
+export const runChangedPayload = (run, location, occurrence = 0) => Object.freeze({
+  id: str(run.id), sha: str(run.sha), state: str(run.state), at: str(run.updatedAt),
+  occurrence, location: location ?? null, key: runSignature(run),
 })
-export function changedRuns(previous, next) {
+export function changedRuns(previous, next, location) {
   const before = new Map()
   const identity = (run) => run
   for (const run of [...list(previous?.active, identity), ...list(previous?.recent, identity)]) if (run.id) before.set(run.id, runSignature(run))
@@ -248,11 +252,17 @@ export function changedRuns(previous, next) {
     const key = runSignature(run)
     if (before.get(run.id) === key) continue
     before.set(run.id, key)
-    out.push(runChangedPayload(run))
+    out.push(runChangedPayload(run, location))
   }
   return out
 }
-export const eventKey = (data) => str(data?.key) || joinKey(data?.id, data?.sha, data?.state, data?.at)
+// Value-only keys lose repeated real transitions. The occurrence number rides
+// with the key so two emissions of the same run state stay distinct.
+export const eventKey = (data) => {
+  const base = str(data?.key) || joinKey(data?.id, data?.sha, data?.state, data?.at)
+  const occurrence = data?.occurrence
+  return occurrence ? `${base}#${occurrence}` : base
+}
 export function eventMatchesLocation(eventLocation, ownLocation) {
   const event = locationInfo({ location: eventLocation })
   const own = locationInfo({ location: ownLocation })

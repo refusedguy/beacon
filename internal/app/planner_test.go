@@ -372,7 +372,7 @@ func largeDispatchFixtures() ([]core.Task, []*core.Run) {
 	const (
 		candidateCount = 1000
 		activeCount    = 500
-		pathCount      = 3
+		pathCount      = 2
 	)
 	tasks := make([]core.Task, candidateCount)
 	for i := range tasks {
@@ -732,4 +732,59 @@ func BenchmarkPlannerSelectLargeDispatch(b *testing.B) {
 		}
 	}
 	b.ReportMetric(float64(checks)/float64(b.N), "overlap-checks/op")
+}
+
+func TestPlannerSkipsOversizedScope(t *testing.T) {
+	tasks := []core.Task{
+		{ID: "paths", Status: core.TaskAvailable, Scope: []core.ScopePath{
+			core.ScopeFile("docs/a.md"), core.ScopeFile("docs/b.md"),
+			core.ScopeFile("docs/c.md"), core.ScopeFile("docs/d.md"),
+		}},
+		{ID: "files", Status: core.TaskAvailable, Scope: []core.ScopePath{
+			core.ScopeFile("a.go"), core.ScopeFile("b.go"), core.ScopeFile("c.go"),
+		}},
+		{ID: "ok", Status: core.TaskAvailable, Scope: []core.ScopePath{
+			core.ScopeFile("ok.go"), core.ScopeFile("ok_test.go"),
+		}},
+	}
+	chosen, skipped, err := NewPlanner(nil).Select(tasks, nil, 3, false)
+	if err != nil {
+		t.Fatalf(`NewPlanner(nil).Select(tasks, nil, 3, false): %v`, err)
+	}
+	if len(chosen) != 1 || chosen[0].ID != "ok" {
+		t.Fatalf("chosen = %v, want the in-cap card only", taskIDs(chosen))
+	}
+	byID := map[core.TaskID]SkippedTask{}
+	for _, s := range skipped {
+		byID[s.TaskID] = s
+	}
+	if len(byID) != 2 {
+		t.Fatalf("skipped = %+v, want two oversized cards", skipped)
+	}
+	for _, id := range []core.TaskID{"paths", "files"} {
+		if byID[id].Code != SkipOversizedScope {
+			t.Errorf("%s skip = %+v, want %q", id, byID[id], SkipOversizedScope)
+		}
+	}
+}
+
+func TestPlannerSelectsSiblingsOnOneOwnerInParallel(t *testing.T) {
+	tasks := []core.Task{
+		{ID: "left", Status: core.TaskAvailable,
+			DependsOn: []core.TaskID{"OWNER"},
+			Scope:     []core.ScopePath{core.ScopeFile("left.go")}},
+		{ID: "right", Status: core.TaskAvailable,
+			DependsOn: []core.TaskID{"OWNER"},
+			Scope:     []core.ScopePath{core.ScopeFile("right.go")}},
+	}
+	chosen, skipped, err := NewPlanner(nil).Select(tasks, nil, 2, false)
+	if err != nil {
+		t.Fatalf(`NewPlanner(nil).Select(tasks, nil, 2, false): %v`, err)
+	}
+	if ids := taskIDs(chosen); len(ids) != 2 || ids[0] != "left" || ids[1] != "right" {
+		t.Fatalf("chosen = %v, want both siblings", ids)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want none", skipped)
+	}
 }

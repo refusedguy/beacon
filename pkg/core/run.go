@@ -232,11 +232,17 @@ type WireEvent struct {
 	At    string `json:"at"`
 }
 
-// NewWireEvent maps a harness event into the loopback wire shape. Harness
-// events carry neither a sequence number nor a timestamp, so id and at stay
-// empty. The client reads the event name from type.
-func NewWireEvent(ev HarnessEvent) WireEvent {
-	return WireEvent{Type: ev.Kind, RunID: string(ev.RunID)}
+// NewWireEvent maps a harness event into the loopback wire shape. The daemon
+// assigns the id and the timestamp when it observes the event, so every frame
+// for one event carries the same identity as its payload. The client reads the
+// event name from type.
+func NewWireEvent(ev HarnessEvent, id int64, at time.Time) WireEvent {
+	return WireEvent{
+		ID:    id,
+		Type:  ev.Kind,
+		RunID: string(ev.RunID),
+		At:    at.UTC().Format(time.RFC3339),
+	}
 }
 
 // WireControlResult is the loopback answer to a control request. Applied is
@@ -453,7 +459,10 @@ func (r *Run) Apply(e Event) error {
 		r.Reason = ""
 	}
 	r.State = next
-	if next.Terminal() {
+	// A blocked run has no agent doing work, even when a wake or nudge held a
+	// slot before the block. Free the slot now instead of waiting for the orphan
+	// sweep to confirm a dead session. waiting_ci keeps its session on purpose.
+	if next.Terminal() || next.Blocked() {
 		r.ReleaseAgent()
 	}
 	r.UpdatedAt = time.Now().UTC()

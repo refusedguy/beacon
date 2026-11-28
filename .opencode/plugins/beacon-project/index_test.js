@@ -123,6 +123,46 @@ test("an orchestrator is allowed to run a full go test suite", async () => {
   })
 })
 
+test("a direct state db read is blocked for every agent, including the orchestrator", async () => {
+  const ctx = fakeCtx()
+  await registerShellGuard(ctx, {}, {})
+  const commands = [
+    'sqlite3 .beacon/state.db "SELECT * FROM runs"',
+    'sqlite3 /work/.beacon/state.db "SELECT status FROM runs"',
+    "cat .beacon/state.db",
+  ]
+  await withWarnings((messages) => {
+    for (const agent of ["worker", "orchestrator", "build"]) {
+      for (const command of commands) {
+        assert.throws(
+          () => ctx.handler(event(command, agent)),
+          (error) => /direct state db read/.test(error.message)
+            && /beacon status --snapshot or beacon report/.test(error.message),
+          `should block for ${agent}: ${command}`,
+        )
+      }
+    }
+    for (const command of ["beacon status --snapshot", "beacon report", "rg -n state .beacon"]) {
+      assert.doesNotThrow(() => ctx.handler(event(command, "orchestrator")), `should allow: ${command}`)
+    }
+    assert.ok(messages.length > 0)
+  })
+})
+
+test("the state db rule is role-independent and matches both path separators", () => {
+  const rule = SHELL_GUARD_RULES.find((entry) => entry.id === "direct state db read")
+  assert.ok(rule, "the state db rule is built in")
+  assert.equal(rule.allAgents, true)
+  for (const command of [
+    "sqlite3 .beacon/state.db 'select 1'",
+    "sqlite3 .beacon\\state.db 'select 1'",
+    "echo $(sqlite3 .beacon/state.db 'select 1')",
+  ]) {
+    assert.equal(findShellGuardHit("bash", command)?.id, "direct state db read", `should guard: ${command}`)
+  }
+  assert.equal(findShellGuardHit("bash", "beacon status --snapshot"), null)
+})
+
 test("warn mode logs instead of throwing", async () => {
   const ctx = fakeCtx()
   await registerShellGuard(ctx, { shellGuard: "warn" }, {})

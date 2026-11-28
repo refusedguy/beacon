@@ -1,13 +1,14 @@
 ---
 id: T-b9eefe6b
 title: Block direct state db reads for every agent
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/shell_guard.js
     - .opencode/plugins/beacon-project/index_test.js
 priority: 1
 kind: task
 require_review: llm
+status_reason: "Delivered in PR #2916."
 ---
 
 Goal: no agent can read .beacon/state.db directly; the only state view becomes a tool result with generated_at.

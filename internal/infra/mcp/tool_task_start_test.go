@@ -128,6 +128,7 @@ func callStart(t *testing.T, f *startFixture, id string) app.StartOneOutcome {
 	t.Helper()
 	res, err := f.client.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_start", Arguments: StartArgs{TaskID: id},
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 	})
 	if err != nil {
 		t.Fatalf("CallTool(beacon_task_start): %v", err)

@@ -48,6 +48,7 @@ func TestTaskCreateOverInMemoryTransport(t *testing.T) {
 
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_create",
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{
 			"title":    "Add task creation tool",
 			"body":     "Create a card in one call.",

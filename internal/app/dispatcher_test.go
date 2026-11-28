@@ -1717,6 +1717,34 @@ func TestSelectDispatchCandidatesSelection(t *testing.T) {
 	}
 }
 
+// TestSelectDispatchCandidatesRejectsUnscopedUnderStrict proves strict mode
+// drops a ready task with no explicit scope before it can widen to an all-files
+// claim that collides with every active run.
+func TestSelectDispatchCandidatesRejectsUnscopedUnderStrict(t *testing.T) {
+	unscoped := core.Task{ID: "T-empty", Status: core.TaskAvailable}
+	scoped := core.Task{ID: "T-scoped", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("scoped.go")}}
+	ready := []core.Task{unscoped, scoped}
+	active := []*core.Run{busyRun("r-1", "R-1"), busyRun("r-2", "R-2")}
+
+	sel, err := selectDispatchCandidates(NewPlanner(nil), ready, active, 5, 3, true)
+	if err != nil {
+		t.Fatalf("selectDispatchCandidates: %v", err)
+	}
+	if len(sel.Chosen) != 1 || sel.Chosen[0].ID != scoped.ID {
+		t.Fatalf("chosen = %+v, want only T-scoped", sel.Chosen)
+	}
+	if len(sel.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want one no-scope skip", sel.Skipped)
+	}
+	skip := sel.Skipped[0]
+	if skip.TaskID != unscoped.ID || skip.Code != SkipNoScope {
+		t.Fatalf("skip = %+v, want T-empty with code %s", skip, SkipNoScope)
+	}
+	if skip.BlockedBy != "" || skip.BlockedByRun != "" || len(skip.Overlap) != 0 {
+		t.Fatalf("no-scope skip carries conflict data: %+v", skip)
+	}
+}
+
 func TestSelectDispatchCandidatesPropagatesPlannerError(t *testing.T) {
 	planner := &failingPlanner{}
 	_, err := selectDispatchCandidates(planner, []core.Task{{ID: "T-1"}}, nil, 1, 1, false)
@@ -1868,4 +1896,100 @@ func TestDispatchReReadsActiveOnlyAfterSpawnFailure(t *testing.T) {
 	if store.findActive != 0 {
 		t.Fatalf("FindActiveByTask calls = %d, want 0", store.findActive)
 	}
+}
+
+// recordingPlanner wraps the real planner so a test can see that Dispatch still
+// reaches the selection seam through planDispatch.
+type recordingPlanner struct {
+	ConflictPlanner
+	calls int
+	limit int
+}
+
+func (p *recordingPlanner) Select(candidates []core.Task, active []*core.Run, limit int, strict bool) ([]core.Task, []SkippedTask, error) {
+	p.calls++
+	p.limit = limit
+	return p.ConflictPlanner.Select(candidates, active, limit, strict)
+}
+
+func TestDispatchSeamFilesReachable(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("selection", func(t *testing.T) {
+		ready := []core.Task{{ID: "T-S1", Status: core.TaskAvailable}, {ID: "T-S2", Status: core.TaskAvailable}}
+		sel, err := selectDispatchCandidates(NewPlanner(nil), ready, nil, 1, 5, false)
+		if err != nil {
+			t.Fatalf("selectDispatchCandidates: %v", err)
+		}
+		if sel.Limit != 1 || len(sel.Chosen) != 1 {
+			t.Fatalf("selection = %+v, want one candidate within a limit of 1", sel)
+		}
+		planner := &recordingPlanner{ConflictPlanner: NewPlanner(nil)}
+		d := &Dispatcher{
+			Source: &fakeSource{tasks: ready}, Planner: planner,
+			Workspace: &fakeWorkspace{}, Harness: &fakeHarness{}, Store: newFakeStore(),
+			Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
+		}
+		if _, err := d.Dispatch(ctx, 1); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		if planner.calls != 1 || planner.limit != 1 {
+			t.Fatalf("planner calls=%d limit=%d, want 1 and 1", planner.calls, planner.limit)
+		}
+	})
+
+	t.Run("slots", func(t *testing.T) {
+		d := &Dispatcher{Concurrency: core.Concurrency{MaxInFlight: 3, MaxActiveAgents: 2}}
+		d.reserved = map[core.RunID]*slotReservation{"r-1": {runID: "r-1", agent: true}}
+		active := []*core.Run{busyRun("r-0", "R-0")}
+		if view := d.withReserved(active); len(view) != 2 {
+			t.Fatalf("withReserved view = %d runs, want 2", len(view))
+		}
+		if got := d.availableFrom(active); got != 1 {
+			t.Fatalf("availableFrom = %d, want 1", got)
+		}
+		wake := &Dispatcher{Store: newFakeStore(), Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1}}
+		if !wake.ReserveForWake(ctx, "r-wake") {
+			t.Fatal("ReserveForWake refused a free slot")
+		}
+		if got := wake.Available(ctx); got != 0 {
+			t.Fatalf("Available after reserve = %d, want 0", got)
+		}
+		wake.ReleaseWake(ctx, "r-wake")
+		if got := wake.Available(ctx); got != 1 {
+			t.Fatalf("Available after release = %d, want 1", got)
+		}
+	})
+
+	t.Run("launch", func(t *testing.T) {
+		h := &fakeHarness{}
+		d := &Dispatcher{
+			Source:  &fakeSource{tasks: []core.Task{{ID: "T-L", Status: core.TaskAvailable}}},
+			Planner: NewPlanner(nil), Workspace: &fakeWorkspace{}, Harness: h, Store: newFakeStore(),
+			Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+		}
+		res, err := d.Dispatch(ctx, 1)
+		if err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		if len(res.Runs) != 1 || len(h.sessions) != 1 {
+			t.Fatalf("runs=%d sessions=%d, want 1 and 1", len(res.Runs), len(h.sessions))
+		}
+		if !strings.Contains(h.prompts[0], string(res.Runs[0].ID)) {
+			t.Fatalf("spawn prompt missing run ID: %q", h.prompts[0])
+		}
+	})
+
+	t.Run("prompt", func(t *testing.T) {
+		task := core.Task{ID: "T-P", Title: "Prompt task", WorkerPrompt: "custom"}
+		built := BuildSpawnPrompt(task, "run-p", "/ws/p", "operator note")
+		if direct := spawnPrompt(task, "run-p", "/ws/p", "operator note"); built != direct {
+			t.Fatal("BuildSpawnPrompt and spawnPrompt disagree")
+		}
+		for _, want := range []string{"run-p", "T-P", "/ws/p", "operator note", "custom", "gofmt -l"} {
+			if !strings.Contains(built, want) {
+				t.Errorf("prompt missing %q", want)
+			}
+		}
+	})
 }

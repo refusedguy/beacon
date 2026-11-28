@@ -83,6 +83,193 @@ func (s StatusService) Recent(ctx context.Context, limit int) ([]*core.Run, erro
 	return redactRuns(runs), nil
 }
 
+// RunExplainStore is the one-run read side of status --explain. It has no list
+// method, so an explain call reads one run and its bounded history instead of
+// building a full snapshot.
+type RunExplainStore interface {
+	RunExplain(ctx context.Context, id core.RunID) (*RunExplainData, error)
+}
+
+// StatusExplainService turns one run's stored history into a short operator
+// answer. It is separate from ExplainService, which dry-runs the merge policy.
+type StatusExplainService struct{ Store RunExplainStore }
+
+// Explain loads id and renders why it is in its current state. An unknown id is
+// a not-found error so the command reports it instead of printing an empty
+// answer. A zero now reads the wall clock; tests inject a fixed time.
+func (s StatusExplainService) Explain(ctx context.Context, id core.RunID, now time.Time) (string, error) {
+	if s.Store == nil {
+		return "", core.Errorf(core.CodeUnavailable, "explain store is not configured")
+	}
+	data, err := s.Store.RunExplain(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if data == nil || data.Run == nil {
+		return "", core.Errorf(core.CodeNotFound, "run %s", id)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return ExplainRunText(data.Run, data.Events, data.Decision, now), nil
+}
+
+// ExplainRunText renders one run as short operator text. It is pure: every fact
+// comes from the supplied run, events and decision, and now is the only clock.
+// The same text serves the CLI and any caller that already holds these values.
+func ExplainRunText(run *core.Run, events []RunEvent, decision *Decision, now time.Time) string {
+	if run == nil {
+		return "run: none\n"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "run %s (%s) is %s for %s\n", run.ID, run.TaskID, run.State,
+		explainTimeInState(run, events, now))
+	fmt.Fprintf(&b, "last transition: %s\n", explainLastTransition(events))
+	fmt.Fprintf(&b, "reason: %s\n", explainReason(run.Reason, decision))
+	verdict, criterion := "none", "none"
+	if decision != nil {
+		if decision.Verdict != "" {
+			verdict = decision.Verdict
+		}
+		if named := decisionCriterion(decision); named != "" {
+			criterion = named
+		}
+	}
+	fmt.Fprintf(&b, "last verdict: %s criterion: %s\n", verdict, criterion)
+	if failed := explainFailedCheck(run.Checks); failed != "" {
+		fmt.Fprintf(&b, "failed check: %s\n", failed)
+	}
+	fmt.Fprintf(&b, "attempts: %s\n", explainAttempts(run))
+	action := explainAction(run, decision)
+	if action == "" {
+		action = "none"
+	}
+	fmt.Fprintf(&b, "action: %s\n", action)
+	return b.String()
+}
+
+// explainStateStart is the timestamp of the newest event that entered the
+// run's current state. Older databases have no events, so UpdatedAt is the
+// fallback and still gives an elapsed window.
+func explainStateStart(run *core.Run, events []RunEvent) time.Time {
+	var start time.Time
+	for i := range events {
+		if events[i].State == string(run.State) && (start.IsZero() || events[i].At.After(start)) {
+			start = events[i].At
+		}
+	}
+	if !start.IsZero() {
+		return start
+	}
+	return run.UpdatedAt
+}
+
+func explainTimeInState(run *core.Run, events []RunEvent, now time.Time) string {
+	start := explainStateStart(run, events)
+	end := now
+	if run.State.Terminal() {
+		end = run.UpdatedAt
+	}
+	if end.Before(start) {
+		end = start
+	}
+	return end.Sub(start).Round(time.Second).String()
+}
+
+// explainLastTransition names the newest timeline entry. A run saved before
+// timeline recording has no entries, so it reports none instead of a zero date.
+func explainLastTransition(events []RunEvent) string {
+	var last *RunEvent
+	for i := range events {
+		if last == nil || events[i].At.After(last.At) ||
+			(events[i].At.Equal(last.At) && events[i].ID > last.ID) {
+			last = &events[i]
+		}
+	}
+	if last == nil {
+		return "none"
+	}
+	kind := last.Kind
+	if kind == "" {
+		kind = "state"
+	}
+	return fmt.Sprintf("%s -> %s at %s", kind, last.State, last.At.UTC().Format(time.RFC3339))
+}
+
+// decisionCriterion reads the criterion name from a decision's fields. A row
+// that carries no criterion, including every row written before that field was
+// used, reports none.
+func decisionCriterion(decision *Decision) string {
+	if decision == nil {
+		return ""
+	}
+	name, _ := decision.Fields["criterion"].(string)
+	return name
+}
+
+// explainReason shows the run reason and, when it disagrees with the newest
+// decision, marks it stale and adds the decision's cause. Both strings are
+// redacted because reasons can carry provider output.
+func explainReason(reason string, decision *Decision) string {
+	reason = redact.Redact(reason)
+	if decision == nil {
+		if reason == "" {
+			return "<none>"
+		}
+		return reason
+	}
+	latest := redact.Redact(decision.Reason)
+	if latest == "" || latest == reason {
+		if reason == "" {
+			return "<none>"
+		}
+		return reason
+	}
+	if reason == "" {
+		return "<none> (stale; last decision: " + latest + ")"
+	}
+	return reason + " (stale; last decision: " + latest + ")"
+}
+
+func explainFailedCheck(checks []core.CheckResult) string {
+	for _, c := range checks {
+		if c.State == core.CheckFailure {
+			return c.Name
+		}
+	}
+	return ""
+}
+
+func explainAttempts(run *core.Run) string {
+	out := fmt.Sprintf("rebase %d/%d, fix %d/%d", run.RebaseAttempts, run.MaxAttempts,
+		run.FixAttempts, run.MaxAttempts)
+	if run.MaxAttempts > 0 && (run.RebaseAttempts >= run.MaxAttempts || run.FixAttempts >= run.MaxAttempts) {
+		out += " (exhausted)"
+	}
+	return out
+}
+
+// explainAction maps the current state to the control verb that moves it
+// forward. An approval criterion in waiting_ci needs approve; other waiting
+// states need watch. Merged is terminal, so it has no action.
+func explainAction(run *core.Run, decision *Decision) core.ControlAction {
+	switch run.State {
+	case core.RunRunning, core.RunWaitingCI, core.RunNeedsRebase:
+		if run.State == core.RunWaitingCI && decisionCriterion(decision) == "approvals" {
+			return core.ControlApprove
+		}
+		return core.ControlWatch
+	case core.RunNeedsAgentFix:
+		return core.ControlNudge
+	case core.RunBlocked:
+		return core.ControlUnblock
+	case core.RunClosed:
+		return core.ControlRetry
+	default:
+		return ""
+	}
+}
+
 // TickReconciler is the part of the reconciler a forced tick needs.
 type TickReconciler interface {
 	Reconcile(ctx context.Context, pr int) (core.MergeDecision, error)

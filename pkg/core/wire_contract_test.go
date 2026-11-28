@@ -35,12 +35,11 @@ func contractFixture() wireContractPayload {
 			Reason:    "checking CI",
 			UpdatedAt: time.Date(2026, time.November, 25, 10, 0, 0, 0, time.UTC),
 		})},
-		Event: WireEvent{
-			ID:    17,
-			Type:  "idle",
-			RunID: "run-contract-1",
-			At:    "2026-11-25T10:00:00Z",
-		},
+		Event: NewWireEvent(
+			HarnessEvent{Kind: "idle", RunID: "run-contract-1"},
+			17,
+			time.Date(2026, time.November, 25, 10, 0, 0, 0, time.UTC),
+		),
 		Control: NewWireControlResult(ControlApprove, RunID("run-contract-1")),
 	}
 }

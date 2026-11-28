@@ -128,7 +128,7 @@ export const beaconProjectDefinition = {
       const pollMs = pollIntervalMs(options.statusPollMs)
       watcher = statusRpc && watcherEnabled(options) && pollMs > 0
         ? createRunChangeWatcher(statusSource, {
-          emit: (change) => statusRpc.events?.emit?.(RUN_CHANGED_EVENT, change),
+          emit: (change) => statusRpc.events?.emit?.(RUN_CHANGED_EVENT, { ...change, location: ctx.location }),
           deps: { intervalMs: pollMs },
         }) : null
       watcher?.start()

@@ -1,12 +1,160 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// The 3-2-1200 cap keeps a card small enough to review: at most three scope
+// paths, two production files and 1200 summed lines. A production file is a
+// non-test Go file. Lines are counted over every concrete file a scope expands
+// to. Directory and glob scopes expand against the checkout before either
+// count is taken.
+const (
+	maxScopePaths      = 3
+	maxProductionFiles = 2
+	maxScopeLines      = 1200
+)
+
+// scopeBudget is one card's measured scope. Creation fills every field from
+// the checkout. The dispatcher has no checkout, so it fills paths and files
+// from the parsed card and leaves lines at zero.
+type scopeBudget struct {
+	paths int
+	files int
+	lines int
+}
+
+func scopeWithinCap(b scopeBudget) bool {
+	return b.paths <= maxScopePaths && b.files <= maxProductionFiles && b.lines <= maxScopeLines
+}
+
+// validateCardScopes applies the cap to each card of an expanded graph on its
+// own. An epic and its children are checked separately, never as one sum.
+func validateCardScopes(root string, tasks []core.Task) error {
+	for _, task := range tasks {
+		budget := measuredScopeBudget(root, task.Scope)
+		if scopeWithinCap(budget) {
+			continue
+		}
+		return core.Errorf(core.CodeInvalidInput,
+			"task %s scope exceeds the 3-2-1200 cap: %d paths, %d production files, %d lines",
+			task.ID, budget.paths, budget.files, budget.lines)
+	}
+	return nil
+}
+
+// declaredScopeBudget counts what a parsed card carries. A file scope counts
+// as a production file even when the file has not been written yet, so a new
+// production file still consumes a slot.
+func declaredScopeBudget(scope []core.ScopePath) scopeBudget {
+	b := scopeBudget{paths: len(scope)}
+	for _, p := range scope {
+		if p.Kind() == 'f' && isProductionFile(p.Value()) {
+			b.files++
+		}
+	}
+	return b
+}
+
+func measuredScopeBudget(root string, scope []core.ScopePath) scopeBudget {
+	b := scopeBudget{paths: len(scope)}
+	seen := make(map[string]bool)
+	for _, p := range scope {
+		for _, file := range expandScope(root, p) {
+			if seen[file] {
+				continue
+			}
+			seen[file] = true
+			if isProductionFile(file) {
+				b.files++
+			}
+			if root == "" {
+				continue
+			}
+			if data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(file))); err == nil {
+				b.lines += countLines(data)
+			}
+		}
+	}
+	return b
+}
+
+// expandScope turns one scope path into concrete paths relative to root. A
+// file scope yields its declared path even when the file is absent. Directory
+// and glob scopes walk the shortest literal prefix and keep the files the
+// scope covers, so a glob never walks the whole checkout.
+func expandScope(root string, p core.ScopePath) []string {
+	value := p.Value()
+	if p.Kind() == 'f' {
+		return []string{value}
+	}
+	walkRoot := root
+	if p.Kind() != 'a' {
+		if prefix := scopePrefix(value); prefix != "" {
+			walkRoot = filepath.Join(root, filepath.FromSlash(prefix))
+		}
+	}
+	if walkRoot == "" {
+		return nil
+	}
+	var out []string
+	_ = filepath.WalkDir(walkRoot, func(name string, d fs.DirEntry, err error) error {
+		if err != nil || d == nil {
+			return nil
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", ".beacon", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, name)
+		if relErr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if p.CoversPath(rel) {
+			out = append(out, rel)
+		}
+		return nil
+	})
+	return out
+}
+
+// scopePrefix returns the literal directory prefix before the first wildcard.
+func scopePrefix(pattern string) string {
+	if i := strings.IndexAny(pattern, "*?"); i >= 0 {
+		pattern = pattern[:i]
+	}
+	if i := strings.LastIndexByte(pattern, '/'); i >= 0 {
+		return pattern[:i]
+	}
+	return ""
+}
+
+func isProductionFile(file string) bool {
+	return strings.HasSuffix(file, ".go") && !strings.HasSuffix(file, "_test.go")
+}
+
+func countLines(data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	n := bytes.Count(data, []byte{'\n'})
+	if data[len(data)-1] != '\n' {
+		n++
+	}
+	return n
+}
 
 // TaskGraphStore is the store capability TaskCreator uses to sync the task graph.
 type TaskGraphStore interface {
@@ -151,19 +299,6 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	}
 	in = resolved[0]
 	children := epicChildren(id, in.Plan)
-	key := idempotencyKey(id, title, in.Plan)
-	writer := c.writer()
-	if epic {
-		if existing, ok := lookupCreated(ctx, writer, &c.Cache, key, id, children); ok {
-			return c.result(existing), nil
-		}
-		// Children fetch this branch before the epic opens a PR, so publish it
-		// before any card is written. A failure leaves no half-created epic.
-		if err := ensureEpicBranch(ctx, c.Workspace, epicBranch(id), publishBase(c.Root)); err != nil {
-			return out, fmt.Errorf("create epic branch: %w", err)
-		}
-	}
-
 	task := core.Task{
 		ID: id, Title: title, Body: strings.TrimSpace(in.Body),
 		Scope: taskScopes(in.Scope), DependsOn: taskDependencies(in.Depends),
@@ -178,6 +313,22 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		}
 	}
 	graph := append(append([]core.Task{}, children...), task)
+	if err := validateCardScopes(c.Root.Path, graph); err != nil {
+		return out, err
+	}
+
+	key := idempotencyKey(id, title, in.Plan)
+	writer := c.writer()
+	if epic {
+		if existing, ok := lookupCreated(ctx, writer, &c.Cache, key, id, children); ok {
+			return c.result(existing), nil
+		}
+		// Children fetch this branch before the epic opens a PR, so publish it
+		// before any card is written. A failure leaves no half-created epic.
+		if err := ensureEpicBranch(ctx, c.Workspace, epicBranch(id), publishBase(c.Root)); err != nil {
+			return out, fmt.Errorf("create epic branch: %w", err)
+		}
+	}
 
 	created, err := writer.Write(ctx, graph)
 	if err != nil {

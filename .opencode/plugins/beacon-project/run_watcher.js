@@ -21,6 +21,7 @@ export function createRunChangeWatcher(source, { emit, deps = {} } = {}) {
   let timer = null
   let stopped = false
   let inFlight = false
+  let occurrence = 0
   const tick = async () => {
     if (stopped || inFlight) return
     inFlight = true
@@ -35,7 +36,7 @@ export function createRunChangeWatcher(source, { emit, deps = {} } = {}) {
       const changes = previous ? changedRuns(previous, next) : []
       previous = next
       previousKey = key
-      for (const change of changes) await emit(change)
+      for (const change of changes) await emit({ ...change, occurrence: ++occurrence })
     } catch (error) {
       console.warn(`beacon run events: watch failed: ${error?.message ?? error}`)
     } finally { inFlight = false }
