@@ -335,7 +335,12 @@ func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64,
 func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
 	// Keep the state list literal: the partial index predicate must match it
 	// exactly, and bound parameters there would force a full scan and sort.
-	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN (`+activeStatesSQL+`) ORDER BY updated_at`)
+	predicate := `state NOT IN (` + activeStatesSQL + `)`
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE `+predicate).Scan(&n); err != nil {
+		return nil, err
+	}
+	return s.queryAllCap(ctx, n, `SELECT `+runColumns+` FROM runs WHERE `+predicate+` ORDER BY updated_at`)
 }
 
 // ListRecent returns at most limit finished runs, newest first.
@@ -369,11 +374,18 @@ func (s *Store) ListByIncident(ctx context.Context, incidentID string) ([]*core.
 
 // queryAll runs query and scans every returned row into a run.
 func (s *Store) queryAll(ctx context.Context, query string, args ...any) ([]*core.Run, error) {
+	return s.queryAllCap(ctx, 0, query, args...)
+}
+
+// queryAllCap is queryAll with the result slice allocated up front. A reader
+// that already knows its row count allocates once instead of growing the slice
+// through repeated reallocations and copies.
+func (s *Store) queryAllCap(ctx context.Context, capacity int, query string, args ...any) ([]*core.Run, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	return collectRows(rows, scanRun)
+	return collectRowsCap(rows, capacity, scanRun)
 }
 
 // queryOne runs query and scans at most one row into a run.
@@ -411,10 +423,33 @@ func collectRowsCap[T any](rows *sql.Rows, capacity int, scan func(scanner) (T, 
 	return out, rows.Err()
 }
 
-// decodeJSON decodes one JSON text column into dst. Every scanner calls this
-// so the byte conversion lives in one place. Callers keep the error prefix
-// that names the column.
+// Trivial JSON column values. Most rows store one of these, so decoding them
+// through json.Unmarshal buys nothing and pays for reflection on every scan.
+const (
+	jsonEmpty       = ""
+	jsonEmptyObject = "{}"
+	jsonEmptyArray  = "[]"
+	jsonNull        = "null"
+)
+
+// decodeJSON decodes one JSON text column into dst. Empty and trivial values
+// reset dst directly, which skips json.Unmarshal on the common case. Every
+// scanner calls this so the byte conversion lives in one place. Callers keep
+// the error prefix that names the column.
 func decodeJSON(text string, dst any) error {
+	if text == jsonEmpty || text == jsonEmptyObject || text == jsonEmptyArray || text == jsonNull {
+		switch d := dst.(type) {
+		case *[]core.ScopePath:
+			*d = nil
+			return nil
+		case *[]core.CheckResult:
+			*d = nil
+			return nil
+		case *map[string]any:
+			*d = nil
+			return nil
+		}
+	}
 	return json.Unmarshal([]byte(text), dst)
 }
 
