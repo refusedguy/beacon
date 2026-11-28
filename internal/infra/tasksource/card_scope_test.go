@@ -24,20 +24,15 @@ const (
 var hotFiles = []string{
 	".github/workflows/ci.yml",
 	"cmd/beacon/commands.go",
-	"cmd/beacon/http.go",
 	"cmd/beacon/main.go",
 	"cmd/beacon/mcp.go",
 	"cmd/beacon/serve.go",
-	"docs/perf/bench-registry.json",
 	"internal/app/control.go",
 	"internal/app/dispatcher.go",
 	"internal/app/reconcile_observation.go",
 	"internal/app/reconciler.go",
-	"internal/bench/registry.go",
-	"internal/bench/registry_test.go",
 	"internal/bench/run_watcher_bench.js",
 	"internal/infra/mcp/server.go",
-	"internal/infra/mcp/tool_dispatch.go",
 	"internal/infra/sqlite/store.go",
 }
 
