@@ -1,13 +1,14 @@
 ---
 id: T-8d6bc5a1
 title: Accept build agent as orchestrator role
-status: available
+status: done
 scope:
     - internal/infra/mcp/registry.go
     - internal/infra/mcp/registry_test.go
 priority: 1
 kind: task
 require_review: llm
+status_reason: Delivered directly on main in commit 9ea89c46.
 ---
 
 Goal: let the operator's `build` agent call orchestrator-only MCP tools after the typed permission fix.
