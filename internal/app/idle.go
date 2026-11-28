@@ -141,7 +141,7 @@ func (r *Reconciler) closeOrphan(ctx context.Context, run *core.Run) {
 		slog.Error("orphan close save", "run", run.ID, "error", err)
 		return
 	}
-	r.notifyParent(ctx, run, run.PRNumber, string(run.State))
+	r.notifyParent(ctx, run, run.PRNumber, reason)
 	_ = r.notify(run, "orphan run closed", reason)
 	bestEffort("orphan cleanup", func() error {
 		return r.cleanupRun(ctx, run)

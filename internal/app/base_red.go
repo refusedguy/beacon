@@ -82,7 +82,9 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 		if err := r.notify(run, "base_red", "base branch is red: "+reason); err != nil {
 			return err
 		}
-		r.notifyParent(ctx, run, run.PRNumber, "base_red: "+reason)
+		// reason is the failed check, not the run's state. notifyParent reads
+		// the blocked state from the store and keeps this reason alongside it.
+		r.notifyParent(ctx, run, run.PRNumber, reason)
 		return nil
 	}
 	return r.ensureFixer(ctx, in, base, run)
