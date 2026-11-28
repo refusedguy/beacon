@@ -1,7 +1,7 @@
 ---
 id: T-cf55afbe
 title: 'P19: MCP dispatch response encoding'
-status: available
+status: dropped
 scope:
     - internal/infra/mcp/tool_dispatch.go
     - internal/bench/mcp_dispatch_bench_test.go
@@ -14,6 +14,7 @@ depends:
 priority: 4
 kind: task
 require_review: llm
+status_reason: "Declined: advisory inconclusive by construction because the card owns ci.yml; structural gate never landed."
 ---
 
 Goal: avoid serializing runs and skipped items twice in beacon_dispatch response.
