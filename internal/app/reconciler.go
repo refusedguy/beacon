@@ -276,7 +276,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	newSHA, err := r.SCM.UpdateBranch(ctx, obs.PRNumber, obs.HeadSHA)
 	if err != nil {
 		r.Decisions.logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts+1, "", "failed")
-		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}, obs); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}, attemptedRebaseObservation(obs)); err != nil {
 			return err
 		}
 		// An UpdateBranch failure is a provider call the worker cannot fix.
