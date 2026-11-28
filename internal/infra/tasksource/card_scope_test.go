@@ -38,7 +38,6 @@ var hotFiles = []string{
 	"internal/bench/run_watcher_bench.js",
 	"internal/infra/mcp/server.go",
 	"internal/infra/mcp/tool_dispatch.go",
-	"internal/infra/sqlite/schema.go",
 	"internal/infra/sqlite/store.go",
 }
 

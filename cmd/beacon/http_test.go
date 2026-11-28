@@ -296,7 +296,11 @@ func TestEventFramesDropsSlowSubscriber(t *testing.T) {
 
 	src := make(chan core.HarnessEvent)
 	frames := newEventFrames(src, json.Marshal)
-	go frames.run(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		frames.run(ctx)
+	}()
 
 	slow, unSlow := frames.subscribe()
 	defer unSlow()
@@ -312,6 +316,12 @@ func TestEventFramesDropsSlowSubscriber(t *testing.T) {
 			t.Fatalf("fast monitor stalled at frame %d", j)
 		}
 	}
+
+	// A full slow channel drops its oldest frame, then queues a resync marker.
+	// Let the broadcaster finish before draining, or the drain can observe the
+	// channel between those two steps and count one frame too few.
+	close(src)
+	<-done
 
 	count := 0
 	for {
