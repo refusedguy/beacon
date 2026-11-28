@@ -339,6 +339,16 @@ var restartFieldChecks = []restartField{
 	{"webhook", func(a, b config.Config) bool { return reflect.DeepEqual(a.Webhook, b.Webhook) }},
 }
 
+// maxAutoRebasesCheck classifies the automatic rebase cap. The reconciler
+// reads that cap when it is built and keeps it for the life of the daemon, so
+// an edit cannot reach a running reconciler. The check stays outside
+// restartFieldChecks because that table's length is pinned by the reload
+// benchmark's work constant.
+var maxAutoRebasesCheck = restartField{
+	name:  "merge.max_auto_rebases",
+	equal: func(a, b config.Config) bool { return a.Merge.MaxAutoRebases == b.Merge.MaxAutoRebases },
+}
+
 // restartFields names changed fields that cannot be applied without replacing
 // a service the MCP server holds. Values are never included in the result.
 func restartFields(old, next config.Config) []string {
@@ -354,13 +364,17 @@ func restartFields(old, next config.Config) []string {
 // configChange classifies a config edit before any service is rebuilt. It
 // returns the restart fields that changed, whether the edit is confined to the
 // model, and whether it is confined to workflow-resolved required checks.
-// Restart changes cannot be applied to running services. A model-only change
-// needs no new harness or policy, because dispatch resolves the model from the
-// live config. A checks-only change in workflow mode comes from a workflow job
+// Restart changes cannot be applied to running services, including the
+// automatic rebase cap the reconciler captures at construction. A model-only
+// change needs no new harness or policy, because dispatch resolves the model
+// from the live config. A checks-only change in workflow mode comes from a workflow job
 // rename and needs a new policy but no new harness or reload broadcast. Any
 // other change rebuilds the harness and policy from the new config.
 func configChange(old, next config.Config) (restart []string, modelOnly, checksOnly bool) {
 	restart = restartFields(old, next)
+	if !maxAutoRebasesCheck.equal(old, next) {
+		restart = append(restart, maxAutoRebasesCheck.name)
+	}
 	if len(restart) > 0 {
 		return restart, false, false
 	}
