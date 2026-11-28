@@ -129,7 +129,9 @@ export const beaconProjectDefinition = {
       watcher = statusRpc && watcherEnabled(options) && pollMs > 0
         ? createRunChangeWatcher(statusSource, {
           emit: (change) => statusRpc.events?.emit?.(RUN_CHANGED_EVENT, { ...change, location: ctx.location }),
-          deps: { intervalMs: pollMs },
+          // CliStatusSource.snapshot() already normalizes. The watcher's default
+          // normalizer is for raw sources, so keep the source's value as-is here.
+          deps: { intervalMs: pollMs, normalizeSnapshot: (value) => value },
         }) : null
       watcher?.start()
     }
