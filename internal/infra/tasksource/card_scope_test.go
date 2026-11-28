@@ -26,7 +26,6 @@ var hotFiles = []string{
 	"cmd/beacon/main.go",
 	"cmd/beacon/serve.go",
 	"internal/app/dispatcher.go",
-	"internal/app/reconcile_observation.go",
 	"internal/app/reconciler.go",
 	"internal/bench/run_watcher_bench.js",
 	"internal/infra/sqlite/store.go",
