@@ -198,9 +198,10 @@ func (m model) Init() tea.Cmd {
 	return m.reload()
 }
 
-// reload returns a command that fetches the current run snapshot.
+// reload returns a command that fetches the current run snapshot. It claims a
+// generation so a reply from an earlier reload cannot overwrite a later one.
 func (m model) reload() tea.Cmd {
-	gen := m.refreshGen.Load()
+	gen := m.refreshGen.Add(1)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
 		defer cancel()
@@ -273,7 +274,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case Event:
 		return m.onRefresh(msg)
 	case runsMsg:
-		if msg.stale || msg.gen < m.refreshGen.Load() {
+		// Only the reply that still owns the current generation may change the
+		// view. An older reply is dropped instead of rolling the frame back.
+		if msg.stale || msg.gen != m.refreshGen.Load() {
 			return m, nil
 		}
 		if msg.err != nil {
