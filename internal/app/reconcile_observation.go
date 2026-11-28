@@ -65,12 +65,18 @@ const DefaultMaxAutoRebases = 2
 // aliases the exported default so the value is defined once.
 const maxAutoRebases = DefaultMaxAutoRebases
 
-// autoRebaseCap returns the configured automatic rebase cap. A Reconciler
-// built directly in a test keeps the fallback, so no caller can accidentally
-// raise the budget by omitting the field.
+// autoRebaseCap returns the automatic rebase cap the reconciler enforces on
+// this tick. The composition root supplies RebaseCap from the live config, so
+// a reload changes the cap without rebuilding the reconciler. A Reconciler
+// built directly in a test keeps its fixed MaxAutoRebases or the fallback, so
+// no caller can accidentally raise the budget by omitting both.
 func (r *Reconciler) autoRebaseCap() int {
-	if r.MaxAutoRebases > 0 {
-		return r.MaxAutoRebases
+	cap := r.MaxAutoRebases
+	if r.RebaseCap != nil {
+		cap = r.RebaseCap()
+	}
+	if cap > 0 {
+		return cap
 	}
 	return DefaultMaxAutoRebases
 }
