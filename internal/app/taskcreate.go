@@ -143,6 +143,13 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	if err != nil {
 		return out, err
 	}
+	// A single card has no earlier batch card, so resolve its depends, body and
+	// plan with the same rules: every @N must name an earlier card in the batch.
+	resolved, err := resolveBatchInputs([]CreateTaskInput{in}, []core.TaskID{id})
+	if err != nil {
+		return out, err
+	}
+	in = resolved[0]
 	children := epicChildren(id, in.Plan)
 	key := idempotencyKey(id, title, in.Plan)
 	writer := c.writer()

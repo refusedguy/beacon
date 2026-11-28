@@ -1145,6 +1145,82 @@ func (p *recordingPublisher) Publish(_ context.Context, pathspec, message string
 	return nil
 }
 
+func TestCreateBatchResolvesRefsInBodyAndPlan(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	got, err := creator.CreateBatch(context.Background(), []CreateTaskInput{
+		{Title: "First"},
+		{
+			Title: "Epic", Kind: core.TaskKindEpic, Body: "See @1 for context.",
+			Plan: []core.ChildSpec{{Title: "Child", Depends: []core.TaskID{"@1"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateBatch: %v", err)
+	}
+	if len(src.created) != 3 {
+		t.Fatalf("created = %d, want first card plus child plus epic", len(src.created))
+	}
+	want := string(got[0].ID)
+	if epic := src.created[2]; epic.Body != "See "+want+" for context." {
+		t.Fatalf("epic body = %q, want @1 resolved to %q", epic.Body, want)
+	}
+	if child := src.created[1]; len(child.DependsOn) != 1 || child.DependsOn[0] != core.TaskID(want) {
+		t.Fatalf("child depends = %v, want %q", child.DependsOn, want)
+	}
+}
+
+func TestCreateRejectsInvalidLocalRefs(t *testing.T) {
+	epicWithRef := CreateTaskInput{
+		Title: "Epic", Kind: core.TaskKindEpic,
+		Plan: []core.ChildSpec{{Title: "Child", Depends: []core.TaskID{"@1"}}},
+	}
+	cases := []struct {
+		name  string
+		in    CreateTaskInput
+		batch []CreateTaskInput
+	}{
+		{"single depends @0", CreateTaskInput{Title: "A", Depends: []string{"@0"}}, nil},
+		{"single depends @01", CreateTaskInput{Title: "A", Depends: []string{"@01"}}, nil},
+		{"single depends @1", CreateTaskInput{Title: "A", Depends: []string{"@1"}}, nil},
+		{"single body @1", CreateTaskInput{Title: "A", Body: "ref @1"}, nil},
+		{"single plan @1", epicWithRef, nil},
+		{"batch depends @0", CreateTaskInput{}, []CreateTaskInput{{Title: "A"}, {Title: "B", Depends: []string{"@0"}}}},
+		{"batch body @01", CreateTaskInput{}, []CreateTaskInput{{Title: "A"}, {Title: "B", Body: "ref @01"}}},
+		{"batch plan forward", CreateTaskInput{}, []CreateTaskInput{epicWithRef}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+			creator := &TaskCreator{Source: src, Workspace: &fakeWorkspace{log: &callLog{}},
+				Root: core.Workspace{Path: "/root", Branch: "main"}}
+			var err error
+			if tc.batch != nil {
+				_, err = creator.CreateBatch(context.Background(), tc.batch)
+			} else {
+				_, err = creator.Create(context.Background(), tc.in)
+			}
+			if core.CodeOf(err) != core.CodeInvalidInput {
+				t.Fatalf("error = %v, want CodeInvalidInput", err)
+			}
+			if len(src.log.items) != 0 {
+				t.Fatalf("invalid ref still wrote cards: %v", src.log.items)
+			}
+		})
+	}
+}
+
+func TestEpicIDChangesWithChildDependencies(t *testing.T) {
+	plan := []core.ChildSpec{{Title: "Child", Depends: []core.TaskID{"A"}}}
+	first := epicTaskID("Epic", plan)
+	plan[0].Depends = []core.TaskID{"B"}
+	if second := epicTaskID("Epic", plan); second == first {
+		t.Fatalf("epic id stayed %q after a child dependency change", first)
+	}
+}
+
 func TestTaskCreatorUsesInjectedRoles(t *testing.T) {
 	writer := &recordingCardWriter{inner: sourceCardWriter{Source: &fakeSource{log: &callLog{}}}}
 	publisher := &recordingPublisher{}
