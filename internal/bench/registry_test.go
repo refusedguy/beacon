@@ -167,6 +167,114 @@ func TestRegistryCLIBenchLimiters(t *testing.T) {
 	}
 }
 
+// cliWatcherRows are the three canonical rows this card freezes. A registry
+// key and limiter alone do not decide a comparison: the harness must still
+// print the row under that key with work and err fields. The table pairs each
+// key with its frozen limiter so a rename on either side fails a test.
+var cliWatcherRows = []struct{ key, limiter string }{
+	{"status-cli-paths", statusCLIPathsLimiter},
+	{"open-prepared-db", openPreparedDBLimiter},
+	{"run-watcher-fp", runWatcherFPLimiter},
+}
+
+// TestCLIWatcherRowRegistryKeys locks the CLI and watcher canonical rows end
+// to end. Every key must keep a registry spec with its frozen limiter, ns unit
+// and work/err metrics, and some benchmark or report line must still emit that
+// key, limiter and both metrics. Dropping a key or renaming a limiter leaves a
+// variant with no deciding row and fails here.
+func TestCLIWatcherRowRegistryKeys(t *testing.T) {
+	byKey := make(map[string]Spec, len(Registry()))
+	for _, spec := range Registry() {
+		byKey[spec.Key] = spec
+	}
+	source := benchSource(t)
+	for _, row := range cliWatcherRows {
+		spec, ok := byKey[row.key]
+		if !ok {
+			t.Errorf("registry has no spec for canonical key %q", row.key)
+			continue
+		}
+		if spec.Limiter != row.limiter {
+			t.Errorf("%s limiter = %q, want frozen %q", row.key, spec.Limiter, row.limiter)
+		}
+		if spec.Unit != "ns" || spec.WorkMetric != "work" || spec.ErrMetric != "errs" {
+			t.Errorf("%s metrics = %q, %q, %q; want ns, work, errs", row.key, spec.Unit, spec.WorkMetric, spec.ErrMetric)
+		}
+		if spec.Placement != PlacementPR {
+			t.Errorf("%s placement = %q, want %q", row.key, spec.Placement, PlacementPR)
+		}
+		if !strings.Contains(source, strconv.Quote(row.key)) {
+			t.Errorf("no benchmark or report line emits canonical key %q", row.key)
+		}
+		if !strings.Contains(source, strconv.Quote(row.limiter)) {
+			t.Errorf("no benchmark or report line emits limiter %q", row.limiter)
+		}
+		for _, metric := range []string{"work", "errs"} {
+			if !strings.Contains(source, strconv.Quote(metric)) {
+				t.Errorf("canonical key %q has no emitted %q metric", row.key, metric)
+			}
+		}
+	}
+}
+
+// TestCLIWatcherMovingArmHasOwnWork locks the opt-in moving generatedAt arm
+// that P15 added to run_watcher_bench.js. The arm keeps its own canonical key
+// and row, builds work from its own counters, asserts its own normalization
+// count and gates on snapshots and emissions instead of folding into the
+// stable arm's equal-work comparison. Holding it here keeps the Go side of the
+// wiring frozen without editing the harness T-d1000007 owns.
+func TestCLIWatcherMovingArmHasOwnWork(t *testing.T) {
+	const (
+		stableKey    = "run-watcher-fp"
+		movingKey    = "run-watcher-fp-moving"
+		churnLimiter = "generated_at timestamp churn"
+	)
+	data, err := os.ReadFile("run_watcher_bench.js")
+	if err != nil {
+		t.Fatalf("read run_watcher_bench.js: %v", err)
+	}
+	source := string(data)
+
+	if movingKey == stableKey {
+		t.Fatal("moving arm key must differ from the stable row key")
+	}
+	if !strings.Contains(source, "MOVING_KEY = "+strconv.Quote(movingKey)) {
+		t.Errorf("moving arm has no distinct canonical key %q", movingKey)
+	}
+	if !strings.Contains(source, "BENCH_MOVING_ARM") {
+		t.Error("moving arm is no longer opt-in")
+	}
+
+	// The moving arm prints its own row. Its work must be built from the
+	// moving arm's counters, not copied from the stable arm's row.
+	row := regexp.MustCompile(`(?s)key:\s*MOVING_KEY\s*,.*?work:\s*([^,\n]+)\s*,\s*errs:\s*([^,\n]+)\s*,\s*limiter:\s*"([^"]+)"`).FindStringSubmatch(source)
+	if row == nil {
+		t.Fatal("moving arm has no canonical row with work, errs and limiter")
+	}
+	for _, counter := range []string{"m.snapshots", "m.norm", "m.emissions"} {
+		if !strings.Contains(row[1], counter) {
+			t.Errorf("moving work = %q, want it built from %s", row[1], counter)
+		}
+	}
+	if !strings.Contains(row[2], "m.errs") {
+		t.Errorf("moving errs = %q, want the moving arm's own error count", row[2])
+	}
+	if row[3] != churnLimiter {
+		t.Errorf("moving limiter = %q, want %q", row[3], churnLimiter)
+	}
+	if row[3] == runWatcherFPLimiter {
+		t.Error("moving arm reuses the stable row limiter; it must price timestamp churn")
+	}
+
+	// Expected work and the verdict inputs belong to this arm alone.
+	if !strings.Contains(source, "moving[s][0].norm, TICKS") {
+		t.Error("moving arm lost its own expected normalization count")
+	}
+	if !strings.Contains(source, `["snapshots", "emissions", "errs"]`) {
+		t.Error("moving arm no longer gates on snapshots and emissions")
+	}
+}
+
 // harnessSources are the files that print canonical perf rows. Go benchmarks
 // print through printPerfRow; the Node harnesses, the workspace latency test,
 // the HTTP frame harness and the Go TUI view harness print the payload
