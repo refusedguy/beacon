@@ -1,7 +1,7 @@
 ---
 id: T-5dbcac20
 title: 'P21: CI wall clock cleanup after warm-cache'
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 depends:
