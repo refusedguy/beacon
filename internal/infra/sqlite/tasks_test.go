@@ -41,3 +41,49 @@ func TestSyncTasksPersistsParent(t *testing.T) {
 		t.Fatalf("epic parent = %q, want empty", got)
 	}
 }
+
+func TestSyncTasksRejectsBadGraphBeforeWriting(t *testing.T) {
+	cases := []struct {
+		name  string
+		tasks []core.Task
+	}{
+		{
+			name: "self dependency",
+			tasks: []core.Task{
+				{ID: "T-A", DependsOn: []core.TaskID{"T-A"}, Status: core.TaskAvailable},
+			},
+		},
+		{
+			name: "cycle",
+			tasks: []core.Task{
+				{ID: "T-A", DependsOn: []core.TaskID{"T-B"}, Status: core.TaskAvailable},
+				{ID: "T-B", DependsOn: []core.TaskID{"T-A"}, Status: core.TaskAvailable},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+
+			if err := store.SyncTasks(ctx, []core.Task{{ID: "T-A", Status: core.TaskAvailable}}); err != nil {
+				t.Fatal(err)
+			}
+			err = store.SyncTasks(ctx, tc.tasks)
+			if core.CodeOf(err) != core.CodeInvalidInput {
+				t.Fatalf("error = %v, want CodeInvalidInput", err)
+			}
+			ready, err := store.ListReadyTasks(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ready) != 1 || ready[0].ID != "T-A" {
+				t.Fatalf("stored graph changed after a rejected sync: %+v", ready)
+			}
+		})
+	}
+}

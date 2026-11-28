@@ -234,6 +234,11 @@ func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string) error {
 // hold exactly these cards. SetTaskStatus clears the fingerprint because it
 // changes a stored status outside this function.
 func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
+	// Reject an impossible graph before touching the cache or the tables, so a
+	// failed sync leaves both the stored graph and the fingerprint unchanged.
+	if err := core.ValidateTaskGraph(tasks); err != nil {
+		return err
+	}
 	fp, err := syncFingerprint(tasks)
 	if err != nil {
 		return err
@@ -278,27 +283,21 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	return nil
 }
 
-// readyTasksQuery selects tasks with no unresolved dependencies. Its status
-// lists are bound parameters built from the shared definitions, so no caller
-// value is interpolated into the SQL.
+// readyTasksQuery selects tasks with no unresolved dependency. A task blocked
+// through a chain is already blocked by its direct dependency, whose status is
+// not resolved, so a one-hop check covers the same set without walking the
+// graph to a depth limit. Status lists are bound parameters built from the
+// shared definitions, so no caller value is interpolated into the SQL.
 var readyTasksQuery, readyTasksArgs = inQuery(`
-WITH RECURSIVE blocked_chain(task_id, origin, depth) AS (
-  SELECT d.task_id, d.depends_on, 1
-  FROM task_deps d
-  JOIN tasks t ON t.id = d.depends_on
-  WHERE t.status NOT IN (%s)
-  UNION
-  SELECT d.task_id, b.origin, b.depth + 1
-  FROM task_deps d
-  JOIN blocked_chain b ON d.depends_on = b.task_id
-  JOIN tasks t ON t.id = d.depends_on
-  WHERE t.status NOT IN (%s) AND b.depth < 64
-)
 SELECT id, title, body, priority, scope_json, source_ref, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt
-FROM tasks
-WHERE status IN (%s)
-  AND id NOT IN (SELECT task_id FROM blocked_chain)
-ORDER BY priority DESC, id`, resolvedTaskStatuses, resolvedTaskStatuses, openTaskStatuses)
+FROM tasks t
+WHERE t.status IN (%s)
+  AND NOT EXISTS (
+    SELECT 1 FROM task_deps d
+    JOIN tasks dep ON dep.id = d.depends_on
+    WHERE d.task_id = t.id AND dep.status NOT IN (%s)
+  )
+ORDER BY priority DESC, id`, openTaskStatuses, resolvedTaskStatuses)
 
 // SetTaskStatus sets the status of taskID. A write that matched no row leaves
 // the table unchanged, so it keeps the last SyncTasks fingerprint.
