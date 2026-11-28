@@ -120,7 +120,11 @@ func actionEffects(perms []Permission) map[string]string {
 func TestGeneratedPermissionsUseNamespacedActions(t *testing.T) {
 	set := GeneratedPermissions(ToolCatalog())
 	wantGlobal := []string{
+		"beacon_beacon_control",
+		"beacon_beacon_dispatch",
+		"beacon_beacon_recent",
 		"beacon_beacon_reconcile",
+		"beacon_beacon_status",
 		"beacon_beacon_task_close",
 		"beacon_beacon_task_create",
 		"beacon_beacon_task_delete",
@@ -137,7 +141,8 @@ func TestGeneratedPermissionsUseNamespacedActions(t *testing.T) {
 		}
 	}
 	for _, action := range []string{
-		"beacon_reconcile", "beacon_task_close", "beacon_task_create",
+		"beacon_control", "beacon_dispatch", "beacon_recent", "beacon_reconcile",
+		"beacon_status", "beacon_task_close", "beacon_task_create",
 		"beacon_task_delete", "beacon_task_start", "beacon_task_update",
 	} {
 		if _, ok := global[action]; ok {
@@ -146,21 +151,15 @@ func TestGeneratedPermissionsUseNamespacedActions(t *testing.T) {
 	}
 }
 
-// TestGeneratedPermissionsAllowWorkerControl keeps the control tool free of
-// permission prompts. Control is a worker tool, so every role gets an allow.
-func TestGeneratedPermissionsAllowWorkerControl(t *testing.T) {
+// TestGeneratedPermissionsDenyWorkerControl keeps run control with the
+// orchestrator. Build and orchestrator get an allow; workers get a deny.
+func TestGeneratedPermissionsDenyWorkerControl(t *testing.T) {
 	set := GeneratedPermissions(ToolCatalog())
-	for _, group := range []struct {
-		name  string
-		perms []Permission
-	}{
-		{"allow", set.Allow},
-		{"deny", set.Deny},
-	} {
-		effects := actionEffects(group.perms)
-		if got := effects["beacon_beacon_control"]; got != "allow" {
-			t.Errorf("%s beacon_beacon_control = %q, want allow", group.name, got)
-		}
+	if got := actionEffects(set.Allow)["beacon_beacon_control"]; got != "allow" {
+		t.Errorf("allow beacon_beacon_control = %q, want allow", got)
+	}
+	if got := actionEffects(set.Deny)["beacon_beacon_control"]; got != "deny" {
+		t.Errorf("deny beacon_beacon_control = %q, want deny", got)
 	}
 }
 
