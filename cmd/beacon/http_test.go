@@ -155,18 +155,22 @@ func TestChangeSubscribersDropsSlowClientWithoutBlockingOthers(t *testing.T) {
 		}
 	}
 
-	// slow kept the first subscriberBuffer changes and dropped the last one.
+	// slow keeps exactly subscriberBuffer frames after the extra change. Wait
+	// for a full buffer before checking, because the broadcaster removes one
+	// frame and then adds the resync marker while the test is draining.
 	count := 0
-	for {
+	for count < subscriberBuffer {
 		select {
 		case <-slow:
 			count++
-		default:
-			if count != subscriberBuffer {
-				t.Fatalf("slow subscriber buffered %d changes, want %d", count, subscriberBuffer)
-			}
-			return
+		case <-time.After(2 * time.Second):
+			t.Fatalf("slow subscriber stalled at %d frames, want %d", count, subscriberBuffer)
 		}
+	}
+	select {
+	case <-slow:
+		t.Fatalf("slow subscriber buffered %d frames, want %d", count+1, subscriberBuffer)
+	default:
 	}
 }
 
@@ -987,6 +991,29 @@ func TestAppendHarnessFrameMatchesWriteSSE(t *testing.T) {
 		want := recorder.Body.String()
 		if got := string(appendHarnessFrame(nil, body)); got != want {
 			t.Fatalf("appendHarnessFrame(%+v) = %q, want %q", we, got, want)
+		}
+	}
+}
+
+// TestWriteSSEWireShapeWithReusedBuffer pins the frame bytes across repeated
+// calls, so a pooled buffer cannot carry one call's payload into the next.
+func TestWriteSSEWireShapeWithReusedBuffer(t *testing.T) {
+	for i, tc := range []struct {
+		event   string
+		payload wirePRChanged
+	}{
+		{"pr_changed", wirePRChanged{PR: 1}},
+		{"harness", wirePRChanged{PR: 987654}},
+	} {
+		body, err := json.Marshal(tc.payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "event: " + tc.event + "\ndata: " + string(body) + "\n\n"
+		recorder := httptest.NewRecorder()
+		writeSSE(recorder, tc.event, tc.payload)
+		if got := recorder.Body.String(); got != want {
+			t.Fatalf("call %d: writeSSE = %q, want %q", i, got, want)
 		}
 	}
 }

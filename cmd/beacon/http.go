@@ -642,18 +642,48 @@ func appendSSEID(dst []byte, id int64) []byte {
 	return append(dst, '\n')
 }
 
+// sseFrameBuffer holds one reusable frame buffer with a JSON encoder bound to
+// it. writeSSE marshals the payload straight into the frame, so neither the
+// encoded body nor the assembled frame allocates on a warm pool. The encoder
+// is created once per pooled object, not once per write.
+type sseFrameBuffer struct {
+	buf []byte
+	enc *json.Encoder
+}
+
+func newSSEFrameBuffer() *sseFrameBuffer {
+	f := &sseFrameBuffer{}
+	f.enc = json.NewEncoder(f)
+	return f
+}
+
+// Write appends encoded JSON to the frame buffer. The event and data prefixes
+// are already in place when json.Encoder calls it.
+func (f *sseFrameBuffer) Write(p []byte) (int, error) {
+	f.buf = append(f.buf, p...)
+	return len(p), nil
+}
+
+var sseFrameBufferPool = sync.Pool{New: func() any { return newSSEFrameBuffer() }}
+
+// writeSSE writes one complete event/data frame. json.Encoder terminates the
+// JSON value with a newline; dropping it leaves the single blank line that
+// ends an SSE frame.
 func writeSSE(rw http.ResponseWriter, event string, payload any) {
-	b, err := json.Marshal(payload)
-	if err != nil {
+	f := sseFrameBufferPool.Get().(*sseFrameBuffer)
+	defer sseFrameBufferPool.Put(f)
+	f.buf = f.buf[:0]
+	f.buf = append(f.buf, "event: "...)
+	f.buf = append(f.buf, event...)
+	f.buf = append(f.buf, "\ndata: "...)
+	if err := f.enc.Encode(payload); err != nil {
 		return
 	}
-	frame := make([]byte, 0, len(event)+len(b)+16)
-	frame = append(frame, "event: "...)
-	frame = append(frame, event...)
-	frame = append(frame, "\ndata: "...)
-	frame = append(frame, b...)
-	frame = append(frame, "\n\n"...)
-	_, _ = rw.Write(frame)
+	if n := len(f.buf); n > 0 && f.buf[n-1] == '\n' {
+		f.buf = f.buf[:n-1]
+	}
+	f.buf = append(f.buf, "\n\n"...)
+	_, _ = rw.Write(f.buf)
 }
 
 func writeJSON(rw http.ResponseWriter, v any) {
