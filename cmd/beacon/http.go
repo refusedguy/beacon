@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -52,56 +53,49 @@ func (s *streamID) assign() int64 {
 }
 
 // runsCache holds the serialized runs response for one store revision. A
-// revision advances when the harness or a pull request changes. Keying the
-// bytes by revision means a repeated or out-of-order invalidation cannot serve
-// a snapshot from the wrong generation, and every runs GET in one revision
-// reads the same bytes.
+// revision is the wire content of the runs the store returned. Keying the bytes
+// by content means a save that commits after an event is visible on the next
+// GET: an event can no longer leave the cache holding bytes from a snapshot
+// that was built before the save.
 //
-// The mutex is held while the snapshot is built. That serializes concurrent
-// GETs and guarantees a single store read per revision.
+// The store is read on every GET. The cached bytes avoid re-encoding when the
+// store has not moved, and the mutex keeps one store read at a time.
 type runsCache struct {
-	mu       sync.Mutex
-	body     []byte
-	revision uint64 // revision the body was built for
-	version  uint64 // revision advanced by invalidation
+	mu   sync.Mutex
+	body []byte // wire bytes of the last store read
 }
 
-// invalidate advances the store revision. The next runs GET rebuilds the
-// snapshot from the store.
+// invalidate drops the cached bytes. The next GET reads the store again. This
+// is kept as a hint for callers that observe harness or pull request changes,
+// but correctness no longer depends on the timing of those hints.
 func (c *runsCache) invalidate() {
 	c.mu.Lock()
-	c.version++
+	c.body = nil
 	c.mu.Unlock()
 }
 
-// revision now reports the current store revision.
-func (c *runsCache) currentRevision() uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.version
-}
-
-// snapshot returns the cached JSON for the current revision, building it once
-// when the cached bytes belong to an older revision. The bytes match writeJSON
-// exactly, including the trailing newline from json.Encoder.
+// snapshot returns JSON built from the store's current runs. The bytes match
+// writeJSON exactly, including the trailing newline from json.Encoder. When
+// the store content has not changed since the last read, the cached bytes are
+// returned instead of encoding again.
 func (c *runsCache) snapshot(ctx context.Context, status apiStatus) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.body != nil && c.revision == c.version {
-		return c.body, nil
-	}
 	runs, err := status.Active(ctx)
 	if err != nil {
 		return nil, err
 	}
 	// Marshal writes the same bytes as Encoder.Encode. Appending the newline
-	// here avoids an Encoder and a bytes.Buffer on every revision.
+	// here avoids an Encoder and a bytes.Buffer on every read.
 	b, err := json.Marshal(core.NewWireRuns(runs))
 	if err != nil {
 		return nil, err
 	}
-	c.body = append(b, '\n')
-	c.revision = c.version
+	b = append(b, '\n')
+	if c.body != nil && bytes.Equal(c.body, b) {
+		return c.body, nil
+	}
+	c.body = b
 	return c.body, nil
 }
 
@@ -172,8 +166,8 @@ func broadcast(subs map[chan []byte]struct{}, frame []byte, newResync func() []b
 
 // changeSubscribers broadcasts complete PR change frames to one channel per
 // SSE connection. Each connection owns its channel, so every monitor sees
-// every change. It also owns the runs snapshot, because it sees each PR change
-// once at the source and can advance the revision before the monitors react.
+// every change. It also drops the runs snapshot once at the source, so many
+// monitors reacting to one change do not each keep stale bytes alive.
 type changeSubscribers struct {
 	mu       sync.Mutex
 	subs     map[chan []byte]struct{}
@@ -455,9 +449,10 @@ func runHTTP(ctx context.Context, errCh chan<- error, addr string, handler http.
 // startAPIServer serves the loopback API until ctx ends and reports its exit
 // on errCh. It owns the handler wiring, while runHTTP owns the server lifecycle.
 func startAPIServer(ctx context.Context, services apiServices, token string, events <-chan core.HarnessEvent, changes *changeSubscribers, addr string, errCh chan<- error) {
-	// One view feeds the frame broadcaster and one ends the snapshot
-	// generation. A single consumer owns the invalidation view, so one harness
-	// event invalidates once no matter how many monitors are connected.
+	// One view feeds the frame broadcaster and one drops the cached runs bytes.
+	// A single consumer owns the invalidation view, so one harness event clears
+	// the cache once no matter how many monitors are connected. The runs GET
+	// still reads the store, so a save that lands after the event wins.
 	views := fanout(ctx, events, 2)
 	go invalidateOnHarness(ctx, views[1], changes.snapshot)
 	ids := newStreamID()
@@ -472,9 +467,10 @@ func startAPIServer(ctx context.Context, services apiServices, token string, eve
 	runHTTP(ctx, errCh, addr, api.handler())
 }
 
-// invalidateOnHarness ends the current snapshot generation whenever the
-// harness reports an event. The caller runs one copy of this loop so each
-// event ends exactly one generation.
+// invalidateOnHarness drops the cached runs bytes whenever the harness reports
+// an event. The caller runs one copy of this loop so each event clears the
+// cache exactly once. The following GET reads the store, so bytes are rebuilt
+// from whatever the reconciler has committed by then.
 func invalidateOnHarness(ctx context.Context, events <-chan core.HarnessEvent, cache *runsCache) {
 	for {
 		select {
