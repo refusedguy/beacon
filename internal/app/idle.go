@@ -15,7 +15,7 @@ func idleHead(run *core.Run) string {
 	if run.HeadSHA != "" {
 		return run.HeadSHA
 	}
-	return "idle"
+	return core.IdleHead
 }
 
 // idleNudgeKey binds the claim to one run and one observed head. The claim
@@ -96,7 +96,7 @@ func (r *Reconciler) nudgeIdleRun(ctx context.Context, run *core.Run) {
 		r.blockIdle(ctx, run, "idle without PR: nudge already delivered")
 		return
 	}
-	wakeErr := r.wakeWithEvent(ctx, run, idleObservation(run), "idle without PR", core.EvIdleNudge)
+	wakeErr := r.wakeWithEvent(ctx, run, idleObservation(run), "idle without PR", core.EvIdleNudge, core.WakeIdle)
 	if wakeErr != nil {
 		logStep("idle nudge", run, wakeErr)
 		if err := r.Store.ReleaseDelivery(ctx, key); err != nil {

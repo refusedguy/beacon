@@ -271,7 +271,10 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}, obs); err != nil {
 			return err
 		}
-		return r.wake(ctx, run, obs, "automatic rebase failed: "+err.Error())
+		// An UpdateBranch failure is a provider call the worker cannot fix.
+		// Spending a fix attempt on it would ask the worker to repair Beacon's
+		// own request, so the operator gets the notice instead.
+		return r.notify(run, "automatic rebase failed", "automatic rebase failed: "+err.Error())
 	}
 	if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}, core.Observation{HeadSHA: newSHA, BaseSHA: obs.BaseSHA}); err != nil {
 		return err
@@ -280,14 +283,15 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	return nil
 }
 
-func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observation, reason string) error {
-	return r.wakeWithEvent(ctx, run, obs, reason, core.EvAgentFixed)
+func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observation, reason string, action core.WakeAction) error {
+	return r.wakeWithEvent(ctx, run, obs, reason, core.EvAgentFixed, action)
 }
 
 // wakeWithEvent applies the wake guards once and records the delivered wake
 // with kind. An idle nudge uses EvIdleNudge so the run stays in running state
-// while it spends the same bounded fix budget as a check failure.
-func (r *Reconciler) wakeWithEvent(ctx context.Context, run *core.Run, obs core.Observation, reason string, kind core.EventKind) error {
+// while it spends the same bounded fix budget as a check failure. The action
+// selects the prompt that matches the reason for the wake.
+func (r *Reconciler) wakeWithEvent(ctx context.Context, run *core.Run, obs core.Observation, reason string, kind core.EventKind, action core.WakeAction) error {
 	if !run.CanWake() {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "fix attempts exhausted"}, core.Observation{}); err != nil {
 			return err
@@ -306,6 +310,7 @@ func (r *Reconciler) wakeWithEvent(ctx context.Context, run *core.Run, obs core.
 		Reason: reason, Excerpt: compact(obs.FailureExcerpt),
 		Workspace: run.WorkspacePath, Branch: run.Branch,
 		RebaseTry: run.RebaseAttempts, FixTry: run.FixAttempts,
+		Action: action,
 	}
 	if err := r.Harness.Wake(ctx, run.SessionID, w); err != nil {
 		return fmt.Errorf("wake: %w", err)

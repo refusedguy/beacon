@@ -448,16 +448,37 @@ func (r *Reconciler) guardEpicReviewTask(ctx context.Context, epic core.Task, is
 		mode = core.ReviewModeLLM
 	}
 	if mode == core.ReviewModeLLM {
-		r.maybeSpawnReviewer(ctx, run, obs)
+		r.maybeSpawnReviewer(ctx, epic, run, obs)
 	}
 	return !r.Policy.ReviewRequired(mode, obs), nil
+}
+
+// reviewPrompt names the criteria and both outcomes. A reviewer that only hears
+// about the approve branch approves changes it never checked; the negative
+// branch tells it to report failures instead.
+func reviewPrompt(run *core.Run, epic core.Task, obs core.Observation) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Review epic pull request #%d at SHA %s.\n", obs.PRNumber, obs.HeadSHA)
+	b.WriteString("Criteria: all required checks pass, no unresolved discussion remains, and every changed file stays inside the card scope")
+	if len(epic.Scope) > 0 {
+		paths := make([]string, 0, len(epic.Scope))
+		for _, p := range epic.Scope {
+			paths = append(paths, p.Value())
+		}
+		b.WriteString(": ")
+		b.WriteString(strings.Join(paths, ", "))
+	}
+	b.WriteString(".\n")
+	fmt.Fprintf(&b, "If every criterion passes, call beacon_control approve with run_id %s and sha %s.\n", run.ID, obs.HeadSHA)
+	b.WriteString("If any criterion fails, do not approve. Report the failing criteria to the parent session so the worker can fix them.\n")
+	return b.String()
 }
 
 // maybeSpawnReviewer starts one LLM review session for an epic commit. The
 // reviewer approves the run through beacon_control when the change passes. A
 // run row is persisted for the session so no live worker is invisible to the
 // slot accounting or the orphan sweep.
-func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs core.Observation) {
+func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, epic core.Task, run *core.Run, obs core.Observation) {
 	if r.Harness == nil || obs.HeadSHA == "" {
 		return
 	}
@@ -478,10 +499,7 @@ func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs 
 		ID:    core.TaskID("REVIEW-" + string(run.ID)),
 		Title: fmt.Sprintf("Review epic PR #%d", obs.PRNumber),
 	}
-	prompt := fmt.Sprintf(
-		"Review epic pull request #%d at SHA %s. If it passes, call beacon_control approve with run_id %s and sha %s.",
-		obs.PRNumber, obs.HeadSHA, run.ID, obs.HeadSHA,
-	)
+	prompt := reviewPrompt(run, epic, obs)
 	req := core.SpawnRequest{
 		Task: task, RunID: reviewID,
 		Prompt: prompt, ParentSessionID: run.ParentSessionID,
