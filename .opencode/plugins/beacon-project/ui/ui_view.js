@@ -9,6 +9,7 @@ import {
   dispatchItem, isDispatching, nextStepLine, queueRowsWithMeta, readyCount, shortTaskID, spacerItem, taskTree, timelineText, truncate,
 } from "./ui_alerts.js"
 import { clockTime, elapsed, timeOf } from "./time_format.js"
+import { STALE_ACTION } from "./ui_error.js"
 export { elapsed }
 
 export const STATE_BAR_WIDTH = 30
@@ -42,15 +43,9 @@ const STATE_VIEW = Object.freeze({
 })
 const stateView = (state) => STATE_VIEW[str(state).toLowerCase()] ?? { marker: "·", color: "muted", label: "?" }
 
-// Recent rows use three calm verdicts instead of the full active state names.
-function recentBadge(run) {
-  const state = str(run?.state).toLowerCase()
-  const reason = str(run?.reason)
-  if (/already merged|duplicate/i.test(reason)) return "DUP"
-  if (state === "merged") return "OK"
-  if (state === "closed" || state === "blocked" || state === "needs_agent_fix") return "ERR"
-  return "OK"
-}
+// Recent rows use the same state names as the active rows. A run that has not
+// finished must never inherit the label of a successful one.
+const recentBadge = (run) => stateView(run?.state).label
 
 export const SIDEBAR_OPEN = Object.freeze({ active: true, queue: false, recent: true })
 export const DETAIL_OPEN = Object.freeze({ why: true, checks: true, timeline: true, technical: false })
@@ -236,10 +231,9 @@ export function runLineItems(run, now = Date.now(), recent = false) {
     color: "muted", statusColor: errorReason ? "error" : "muted", runID: run.id }
   if (recent) {
     const badge = recentBadge(run)
-    const tone = badge === "DUP" ? "muted" : badge === "ERR" ? "error"
-      : state === "merged" ? MERGED_COLOR : "success"
+    const tone = v.color
     return [
-      { marker: badge === "OK" ? "✔" : "✖", markerSpace: true, name: title, status: badge,
+      { marker: v.marker, markerSpace: true, name: title, status: badge,
         color: tone, markerColor: tone, nameColor: "muted", nameBold: false, statusColor: tone,
         recent: true, runID: run.id },
       { ...secondLine, markerSpace: 2, recent: true, markerColor: "muted" },
@@ -313,7 +307,15 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
     { marker: "", name: "Beacon", status: bar.summary, color: "action", bold: true },
     { marker: "", name: bar.legend, status: "", color: "muted" },
   ]
-  if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
+  if (error) items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)} · ${STALE_ACTION}`,
+    status: "", color: "warning", banner: true })
+  const live = str(snapshot?.live)
+  if (live) items.push({ marker: "", name: `live: ${live}`,
+    status: live === "live" ? "" : STALE_ACTION, color: live === "live" ? "muted" : "warning" })
+  const root = str(snapshot?.root)
+  if (root) items.push({ marker: "", name: `root ${root}`,
+    status: snapshot.verified === true ? "verified" : "unverified (open from the main project)",
+    color: "muted", statusColor: snapshot.verified === true ? "success" : "warning" })
   const listItems = []
   for (const alert of [daemonAlertItem(view.daemon), baseIncidentItem(view.baseIncident)]) {
     if (alert) listItems.push(alert)
@@ -325,7 +327,8 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   const tree = open.queue === true && !queueEmpty ? taskTree(view.queue) : null
   listItems.push(sectionItem("Active", active.length, "active", open.active !== false))
   if (open.active !== false) {
-    if (!active.length) listItems.push({ marker: "", name: "No active runs", status: "", color: "muted" })
+    if (!active.length) listItems.push({ marker: "", name: "No active runs",
+      status: "beacon dispatch to start one", color: "muted" })
     active.forEach((run) => listItems.push(...runLineItems(run, now)))
     if (dispatching || ready > 0) listItems.push(dispatchItem(ready, dispatching))
   }
@@ -333,9 +336,10 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
     // A counted, expandable "Queue 0" next to a "No tasks ready" row says the
     // same thing twice. One flat header carries the whole empty-queue fact.
     listItems.push({
-      marker: "", name: "Queue", status: "no tasks ready",
+      marker: "", name: "Queue", status: "none ready: all claimed or not todo",
       color: "action", bold: true, statusColor: "muted",
     })
+    listItems.push({ marker: "", name: "Next: beacon dispatch", status: "", color: "muted" })
   } else {
     listItems.push(sectionItem("Queue", view.queue.length, "queue", open.queue === true))
     if (open.queue === true) {
@@ -350,7 +354,8 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
   }
   listItems.push(sectionItem("Recent", recent.length, "recent", open.recent !== false))
   if (open.recent !== false) {
-    if (!recent.length) listItems.push({ marker: "", name: "No recent runs", status: "", color: "muted" })
+    if (!recent.length) listItems.push({ marker: "", name: "No recent runs",
+      status: "dispatch a task first", color: "muted" })
     recent.forEach((run) => listItems.push(...runLineItems(run, now, true)))
   }
   return { ...bar, items: [...items, ...listItems], listItems, active, recent, view, queue: view.queue, ready }
@@ -368,7 +373,14 @@ export const launchSourceText = (metrics = {}) => {
 export const metricsLine = (snapshot = EMPTY_SNAPSHOT) => {
   const item = stateBarItem(snapshot)
   const launch = launchSourceText(snapshot?.metrics)
-  return { marker: "", name: `Beacon ${item.summary}`, status: [item.legend, launch].filter(Boolean).join(" · "), color: "muted" }
+  const live = str(snapshot?.live)
+  const root = str(snapshot?.root)
+  const location = root ? `root ${root} ${snapshot.verified === true ? "verified" : "unverified"}` : ""
+  const liveState = live ? `live: ${live}` : ""
+  return {
+    marker: "", name: `Beacon ${item.summary}`,
+    status: [item.legend, liveState, location, launch].filter(Boolean).join(" · "), color: "muted",
+  }
 }
 
 const stamp = (value) => clockTime(value) || "?"
@@ -392,10 +404,15 @@ function phaseSummary(run, now) {
 export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_OPEN) {
   if (!run) return {
     badge: "", pr: "", branch: "", title: "No run selected", task: "", phase: "",
-    nextStep: "", fixer: "", actions: [], rows: [{ text: "No run selected", color: "muted" }],
+    nextStep: "Select a run with j/k or click a row in Active",
+    fixer: "", actions: [], rows: [
+      { text: "No run selected", color: "muted" },
+      { text: "Next: select a run with j/k or click a row in Active", color: "muted" },
+    ],
   }
   const v = stateView(run.state)
   const state = str(run.state).toLowerCase()
+  const nextStep = nextStepLine(run)
   const rows = []
   const problem = state === "blocked" || state === "closed" || state === "needs_agent_fix"
   const isOpen = (key) => key === "why" && problem ? true
@@ -411,19 +428,24 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     const reason = state === "merged" ? mergedReason(run) : str(run.reason).trim()
     row({ marker: "", name: reason || "No reason recorded", status: "", kind: "reason",
       color: problem ? "error" : "base" })
+    if (nextStep) row({ marker: "", name: `Next: ${nextStep}`, status: "", color: "action", kind: "next" })
   }
   const { checks, stale } = checksForRun(run)
   header("CI Checks", "checks", stale.length ? `pending for ${shortSHA(run.sha)}` : checksSummary(checks, run.checks?.ciWallSeconds))
   if (isOpen("checks")) {
     if (stale.length) row({ marker: "", name: `Checks pending for head ${shortSHA(run.sha)}`, status: "", color: "warning", kind: "check" })
-    if (!checks.length && !stale.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "check" })
-    else checks.forEach((c) => row(checkRow(c)))
+    if (!checks.length && !stale.length) {
+      row({ marker: "", name: "(none): CI has not reported checks yet", status: "", color: "muted", kind: "check" })
+      row({ marker: "", name: "Next: wait for CI or retry after it reports", status: "", color: "muted", kind: "next" })
+    } else checks.forEach((c) => row(checkRow(c)))
   }
   header("Timeline", "timeline")
   if (isOpen("timeline")) {
     const timeline = [...(run.timeline ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
-    if (!timeline.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "timeline" })
-    else timeline.forEach((e) => row({
+    if (!timeline.length) {
+      row({ marker: "", name: "(none): no observation has been recorded", status: "", color: "muted", kind: "timeline" })
+      row({ marker: "", name: "Next: run beacon status --snapshot after the next observation", status: "", color: "muted", kind: "next" })
+    } else timeline.forEach((e) => row({
       marker: key(stamp(e.at)), name: timelineText(e), status: "", color: "muted",
       markerColor: "muted", nameColor: "base", kind: "timeline",
     }))
@@ -448,8 +470,10 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     const all = [...(run.decisions ?? [])].sort((a, b) => str(a.at).localeCompare(str(b.at)))
     const decisions = all.slice(-DECISION_LIMIT)
     if (all.length > decisions.length) row({ marker: "", name: `... ${all.length - decisions.length} earlier decisions`, status: "", color: "muted", kind: "decision" })
-    if (!decisions.length) row({ marker: "", name: "(none)", status: "", color: "muted", kind: "decision" })
-    else decisions.forEach((d) => row({
+    if (!decisions.length) {
+      row({ marker: "", name: "(none): no merge decision yet", status: "", color: "muted", kind: "decision" })
+      row({ marker: "", name: "Next: retry or nudge after the run advances", status: "", color: "muted", kind: "next" })
+    } else decisions.forEach((d) => row({
       marker: key(stamp(d.at)), name: `${d.kind || "decision"} ${d.verdict || d.action || ""}`.trimEnd(),
       status: "", color: "muted", kind: "decision",
     }))
@@ -462,7 +486,7 @@ export function detailModel(run, metrics = {}, now = Date.now(), open = DETAIL_O
     title: str(run.title) || str(run.taskID) || "-",
     task: run.taskID || "-",
     phase: phaseSummary(run, now),
-    nextStep: nextStepLine(run),
+    nextStep,
     fixer: run.isFixer ? "FIXER" : "",
     actions: detailActions(run),
     rows,

@@ -117,7 +117,12 @@ export const beaconProjectDefinition = {
       try {
         statusRpc = await ctx.rpc.register(BeaconStatusRpc, createStatusRpcHandlers(statusSource, { limits }))
       } catch (error) {
-        console.warn(`beacon status panel: RPC registration failed: ${error.message}`)
+        const cause = error?.message ?? String(error)
+        console.warn(`beacon status panel: RPC registration failed: ${cause}`)
+        ctx.ui?.toast?.show?.({
+          message: `Live status registration failed: ${cause} · restart beacon serve and reload the window`,
+          variant: "warning",
+        })
       }
 
       const pollMs = pollIntervalMs(options.statusPollMs)
