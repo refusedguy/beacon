@@ -54,7 +54,11 @@ type Control struct {
 	Harness   core.AgentHarness
 	Workspace core.WorkspaceManager
 	OnChange  func(int)
-	writeMu   sync.Mutex
+	// AgentSlots is optional. When the port supports atomic reservations,
+	// Nudge reserves a slot before waking so two nudges cannot spend the same
+	// free slot.
+	AgentSlots core.AgentSlots
+	writeMu    sync.Mutex
 }
 
 // ControlArgs carries the arguments of one control action. A boundary fills
@@ -74,6 +78,13 @@ type ControlNotice struct {
 }
 
 func (n *ControlNotice) Error() string { return n.Reason }
+
+// slotReserver reports the richer slot policy when the injected AgentSlots
+// supports reservations. Other ports keep the plain availability check.
+func (c *Control) slotReserver() wakeSlots {
+	slots, _ := c.AgentSlots.(wakeSlots)
+	return slots
+}
 
 // controlActorKey carries the agent that initiated a control action. A
 // boundary sets it from caller metadata without changing the ControlPort
@@ -400,6 +411,19 @@ func (c *Control) Nudge(ctx context.Context, id core.RunID, message string) erro
 	}
 	if c.Harness == nil {
 		return core.Errorf(core.CodeConflict, "harness is not configured")
+	}
+	if slots := c.slotReserver(); slots != nil {
+		if !slots.ReserveForWake(ctx, run.ID) {
+			return core.Errorf(core.CodeConflict, "no agent slot free for run %s", id)
+		}
+		defer slots.ReleaseWake(ctx, run.ID)
+	} else if c.AgentSlots != nil && c.AgentSlots.Available(ctx) <= 0 {
+		return core.Errorf(core.CodeConflict, "no agent slot free for run %s", id)
+	}
+	// A nudge keeps the existing session live, so it holds the run's slot.
+	run.HoldAgent()
+	if err := c.Store.Save(ctx, run); err != nil {
+		return err
 	}
 	return c.Harness.Wake(ctx, run.SessionID, core.WakeContext{
 		RunID: run.ID, PRNumber: run.PRNumber, HeadSHA: run.HeadSHA,
