@@ -1,7 +1,7 @@
 ---
 id: T-4536fbaa
 title: 'P16: Wire notification benchmarks into advisory'
-status: available
+status: done
 scope:
     - internal/infra/notify/telegram.go
     - internal/infra/notify/telegram_test.go

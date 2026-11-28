@@ -437,7 +437,7 @@ jobs:
           while IFS= read -r path; do
             case "$path" in
               internal/bench/ui_bench.js) continue ;;
-              internal/bench/*|docs/perf/*|internal/infra/workspace/git_worktree_test.go|cmd/beacon/http_test.go|ui/tui/model_test.go|ui/tui/refresh_bench_test.go)
+              internal/bench/*|docs/perf/*|internal/infra/workspace/git_worktree_test.go|internal/infra/notify/telegram_bench_test.go|internal/infra/notify/telegram_test.go|cmd/beacon/http_test.go|ui/tui/model_test.go|ui/tui/refresh_bench_test.go)
                 if [[ -f "$RUNNER_TEMP/perf-head/$path" ]]; then
                   mkdir -p "$RUNNER_TEMP/perf-base/$(dirname "$path")"
                   cp "$RUNNER_TEMP/perf-head/$path" "$RUNNER_TEMP/perf-base/$path"
@@ -489,6 +489,8 @@ jobs:
               {
                 find internal/bench docs/perf -type f -print 2>/dev/null
                 printf '%s\n' internal/infra/workspace/git_worktree_test.go \
+                  internal/infra/notify/telegram_bench_test.go \
+                  internal/infra/notify/telegram_test.go \
                   cmd/beacon/http_test.go \
                   ui/tui/model_test.go \
                   ui/tui/refresh_bench_test.go \
@@ -561,6 +563,9 @@ jobs:
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_CACHE=warm go test -vet=off -run '^$' \
+                -bench '^BenchmarkTelegramNotify$' -benchtime=100x -count=1 -benchmem ./internal/infra/notify/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && taskset -c "$cpu" go test ./internal/infra/workspace/ -run '^TestGitWorktreeRemoveLatencyAlternating$' -count=1 -v) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
@@ -826,6 +831,7 @@ jobs:
             'json-control': 'JSONControl',
             'http-frame-emission': 'HTTPFramesEmission',
             'go-tui-view': 'GoTUIView',
+            'telegram-notify': 'TelegramNotify',
           };
           // Deterministic call counters each key owns. The reconcile tick
           // counts guard the green-base path. The two base-red keys publish
@@ -1312,6 +1318,9 @@ jobs:
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_CACHE=warm go test -vet=off -run '^$' \
+                -bench '^BenchmarkTelegramNotify$' -benchtime=100x -count=1 -benchmem ./internal/infra/notify/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
               (cd "$dir" && taskset -c "$cpu" go test ./internal/infra/workspace/ -run '^TestGitWorktreeRemoveLatencyAlternating$' -count=1 -v) \
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"

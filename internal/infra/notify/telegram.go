@@ -16,18 +16,34 @@ import (
 
 // Telegram sends notifications through the Telegram Bot API.
 type Telegram struct {
-	Token  string
-	ChatID string
-	HTTP   *http.Client
+	Token    string
+	ChatID   string
+	HTTP     *http.Client
+	endpoint string
 }
 
-// NewTelegram builds a notifier for a bot token and chat.
+// NewTelegram builds a notifier for a bot token and chat. The endpoint is
+// built once here because the token and its PathEscape cannot change on the
+// send path.
 func NewTelegram(token, chatID string) *Telegram {
-	return &Telegram{Token: token, ChatID: chatID, HTTP: &http.Client{Timeout: 10 * time.Second}}
+	return &Telegram{
+		Token:    token,
+		ChatID:   chatID,
+		HTTP:     &http.Client{Timeout: 10 * time.Second},
+		endpoint: "https://api.telegram.org/bot" + url.PathEscape(token) + "/sendMessage",
+	}
 }
 
 // Enabled reports whether a token and chat id are configured.
 func (t *Telegram) Enabled() bool { return t.Token != "" && t.ChatID != "" }
+
+// telegramPayload encodes the two fields the Bot API accepts. A tagged struct
+// marshals without the reflection and map allocation a map[string]string
+// needs, and emits the same bytes in the same field order.
+type telegramPayload struct {
+	ChatID string `json:"chat_id"`
+	Text   string `json:"text"`
+}
 
 // Notify sends n as a Telegram message.
 func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
@@ -35,12 +51,8 @@ func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
 		return nil
 	}
 	text := redact.Redact(fmt.Sprintf("beacon [%s] %s: %s", n.RunID, n.Subject, n.Body))
-	payload, _ := json.Marshal(map[string]string{
-		"chat_id": t.ChatID,
-		"text":    text,
-	})
-	endpoint := "https://api.telegram.org/bot" + url.PathEscape(t.Token) + "/sendMessage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	payload, _ := json.Marshal(telegramPayload{ChatID: t.ChatID, Text: text})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
