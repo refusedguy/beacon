@@ -80,6 +80,15 @@ func (c *etagCache[V]) set(key string, entry *etagValue[V]) {
 	}
 }
 
+// invalidate removes the cached entry for key under the mutex. A mutation that
+// changes server state calls this instead of update: the validator no longer
+// describes the remote resource, so the next fetch must be unconditional.
+func (c *etagCache[V]) invalidate(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
+
 // update applies fn to a cached value and refreshes its timestamp while
 // keeping its validator. A mutation writes through so the next conditional
 // GET starts from the state the mutation produced.
