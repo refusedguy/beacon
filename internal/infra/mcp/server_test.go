@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -70,6 +72,31 @@ func TestToolCatalogMatchesRegisteredTools(t *testing.T) {
 		!byName["beacon_task_delete"].OrchestratorOnly || !byName["beacon_task_update"].OrchestratorOnly ||
 		!byName["beacon_task_close"].OrchestratorOnly || !byName["beacon_reconcile"].OrchestratorOnly {
 		t.Fatalf("only task creation, deletion, update, close and reconcile should be orchestrator-only: %+v", catalog)
+	}
+}
+
+// workerToolNames is the golden list of tools workers may call. It is sorted
+// by name. A worker tool added, removed or renamed changes the permission gate,
+// so it must land with a catalog edit and a regenerated opencode.json.
+var workerToolNames = []string{
+	"beacon_control",
+	"beacon_dispatch",
+	"beacon_recent",
+	"beacon_status",
+	"beacon_wait",
+	"beacon_watch_pr",
+}
+
+func TestWorkerToolNamesArePinned(t *testing.T) {
+	var got []string
+	for _, spec := range ToolCatalog() {
+		if !spec.OrchestratorOnly {
+			got = append(got, spec.Name)
+		}
+	}
+	sort.Strings(got)
+	if !slices.Equal(got, workerToolNames) {
+		t.Fatalf("worker tools = %q, want golden list %q", got, workerToolNames)
 	}
 }
 
