@@ -57,15 +57,7 @@ func ValidateTaskGraph(tasks []Task) error {
 			}
 			switch state[dep] {
 			case visiting:
-				start := 0
-				for i, node := range stack {
-					if node == dep {
-						start = i
-						break
-					}
-				}
-				cycle := append([]TaskID(nil), stack[start:]...)
-				return append(cycle, dep)
+				return cycleFrom(stack, dep)
 			case unvisited:
 				if cycle := walk(dep); len(cycle) > 0 {
 					return cycle
@@ -81,14 +73,31 @@ func ValidateTaskGraph(tasks []Task) error {
 			continue
 		}
 		if cycle := walk(id); len(cycle) > 0 {
-			names := make([]string, len(cycle))
-			for i, node := range cycle {
-				names[i] = string(node)
-			}
-			return Errorf(CodeInvalidInput, "dependency cycle: %s", strings.Join(names, " -> "))
+			return cycleError(cycle)
 		}
 	}
 	return nil
+}
+
+// cycleFrom closes a stack at dep, naming the path from dep back to dep.
+func cycleFrom(stack []TaskID, dep TaskID) []TaskID {
+	start := 0
+	for i, node := range stack {
+		if node == dep {
+			start = i
+			break
+		}
+	}
+	cycle := append([]TaskID(nil), stack[start:]...)
+	return append(cycle, dep)
+}
+
+func cycleError(cycle []TaskID) error {
+	names := make([]string, len(cycle))
+	for i, node := range cycle {
+		names[i] = string(node)
+	}
+	return Errorf(CodeInvalidInput, "dependency cycle: %s", strings.Join(names, " -> "))
 }
 
 // ChildKey canonicalizes a plan's children for identity checks. It sorts by
