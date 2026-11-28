@@ -332,6 +332,16 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		ResolveModel:       resolveModel,
 		Decisions:          infra.decisions,
 	}
+	// Manual and automatic intake share one brake. The dispatcher reads the
+	// address of the config value the reconciler copies below, so a closed gate
+	// stops the CLI, the MCP tool and the daemon tick together.
+	disp.DispatchOpen = &cfg.AutoDispatch.DispatchOpen
+	watchdogAges := make(map[core.RunState]time.Duration, 4)
+	for _, state := range []core.RunState{core.RunWaitingCI, core.RunNeedsRebase, core.RunNeedsAgentFix, core.RunBlocked} {
+		if age, err := cfg.Watchdog.AgeFor(state); err == nil && age > 0 {
+			watchdogAges[state] = age
+		}
+	}
 	ctrl := &app.Control{Store: infra.store, Harness: h, Workspace: infra.workspace, OnChange: func(pr int) {
 		select {
 		case infra.changes <- pr:
@@ -339,19 +349,24 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		}
 	}}
 	recon := newReconciler(app.ReconcilerConfig{
-		Notifier:           notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
-		Repo:               cfg.RepoSlug(),
-		BaseBranch:         cfg.BaseBranch,
-		ParentSession:      parentSession,
-		BaseRedMode:        cfg.OnBaseRed.Mode,
-		WorkerInstructions: cfg.Harness.WorkerInstructions,
-		MaxFixTries:        cfg.OnBaseRed.MaxFixAttempts,
-		MaxAttempts:        cfg.Merge.MaxAttempts,
-		Interval:           cfg.Interval(),
-		OrphanTimeout:      cfg.OrphanTimeoutDuration(),
-		AutoRebase:         cfg.Merge.AutoRebase,
-		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
-		RebaseCap:          infra.capProvider,
+		Notifier:              notify.NewTelegram(cfg.Notify.TelegramToken, cfg.Notify.ChatID),
+		Repo:                  cfg.RepoSlug(),
+		BaseBranch:            cfg.BaseBranch,
+		ParentSession:         parentSession,
+		BaseRedMode:           cfg.OnBaseRed.Mode,
+		WorkerInstructions:    cfg.Harness.WorkerInstructions,
+		MaxFixTries:           cfg.OnBaseRed.MaxFixAttempts,
+		MaxAttempts:           cfg.Merge.MaxAttempts,
+		Interval:              cfg.Interval(),
+		OrphanTimeout:         cfg.OrphanTimeoutDuration(),
+		AutoRebase:            cfg.Merge.AutoRebase,
+		MaxAutoRebases:        cfg.Merge.MaxAutoRebases,
+		RebaseCap:             infra.capProvider,
+		AutoDispatchEnabled:   cfg.AutoDispatch.Enabled,
+		AutoDispatchBatchSize: cfg.AutoDispatch.BatchSize,
+		DispatchOpen:          cfg.AutoDispatch.DispatchOpen,
+		WatchdogEnabled:       cfg.Watchdog.Enabled,
+		WatchdogAges:          watchdogAges,
 	}, runStore, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
 	explain := app.ExplainService{Store: infra.store, SCM: infra.scm}
@@ -422,6 +437,13 @@ func newReconciler(
 		AutoRebase:         cfg.AutoRebase,
 		MaxAutoRebases:     cfg.MaxAutoRebases,
 		RebaseCap:          cfg.RebaseCap,
+
+		Dispatch:              disp,
+		AutoDispatchEnabled:   cfg.AutoDispatchEnabled,
+		AutoDispatchBatchSize: cfg.AutoDispatchBatchSize,
+		DispatchOpen:          cfg.DispatchOpen,
+		WatchdogEnabled:       cfg.WatchdogEnabled,
+		WatchdogAges:          cfg.WatchdogAges,
 	}
 }
 
