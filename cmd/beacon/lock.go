@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -150,11 +151,100 @@ type daemonState struct {
 	Heartbeat time.Time `json:"heartbeat"`
 }
 
-// daemonError is the on-disk record of the daemon's most recent fatal error.
+// daemonError is one process's fatal error record. ProcessKey identifies the
+// opener that wrote it, so a losing opener's diagnostic survives startup.
 type daemonError struct {
-	At      time.Time `json:"at"`
-	Kind    string    `json:"kind"`
-	Message string    `json:"message"`
+	At         time.Time `json:"at"`
+	Kind       string    `json:"kind"`
+	Message    string    `json:"message"`
+	ProcessKey string    `json:"process_key"`
+}
+
+// daemonDiagnostics maps a process key to that process's latest error. Each
+// process writes only its own entry, so no opener can clear another's record.
+type daemonDiagnostics map[string]daemonError
+
+// processKey identifies the current process in the diagnostics store.
+func processKey() string {
+	return strconv.Itoa(os.Getpid())
+}
+
+// loadDaemonDiagnostics reads the process-keyed error store. A missing or
+// malformed file means no diagnostics, since records are advisory.
+func loadDaemonDiagnostics(dir string) (daemonDiagnostics, error) {
+	records, err := stateFile[daemonDiagnostics](dir, daemonErrorFile).load()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errInvalidState) {
+			return daemonDiagnostics{}, nil
+		}
+		return nil, err
+	}
+	if *records == nil {
+		return daemonDiagnostics{}, nil
+	}
+	return *records, nil
+}
+
+// writeDaemonErrorFor records err under key. It touches only that key, so a
+// competing opener's record is preserved.
+func writeDaemonErrorFor(dir, key, kind string, err error) {
+	record := daemonError{
+		At: time.Now().UTC(), Kind: kind, Message: err.Error(), ProcessKey: key,
+	}
+	records, loadErr := loadDaemonDiagnostics(dir)
+	if loadErr != nil {
+		slog.Error("read daemon diagnostics", "error", loadErr)
+		return
+	}
+	records[key] = record
+	if saveErr := stateFile[daemonDiagnostics](dir, daemonErrorFile).save(records); saveErr != nil {
+		slog.Error("write daemon error record", "error", saveErr)
+	}
+}
+
+// writeDaemonError records the current process's fatal error for doctor.
+func writeDaemonError(dir, kind string, err error) {
+	writeDaemonErrorFor(dir, processKey(), kind, err)
+}
+
+// clearDaemonErrorFor removes only key's diagnostic and leaves other openers'
+// records intact.
+func clearDaemonErrorFor(dir, key string) {
+	records, err := loadDaemonDiagnostics(dir)
+	if err != nil {
+		slog.Error("read daemon diagnostics", "error", err)
+		return
+	}
+	if _, ok := records[key]; !ok {
+		return
+	}
+	delete(records, key)
+	if err := stateFile[daemonDiagnostics](dir, daemonErrorFile).save(records); err != nil {
+		slog.Error("clear daemon error record", "error", err)
+	}
+}
+
+// readDaemonDiagnostics returns every process-keyed error record.
+func readDaemonDiagnostics(dir string) daemonDiagnostics {
+	records, err := loadDaemonDiagnostics(dir)
+	if err != nil {
+		return daemonDiagnostics{}
+	}
+	return records
+}
+
+// latestDaemonError picks the newest record and breaks ties by process key so
+// the choice stays stable across processes.
+func latestDaemonError(records daemonDiagnostics) *daemonError {
+	var latest *daemonError
+	for key, record := range records {
+		if latest == nil || record.At.After(latest.At) ||
+			(record.At.Equal(latest.At) && key > latest.ProcessKey) {
+			chosen := record
+			latest = &chosen
+		}
+	}
+	return latest
 }
 
 // daemonStatus is the liveness report built from the state and error records.
@@ -177,8 +267,14 @@ type daemonTracker struct {
 	done  chan struct{}
 }
 
-// startDaemonState writes the initial state and starts the heartbeat loop.
+// startDaemonState writes the initial state for the current process.
 func startDaemonState(dir string) (*daemonTracker, error) {
+	return startDaemonStateFor(dir, processKey())
+}
+
+// startDaemonStateFor writes the initial state under key and starts the
+// heartbeat loop. Only the lock owner should call it.
+func startDaemonStateFor(dir, key string) (*daemonTracker, error) {
 	root, err := filepath.Abs(filepath.Dir(dir))
 	if err != nil {
 		return nil, err
@@ -193,8 +289,9 @@ func startDaemonState(dir string) (*daemonTracker, error) {
 	if err := t.write(); err != nil {
 		return nil, err
 	}
-	// A stale error record is cleared best effort; the first new error replaces it.
-	stateFile[daemonError](dir, daemonErrorFile).clear()
+	// Clear only this opener's stale diagnostic. A competing opener's error
+	// stays visible so the winner never erases why the loser failed.
+	clearDaemonErrorFor(dir, key)
 	go t.loop()
 	return t, nil
 }
@@ -242,14 +339,6 @@ func (t *daemonTracker) Close() {
 	stateFile[daemonState](t.dir, daemonStateFile).clear()
 }
 
-// writeDaemonError persists a fatal error record for the doctor command to read.
-func writeDaemonError(dir, kind string, err error) {
-	record := daemonError{At: time.Now().UTC(), Kind: kind, Message: err.Error()}
-	if writeErr := stateFile[daemonError](dir, daemonErrorFile).save(record); writeErr != nil {
-		slog.Error("write daemon error record", "error", writeErr)
-	}
-}
-
 // readDaemonStatus reconstructs daemon liveness from the state and error files.
 func readDaemonStatus(dir string) daemonStatus {
 	status := daemonStatus{State: "absent"}
@@ -278,7 +367,7 @@ func readDaemonStatus(dir string) daemonStatus {
 	case !os.IsNotExist(err):
 		status.State = "unreadable"
 	}
-	if record, err := stateFile[daemonError](dir, daemonErrorFile).load(); err == nil {
+	if record := latestDaemonError(readDaemonDiagnostics(dir)); record != nil {
 		status.Error = record
 	}
 	return status

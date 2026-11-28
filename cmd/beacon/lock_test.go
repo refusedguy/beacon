@@ -144,6 +144,79 @@ func TestLockContentionPreservesLockFile(t *testing.T) {
 	}
 }
 
+func TestTwoOpenersOneLock(t *testing.T) {
+	dir := t.TempDir()
+
+	// The winner owns the lock and carries a stale diagnostic from an earlier
+	// attempt under its own process key.
+	writeDaemonErrorFor(dir, "winner", "lock", errors.New("winner earlier failure"))
+	first, err := acquireLock(dir)
+	if err != nil {
+		t.Fatalf("first acquireLock: %v", err)
+	}
+	defer first.Close()
+	tracker, err := startDaemonStateFor(dir, "winner")
+	if err != nil {
+		t.Fatalf("startDaemonStateFor: %v", err)
+	}
+	defer tracker.Close()
+
+	// Startup cleared only the winner's key.
+	if _, ok := readDaemonDiagnostics(dir)["winner"]; ok {
+		t.Fatal("winner's stale diagnostic survived its own startup")
+	}
+
+	// A competing opener loses the lock and records why it failed.
+	second, err := acquireLock(dir)
+	if err == nil {
+		_ = second.Close()
+		t.Fatal("second opener acquired the lock")
+	}
+	writeDaemonErrorFor(dir, "loser", "lock", err)
+
+	records := readDaemonDiagnostics(dir)
+	loser, ok := records["loser"]
+	if !ok {
+		t.Fatalf("loser diagnostic was erased: %+v", records)
+	}
+	if loser.ProcessKey != "loser" || !strings.Contains(loser.Message, "already running") {
+		t.Fatalf("loser diagnostic = %+v", loser)
+	}
+	if got := readDaemonStatus(dir); got.Error == nil || got.Error.ProcessKey != "loser" {
+		t.Fatalf("status error = %+v", got.Error)
+	}
+}
+
+func TestProcessKeyedDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	writeDaemonErrorFor(dir, "opener-a", "lock", errors.New("a lost the lock"))
+	writeDaemonErrorFor(dir, "opener-b", "daemon", errors.New("b found no daemon"))
+
+	records := readDaemonDiagnostics(dir)
+	if len(records) != 2 {
+		t.Fatalf("records = %+v, want two process-keyed entries", records)
+	}
+	if records["opener-a"].Kind != "lock" || records["opener-b"].Kind != "daemon" {
+		t.Fatalf("records = %+v", records)
+	}
+	if records["opener-a"].ProcessKey != "opener-a" || records["opener-b"].ProcessKey != "opener-b" {
+		t.Fatalf("records = %+v, want self-describing process keys", records)
+	}
+
+	// Clearing one opener leaves the other's diagnostic intact.
+	clearDaemonErrorFor(dir, "opener-a")
+	records = readDaemonDiagnostics(dir)
+	if len(records) != 1 {
+		t.Fatalf("records = %+v, want one entry after clear", records)
+	}
+	if _, ok := records["opener-b"]; !ok {
+		t.Fatalf("opener-b diagnostic was erased: %+v", records)
+	}
+	if got := readDaemonStatus(dir); got.Error == nil || got.Error.Kind != "daemon" {
+		t.Fatalf("status error = %+v", got.Error)
+	}
+}
+
 func TestStatusCommandReportsDaemonLiveness(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, ".beacon")
