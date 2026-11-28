@@ -15,6 +15,22 @@ test("snapshotFingerprint compares raw snapshots by value", () => {
   assert.equal(snapshotFingerprint(undefined), snapshotFingerprint(null))
 })
 
+test("the identity normalizer leaves a CliStatusSource snapshot untouched", async () => {
+  // CliStatusSource.snapshot() returns an already-normalized object. The
+  // operator watcher passes an identity normalizer so it is not rebuilt again.
+  const normalized = normalizeSnapshot({ active: [run("run-1")], recent: [] })
+  const seen = []
+  const watcher = createRunChangeWatcher({ snapshot: async () => normalized }, {
+    emit: () => {},
+    deps: { normalizeSnapshot: (value) => { seen.push(value); return value } },
+  })
+  await watcher.tick()
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0], normalized, "the watcher reuses the source object")
+  await watcher.tick()
+  assert.equal(seen.length, 1, "an unchanged normalized snapshot is not normalized twice")
+})
+
 test("1000 idle ticks normalize once and emit no extra events", async () => {
   const raw = { active: [run("run-1")], recent: [] }
   let snapshots = 0
