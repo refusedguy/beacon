@@ -76,6 +76,12 @@ func runServe(cmd *cobra.Command, configPath string) error {
 
 	ctx, stop := signalContext(cmd.Context())
 	defer stop()
+	return serveRuntime(ctx, w, dir, token, addr)
+}
+
+// serveRuntime runs the reconciler, the loopback API and the optional webhook
+// until the context ends or a server fails.
+func serveRuntime(ctx context.Context, w *wiring, dir, token, addr string) error {
 	go w.watcher.Run(ctx)
 	if watcher, ok := w.harness.(core.IdleWatcher); ok {
 		go watcher.WatchIdle(ctx)
@@ -95,16 +101,7 @@ func runServe(cmd *cobra.Command, configPath string) error {
 	go func() { errCh <- w.recon.Run(ctx, changeViews[0]) }()
 
 	startAPIServer(ctx, apiServices{status: w.status, control: w.control}, token, events[1], subs, addr, errCh)
-
-	if w.cfg.Webhook.Enabled {
-		hookAddr := w.cfg.Webhook.Addr
-		if hookAddr == "" {
-			hookAddr = "127.0.0.1:8766"
-		}
-		mux := http.NewServeMux()
-		mux.Handle("/webhook", (&scm.Webhook{Secret: w.cfg.Webhook.Secret, Changes: w.changes}).Handler())
-		runHTTP(ctx, errCh, hookAddr, mux)
-	}
+	startServeWebhook(ctx, errCh, w)
 
 	select {
 	case <-ctx.Done():
@@ -116,6 +113,20 @@ func runServe(cmd *cobra.Command, configPath string) error {
 		writeDaemonError(dir, "serve", err)
 		return err
 	}
+}
+
+// startServeWebhook binds the webhook when the config enables it.
+func startServeWebhook(ctx context.Context, errCh chan error, w *wiring) {
+	if !w.cfg.Webhook.Enabled {
+		return
+	}
+	hookAddr := w.cfg.Webhook.Addr
+	if hookAddr == "" {
+		hookAddr = "127.0.0.1:8766"
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/webhook", (&scm.Webhook{Secret: w.cfg.Webhook.Secret, Changes: w.changes}).Handler())
+	runHTTP(ctx, errCh, hookAddr, mux)
 }
 
 // fanout copies every value from src into n buffered views. A slow view drops
