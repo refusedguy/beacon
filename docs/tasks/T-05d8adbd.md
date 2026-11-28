@@ -1,7 +1,7 @@
 ---
 id: T-05d8adbd
 title: Enforce one owner per hot file in CI
-status: available
+status: done
 scope:
     - internal/infra/tasksource/card_scope_test.go
     - docs/perf/status.md
