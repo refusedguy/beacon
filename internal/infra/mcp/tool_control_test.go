@@ -123,7 +123,7 @@ func callControl(t *testing.T, cs *msdk.ClientSession, args map[string]any) *msd
 func callTool(t *testing.T, cs *msdk.ClientSession, name string, args map[string]any) *msdk.CallToolResult {
 	t.Helper()
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
-		Name: name, Arguments: args,
+		Name: name, Arguments: args, Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 	})
 	if err != nil {
 		t.Fatal(err)

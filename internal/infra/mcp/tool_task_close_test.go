@@ -41,6 +41,7 @@ func callClose(t *testing.T, cs *msdk.ClientSession, args map[string]any) (app.C
 	t.Helper()
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_close", Arguments: args,
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 	})
 	if err != nil {
 		t.Fatalf("cs.CallTool(beacon_task_close): %v", err)

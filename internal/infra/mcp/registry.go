@@ -29,13 +29,25 @@ type ToolSpec struct {
 	Register func(*msdk.Server, Services)
 }
 
-// requireOrchestrator refuses a tool call whose metadata names a worker agent.
-// An absent or operator identity is allowed: the pooled daemon serves trusted
-// sessions that send no metadata at all.
+const (
+	roleAbsent       = "absent"
+	roleOrchestrator = "orchestrator"
+)
+
+// requireOrchestrator refuses a tool call that does not name an orchestrator
+// agent. A worker identity and absent agent metadata are both refusals, each
+// with a coded error that names the observed role and the required role. A
+// caller can then diagnose the denial from the error alone instead of falling
+// through to an interactive permission prompt.
 func requireOrchestrator(req *msdk.CallToolRequest) error {
 	agent := metaString(req, "beacon/agent", "ai.opencode/agent")
-	if isWorkerAgent(agent) {
-		return core.Errorf(core.CodeInvalidInput, "tool is orchestrator only; caller agent %q is a worker", agent)
+	observed := strings.TrimSpace(agent)
+	if observed == "" {
+		observed = roleAbsent
+	}
+	if observed == roleAbsent || isWorkerAgent(observed) {
+		return core.Errorf(core.CodePermissionDenied,
+			"tool is orchestrator only; observed role %q, required role %q", observed, roleOrchestrator)
 	}
 	return nil
 }
