@@ -32,7 +32,6 @@ var hotFiles = []string{
 	"internal/app/reconcile_observation.go",
 	"internal/app/reconciler.go",
 	"internal/bench/run_watcher_bench.js",
-	"internal/infra/mcp/server.go",
 	"internal/infra/sqlite/store.go",
 }
 
