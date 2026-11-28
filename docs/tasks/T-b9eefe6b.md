@@ -1,7 +1,7 @@
 ---
 id: T-b9eefe6b
 title: Block direct state db reads for every agent
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/shell_guard.js
     - .opencode/plugins/beacon-project/index_test.js
