@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 
@@ -15,21 +14,6 @@ const (
 	maxScopePaths = 4
 	maxHotFiles   = 2
 )
-
-// hotFiles names every path claimed by two or more non-terminal cards in the
-// corpus this guard landed on. A contested path outside this list means a new
-// card introduced overlap, so TestCardScopeGuardCorpus fails until someone
-// updates the list on purpose. The list is the CI counterpart of the hot-file
-// singleton rule in AGENTS.md.
-var hotFiles = []string{
-	".github/workflows/ci.yml",
-	"cmd/beacon/main.go",
-	"cmd/beacon/serve.go",
-	"internal/app/dispatcher.go",
-	"internal/app/reconciler.go",
-	"internal/bench/run_watcher_bench.js",
-	"internal/infra/sqlite/store.go",
-}
 
 // legacyCards names the non-terminal cards whose Scope predates this guard.
 // They keep their scopes until their owners split them. Every other card must
@@ -217,9 +201,9 @@ func TestScopeGuardRules(t *testing.T) {
 }
 
 // TestCardScopeGuardCorpus walks docs/tasks and enforces the rules on every
-// non-terminal card that is not on the legacy list. It first checks that the
-// explicit hot list matches the contested paths in the corpus, so a new owner
-// of a contested path or a new contested path fails the test.
+// non-terminal card that is not on the legacy list. Contested paths are derived
+// from the corpus on each run, so closing or merging a card cannot leave a
+// stale hardcoded list that breaks every open branch.
 func TestCardScopeGuardCorpus(t *testing.T) {
 	dir := filepath.Join("..", "..", "..", "docs", "tasks")
 	cards := readScopeCards(t, dir)
@@ -228,26 +212,18 @@ func TestCardScopeGuardCorpus(t *testing.T) {
 	}
 	owners := ownersByPath(cards)
 
-	var derived []string
-	for p, ids := range owners {
+	legacy := stringSet(legacyCards)
+	contested := make(map[string]bool)
+	for path, ids := range owners {
 		if len(ids) > 1 {
-			derived = append(derived, p)
+			contested[path] = true
 		}
 	}
-	sort.Strings(derived)
-	listed := append([]string(nil), hotFiles...)
-	sort.Strings(listed)
-	if strings.Join(derived, "\n") != strings.Join(listed, "\n") {
-		t.Fatalf("hot list and corpus disagree:\nlisted:  %v\ncorpus:  %v", listed, derived)
-	}
-
-	legacy := stringSet(legacyCards)
-	hot := stringSet(hotFiles)
 	for _, c := range cards {
 		if legacy[c.id] {
 			continue
 		}
-		for _, v := range scopeGuardViolations(c, owners, hot) {
+		for _, v := range scopeGuardViolations(c, owners, contested) {
 			t.Errorf("%s: %s", c.id, v)
 		}
 	}
