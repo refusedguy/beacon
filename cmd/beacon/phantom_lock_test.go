@@ -20,15 +20,15 @@ func TestStaleDaemonLockIsReacquired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first acquireLock: %v", err)
 	}
+	// The kernel releases the flock when its owner exits. A stale daemon
+	// record does not hold the lock and must not block a new owner.
+	first.Close()
 	second, err := acquireLock(dir)
 	if err != nil {
-		t.Fatalf("second acquireLock after stale owner: %v", err)
+		t.Fatalf("second acquireLock after stale owner exits: %v", err)
 	}
 	defer second.Close()
-	// Both descriptors name the same lock file path; the stale owner no
-	// longer blocks a new daemon from taking over.
 	if _, err := os.Stat(filepath.Join(dir, "beacon.lock")); err != nil {
 		t.Fatalf("lock file missing after takeover: %v", err)
 	}
-	_ = first
 }

@@ -85,8 +85,7 @@ func TestDaemonStatusWithoutState(t *testing.T) {
 
 func TestLockFailureLeavesVisibleError(t *testing.T) {
 	dir := t.TempDir()
-	// A live owner keeps the lock held. Without a fresh daemon record the
-	// lock is treated as abandoned and reacquired.
+	// A live owner keeps the lock held, so a second acquire must fail.
 	state := daemonState{PID: os.Getpid(), StartedAt: time.Now().UTC(), Heartbeat: time.Now().UTC()}
 	writeStateFile(t, filepath.Join(dir, daemonStateFile), state)
 	first, err := acquireLock(dir)
@@ -106,6 +105,42 @@ func TestLockFailureLeavesVisibleError(t *testing.T) {
 	}
 	if got.Error.At.IsZero() || !strings.Contains(got.Error.Message, "already running") {
 		t.Fatalf("error record = %+v", got.Error)
+	}
+}
+
+func TestLockContentionPreservesLockFile(t *testing.T) {
+	dir := t.TempDir()
+	// A stale daemon record must not turn contention into a takeover. The
+	// flock, not daemon.json, decides who owns the reconciler.
+	writeStateFile(t, filepath.Join(dir, daemonStateFile), daemonState{
+		PID:       99999999,
+		StartedAt: time.Now().UTC().Add(-time.Hour),
+		Heartbeat: time.Now().UTC().Add(-time.Hour),
+	})
+	first, err := acquireLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	path := filepath.Join(dir, "beacon.lock")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := acquireLock(dir)
+	if err == nil {
+		_ = second.Close()
+		t.Fatal("second acquireLock succeeded while the lock was held")
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("error = %v, want a contention error", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("lock file removed on contention: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("lock file was replaced on contention")
 	}
 }
 
