@@ -44,6 +44,8 @@ type eventRelay struct {
 	mu      sync.Mutex
 	changed chan struct{}
 	reloads uint64
+	done    chan struct{}
+	once    sync.Once
 }
 
 // newEventRelay creates a relay with a fresh event channel and reload signal.
@@ -51,7 +53,14 @@ func newEventRelay() *eventRelay {
 	return &eventRelay{
 		out:     make(chan core.HarnessEvent, 64),
 		changed: make(chan struct{}),
+		done:    make(chan struct{}),
 	}
+}
+
+// stop wakes listeners blocked on the relay so they exit with the daemon. It
+// is safe to call more than once.
+func (r *eventRelay) stop() {
+	r.once.Do(func() { close(r.done) })
 }
 
 // reloadSignal returns the channel that fires on the next config reload.
@@ -148,6 +157,7 @@ func newLiveState(cfg config.Config, h core.AgentHarness) *liveState {
 func (cw *configWatcher) Run(ctx context.Context) {
 	ticker := time.NewTicker(cw.interval)
 	defer ticker.Stop()
+	defer cw.live.Load().relay.stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -171,12 +181,15 @@ func (cw *configWatcher) reload() bool {
 	if sum == cw.hash {
 		return false
 	}
-	cw.hash = sum
 	cfg, root, err := loadConfig(cw.path)
 	if err != nil || !cfg.Complete() {
 		slog.Warn("config watch: invalid config ignored", "path", cw.path)
 		return false
 	}
+	// Advance the hash only after the file parses and stays complete. An
+	// invalid edit leaves the previous hash in place so the next tick retries
+	// the file once the operator corrects it.
+	cw.hash = sum
 	previous := cw.live.Load()
 	if reflect.DeepEqual(previous.cfg, cfg) {
 		// Only workflow bytes changed, but resolution produced the same
@@ -394,7 +407,6 @@ type reloadableHarness struct {
 func (h *reloadableHarness) init() {
 	h.once.Do(func() {
 		h.relay = (*h.live).Load().relay
-		h.setForwarder(h.events)
 		h.setForwarder(h.current().Events())
 		go h.pump()
 	})
@@ -440,6 +452,12 @@ func (h *reloadableHarness) setForwarder(src <-chan core.HarnessEvent) {
 	}()
 }
 
+// stop cancels the active forwarder so it does not outlive the daemon. A reload
+// may still replace it later, so this does not latch like relay.stop.
+func (h *reloadableHarness) stop() {
+	h.setForwarder(nil)
+}
+
 // activeForwarder returns the forwarder currently reading a harness channel.
 func (h *reloadableHarness) activeForwarder() *eventForwarder {
 	h.mu.Lock()
@@ -458,7 +476,12 @@ func (h *reloadableHarness) pump() {
 			processed = count
 			continue
 		}
-		<-changed
+		select {
+		case <-changed:
+		case <-h.relay.done:
+			h.setForwarder(nil)
+			return
+		}
 	}
 }
 

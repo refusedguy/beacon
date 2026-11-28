@@ -1,7 +1,11 @@
 ---
 id: T-4de758ed
 title: Give daemon goroutines a stop path
-status: available
+<<<<<<< Updated upstream
+status: done
+=======
+status: done
+>>>>>>> Stashed changes
 scope:
     - cmd/beacon/config_watch.go
     - cmd/beacon/serve.go
@@ -10,6 +14,7 @@ scope:
 priority: 2
 kind: task
 require_review: llm
+status_reason: Delivered in PR 2899, commit 4f10866c
 ---
 
 Goal: make long-lived daemon goroutines stop when the daemon stops.

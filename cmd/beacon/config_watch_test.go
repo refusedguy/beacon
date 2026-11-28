@@ -239,6 +239,40 @@ func TestConfigReloadKeepsPreviousModelOnInvalidConfig(t *testing.T) {
 	}
 }
 
+// TestConfigReloadRetriesAfterInvalidEdit confirms an invalid edit does not
+// consume the watch hash. The next tick must still see the corrected file as a
+// change and apply it.
+func TestConfigReloadRetriesAfterInvalidEdit(t *testing.T) {
+	path := watchConfig(t, "http://127.0.0.1:1", "model-a", "worker-token")
+	cw, _ := newTestWatcher(t, path)
+	before := cw.live.Load()
+	validHash := cw.hash
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeWatchFile(t, path, "harness: [unclosed\n")
+	if cw.reload() {
+		t.Fatal("invalid YAML was applied")
+	}
+	if got := cw.live.Load(); got != before {
+		t.Fatal("invalid YAML replaced the live state")
+	}
+	if cw.hash != validHash {
+		t.Fatal("invalid edit advanced the watch hash; the corrected file would be ignored")
+	}
+
+	writeWatchFile(t, path, strings.Replace(string(body), "model: model-a", "model: model-b", 1))
+	if !cw.reload() {
+		t.Fatal("corrected config was not applied on the next tick")
+	}
+	if got := cw.live.Load().cfg.Harness.Model; got != "model-b" {
+		t.Fatalf("model after correction = %q, want model-b", got)
+	}
+}
+
 func captureWatchLogs(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer

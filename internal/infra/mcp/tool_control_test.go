@@ -68,6 +68,18 @@ func (s *controlStore) Save(_ context.Context, run *core.Run) error {
 	return nil
 }
 
+func (s *controlStore) FindByPR(_ context.Context, pr int) (*core.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, run := range s.runs {
+		if run.PRNumber == pr {
+			copy := *run
+			return &copy, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *controlStore) SetApproval(_ context.Context, id core.RunID, sha string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -857,6 +869,69 @@ func TestControlBatchRetryKeepsSucceededIDs(t *testing.T) {
 	if second.Results[1].ID != "missing" || second.Results[1].Status != "error" {
 		t.Fatalf("missing id result = %+v", second.Results[1])
 	}
+}
+
+// slowStopHarness parks Stop so a batch cannot finish until the test releases
+// it. Cleanup belongs in the background, so the batch must return first.
+type slowStopHarness struct {
+	core.AgentHarness
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *slowStopHarness) Stop(context.Context, string) error {
+	h.once.Do(func() { close(h.started) })
+	<-h.release
+	return nil
+}
+
+func TestControlBatchCancelWithSlowCleanups(t *testing.T) {
+	store := newControlStore()
+	const n = 5
+	ids := make([]any, 0, n)
+	for i := 0; i < n; i++ {
+		id := core.RunID(fmt.Sprintf("slow-%d", i))
+		run := core.NewRun(id, "T-1", time.Now())
+		run.SessionID = "sess-" + string(id)
+		store.add(run)
+		ids = append(ids, string(id))
+	}
+	h := &slowStopHarness{started: make(chan struct{}), release: make(chan struct{})}
+	cs := controlClient(t, Services{Control: &app.Control{Store: store, Harness: h}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	res, err := cs.CallTool(ctx, &msdk.CallToolParams{
+		Name:      "beacon_control",
+		Arguments: map[string]any{"action": "cancel", "run_ids": ids},
+	})
+	if err != nil {
+		t.Fatalf("batch cancel returned an error after cleanup started: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("batch cancel reported an error: %s", controlText(t, res))
+	}
+	got := parseControlBatch(t, res)
+	if len(got.Results) != n {
+		t.Fatalf("results = %+v, want %d", got.Results, n)
+	}
+	for _, item := range got.Results {
+		if item.Status != "ok" {
+			t.Fatalf("result = %+v, want ok", item)
+		}
+	}
+	for _, id := range ids {
+		if state := store.runs[core.RunID(id.(string))].State; state != core.RunClosed {
+			t.Fatalf("run %s = %s, want %s", id, state, core.RunClosed)
+		}
+	}
+	select {
+	case <-h.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background cleanup never started Stop")
+	}
+	close(h.release)
 }
 
 func TestControlSingleRepeatCancelStillReturnsOK(t *testing.T) {
