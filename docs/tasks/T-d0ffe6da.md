@@ -1,13 +1,14 @@
 ---
 id: T-d0ffe6da
 title: Update init test to namespaced permission actions
-status: available
+status: done
 scope:
     - cmd/beacon/init_test.go
     - cmd/beacon/init.go
 priority: 1
 kind: task
 require_review: llm
+status_reason: Test expectation updated in PR 2895 (beacon_beacon_task_create)
 ---
 
 Goal: make go test ./cmd/beacon pass on main again.
