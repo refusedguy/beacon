@@ -15,6 +15,12 @@ import (
 // sseFrame names the shared frame type for the OpenCode stream callback.
 type sseFrame = core.SSEFrame
 
+// Kinds of the core harness events this adapter emits.
+const (
+	eventKindIdle        = "idle"
+	eventKindSessionDead = "session_dead"
+)
+
 // WatchIdle starts the idle stream watcher in the background.
 func (h *Harness) WatchIdle(ctx context.Context) {
 	h.init()
@@ -83,7 +89,8 @@ func (h *Harness) streamIdle(ctx context.Context) error {
 		return fmt.Errorf("opencode event stream: status %d", resp.StatusCode)
 	}
 	return readSSE(resp.Body, func(f sseFrame) {
-		if f.Event != "session.idle" {
+		kind, ok := harnessEventKind(f)
+		if !ok {
 			return
 		}
 		session := sessionIDFromData(f.Data)
@@ -95,10 +102,43 @@ func (h *Harness) streamIdle(ctx context.Context) error {
 			return
 		}
 		select {
-		case h.events <- core.HarnessEvent{RunID: run, SessionID: session, Kind: "idle"}:
+		case h.events <- core.HarnessEvent{RunID: run, SessionID: session, Kind: kind}:
 		case <-ctx.Done():
 		}
 	})
+}
+
+// harnessEventKind maps a vendor SSE frame to a core harness event kind. A
+// frame with no kind carries no signal that Beacon acts on.
+func harnessEventKind(f sseFrame) (string, bool) {
+	switch f.Event {
+	case "session.idle":
+		return eventKindIdle, true
+	case "session.deleted", "session.canceled", "session.cancelled":
+		return eventKindSessionDead, true
+	case "session.execution.interrupted":
+		if interruptionEndsSession(f.Data) {
+			return eventKindSessionDead, true
+		}
+	}
+	return "", false
+}
+
+// interruptionEndsSession separates a user or server cancel from an interrupt
+// caused by a new prompt. A superseded or timed-out turn leaves the session
+// alive and must not close its run.
+func interruptionEndsSession(data string) bool {
+	var payload struct {
+		Reason     string `json:"reason"`
+		Properties struct {
+			Reason string `json:"reason"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &payload); err != nil {
+		return true
+	}
+	reason := firstNonEmpty(payload.Properties.Reason, payload.Reason)
+	return reason != "superseded" && reason != "inactivity"
 }
 
 // readSSE parses the OpenCode stream. Unlike the loopback stream, this stream
