@@ -18,6 +18,18 @@ const TIMELINE_TEXT = Object.freeze({
 const STATE_NAMES = Object.freeze({
   waiting_ci: "waiting CI", needs_rebase: "needs rebase", needs_agent_fix: "needs agent fix",
 })
+// GitHub names a matrix cell "<job> (<value>, ...)". A failed cell outside the
+// required set is advisory, so it must not read as a merge blocker.
+const MATRIX_CELL = /\s+\([^)]*\)\s*$/
+// A nightly job is skipped on ordinary pushes and PRs. That is the expected
+// outcome, not a missing gate.
+const SCHEDULE_ONLY = /\bnightly\b|\bscheduled\b|\bschedule\b/i
+const STALE_HEAD_ERROR = /\bupdate branch\b|\bstale PR head\b|\bnon-fast-forward\b|\bfetch first\b|\bstale info\b|\bgitobjectid\b/i
+const isOptionalCheck = (check) => MATRIX_CELL.test(str(check?.name))
+  || check?.required === false || check?.optional === true
+const isScheduleSkip = (check) => (SCHEDULE_ONLY.test(str(check?.name))
+  || check?.schedule_only === true || check?.scheduleOnly === true)
+  && str(check?.state).toLowerCase() === "skipped"
 
 export function timelineText(event = {}) {
   const kind = str(event.kind).toLowerCase()
@@ -366,7 +378,15 @@ const NEXT_STEPS = Object.freeze({
   merged: "",
 })
 
-export const nextStepLine = (run) => run ? (NEXT_STEPS[str(run.state).toLowerCase()] ?? "") : ""
+export const nextStepLine = (run) => {
+  if (!run) return ""
+  // A stale head makes the automatic branch update fail before any check can
+  // run. Name the refresh instead of repeating the generic fix hint.
+  if (STALE_HEAD_ERROR.test(str(run.reason))) {
+    return "Refresh the PR head, then retry or nudge the fixer"
+  }
+  return NEXT_STEPS[str(run.state).toLowerCase()] ?? ""
+}
 
 // Pure formatters see the same titles and reasons on every poll. One bounded
 // FIFO memo serves them both, so a long session cannot grow either cache.
@@ -405,6 +425,7 @@ export function truncate(value, width) {
 }
 
 const REASON_RULES = [
+  [/^unavailable:\s*update branch\b.*/i, "stale PR head"],
   [/^workspace:\s*conflict:\s*refusing to remove dirty worktree\b.*/i, "dirty worktree"],
   [/^workspace:\s*conflict:\s*/i, ""],
   [/^workspace:\s*/i, ""],
@@ -444,13 +465,16 @@ export function checkRow(check) {
   const failed = state === "failure" || state === "failed" || state === "error"
   const short = CHECK_BUCKETS[state] ?? ""
   const name = str(check?.name) || "check"
+  const optional = failed && isOptionalCheck(check)
+  const note = optional ? "not required" : isScheduleSkip(check) ? "expected"
+    : short && state !== "success" ? short : ""
   return {
-    marker: failed ? "✖" : state === "success" ? "✔" : "◐",
+    marker: optional ? "◐" : failed ? "✖" : state === "success" ? "✔" : "◐",
     markerSpace: true,
-    name: short && state !== "success" ? `${name} ${short}` : name,
+    name: note ? `${name} ${note}` : name,
     status: check?.durationSeconds ? clockDuration(check.durationSeconds) : "",
     statusColor: "muted",
-    color: failed ? "error" : "muted",
+    color: failed && !optional ? "error" : "muted",
     kind: "check",
   }
 }
@@ -458,9 +482,12 @@ export function checkRow(check) {
 export function checksSummary(checks = [], ciWallSeconds) {
   const list = Array.isArray(checks) ? checks : []
   if (!list.length) return ""
-  const buckets = { success: 0, failed: 0, skipped: 0, pending: 0 }
+  const buckets = { success: 0, failed: 0, skipped: 0, pending: 0, optional: 0, expected: 0 }
   for (const check of list) {
     const state = str(check?.state).toLowerCase()
+    const failed = state === "failure" || state === "failed" || state === "error"
+    if (failed && isOptionalCheck(check)) { buckets.optional += 1; continue }
+    if (isScheduleSkip(check)) { buckets.expected += 1; continue }
     const bucket = state === "success" ? "success" : CHECK_BUCKETS[state] ?? "pending"
     buckets[bucket] += 1
   }
@@ -469,7 +496,9 @@ export function checksSummary(checks = [], ciWallSeconds) {
   const parts = []
   if (buckets.failed) parts.push(`${buckets.failed} failed`)
   parts.push(`${buckets.success}/${list.length}`)
+  if (buckets.optional) parts.push(`${buckets.optional} not required`)
   if (buckets.skipped) parts.push(`${buckets.skipped} skipped`)
+  if (buckets.expected) parts.push(`${buckets.expected} expected (schedule-only)`)
   if (buckets.pending) parts.push(`${buckets.pending} pending`)
   // GitHub runs required checks in parallel, so their durations overlap. The
   // Go side measures the real span; the longest job is only a fallback.
