@@ -4,10 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
+)
+
+// Shared zero-length slices keep empty JSON collections non-null without an
+// allocation per snapshot field or queue item.
+var (
+	emptyRunEvents  = []RunEvent{}
+	emptyDecisions  = []Decision{}
+	emptyStringList = []string{}
 )
 
 // StatusStore is the run read side StatusService needs.
@@ -360,19 +369,35 @@ func failedCheckNames(raw string) []string {
 
 func nonNullStrings(values []string) []string {
 	if values == nil {
-		return []string{}
+		return emptyStringList
 	}
 	return values
 }
 
+// collectRunIDs returns the distinct non-empty run IDs in group order. The
+// first pass counts them into seen, so the result is allocated once at its
+// final size instead of growing through repeated appends. The second pass
+// clears each seen entry as it is emitted, keeping one map and stable order.
 func collectRunIDs(groups ...[]*core.Run) []string {
-	seen := make(map[string]bool)
-	var ids []string
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	seen := make(map[string]bool, total)
 	for _, group := range groups {
 		for _, run := range group {
 			id := string(run.ID)
-			if id != "" && !seen[id] {
+			if id != "" {
 				seen[id] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for _, group := range groups {
+		for _, run := range group {
+			id := string(run.ID)
+			if id != "" && seen[id] {
+				seen[id] = false
 				ids = append(ids, id)
 			}
 		}
@@ -380,11 +405,28 @@ func collectRunIDs(groups ...[]*core.Run) []string {
 	return ids
 }
 
+// groupHistory buckets events and decisions by run. A counting pass sizes each
+// bucket before it is filled, so a run with many rows allocates its backing
+// array once instead of growing one append at a time.
 func groupHistory(events []RunEvent, decisions []Decision) (map[string][]RunEvent, map[string][]Decision) {
-	timeline := make(map[string][]RunEvent)
-	histories := make(map[string][]Decision)
+	eventCounts := make(map[string]int, len(events))
+	for _, event := range events {
+		eventCounts[event.RunID]++
+	}
+	decisionCounts := make(map[string]int, len(decisions))
+	for _, decision := range decisions {
+		decisionCounts[decision.RunID]++
+	}
+	timeline := make(map[string][]RunEvent, len(eventCounts))
+	for id, n := range eventCounts {
+		timeline[id] = make([]RunEvent, 0, n)
+	}
 	for _, event := range events {
 		timeline[event.RunID] = append(timeline[event.RunID], event)
+	}
+	histories := make(map[string][]Decision, len(decisionCounts))
+	for id, n := range decisionCounts {
+		histories[id] = make([]Decision, 0, n)
 	}
 	for _, decision := range decisions {
 		histories[decision.RunID] = append(histories[decision.RunID], decision)
@@ -395,11 +437,11 @@ func groupHistory(events []RunEvent, decisions []Decision) (map[string][]RunEven
 func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories map[string][]Decision, now time.Time, repo ...string) RunSnapshot {
 	events := timeline[string(run.ID)]
 	if events == nil {
-		events = []RunEvent{}
+		events = emptyRunEvents
 	}
 	decisions := histories[string(run.ID)]
 	if decisions == nil {
-		decisions = []Decision{}
+		decisions = emptyDecisions
 	}
 	link := ""
 	if len(repo) > 0 {
@@ -429,7 +471,7 @@ func prLink(repo string, pr int) string {
 	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
 		return ""
 	}
-	return "https://github.com/" + owner + "/" + name + "/pull/" + fmt.Sprint(pr)
+	return "https://github.com/" + owner + "/" + name + "/pull/" + strconv.Itoa(pr)
 }
 
 // checkSnapshots maps stored checks to the UI contract without any SCM call.

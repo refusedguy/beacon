@@ -119,8 +119,7 @@ func makeMetrics(
 	m := Metrics{Skips: map[string]int{}, Blocked: map[string]int{}, LaunchSources: map[string]int{}}
 	merged := make(map[string]bool)
 	blocked := make(map[string]bool)
-	addRunMetrics(&m, active, recent, merged, blocked)
-	addLaunchMetrics(&m, active, recent)
+	addSnapshotMetrics(&m, active, recent, merged, blocked)
 	for _, events := range timeline {
 		for _, event := range events {
 			if event.Kind == "merged" {
@@ -178,10 +177,12 @@ func blockedReasonCategory(reason string) string {
 	}
 }
 
-// addRunMetrics folds the durations already computed for each run snapshot into
-// the totals. It never walks a timeline again, so each timeline is measured
-// exactly once by makeRunSnapshot.
-func addRunMetrics(m *Metrics, active, recent []RunSnapshot, merged, blocked map[string]bool) {
+// addSnapshotMetrics folds the durations already computed for each run snapshot
+// into the totals and counts each run by its launch source in one pass. It never
+// walks a timeline again, so each timeline is measured exactly once by
+// makeRunSnapshot. A run with no recorded source came from an automatic path and
+// counts as daemon.
+func addSnapshotMetrics(m *Metrics, active, recent []RunSnapshot, merged, blocked map[string]bool) {
 	for _, group := range [][]RunSnapshot{active, recent} {
 		for _, snap := range group {
 			m.CIWaitSeconds += snap.Durations.WaitingCI
@@ -197,24 +198,12 @@ func addRunMetrics(m *Metrics, active, recent []RunSnapshot, merged, blocked map
 				m.Blocked[blockedReasonCategory(snap.Reason)]++
 				m.BlockedCount++
 			}
-		}
-	}
-	m.ActiveCount = len(active)
-	m.RecentCount = len(recent)
-}
-
-// addLaunchMetrics counts runs by the path that started them. A run with no
-// recorded source came from an automatic path, so it counts as daemon.
-func addLaunchMetrics(m *Metrics, active, recent []RunSnapshot) {
-	if m.LaunchSources == nil {
-		m.LaunchSources = map[string]int{}
-	}
-	for _, group := range [][]RunSnapshot{active, recent} {
-		for _, snap := range group {
 			source := core.ParseLaunchSource(snap.LaunchSource)
 			m.LaunchSources[string(source)]++
 		}
 	}
+	m.ActiveCount = len(active)
+	m.RecentCount = len(recent)
 }
 
 func addDecisionMetrics(m *Metrics, histories map[string][]Decision, merged, blocked map[string]bool) {
