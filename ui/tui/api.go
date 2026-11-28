@@ -133,6 +133,17 @@ func (c *Client) endpoint() (string, error) {
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
+// statusAction names one command the operator can run after a failed request.
+func statusAction(status int) string {
+	if status >= http.StatusInternalServerError {
+		return "restart beacon serve"
+	}
+	if status == http.StatusNotFound {
+		return "restart beacon serve and check the daemon routes"
+	}
+	return "check beacon status and retry"
+}
+
 // do sends an HTTP request to the daemon and returns the response body and
 // status. A non-2xx status also returns an error. The body is still returned so
 // Control can read a structured refusal from the wire.
@@ -173,7 +184,12 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 		return nil, resp.StatusCode, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return data, resp.StatusCode, fmt.Errorf("tui: %s %s: status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
+		status := resp.StatusCode
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return data, status, fmt.Errorf("tui: %s %s: status %d: token rejected · restart beacon serve and copy the token from .beacon/connection.json", method, path, status)
+		}
+		return data, status, fmt.Errorf("tui: %s %s: status %d: %s · %s", method, path, status,
+			strings.TrimSpace(string(data)), statusAction(status))
 	}
 	return data, resp.StatusCode, nil
 }

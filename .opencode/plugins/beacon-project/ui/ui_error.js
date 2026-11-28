@@ -5,6 +5,10 @@ const CLI_NOISE = /--help|usage:|unknown (?:command|flag)|^(?:[\w.]*Error|Error)
 const FALLBACK = "beacon status temporarily unavailable"
 const MAX_CHARS = 120
 
+// Every stale banner carries this one command. The operator can check the
+// daemon without opening the config file or guessing a flag.
+export const STALE_ACTION = "retry: beacon status --snapshot"
+
 export function cleanErrorMessage(cause) {
   const raw = typeof cause === "string" ? cause
     : cause && typeof cause.message === "string" ? cause.message : String(cause)

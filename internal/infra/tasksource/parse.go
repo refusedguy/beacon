@@ -91,7 +91,7 @@ func (s CardStore) PatchStatus(ctx context.Context, id core.TaskID, status strin
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, []byte(updated), 0o644)
+	return writeCardAtomic(c.path, updated)
 }
 
 // stringList decodes YAML scalars and sequences into a string slice.
@@ -192,9 +192,14 @@ type epicFields struct {
 	Plan          []planSpec `yaml:"plan,omitempty"`
 }
 
-// taskFields holds the normalized fields parsed from a task body.
+// taskFields holds the normalized fields parsed from a card or an issue body.
+// Both decoders fill it through the same alias rules, so a field written in
+// frontmatter, in a fenced YAML block or on a flat line resolves the same way
+// in either source.
 type taskFields struct {
 	ID            string
+	Title         string
+	Status        string
 	Parent        string
 	Scope         []string
 	Depends       []string
@@ -202,6 +207,10 @@ type taskFields struct {
 	Kind          core.TaskKind
 	BaseBranch    string
 	RequireReview core.ReviewMode
+	Phase         string
+	SourceRef     string
+	WorkerAgent   string
+	WorkerPrompt  string
 	Plan          []core.ChildSpec
 }
 
@@ -345,28 +354,34 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 	return fields
 }
 
-// parseTaskFields decodes card text without the cache. It keeps field aliases
-// and scope conversion in one place so cached and fresh parses stay identical.
-func parseTaskFields(body, dir, depPrefix string) taskFields {
+// decodeSchema maps the shared wire shape onto normalized fields. Frontmatter
+// and fenced YAML both decode into cardSchema first, so this is their one
+// alias authority.
+func decodeSchema(yf cardSchema, dir string) taskFields {
 	var out taskFields
-	var yf cardSchema
-	lines, block, hasBlock := splitFieldLines(body)
-	if hasBlock {
-		if err := yaml.Unmarshal([]byte(block), &yf); err != nil {
-			slog.Warn("tasksource: malformed YAML field block", "error", err)
-		} else {
-			out.ID = core.FirstNonEmpty(strings.TrimSpace(yf.TaskID), strings.TrimSpace(yf.ID))
-			out.Parent = strings.TrimSpace(yf.Parent)
-			out.Scope = append(out.Scope, yf.combinedScope()...)
-			out.Depends = append(out.Depends, yf.Depends...)
-			out.Depends = append(out.Depends, yf.DependsOn...)
-			out.Priority = yf.Priority
-			out.Kind = normalizeKind(yf.Kind)
-			out.BaseBranch = strings.TrimSpace(yf.BaseBranch)
-			out.RequireReview = normalizeReview(yf.RequireReview)
-			out.Plan = childSpecs(yf.Plan, dir)
-		}
-	}
+	out.ID = core.FirstNonEmpty(strings.TrimSpace(yf.TaskID), strings.TrimSpace(yf.ID))
+	out.Title = strings.TrimSpace(yf.Title)
+	out.Status = strings.TrimSpace(yf.Status)
+	out.Parent = strings.TrimSpace(yf.Parent)
+	out.Scope = append(out.Scope, yf.combinedScope()...)
+	out.Depends = append(out.Depends, yf.Depends...)
+	out.Depends = append(out.Depends, yf.DependsOn...)
+	out.Priority = yf.Priority
+	out.Kind = normalizeKind(yf.Kind)
+	out.BaseBranch = strings.TrimSpace(yf.BaseBranch)
+	out.RequireReview = normalizeReview(yf.RequireReview)
+	out.Phase = strings.TrimSpace(yf.Phase)
+	out.SourceRef = strings.TrimSpace(yf.SourceRef)
+	out.WorkerAgent = strings.TrimSpace(yf.WorkerAgent)
+	out.WorkerPrompt = strings.TrimSpace(yf.WorkerPrompt)
+	out.Plan = childSpecs(yf.Plan, dir)
+	return out
+}
+
+// decodeAliases applies the flat-line aliases to fields already decoded from
+// YAML. Markdown cards and issue bodies call it with their own lines, so a
+// TaskID, ParentTask or Russian legacy key resolves the same way in both.
+func decodeAliases(lines []string, dir, depPrefix string, out *taskFields) {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		switch {
@@ -384,10 +399,18 @@ func parseTaskFields(body, dir, depPrefix string) taskFields {
 			out.BaseBranch = afterColon(line)
 		case strings.HasPrefix(line, "RequireReview:"):
 			out.RequireReview = normalizeReview(afterColon(line))
-		case strings.HasPrefix(line, "TaskID:"):
+		case strings.HasPrefix(line, "TaskID:"), strings.HasPrefix(line, "ID:"):
 			out.ID = afterColon(line)
+		case strings.HasPrefix(line, "Title:"):
+			out.Title = afterColon(line)
+		case strings.HasPrefix(line, "Status:"), strings.HasPrefix(line, "Статус:"):
+			out.Status = afterColon(line)
 		case strings.HasPrefix(line, "Parent:"), strings.HasPrefix(line, "ParentTask:"):
 			out.Parent = afterColon(line)
+		case strings.HasPrefix(line, "Фаза:"):
+			out.Phase = afterColon(line)
+		case strings.HasPrefix(line, "Ссылка:"):
+			out.SourceRef = afterColon(line)
 		}
 	}
 	out.Scope = unique(out.Scope)
@@ -397,6 +420,42 @@ func parseTaskFields(body, dir, depPrefix string) taskFields {
 			out.Depends[i] = normalizeDep(d, depPrefix)
 		}
 	}
+}
+
+// task converts normalized fields into a core.Task resolved against dir.
+// Callers still fill Body and SourceRef from the card itself.
+func (t taskFields) task(dir string) core.Task {
+	return core.Task{
+		ID:            core.TaskID(t.ID),
+		Title:         t.Title,
+		Status:        normalizeStatus(t.Status),
+		Parent:        core.TaskID(t.Parent),
+		Priority:      t.Priority,
+		Kind:          t.Kind,
+		BaseBranch:    t.BaseBranch,
+		RequireReview: t.RequireReview,
+		WorkerAgent:   t.WorkerAgent,
+		WorkerPrompt:  t.WorkerPrompt,
+		Plan:          t.Plan,
+		Scope:         t.Scopes(dir),
+		DependsOn:     t.Dependencies(),
+	}
+}
+
+// parseTaskFields decodes issue text without the cache. It keeps field aliases
+// and scope conversion in one place so cached and fresh parses stay identical.
+func parseTaskFields(body, dir, depPrefix string) taskFields {
+	var out taskFields
+	var yf cardSchema
+	lines, block, hasBlock := splitFieldLines(body)
+	if hasBlock {
+		if err := yaml.Unmarshal([]byte(block), &yf); err != nil {
+			slog.Warn("tasksource: malformed YAML field block", "error", err)
+		} else {
+			out = decodeSchema(yf, dir)
+		}
+	}
+	decodeAliases(lines, dir, depPrefix, &out)
 	return out
 }
 
