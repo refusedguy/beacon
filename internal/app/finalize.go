@@ -454,7 +454,9 @@ func (r *Reconciler) guardEpicReviewTask(ctx context.Context, epic core.Task, is
 }
 
 // maybeSpawnReviewer starts one LLM review session for an epic commit. The
-// reviewer approves the run through beacon_control when the change passes.
+// reviewer approves the run through beacon_control when the change passes. A
+// run row is persisted for the session so no live worker is invisible to the
+// slot accounting or the orphan sweep.
 func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs core.Observation) {
 	if r.Harness == nil || obs.HeadSHA == "" {
 		return
@@ -464,6 +466,14 @@ func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs 
 	if err != nil || !ok {
 		return
 	}
+	reviewID := core.RunID("review-" + string(run.ID))
+	if !r.reserveAgentSlot(ctx, reviewID) {
+		if releaseErr := r.Store.ReleaseDelivery(ctx, key); releaseErr != nil {
+			slog.Error("release reviewer delivery", "run", run.ID, "error", releaseErr)
+		}
+		return
+	}
+	defer r.releaseAgentSlot(ctx, reviewID)
 	task := core.Task{
 		ID:    core.TaskID("REVIEW-" + string(run.ID)),
 		Title: fmt.Sprintf("Review epic PR #%d", obs.PRNumber),
@@ -473,14 +483,30 @@ func (r *Reconciler) maybeSpawnReviewer(ctx context.Context, run *core.Run, obs 
 		obs.PRNumber, obs.HeadSHA, run.ID, obs.HeadSHA,
 	)
 	req := core.SpawnRequest{
-		Task: task, RunID: core.RunID("review-" + string(run.ID)),
+		Task: task, RunID: reviewID,
 		Prompt: prompt, ParentSessionID: run.ParentSessionID,
 	}
-	if _, err := r.Harness.Spawn(ctx, req); err != nil {
+	session, err := r.Harness.Spawn(ctx, req)
+	if err != nil {
 		if releaseErr := r.Store.ReleaseDelivery(ctx, key); releaseErr != nil {
 			slog.Error("release reviewer delivery", "run", run.ID, "error", releaseErr)
 		}
 		slog.Error("spawn epic reviewer", "run", run.ID, "error", err)
+		return
+	}
+	review := core.NewRun(reviewID, task.ID, time.Now().UTC())
+	review.MaxAttempts = r.maxAttempts()
+	review.ParentSessionID = run.ParentSessionID
+	review.SessionID = session.ID
+	review.HoldAgent()
+	if err := review.Apply(core.Event{Kind: core.EvStart, Reason: "epic review"}); err != nil {
+		slog.Error("reviewer start transition", "run", reviewID, "error", err)
+	}
+	if err := r.Store.Save(ctx, review); err != nil {
+		slog.Error("save epic reviewer", "run", reviewID, "error", err)
+		bestEffort("stop unsaved reviewer", func() error {
+			return r.Harness.Stop(ctx, session.ID)
+		}, "run", reviewID, "task", task.ID)
 	}
 }
 

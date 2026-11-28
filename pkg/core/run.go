@@ -157,8 +157,15 @@ type Run struct {
 	// includes check conclusions and conflict state, so a changed conclusion on
 	// the same SHA is not skipped as a duplicate. A restart rebuilds it on the
 	// next observation, so the value needs no column or migration.
-	ObservedIdentity  string
-	SessionID         string
+	ObservedIdentity string
+	SessionID        string
+	// AgentHeld reports whether a live agent session belongs to this run. It
+	// is set when a worker is spawned or woken and cleared once the session is
+	// confirmed gone. A run in waiting_ci keeps its slot while its session
+	// stays live. SessionLive names the same fact after the session; both flags
+	// move together so either caller can read the one it needs.
+	AgentHeld         bool
+	SessionLive       bool
 	ParentSessionID   string
 	AgentIdentity     string
 	LaunchSource      LaunchSource
@@ -267,6 +274,22 @@ func (r *Run) RecordLaunch(source LaunchSource, agent string) {
 	r.AgentIdentity = strings.TrimSpace(agent)
 }
 
+// HoldAgent marks the run as holding a live agent session.
+func (r *Run) HoldAgent() {
+	r.AgentHeld = true
+	r.SessionLive = true
+}
+
+// ReleaseAgent marks the run's session as gone, freeing its agent slot.
+func (r *Run) ReleaseAgent() {
+	r.AgentHeld = false
+	r.SessionLive = false
+}
+
+// HoldsAgent reports whether the run holds a live agent session. Either flag
+// is enough: an older row may carry only one of them.
+func (r *Run) HoldsAgent() bool { return r.AgentHeld || r.SessionLive }
+
 // RebaseBudgetExhausted reports whether the run has spent its rebase budget
 // under cap. The run's own transitions pass effectiveMax, while the reconciler
 // passes its smaller automatic-rebase cap. Keeping cap at the call site keeps
@@ -311,6 +334,7 @@ func (r *Run) Retry(reason string) error {
 // dispatch or reconcile, never the ones left by the run it replaces.
 func (r *Run) clearRetryResidue() {
 	r.SessionID = ""
+	r.ReleaseAgent()
 	r.WorkspacePath = ""
 	r.BlockedIncidentID = ""
 	r.ObservedSHA = ""
@@ -334,6 +358,7 @@ func (r *Run) ExternalFinalize(obs Observation) error {
 	if obs.HeadSHA != "" {
 		r.HeadSHA = obs.HeadSHA
 	}
+	r.ReleaseAgent()
 	r.UpdatedAt = time.Now().UTC()
 	return nil
 }
@@ -407,6 +432,13 @@ func (r *Run) Apply(e Event) error {
 	if e.Kind == EvUnblock {
 		r.BlockedIncidentID = ""
 	}
+	// Registering a PR means the worker finished its edit turn and handed the
+	// run to CI. Its session no longer occupies an agent slot. A wake uses a
+	// different event, so a woken run keeps its flag while it waits for the
+	// next check result.
+	if e.Kind == EvPRRegistered {
+		r.ReleaseAgent()
+	}
 	if e.HeadSHA != "" {
 		r.HeadSHA = e.HeadSHA
 	}
@@ -421,6 +453,9 @@ func (r *Run) Apply(e Event) error {
 		r.Reason = ""
 	}
 	r.State = next
+	if next.Terminal() {
+		r.ReleaseAgent()
+	}
 	r.UpdatedAt = time.Now().UTC()
 	return nil
 }

@@ -285,9 +285,6 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 // with kind. An idle nudge uses EvIdleNudge so the run stays in running state
 // while it spends the same bounded fix budget as a check failure.
 func (r *Reconciler) wakeWithEvent(ctx context.Context, run *core.Run, obs core.Observation, reason string, kind core.EventKind) error {
-	if !r.hasAgentSlot(ctx) {
-		return nil
-	}
 	if !run.CanWake() {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "fix attempts exhausted"}, core.Observation{}); err != nil {
 			return err
@@ -297,6 +294,10 @@ func (r *Reconciler) wakeWithEvent(ctx context.Context, run *core.Run, obs core.
 	if sameObservation(run, obs) {
 		return nil
 	}
+	if !r.reserveAgentSlot(ctx, run.ID) {
+		return nil
+	}
+	defer r.releaseAgentSlot(ctx, run.ID)
 	w := core.WakeContext{
 		RunID: run.ID, PRNumber: obs.PRNumber, HeadSHA: obs.HeadSHA,
 		Reason: reason, Excerpt: compact(obs.FailureExcerpt),
@@ -306,10 +307,44 @@ func (r *Reconciler) wakeWithEvent(ctx context.Context, run *core.Run, obs core.
 	if err := r.Harness.Wake(ctx, run.SessionID, w); err != nil {
 		return fmt.Errorf("wake: %w", err)
 	}
+	// The session is still live after a wake, even though the run may now move
+	// to waiting_ci. Keep its slot counted until the session is confirmed gone.
+	run.HoldAgent()
 	r.Decisions.logTransitionWake(ctx, run.ID, obs.PRNumber, "woke")
 	// The wake has been delivered. The run must not keep showing the old
 	// failure as its current reason.
 	return r.applyAndSave(ctx, run, core.Event{Kind: kind}, obs)
+}
+
+// wakeSlots is the richer slot policy used by wake and by injected spawns. It
+// replaces the plain availability check with an atomic check-and-reserve so two
+// forced reconciles cannot spend the same free slot. A port that implements
+// only Available keeps the legacy check.
+type wakeSlots interface {
+	AvailableFor(ctx context.Context, runID core.RunID) int
+	ReserveForWake(ctx context.Context, runID core.RunID) bool
+	ReleaseWake(ctx context.Context, runID core.RunID)
+}
+
+func (r *Reconciler) slotReserver() wakeSlots {
+	slots, _ := r.AgentSlots.(wakeSlots)
+	return slots
+}
+
+// reserveAgentSlot checks and reserves one slot for runID in one critical
+// section. A port without the reservation methods falls back to the shared
+// availability check.
+func (r *Reconciler) reserveAgentSlot(ctx context.Context, runID core.RunID) bool {
+	if slots := r.slotReserver(); slots != nil {
+		return slots.ReserveForWake(ctx, runID)
+	}
+	return r.hasAgentSlot(ctx)
+}
+
+func (r *Reconciler) releaseAgentSlot(ctx context.Context, runID core.RunID) {
+	if slots := r.slotReserver(); slots != nil {
+		slots.ReleaseWake(ctx, runID)
+	}
 }
 
 // hasAgentSlot delegates the wake decision to the injected AgentSlots policy.

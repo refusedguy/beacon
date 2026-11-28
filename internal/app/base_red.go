@@ -163,6 +163,10 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	}
 	attempt := in.Attempts + 1
 	id := core.RunID(fmt.Sprintf("fix-%s-%d", in.ID, attempt))
+	if !r.reserveAgentSlot(ctx, id) {
+		return nil
+	}
+	defer r.releaseAgentSlot(ctx, id)
 	task := core.Task{
 		ID:    core.TaskID(fmt.Sprintf("FIX-%s-%d", in.ID, attempt)),
 		Title: "Fix red base branch " + base.BaseBranch,
@@ -193,6 +197,7 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 		return err
 	}
 	run.SessionID = session.ID
+	run.HoldAgent()
 	if session.PR != 0 {
 		run.PRNumber = session.PR
 	}
@@ -200,6 +205,14 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 		return err
 	}
 	if err := r.Store.Save(ctx, run); err != nil {
+		// The fixer is live but has no row, so the orphan sweep cannot find it.
+		// Stop it and remove its workspace here instead.
+		bestEffort("stop unsaved fixer", func() error {
+			return r.Harness.Stop(ctx, session.ID)
+		}, "run", run.ID, "task", run.TaskID)
+		bestEffort("remove unsaved fixer workspace", func() error {
+			return r.Workspace.ForceRemove(ctx, ws)
+		}, "run", run.ID, "task", run.TaskID)
 		return err
 	}
 	in.FixerRunID = run.ID
