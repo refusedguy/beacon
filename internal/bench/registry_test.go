@@ -84,6 +84,7 @@ func TestRegistryPRBenchSpecs(t *testing.T) {
 		{"planner-select-injected-checker", plannerSelectLimiter},
 		{"dispatch-prompt", dispatchPromptLimiter},
 		{nameAssembly, limiterAssembly},
+		{"telegram-notify", telegramNotifyLimiter},
 	} {
 		spec, ok := byKey[tc.key]
 		if !ok {
@@ -105,6 +106,23 @@ func TestRegistryPRBenchSpecs(t *testing.T) {
 	}
 }
 
+// TestRegistryTelegramNotifyLimiter ties the registry limiter to the literal
+// the notify benchmark prints. The benchmark lives in another package, so it
+// cannot import the registry constant; this source check keeps one owner.
+func TestRegistryTelegramNotifyLimiter(t *testing.T) {
+	data, err := os.ReadFile("../infra/notify/telegram_test.go")
+	if err != nil {
+		t.Fatalf("read notify test source: %v", err)
+	}
+	source := string(data)
+	if !strings.Contains(source, strconv.Quote("telegram-notify")) {
+		t.Error("notify benchmark source has no telegram-notify canonical key")
+	}
+	if !strings.Contains(source, strconv.Quote(telegramNotifyLimiter)) {
+		t.Errorf("notify benchmark source has no limiter %q", telegramNotifyLimiter)
+	}
+}
+
 // harnessSources are the files that print canonical perf rows. Go benchmarks
 // print through printPerfRow; the Node harnesses, the workspace latency test,
 // the HTTP frame harness and the Go TUI view harness print the payload
@@ -116,6 +134,8 @@ var harnessSources = []string{
 	"ui_bench.js",
 	"run_watcher_bench.js",
 	"../infra/workspace/git_worktree_test.go",
+	"../infra/notify/telegram_bench_test.go",
+	"../infra/notify/telegram_test.go",
 	"../../cmd/beacon/http_test.go",
 	"../../ui/tui/model_test.go",
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -160,4 +161,7 @@ func BenchmarkTelegramNotify(b *testing.B) {
 	b.ReportMetric(float64(work), nameTelegramNotify+"-work")
 	b.ReportMetric(float64(errs), nameTelegramNotify+"-errs")
 	b.ReportMetric(1, limiterTelegramNotify)
+	// One canonical row for the whole run. The advisory comment reads this row
+	// under the telegram-notify registry key.
+	printTelegramPerfRow(os.Stdout, durations, work, errs)
 }
