@@ -1,7 +1,7 @@
 ---
 id: T-baadf270
 title: Bound terminal run retention and decision cache
-status: available
+status: dropped
 scope:
     - internal/infra/sqlite/store.go
     - internal/infra/sqlite/schema.go
@@ -10,6 +10,7 @@ scope:
 priority: 2
 kind: task
 require_review: llm
+status_reason: Superseded by atomic split cards that satisfy the 3-2-1200 scope cap; intent preserved in the new cards.
 ---
 
 Goal: keep state.db size predictable in a long-running daemon.

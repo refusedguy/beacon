@@ -1,7 +1,7 @@
 ---
 id: T-2fb4a7a8
 title: Auto-dispatch on daemon tick with config gate
-status: available
+status: dropped
 scope:
     - internal/infra/config/config.go
     - internal/app/dispatcher.go
@@ -11,6 +11,7 @@ scope:
 priority: 1
 kind: task
 require_review: llm
+status_reason: Superseded by atomic split cards that satisfy the 3-2-1200 scope cap; intent preserved in the new cards.
 ---
 
 Goal: let the daemon refill agent slots on each tick so an unattended operator does not need an external dispatch loop.

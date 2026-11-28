@@ -183,7 +183,7 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	run.WorkspacePath = ws.Path
 	run.Branch = ws.Branch
 	run.ParentSessionID = r.ParentSessionID
-	prompt := fixerPrompt(base, in, task, r.WorkerInstructions)
+	prompt := fixerPrompt(base, in, task, r.WorkerInstructions, run.ID, base.HeadSHA)
 	session, err := r.Harness.Spawn(ctx, core.SpawnRequest{
 		Task: task, Workspace: ws, RunID: run.ID, Prompt: prompt,
 		ParentSessionID: run.ParentSessionID, IsFixer: true,
@@ -260,11 +260,13 @@ func compactExcerpt(s string) string {
 	return core.TruncateExcerpt(s, excerptRuneLimit)
 }
 
-func fixerPrompt(base core.BaseStatus, in *core.BaseIncident, task core.Task, instructions string) string {
+func fixerPrompt(base core.BaseStatus, in *core.BaseIncident, task core.Task, instructions string, runID core.RunID, baseSHA string) string {
 	var b strings.Builder
 	prependWorkerInstructions(&b, instructions)
-	fmt.Fprintf(&b, "Base branch %s is red. Failed checks: %s\n%s\nFix the base branch and open a PR.",
-		base.BaseBranch, in.FailedChecksJSON, compactExcerpt(base.FailureExcerpt))
+	fmt.Fprintf(&b, "Run ID: %s\n", runID)
+	fmt.Fprintf(&b, "Base branch %s at SHA %s is red. Failed checks: %s\n%s\nFix the base branch and %s\n",
+		base.BaseBranch, baseSHA, strings.Join(failedNames(base.FailedChecks), ", "),
+		compactExcerpt(base.FailureExcerpt), core.OpenPRAndWatchInstruction)
 	appendWorkerPrompt(&b, task)
 	return b.String()
 }
