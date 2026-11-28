@@ -1,7 +1,7 @@
 // Control and dispatch actions from the panel. Every action reports its result
 // through ctx.ui.toast.show and then refreshes the snapshot. The RPC/CLI
 // transport is injected so the same code path is testable in plain Node.
-import { CONTROL_ACTIONS, errorMessage, str } from "./ui_model.js"
+import { CONTROL_ACTIONS, dispatchToast, errorMessage, str } from "./ui_model.js"
 import { isDispatching, setDispatching } from "./ui_alerts.js"
 import { refreshDispatchingViews } from "./ui_sidebar.js"
 import { dispatchRequestId } from "../protocol/body_hash.js"
@@ -121,9 +121,8 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
         const dispatched = source.dispatch(input)
         refreshed = refresh()
         const result = await dispatched
-        const count = Number(result?.started ?? result?.dispatched ?? result?.runs?.length ?? result?.startedRuns ?? 0)
-        show(Number.isFinite(count) && count > 0
-          ? `Dispatched ${count} task${count === 1 ? "" : "s"}` : "Nothing to dispatch right now · add a ready task card", "success")
+        const toast = dispatchToast(result)
+        show(toast.message, toast.variant)
         return result
       } catch (error) {
         show(`Dispatch failed: ${errorMessage(error)}`, "error")

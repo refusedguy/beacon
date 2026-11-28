@@ -16,7 +16,7 @@ function harness(overrides = {}) {
   let refreshes = 0
   const source = {
     control: async (input) => { controls.push(input); return { ok: true, ...(overrides.controlResult ?? {}) } },
-    dispatch: async (input) => { dispatches.push(input); return { started: 1 } },
+    dispatch: async (input) => { dispatches.push(input); return overrides.dispatchResult ?? { started: 1 } },
   }
   const ctx = {
     ui: {
@@ -164,7 +164,43 @@ test("Dispatch starts one task, toasts the result and refreshes", async () => {
   await h.invoke("dispatch")
   assert.deepEqual(h.dispatches, [{ n: 1 }])
   assert.equal(h.toasts[0].message, "Dispatched 1 task")
+  assert.equal(h.toasts[0].variant, "success")
   assert.equal(h.refreshes, 1)
+})
+
+test("a partial dispatch reports skips, failures and the first reason", async () => {
+  const h = harness({ dispatchResult: {
+    ok: true,
+    runs: [{ id: "run-1" }, { id: "run-2" }],
+    skipped: [{ task_id: "T-2", code: "scope_overlap", reason: "scope overlap" }],
+    failures: [{ TaskID: "T-3", Err: "worktree create failed" }],
+  } })
+  await h.invoke("dispatch")
+  assert.equal(h.toasts.length, 1)
+  assert.match(h.toasts[0].message, /Dispatched 2 tasks/)
+  assert.match(h.toasts[0].message, /1 skipped/)
+  assert.match(h.toasts[0].message, /1 failed/)
+  assert.match(h.toasts[0].message, /worktree create failed/)
+  assert.doesNotMatch(h.toasts[0].message, /scope overlap/, "only the first reason is shown")
+  assert.equal(h.toasts[0].variant, "error", "a failed worker is an error even when ok is true")
+})
+
+test("a dispatch with only skips reports the skip count and reason", async () => {
+  const h = harness({ dispatchResult: {
+    started: 0,
+    Skipped: [{ task_id: "T-2", reason: "no agent slot free" }],
+  } })
+  await h.invoke("dispatch")
+  assert.match(h.toasts[0].message, /1 skipped/)
+  assert.match(h.toasts[0].message, /no agent slot free/)
+  assert.equal(h.toasts[0].variant, "warning")
+})
+
+test("an ok false dispatch with no arrays reports the refusal reason", async () => {
+  const h = harness({ dispatchResult: { ok: false, reason: "dispatcher is not ready" } })
+  await h.invoke("dispatch")
+  assert.match(h.toasts[0].message, /dispatcher is not ready/)
+  assert.equal(h.toasts[0].variant, "error")
 })
 
 test("the TUI dispatch id uses the same FNV hash as the RPC request id", () => {
