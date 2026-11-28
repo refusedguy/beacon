@@ -2,7 +2,7 @@
 id: T-4de758ed
 title: Give daemon goroutines a stop path
 <<<<<<< Updated upstream
-status: in_progress
+status: done
 =======
 status: done
 >>>>>>> Stashed changes
@@ -14,6 +14,7 @@ scope:
 priority: 2
 kind: task
 require_review: llm
+status_reason: Delivered in PR 2899, commit 4f10866c
 ---
 
 Goal: make long-lived daemon goroutines stop when the daemon stops.

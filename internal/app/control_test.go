@@ -227,6 +227,57 @@ func TestParallelCancelsAllSucceed(t *testing.T) {
 	}
 }
 
+// blockingHarness parks Stop so a test can tell whether Cancel waited for it.
+type blockingHarness struct {
+	*fakeHarness
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *blockingHarness) Stop(context.Context, string) error {
+	h.once.Do(func() { close(h.started) })
+	<-h.release
+	return nil
+}
+
+func TestCancelReturnsBeforeSlowStopFinishes(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := core.NewRun("r-slow-stop", "T-1", time.Now().UTC())
+	run.SessionID = "sess-slow"
+	run.WorkspacePath = "/ws/T-1"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
+	}
+	h := &blockingHarness{
+		fakeHarness: &fakeHarness{},
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	c := &Control{Store: store, Harness: h, Workspace: &fakeWorkspace{}}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Cancel(ctx, "r-slow-stop") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf(`c.Cancel(ctx, "r-slow-stop"): %v`, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Cancel waited for the slow Stop")
+	}
+	if got := store.runs["r-slow-stop"].State; got != core.RunClosed {
+		t.Fatalf("state = %s, want %s", got, core.RunClosed)
+	}
+	select {
+	case <-h.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background cleanup never started Stop")
+	}
+	close(h.release)
+}
+
 func TestRetrySignalsReconciler(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()
