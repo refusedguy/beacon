@@ -133,16 +133,23 @@ func permission(action, effect string) Permission {
 	return Permission{Action: action, Resource: "*", Effect: effect}
 }
 
-// MergePermissions drops every entry owned by the catalog, then prepends a
-// fresh ordered set. Entries the catalog does not own keep their value.
-func MergePermissions(value any, want []Permission) []any {
+// OwnedActions returns the action names owned by the generated permission
+// writer. It includes the doubled prefix older generators emitted, so both the
+// library merge and cmd/beacon-gen drop the same stale entries. Keeping the
+// rule here gives the two writers one owner.
+func OwnedActions(want []Permission) map[string]bool {
 	owned := make(map[string]bool, len(want)*2)
 	for _, p := range want {
 		owned[p.Action] = true
-		// Older generators prefixed catalog names a second time. Drop those
-		// stale entries as well so a rewrite converges on the current names.
 		owned["beacon_"+p.Action] = true
 	}
+	return owned
+}
+
+// MergePermissions drops every entry owned by the catalog, then prepends a
+// fresh ordered set. Entries the catalog does not own keep their value.
+func MergePermissions(value any, want []Permission) []any {
+	owned := OwnedActions(want)
 	out := make([]any, 0, len(want))
 	for _, p := range want {
 		out = append(out, p)
