@@ -9,6 +9,44 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// idleHead is the observation identity used until a PR is registered. A run
+// without a PR has no head SHA, so one stable token stands in for its head.
+func idleHead(run *core.Run) string {
+	if run.HeadSHA != "" {
+		return run.HeadSHA
+	}
+	return "idle"
+}
+
+// idleNudgeKey binds the claim to one run and one observed head. The claim
+// survives later idle turns on that head, so the same instruction is delivered
+// once instead of once per turn.
+func idleNudgeKey(run *core.Run) string {
+	return fmt.Sprintf("idle-nudge:%s:%s", run.ID, idleHead(run))
+}
+
+// idleObservation gives the shared wake guards an identity for an idle turn.
+func idleObservation(run *core.Run) core.Observation {
+	return core.Observation{
+		HeadSHA: idleHead(run),
+		BaseSHA: run.ObservedBaseSHA,
+		FailureExcerpt: fmt.Sprintf(
+			"You finished a turn but no PR is open for branch %s. Push your changes, %s",
+			run.Branch, core.OpenPRAndWatchInstruction),
+	}
+}
+
+// releaseIdleNudge drops the claim for a run whose idle turn has ended. A
+// state change or a wake failure must not leave a claim that blocks later work.
+func (r *Reconciler) releaseIdleNudge(ctx context.Context, run *core.Run) {
+	if r.Store == nil || run == nil {
+		return
+	}
+	if err := r.Store.ReleaseDelivery(ctx, idleNudgeKey(run)); err != nil {
+		logStep("release idle nudge key", run, err)
+	}
+}
+
 // HandleHarnessEvent attaches a PR by branch name when an agent finishes a turn.
 func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEvent) {
 	if ev.Kind != "idle" || ev.RunID == "" {
@@ -19,7 +57,11 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 		slog.Error("idle run lookup", "error", err)
 		return
 	}
-	if run == nil || run.State != core.RunRunning || run.PRNumber != 0 {
+	if run == nil {
+		return
+	}
+	if run.State != core.RunRunning || run.PRNumber != 0 {
+		r.releaseIdleNudge(ctx, run)
 		return
 	}
 	bound, bindErr := r.bindOpenPR(ctx, run)
@@ -35,31 +77,42 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 		return
 	}
 	if changed {
-		key := "idle-nudge:" + string(run.ID)
-		ok, err := r.Store.ClaimDelivery(ctx, key)
-		if err != nil {
-			logStep("idle nudge key", run, err)
-			return
-		}
-		if ok {
-			w := core.WakeContext{
-				RunID: run.ID, Reason: "idle without PR", Branch: run.Branch,
-				Workspace: run.WorkspacePath,
-				Excerpt:   fmt.Sprintf("You finished a turn but no PR is open for branch %s. Push your changes, %s", run.Branch, core.OpenPRAndWatchInstruction),
-			}
-			wakeErr := r.Harness.Wake(ctx, run.SessionID, w)
-			// The claim guards one idle event, not the run's lifetime. Release it
-			// so a later idle turn can nudge again instead of blocking the run.
-			if err := r.Store.ReleaseDelivery(ctx, key); err != nil {
-				logStep("release idle nudge key", run, err)
-			}
-			if wakeErr != nil {
-				logStep("idle nudge", run, wakeErr)
-			}
-			return
-		}
+		r.nudgeIdleRun(ctx, run)
+		return
 	}
-	if err := run.Apply(core.Event{Kind: core.EvBlock, Reason: "idle without PR or changes"}); err != nil {
+	r.blockIdle(ctx, run, "idle without PR or changes")
+}
+
+// nudgeIdleRun delivers one no-PR instruction per head. The claim stays in
+// place after delivery, so a second idle turn blocks instead of waking again.
+func (r *Reconciler) nudgeIdleRun(ctx context.Context, run *core.Run) {
+	key := idleNudgeKey(run)
+	ok, err := r.Store.ClaimDelivery(ctx, key)
+	if err != nil {
+		logStep("idle nudge key", run, err)
+		return
+	}
+	if !ok {
+		r.blockIdle(ctx, run, "idle without PR: nudge already delivered")
+		return
+	}
+	wakeErr := r.wakeWithEvent(ctx, run, idleObservation(run), "idle without PR", core.EvIdleNudge)
+	if wakeErr != nil {
+		logStep("idle nudge", run, wakeErr)
+		if err := r.Store.ReleaseDelivery(ctx, key); err != nil {
+			logStep("release idle nudge key", run, err)
+		}
+		return
+	}
+	if run.State != core.RunRunning {
+		r.releaseIdleNudge(ctx, run)
+	}
+}
+
+// blockIdle ends an idle loop with a reason the operator can see. The claim
+// goes with it because the run no longer occupies the state that earned it.
+func (r *Reconciler) blockIdle(ctx context.Context, run *core.Run, reason string) {
+	if err := run.Apply(core.Event{Kind: core.EvBlock, Reason: reason}); err != nil {
 		logStep("idle block transition", run, err)
 		return
 	}
@@ -67,7 +120,8 @@ func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEven
 		logStep("idle block", run, err)
 		return
 	}
-	if err := r.notify(run, "idle without PR", "agent finished without opening a PR"); err != nil {
+	r.releaseIdleNudge(ctx, run)
+	if err := r.notify(run, "idle without PR", reason); err != nil {
 		logStep("idle block notify", run, err)
 	}
 }
@@ -96,6 +150,7 @@ func (r *Reconciler) bindOpenPR(ctx context.Context, run *core.Run) (bool, error
 	if err := r.Store.Save(ctx, run); err != nil {
 		return false, err
 	}
+	r.releaseIdleNudge(ctx, run)
 	r.signal(pr)
 	return true, nil
 }
@@ -141,6 +196,7 @@ func (r *Reconciler) closeOrphan(ctx context.Context, run *core.Run) {
 		slog.Error("orphan close save", "run", run.ID, "error", err)
 		return
 	}
+	r.releaseIdleNudge(ctx, run)
 	r.notifyParent(ctx, run, run.PRNumber, reason)
 	_ = r.notify(run, "orphan run closed", reason)
 	bestEffort("orphan cleanup", func() error {

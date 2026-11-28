@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -472,6 +473,11 @@ func postControlJSON(ctx context.Context, info *connectionInfo, body []byte, cli
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		var refusal core.WireControlResult
+		if json.Unmarshal(body, &refusal) == nil && refusal.Reason != "" {
+			return fmt.Errorf("beacon API status %d: %s", resp.StatusCode, refusal.Reason)
+		}
 		return fmt.Errorf("beacon API status %d", resp.StatusCode)
 	}
 	return nil
