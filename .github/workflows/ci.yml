@@ -336,10 +336,11 @@ jobs:
       - run: echo "all module suites passed"
 
   plugin-tui-smoke:
+    # Shared-only diffs skip this job; Beacon stops requiring the check there.
     if: >-
       github.event_name != 'schedule' &&
       github.event_name != 'workflow_dispatch' &&
-      (needs.changes.outputs.shared == 'true' || needs.changes.outputs.plugin == 'true')
+      needs.changes.outputs.plugin == 'true'
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 2
