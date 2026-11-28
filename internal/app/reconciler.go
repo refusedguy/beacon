@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -13,6 +14,11 @@ import (
 // defaultOrphanTimeout is how long a running run without a PR may go stale
 // before its worker session is checked for liveness.
 const defaultOrphanTimeout = 90 * time.Second
+
+// defaultWatchdogAge bounds a watched state whose age is absent from the
+// injected settings. Alerts stay off until WatchdogEnabled is set, so this
+// fallback never changes a daemon that has not opted in.
+const defaultWatchdogAge = 30 * time.Minute
 
 // DefaultOrphanTimeout exposes the built-in fallback to the composition root.
 // A configured timeout and the reconciler's own default then share one value.
@@ -82,6 +88,16 @@ type Promoter interface {
 	PromotePending(ctx context.Context) ([]*core.Run, error)
 }
 
+// DispatchPort refills free agent slots after promotion. Available reports
+// the current slot budget and Dispatch starts up to that many ready cards.
+// The concrete Dispatcher implements the port, so manual and automatic intake
+// share its conflict guards and its dispatch_open brake. A test can supply a
+// fake without building a dispatcher.
+type DispatchPort interface {
+	Available(ctx context.Context) int
+	Dispatch(ctx context.Context, n int) (DispatchResult, error)
+}
+
 // ReconcilerConfig holds the settings the reconciler reads at construction.
 // The composition root copies them from config.Config, so the service never
 // receives unrelated configuration.
@@ -99,6 +115,19 @@ type ReconcilerConfig struct {
 	AutoRebase         bool
 	MaxAutoRebases     int
 	RebaseCap          func() int
+
+	// AutoDispatchEnabled, AutoDispatchBatchSize and DispatchOpen are the
+	// reconciler's copy of the auto_dispatch config. A zero batch size fills
+	// every free slot. The composition root sets DispatchOpen from the config
+	// default, so a dispatcher built without it keeps intake frozen.
+	AutoDispatchEnabled   bool
+	AutoDispatchBatchSize int
+	DispatchOpen          bool
+
+	// WatchdogEnabled and WatchdogAges are the reconciler's copy of the
+	// watchdog config. Ages keyed by run state replace defaultWatchdogAge.
+	WatchdogEnabled bool
+	WatchdogAges    map[core.RunState]time.Duration
 }
 
 // Reconciler observes pull requests, applies merge policy to their runs and
@@ -128,6 +157,21 @@ type Reconciler struct {
 	MaxAutoRebases     int
 	RebaseCap          func() int
 	Decisions          DecisionLogger
+
+	// Dispatch is the intake port used after promotion on each tick. The
+	// flags below are not hot reloaded: the composition root copies them from
+	// config once when it builds the reconciler.
+	Dispatch              DispatchPort
+	AutoDispatchEnabled   bool
+	AutoDispatchBatchSize int
+	DispatchOpen          bool
+	WatchdogEnabled       bool
+	WatchdogAges          map[core.RunState]time.Duration
+
+	// stateAgeSeen remembers the last state observed for each active run so
+	// checkStateAges can release a delivery claim when the run leaves it.
+	stateAgeMu   sync.Mutex
+	stateAgeSeen map[core.RunID]core.RunState
 }
 
 // Reconcile observes pr once, evaluates the merge policy and applies the
@@ -376,6 +420,155 @@ func (r *Reconciler) hasAgentSlot(ctx context.Context) bool {
 	return slots.Available(ctx) > 0
 }
 
+// autoDispatch refills the slots promotion left free. A positive batch size
+// caps the tick; zero fills every free slot. The enabled and dispatch_open
+// gates live in Run so a brake also stops a fake port in tests.
+func (r *Reconciler) autoDispatch(ctx context.Context) {
+	if r.Dispatch == nil {
+		return
+	}
+	budget := r.Dispatch.Available(ctx)
+	if r.AutoDispatchBatchSize > 0 && r.AutoDispatchBatchSize < budget {
+		budget = r.AutoDispatchBatchSize
+	}
+	if budget <= 0 {
+		return
+	}
+	result, err := r.Dispatch.Dispatch(ctx, budget)
+	if err != nil {
+		slog.Error("auto dispatch", "error", err)
+		return
+	}
+	r.Decisions.Record(ctx, Decision{
+		CycleID: cycleID(ctx),
+		Kind:    "dispatch.auto",
+		Fields: map[string]any{
+			"budget":  budget,
+			"started": len(result.Runs),
+			"skipped": len(result.Skipped),
+		},
+	})
+}
+
+// watchdogDeliveryKey claims one age alert per run and state. A release when
+// the run leaves the state lets the same run alert again on a later stall.
+func watchdogDeliveryKey(runID core.RunID, state core.RunState) string {
+	return fmt.Sprintf("state-age:%s:%s", runID, state)
+}
+
+// watchdogAge reports the limit for a watched state. The four watched states
+// are the ones observations can keep fresh without progress; every other
+// state is left to its own transition rules.
+func (r *Reconciler) watchdogAge(state core.RunState) (time.Duration, bool) {
+	switch state {
+	case core.RunWaitingCI, core.RunNeedsRebase, core.RunNeedsAgentFix, core.RunBlocked:
+	default:
+		return 0, false
+	}
+	if age, ok := r.WatchdogAges[state]; ok && age > 0 {
+		return age, true
+	}
+	return defaultWatchdogAge, true
+}
+
+// checkStateAges alerts once for each active run that has held a watched state
+// past its age. Time in state uses UpdatedAt, the only timestamp a run carries.
+// A claimed key blocks later ticks until the run leaves the state or its send
+// fails.
+func (r *Reconciler) checkStateAges(ctx context.Context, runs []*core.Run) {
+	if !r.WatchdogEnabled || r.Store == nil {
+		return
+	}
+	current := make(map[core.RunID]core.RunState, len(runs))
+	for _, run := range runs {
+		if run != nil && !run.State.Terminal() {
+			current[run.ID] = run.State
+		}
+	}
+
+	r.stateAgeMu.Lock()
+	if r.stateAgeSeen == nil {
+		r.stateAgeSeen = make(map[core.RunID]core.RunState, len(current))
+	}
+	for id, prior := range r.stateAgeSeen {
+		if current[id] != prior {
+			r.releaseWatchdogClaim(ctx, id, prior)
+			delete(r.stateAgeSeen, id)
+		}
+	}
+	for id, state := range current {
+		r.stateAgeSeen[id] = state
+	}
+	r.stateAgeMu.Unlock()
+
+	for _, run := range runs {
+		if run != nil && !run.State.Terminal() {
+			r.checkOneStateAge(ctx, run)
+		}
+	}
+}
+
+func (r *Reconciler) checkOneStateAge(ctx context.Context, run *core.Run) {
+	limit, watched := r.watchdogAge(run.State)
+	if !watched {
+		return
+	}
+	age := time.Since(run.UpdatedAt)
+	if age <= limit {
+		return
+	}
+	key := watchdogDeliveryKey(run.ID, run.State)
+	claimed, err := r.Store.ClaimDelivery(ctx, key)
+	if err != nil {
+		slog.Error("claim state age alert", "run", run.ID, "state", run.State, "error", err)
+		return
+	}
+	if !claimed {
+		return
+	}
+	body := fmt.Sprintf("run %s task %s has been in %s for %s (limit %s); last reason: %s",
+		run.ID, run.TaskID, run.State, age.Round(time.Second), limit, run.Reason)
+	if err := r.notifyStateAge(ctx, run, body); err != nil {
+		r.releaseWatchdogClaim(ctx, run.ID, run.State)
+		return
+	}
+	r.Decisions.Record(ctx, Decision{
+		CycleID:  cycleID(ctx),
+		Kind:     "watchdog.state_age",
+		RunID:    string(run.ID),
+		TaskID:   string(run.TaskID),
+		PRNumber: run.PRNumber,
+		Action:   string(run.State),
+		Reason:   run.Reason,
+		Fields: map[string]any{
+			"state": string(run.State),
+			"age":   age.Round(time.Second).String(),
+			"limit": limit.String(),
+		},
+	})
+}
+
+// notifyStateAge sends the operator notice. A nil notifier still consumes the
+// claim, so enabling the watchdog without one does not repeat quiet alerts.
+func (r *Reconciler) notifyStateAge(ctx context.Context, run *core.Run, body string) error {
+	if r.Notifier == nil {
+		return nil
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, operatorNotifyTimeout)
+	defer cancel()
+	return r.Notifier.Notify(sendCtx, core.Notification{
+		RunID:   run.ID,
+		Subject: "stalled in " + string(run.State),
+		Body:    compact(body),
+	})
+}
+
+func (r *Reconciler) releaseWatchdogClaim(ctx context.Context, id core.RunID, state core.RunState) {
+	if err := r.Store.ReleaseDelivery(ctx, watchdogDeliveryKey(id, state)); err != nil {
+		slog.Error("release state age alert", "run", id, "state", state, "error", err)
+	}
+}
+
 // Run drains change events and polls. One failing PR never stops the loop.
 func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 	ticker := time.NewTicker(r.interval())
@@ -420,6 +613,7 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 				slog.Error("list runs", "error", err)
 				continue
 			}
+			r.checkStateAges(tickCtx, runs)
 			r.reconcileOrphanRunning(tickCtx, runs)
 			for _, run := range runs {
 				if run.PRNumber > 0 {
@@ -430,6 +624,9 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 				if _, err := r.Promoter.PromotePending(tickCtx); err != nil {
 					slog.Error("promote pending", "error", err)
 				}
+			}
+			if r.AutoDispatchEnabled && r.DispatchOpen {
+				r.autoDispatch(tickCtx)
 			}
 		}
 	}

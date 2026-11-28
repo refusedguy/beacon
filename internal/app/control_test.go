@@ -713,3 +713,192 @@ func BenchmarkControlConcurrentApprove(b *testing.B) {
 	p95 := all[len(all)*95/100]
 	b.ReportMetric(float64(p95.Microseconds()), "p95-us")
 }
+
+// casFakeStore is a fakeStore with version-checked saves. Get returns a
+// defensive copy so a caller cannot change the stored version before the save.
+type casFakeStore struct {
+	*fakeStore
+}
+
+func (s *casFakeStore) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
+	run, err := s.fakeStore.Get(ctx, id)
+	if err != nil || run == nil {
+		return run, err
+	}
+	copy := *run
+	return &copy, nil
+}
+
+func (s *casFakeStore) SaveCAS(_ context.Context, r *core.Run, expectedAt int64, expectedSHA string) error {
+	s.fakeStore.mu.Lock()
+	defer s.fakeStore.mu.Unlock()
+	stored, ok := s.fakeStore.runs[r.ID]
+	if !ok {
+		return core.Errorf(core.CodeNotFound, "run %s no longer exists", r.ID)
+	}
+	if stored.UpdatedAt.UnixNano() != expectedAt || stored.HeadSHA != expectedSHA {
+		return core.Errorf(core.CodeConflict, "run %s changed since it was read", r.ID)
+	}
+	copy := *r
+	s.fakeStore.runs[r.ID] = &copy
+	return nil
+}
+
+// gatedCASStore holds every caller's first read until two have happened, so
+// concurrent control calls decide from the same version before either saves.
+type gatedCASStore struct {
+	*casFakeStore
+	bothRead chan struct{}
+	mu       sync.Mutex
+	reads    int
+}
+
+func (s *gatedCASStore) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
+	run, err := s.casFakeStore.Get(ctx, id)
+	s.mu.Lock()
+	s.reads++
+	if s.reads == 2 {
+		close(s.bothRead)
+	}
+	s.mu.Unlock()
+	<-s.bothRead
+	return run, err
+}
+
+func TestConcurrentControlCallsDoNotOverwriteOneAnother(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeStore()
+	run := core.NewRun("r-concurrent", "T-1", time.Now().UTC())
+	run.State = core.RunBlocked
+	if err := base.Save(ctx, run); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	store := &gatedCASStore{
+		casFakeStore: &casFakeStore{fakeStore: base},
+		bothRead:     make(chan struct{}),
+	}
+	// Separate Control instances share a store but not a write mutex, as a
+	// CLI call and a daemon tick do.
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- (&Control{Store: store}).Unblock(ctx, "r-concurrent")
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	var applied, refused int
+	for err := range errs {
+		switch {
+		case err == nil:
+			applied++
+		case core.CodeOf(err) == core.CodeInvalidTransition:
+			refused++
+		default:
+			t.Fatalf("unblock = %v, want nil or invalid transition", err)
+		}
+	}
+	if applied != 1 || refused != 1 {
+		t.Fatalf("applied=%d refused=%d, want 1/1", applied, refused)
+	}
+	got, err := store.Get(ctx, "r-concurrent")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != core.RunWaitingCI || got.Reason != "unblocked by operator" {
+		t.Fatalf("run = %+v, want the single winning unblock", got)
+	}
+}
+
+// racingCASStore writes a newer state once, right after the control call has
+// read its version. That stands in for a daemon tick landing mid-control-call.
+type racingCASStore struct {
+	*casFakeStore
+	once sync.Once
+}
+
+func (s *racingCASStore) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
+	run, err := s.casFakeStore.Get(ctx, id)
+	s.once.Do(func() {
+		newer := *run
+		newer.State = core.RunRunning
+		newer.HeadSHA = "sha-new"
+		newer.Reason = "daemon tick"
+		newer.UpdatedAt = newer.UpdatedAt.Add(time.Second)
+		if err := s.fakeStore.Save(ctx, &newer); err != nil {
+			panic(err)
+		}
+	})
+	return run, err
+}
+
+func TestStaleControlWriteKeepsNewerState(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeStore()
+	run := core.NewRun("r-newer", "T-1", time.Now().UTC())
+	run.State = core.RunBlocked
+	run.HeadSHA = "sha-old"
+	run.Reason = "incident"
+	if err := base.Save(ctx, run); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	store := &racingCASStore{casFakeStore: &casFakeStore{fakeStore: base}}
+	c := &Control{Store: store}
+	err := c.Unblock(ctx, "r-newer")
+	if core.CodeOf(err) != core.CodeInvalidTransition {
+		t.Fatalf("error = %v, want invalid transition after the newer state was read", err)
+	}
+	got, err := store.Get(ctx, "r-newer")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != core.RunRunning || got.HeadSHA != "sha-new" || got.Reason != "daemon tick" {
+		t.Fatalf("run = %+v, want the newer daemon state", got)
+	}
+}
+
+// alwaysStaleCASStore refuses every version check, so a control write cannot
+// succeed even after retrying.
+type alwaysStaleCASStore struct {
+	*casFakeStore
+	attempts int
+}
+
+func (s *alwaysStaleCASStore) SaveCAS(ctx context.Context, r *core.Run, _ int64, _ string) error {
+	s.attempts++
+	// Move the stored version forward so every conflict reads as a stale write.
+	stored, err := s.fakeStore.Get(ctx, r.ID)
+	if err != nil {
+		return err
+	}
+	next := *stored
+	next.UpdatedAt = next.UpdatedAt.Add(time.Second)
+	if err := s.fakeStore.Save(ctx, &next); err != nil {
+		return err
+	}
+	return core.Errorf(core.CodeConflict, "run changed since it was read")
+}
+
+func TestControlRefusesStaleWriteAfterRetries(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeStore()
+	if err := base.Save(ctx, core.NewRun("r-stale", "T-1", time.Now().UTC())); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	store := &alwaysStaleCASStore{casFakeStore: &casFakeStore{fakeStore: base}}
+	c := &Control{Store: store}
+	err := c.Cancel(ctx, "r-stale")
+	if core.CodeOf(err) != core.CodeConflict {
+		t.Fatalf("error = %v, want conflict after bounded retries", err)
+	}
+	if store.attempts != controlWriteAttempts {
+		t.Fatalf("attempts = %d, want %d", store.attempts, controlWriteAttempts)
+	}
+	if got := base.runs["r-stale"]; got.State != core.RunPending {
+		t.Fatalf("state = %s, want unchanged pending", got.State)
+	}
+}
