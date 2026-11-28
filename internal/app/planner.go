@@ -1,10 +1,13 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -90,20 +93,58 @@ type ConflictPlanner interface {
 	Select(candidates []core.Task, active []*core.Run, limit int, strict bool) ([]core.Task, []SkippedTask, error)
 }
 
-// GreedyPlanner selects tasks in candidate order using an injected overlap checker.
-type GreedyPlanner struct {
-	Overlap core.OverlapChecker
+// WaitlistStore records a candidate that lost a scope claim. The sqlite store
+// satisfies this port with AddWaitEntry, so the planner keeps no database of
+// its own. waitingSince is a Unix nanosecond reading: a smaller value waited
+// longer.
+type WaitlistStore interface {
+	AddWaitEntry(ctx context.Context, taskID core.TaskID, paths []core.ScopePath, waitingSince int64) error
 }
 
-var _ func(core.OverlapChecker) ConflictPlanner = NewPlanner
+// GreedyPlanner selects tasks in candidate order using an injected overlap checker.
+type GreedyPlanner struct {
+	Overlap  core.OverlapChecker
+	Waitlist WaitlistStore
+	now      func() int64
+}
+
+var _ func(core.OverlapChecker, ...WaitlistStore) ConflictPlanner = NewPlanner
 
 // NewPlanner returns a ConflictPlanner that uses checker to detect scope overlap.
-// A nil checker uses core.PathsAndDependencies.
-func NewPlanner(checker core.OverlapChecker) ConflictPlanner {
+// A nil checker uses core.PathsAndDependencies. An optional waitlist records
+// lost scope claims; without one Select behaves exactly as it did before.
+func NewPlanner(checker core.OverlapChecker, waitlist ...WaitlistStore) ConflictPlanner {
 	if checker == nil {
 		checker = core.PathsAndDependencies
 	}
-	return GreedyPlanner{Overlap: checker}
+	p := GreedyPlanner{Overlap: checker}
+	if len(waitlist) > 0 {
+		p.Waitlist = waitlist[0]
+	}
+	return p
+}
+
+// queueWait records a skipped card against each path it lost. A failed write
+// never changes the skip set for this cycle: the dispatcher still sees the
+// same reason and blocker it saw before the waitlist existed.
+func (p GreedyPlanner) queueWait(skip SkippedTask) {
+	if p.Waitlist == nil || len(skip.Overlap) == 0 {
+		return
+	}
+	now := p.now
+	if now == nil {
+		now = time.Now().UnixNano
+	}
+	if err := p.Waitlist.AddWaitEntry(context.Background(), skip.TaskID, skip.Overlap, now()); err != nil {
+		slog.Warn("record scope wait", "task", skip.TaskID, "overlap", skip.Overlap, "error", err)
+	}
+}
+
+// addSkip records a lost scope claim and appends its skip. Conflict branches
+// use it so one skipped card costs one statement in Select.
+func (p GreedyPlanner) addSkip(skipped []SkippedTask, skip SkippedTask) []SkippedTask {
+	p.queueWait(skip)
+	return append(skipped, skip)
 }
 
 // Probe IDs keep an active-scope comparison path-only. They cannot collide with
@@ -163,7 +204,7 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 			continue
 		}
 		if blocker, paths := p.activeConflict(t, index); blocker != nil {
-			skipped = append(skipped, SkippedTask{
+			skipped = p.addSkip(skipped, SkippedTask{
 				TaskID:       t.ID,
 				Code:         SkipActiveScopeOverlap,
 				BlockedBy:    blocker.TaskID,
@@ -177,7 +218,7 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 		for _, s := range selected {
 			if p.Overlap(t, s) {
 				paths := intersectScopes(t.Scope, s.Scope)
-				skipped = append(skipped, SkippedTask{
+				skipped = p.addSkip(skipped, SkippedTask{
 					TaskID:    t.ID,
 					Code:      SkipSelectedScopeOverlap,
 					BlockedBy: s.ID,
