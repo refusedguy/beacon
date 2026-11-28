@@ -25,6 +25,7 @@ export function clipboardCopier(ctx, toast) {
     const method = ctx.renderer?.copyToClipboardOSC52
     if (typeof method !== "function") {
       show("Clipboard unavailable in this TUI", "warning")
+      show("Next: copy the ID from the run row", "info")
       return false
     }
     let copied = false
@@ -37,18 +38,25 @@ export function clipboardCopier(ctx, toast) {
 export function createActionRunner(ctx, source, { refresh = async () => {}, afterDispatch = async () => {}, toast, confirm, log = console.debug } = {}) {
   const show = toastShow(ctx, toast)
   const copyText = clipboardCopier(ctx, show)
-  const ask = confirm ?? (async (run) => {
+  const ask = confirm ?? (async (run, action) => {
     if (typeof ctx.ui?.dialog?.confirm !== "function") return undefined
+    const isCancel = action === "cancel"
+    const title = isCancel ? "Cancel run" : "Retry run"
     return ctx.ui.dialog.confirm({
-      title: "Cancel run",
-      message: `Cancel run ${run.id}? This cannot be undone.`,
-      label: { confirm: "Cancel run", cancel: "Keep run" },
+      title,
+      message: isCancel ? `Cancel run ${run.id}? This cannot be undone.`
+        : `Retry run ${run.id}? This starts a new attempt.`,
+      label: { confirm: title, cancel: "Keep run" },
     })
   })
   const copyID = (run) => copyText([str(run.id), str(run.branch)].filter(Boolean).join(" · "))
   const copyPR = (run) => {
     const url = str(run.prURL)
-    if (!url) { show("No PR URL for this run", "warning"); return false }
+    if (!url) {
+      show("No PR URL for this run", "warning")
+      show("Next: wait for the worker to open a PR", "info")
+      return false
+    }
     return copyText(url)
   }
   const control = async (action, run, message) => {
@@ -60,13 +68,14 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
       show(`${action} accepted for ${str(run.id)}`, "success")
       return result
     } catch (error) {
-      show(`${action} failed: ${errorMessage(error)}`, "error")
+      show(`${action} failed: ${errorMessage(error)} · check beacon status and retry`, "error")
       return null
     } finally { await refresh() }
   }
   const nudge = async (run) => {
     if (typeof ctx.ui?.dialog?.prompt !== "function") {
       show("Nudge unavailable in this TUI", "warning")
+      show("Next: use beacon_control nudge from the CLI", "info")
       await refresh()
       return null
     }
@@ -76,7 +85,12 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
       placeholder: "...",
     })
     const message = str(answer).trim()
-    if (!message) { show("No guidance sent", "info"); await refresh(); return null }
+    if (!message) {
+      show("No guidance sent", "info")
+      show("Next: enter guidance and try again", "info")
+      await refresh()
+      return null
+    }
     return control("nudge", run, message)
   }
   let lastDispatch = null
@@ -109,7 +123,7 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
         const result = await dispatched
         const count = Number(result?.started ?? result?.dispatched ?? result?.runs?.length ?? result?.startedRuns ?? 0)
         show(Number.isFinite(count) && count > 0
-          ? `Dispatched ${count} task${count === 1 ? "" : "s"}` : "Nothing to dispatch right now", "success")
+          ? `Dispatched ${count} task${count === 1 ? "" : "s"}` : "Nothing to dispatch right now · add a ready task card", "success")
         return result
       } catch (error) {
         show(`Dispatch failed: ${errorMessage(error)}`, "error")
@@ -132,13 +146,21 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
     if (name === "help") return nudge(run)
     if (name === "cancel" && opts.confirmed !== true) {
       if (typeof ctx.ui?.dialog?.confirm !== "function") {
-        show("Confirmation unavailable, run kept", "warning")
+        show("Confirmation unavailable, run kept · use beacon_control from the CLI", "warning")
         await refresh()
         return null
       }
-      const agreed = await ask(run)
-      if (agreed !== true) {
+      if (await ask(run, "cancel") !== true) {
         show("Run kept, nothing cancelled", "info")
+        await refresh()
+        return null
+      }
+    }
+    // A retry only asks when the host can show a dialog. Without one the
+    // control still runs, so plain Node callers keep the same path as before.
+    if (name === "retry" && opts.confirmed !== true && typeof ctx.ui?.dialog?.confirm === "function") {
+      if (await ask(run, "retry") !== true) {
+        show("Run kept, nothing retried", "info")
         await refresh()
         return null
       }

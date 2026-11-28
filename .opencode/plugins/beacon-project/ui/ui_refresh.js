@@ -30,6 +30,12 @@ export function collectTransitionToasts(previous, snapshot) {
 export function createRefresh(env, applyAll) {
   const { ctx, source, options, timers, flags, signals, lastSeenState } = env
 
+  // The footer and sidebar read these fields from the snapshot. They travel
+  // with the data so a refresh always renders the state that produced it.
+  const withStatus = (snapshot, live) => snapshot && typeof snapshot === "object"
+    ? { ...snapshot, live, root: source.root?.(), verified: source.verified?.() === true }
+    : snapshot
+
   const notify = (snapshot) => {
     for (const toast of collectTransitionToasts(lastSeenState, snapshot)) {
       ctx.ui?.toast?.show?.(toast)
@@ -51,18 +57,23 @@ export function createRefresh(env, applyAll) {
         const empty = !next || (!next.active?.length && !next.recent?.length && !next.queue?.length)
         if (next != null && !(empty && !source.verified())) {
           if (!flags.stale) notify(next)
-          signals.setSnapshot(next)
+          signals.setSnapshot(withStatus(next, "live"))
           rendered = true
         }
         flags.failures = 0
         flags.stale = false
+        flags.retryPending = false
         signals.setError(null)
       }
     } catch (cause) {
       if (flags.stopped) return
       if (mine === flags.generation) {
         flags.failures += 1
+        // The first miss only asks for a retry. The second one admits the
+        // snapshot is stale and shows a cause together with a way back.
         if (flags.failures >= 2) { flags.stale = true; signals.setError(cleanErrorMessage(cause)) }
+        flags.retryPending = !flags.stale
+        signals.setSnapshot(withStatus(signals.m(), flags.stale ? "stale" : "retry pending"))
         rendered = true
       }
     } finally { flags.inFlight = false }

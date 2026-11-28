@@ -148,15 +148,17 @@ func (c *renderCache) rememberFrame(width, cursor int, status string, failed boo
 
 // model is the Bubble Tea state for the run monitor.
 type model struct {
-	client     *Client
-	runs       []Run
-	cursor     int
-	status     string
-	failed     bool
-	width      int
-	debounce   time.Duration
-	refreshGen *atomic.Uint64
-	render     *renderCache
+	client       *Client
+	runs         []Run
+	cursor       int
+	status       string
+	failed       bool
+	width        int
+	debounce     time.Duration
+	refreshGen   *atomic.Uint64
+	render       *renderCache
+	pending      Action
+	pendingRunID string
 }
 
 // runsMsg carries a fetched run snapshot or its error. gen orders responses
@@ -175,6 +177,19 @@ type actionMsg struct {
 	result ControlResult
 	err    error
 }
+
+// errorMsg carries a transport failure to the model. The status line adds one
+// command the operator can run, so a dropped stream never looks like a frozen
+// run list. The aliases name the two sources without changing the message.
+type errorMsg struct {
+	err error
+}
+
+type (
+	streamErrorMsg = errorMsg
+	sseErrorMsg    = errorMsg
+	authErrorMsg   = errorMsg
+)
 
 // refreshMsg requests a refresh after an event. The event is a notification:
 // run state always comes from a fresh runs read, not from the event payload.
@@ -246,7 +261,7 @@ func (m model) apply(action Action) tea.Cmd {
 	run, ok := m.selected()
 	if !ok {
 		return func() tea.Msg {
-			return actionMsg{action: action, err: fmt.Errorf("no run selected")}
+			return actionMsg{action: action, err: fmt.Errorf("no run selected · j/k to move")}
 		}
 	}
 	return func() tea.Msg {
@@ -261,6 +276,35 @@ func (m model) apply(action Action) tea.Cmd {
 	}
 }
 
+// withAction adds one next command to an error that does not carry one. The
+// client already puts the action on HTTP failures, so this avoids repeating it.
+func withAction(message string) string {
+	if strings.Contains(message, "·") {
+		return message
+	}
+	return message + " · restart beacon serve and check .beacon/connection.json"
+}
+
+// confirmArmed asks for a second keypress before a control action runs. The
+// first press names the action and the run, so the operator knows what they are
+// confirming.
+func (m model) confirmArmed(action Action, key string) (tea.Model, tea.Cmd) {
+	run, ok := m.selected()
+	if !ok {
+		m.failed = true
+		m.status = "no run selected · j/k to move"
+		return m, nil
+	}
+	if m.pending == action && m.pendingRunID == run.ID {
+		m.pending, m.pendingRunID = "", ""
+		return m, m.apply(action)
+	}
+	m.failed = false
+	m.pending, m.pendingRunID = action, run.ID
+	m.status = fmt.Sprintf("confirm %s %s: press %s again", action, run.ID, key)
+	return m, nil
+}
+
 // Update applies a Bubble Tea message to the model.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -273,15 +317,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onRefresh(msg.event)
 	case Event:
 		return m.onRefresh(msg)
+	case errorMsg:
+		m.failed = true
+		m.pending, m.pendingRunID = "", ""
+		m.status = "live updates: " + withAction(msg.err.Error())
+		return m, nil
 	case runsMsg:
 		// Only the reply that still owns the current generation may change the
 		// view. An older reply is dropped instead of rolling the frame back.
 		if msg.stale || msg.gen != m.refreshGen.Load() {
 			return m, nil
 		}
+		m.pending, m.pendingRunID = "", ""
 		if msg.err != nil {
 			m.failed = true
-			m.status = "runs: " + msg.err.Error()
+			m.status = "runs: " + withAction(msg.err.Error())
 			return m, nil
 		}
 		m.failed = false
@@ -293,18 +343,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 		}
 		m.status = fmt.Sprintf("loaded %d run(s)", len(m.runs))
+		if len(m.runs) > visibleRows {
+			m.status += fmt.Sprintf(" · showing %d · j/k to scroll", visibleRows)
+		}
 		return m, nil
 	case actionMsg:
 		m.failed = msg.err != nil
+		m.pending, m.pendingRunID = "", ""
 		switch {
 		case msg.err != nil:
-			m.status = string(msg.action) + " " + msg.runID + ": " + msg.err.Error()
+			m.status = string(msg.action) + " " + msg.runID + ": " + withAction(msg.err.Error())
 		case !msg.result.OK:
 			m.failed = true
 			m.status = string(msg.action) + " " + msg.runID + ": refused"
 			if msg.result.Reason != "" {
 				m.status += ": " + msg.result.Reason
 			}
+			m.status += " · retry after the reason is cleared"
 		default:
 			m.status = string(msg.action) + " " + msg.runID + ": applied"
 			return m, m.reload()
@@ -320,21 +375,25 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c", "esc":
 		return m, tea.Quit
 	case "j", "down":
+		m.pending, m.pendingRunID = "", ""
 		if m.cursor < len(m.runs)-1 {
 			m.cursor++
 		}
 	case "k", "up":
+		m.pending, m.pendingRunID = "", ""
 		if m.cursor > 0 {
 			m.cursor--
 		}
 	case "a":
+		m.pending, m.pendingRunID = "", ""
 		return m, m.apply(ActionApprove)
 	case "u":
+		m.pending, m.pendingRunID = "", ""
 		return m, m.apply(ActionUnblock)
 	case "c", "x":
-		return m, m.apply(ActionCancel)
+		return m.confirmArmed(ActionCancel, msg.String())
 	case "r":
-		return m, m.apply(ActionRetry)
+		return m.confirmArmed(ActionRetry, "r")
 	}
 	return m, nil
 }

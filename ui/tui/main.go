@@ -29,7 +29,9 @@ func main() {
 
 	program := tea.NewProgram(newModel(client))
 	go func() {
-		_ = forwardEvents(ctx, client, program)
+		if err := forwardEvents(ctx, client, program); err != nil {
+			program.Send(streamErrorMsg{err: err})
+		}
 	}()
 
 	if _, err := program.Run(); err != nil {

@@ -1,7 +1,7 @@
 ---
 id: T-c60dabd8
 title: Fix operator-facing errors and next actions in plugin and TUI
-status: available
+status: done
 scope:
     - .opencode/plugins/beacon-project/ui/ui_error.js
     - .opencode/plugins/beacon-project/ui/ui_refresh.js
