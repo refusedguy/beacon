@@ -230,47 +230,6 @@ AND state NOT IN (%s)`, taskIDs, terminalStates)
 	return out, rows.Err()
 }
 
-// deliveryRetention is the default window for every pruned table. Delivery
-// keys and approvals are idempotency markers for a SHA, while decisions and run
-// events are audit history. The status snapshot shows only recent history, so
-// a row older than this window can no longer change a snapshot or a decision.
-const deliveryRetention = 30 * 24 * time.Hour
-
-// retentionBatchSize caps how many rows one prune pass removes from a table.
-// The reconcile tick stays short even after a long outage with accumulated
-// rows; a later tick removes the next batch.
-const retentionBatchSize = 1000
-
-// PruneStale deletes delivery, approval, decision and run event rows older than
-// retention. It returns the number of rows removed. A non-positive retention
-// uses the default 30-day window. Decisions are deleted through the summary
-// delete trigger so DecisionCounts keeps matching the rows still stored.
-func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64, error) {
-	if retention <= 0 {
-		retention = deliveryRetention
-	}
-	cutoff := nowUnix() - retention.Nanoseconds()
-	queries := []string{
-		`DELETE FROM deliveries WHERE key IN (SELECT key FROM deliveries WHERE created_at < ? LIMIT ?)`,
-		`DELETE FROM approvals WHERE rowid IN (SELECT rowid FROM approvals WHERE created_at < ? LIMIT ?)`,
-		`DELETE FROM decisions WHERE id IN (SELECT id FROM decisions WHERE at < ? LIMIT ?)`,
-		`DELETE FROM run_events WHERE id IN (SELECT id FROM run_events WHERE at < ? LIMIT ?)`,
-	}
-	var removed int64
-	for _, query := range queries {
-		res, err := s.db.ExecContext(ctx, query, cutoff, retentionBatchSize)
-		if err != nil {
-			return removed, err
-		}
-		n, err := res.RowsAffected()
-		removed += n
-		if err != nil {
-			return removed, err
-		}
-	}
-	return removed, nil
-}
-
 // ListActive returns every run that is not merged or closed. It is a read:
 // retention runs on the reconciler ticker, so status, dispatch and MCP reads
 // never issue DELETE statements.
