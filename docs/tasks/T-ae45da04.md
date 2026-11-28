@@ -1,7 +1,7 @@
 ---
 id: T-ae45da04
 title: Make beacon_control batch replay-safe and convergent
-status: available
+status: done
 scope:
     - internal/infra/mcp/tool_control.go
     - internal/infra/mcp/tool_control_test.go

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -12,26 +13,147 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+const (
+	operatorNotifyTimeout = 10 * time.Second
+	parentNotifyTimeout   = 30 * time.Second
+
+	// parentNotifyInlineWindow lets an in-memory harness finish before the
+	// caller returns. A slow endpoint hands off to a goroutine after the
+	// window, so it cannot hold up a reconcile tick.
+	parentNotifyInlineWindow = 2 * time.Millisecond
+)
+
+// ErrParentNotifyUnsupported reports a harness with no parent inbox. Such a
+// harness cannot deliver the notice, so the decision log must not claim it was
+// sent. Harnesses that support delivery return nil or a real transport error.
+var ErrParentNotifyUnsupported = errors.New("parent notification unsupported")
+
+// parentNotifySupport is the optional capability a harness implements to
+// declare whether it can deliver a message to an orchestrator session.
+type parentNotifySupport interface {
+	ParentNotifySupported() bool
+}
+
+// notify sends one operator notice per run and subject. The delivery claim is
+// taken before the send, so repeated reconcile ticks cannot repeat the same
+// notice. A failed send releases the claim for a later retry.
 func (r *Reconciler) notify(run *core.Run, subject, body string) error {
 	if r.Notifier == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	key := "notify:" + string(run.ID) + ":" + subject
+	if r.Store != nil {
+		ok, err := r.Store.ClaimDelivery(context.Background(), key)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), operatorNotifyTimeout)
 	defer cancel()
-	return r.Notifier.Notify(ctx, core.Notification{RunID: run.ID, Subject: subject, Body: compact(body)})
+	err := r.Notifier.Notify(ctx, core.Notification{RunID: run.ID, Subject: subject, Body: compact(body)})
+	if err != nil && r.Store != nil {
+		if releaseErr := r.Store.ReleaseDelivery(context.Background(), key); releaseErr != nil {
+			slog.Error("release notify delivery", "run", run.ID, "subject", subject, "error", releaseErr)
+		}
+	}
+	return err
 }
 
-func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, state string) {
+// notifyParent claims the terminal parent notice before handing the post to a
+// goroutine. The claim is what prevents a forced reconcile and the daemon tick
+// from posting the same notice twice. Text comes from the persisted run, so an
+// orphan with no pull request never reports PR #0.
+func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, reason string) {
 	if run.ParentSessionID == "" || r.Harness == nil {
 		return
 	}
-	text := fmt.Sprintf("Beacon: PR #%d run %s state %s", pr, run.ID, state)
-	if err := r.Harness.NotifyParent(ctx, run.ParentSessionID, text); err != nil {
-		slog.Error("notify parent", "run", run.ID, "error", err)
-		r.Decisions.logTransitionParentNotify(ctx, run.ID, pr, "failed")
+	key := "parent-notify:" + string(run.ID) + ":" + reason
+	if r.Store != nil {
+		ok, err := r.Store.ClaimDelivery(ctx, key)
+		if err != nil {
+			slog.Error("claim parent notify delivery", "run", run.ID, "error", err)
+			return
+		}
+		if !ok {
+			return
+		}
+	}
+	if support, ok := r.Harness.(parentNotifySupport); ok && !support.ParentNotifySupported() {
+		r.recordParentNotify(ctx, run, pr, key, ErrParentNotifyUnsupported)
 		return
 	}
-	r.Decisions.logTransitionParentNotify(ctx, run.ID, pr, "notified")
+	fresh := run
+	if r.Store != nil {
+		if stored, err := r.Store.Get(ctx, run.ID); err == nil && stored != nil {
+			fresh = stored
+		}
+	}
+	text := parentNoticeText(fresh, pr, reason)
+	session := run.ParentSessionID
+	done := make(chan error, 1)
+	go func() {
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parentNotifyTimeout)
+		defer cancel()
+		done <- r.Harness.NotifyParent(sendCtx, session, text)
+	}()
+	select {
+	case err := <-done:
+		r.recordParentNotify(ctx, run, pr, key, err)
+	case <-time.After(parentNotifyInlineWindow):
+		// The post is still in flight. Record only that it was queued, never
+		// that it was delivered, and let the sender release a failed claim.
+		r.Decisions.logTransitionParentNotify(ctx, run.ID, pr, "queued")
+		go func() {
+			err := <-done
+			r.finishParentNotify(context.WithoutCancel(ctx), run, pr, key, err)
+		}()
+	}
+}
+
+// parentNoticeText builds the notice from the run's persisted state. A zero PR
+// is omitted, and the caller's reason is kept alongside the recorded reason so
+// a blocked run is not described as a state of its own.
+func parentNoticeText(run *core.Run, pr int, reason string) string {
+	var b strings.Builder
+	b.WriteString("Beacon: ")
+	if pr > 0 {
+		fmt.Fprintf(&b, "PR #%d ", pr)
+	}
+	fmt.Fprintf(&b, "run %s state %s", run.ID, run.State)
+	if run.Reason != "" {
+		fmt.Fprintf(&b, " reason %s", run.Reason)
+	}
+	if reason != "" && reason != run.Reason && !strings.Contains(run.Reason, reason) {
+		fmt.Fprintf(&b, " (%s)", reason)
+	}
+	return b.String()
+}
+
+func (r *Reconciler) recordParentNotify(ctx context.Context, run *core.Run, pr int, key string, err error) {
+	result := "notified"
+	if err != nil {
+		result = "failed"
+		if errors.Is(err, ErrParentNotifyUnsupported) || strings.Contains(err.Error(), "unsupported") {
+			result = "unsupported"
+		}
+	}
+	r.Decisions.logTransitionParentNotify(ctx, run.ID, pr, result)
+	r.finishParentNotify(ctx, run, pr, key, err)
+}
+
+// finishParentNotify releases a failed claim so a later path can retry. A
+// terminal run is no longer returned by FindByPR, so its failure stays as the
+// recorded decision rather than an unreachable retry.
+func (r *Reconciler) finishParentNotify(ctx context.Context, run *core.Run, pr int, key string, err error) {
+	if err == nil || r.Store == nil || run.State.Terminal() {
+		return
+	}
+	if releaseErr := r.Store.ReleaseDelivery(ctx, key); releaseErr != nil {
+		slog.Error("release parent notify delivery", "run", run.ID, "pr", pr, "error", releaseErr)
+	}
 }
 
 // compact trims s and caps it at 1200 runes. A byte length check handles short
