@@ -40,7 +40,6 @@ jobs:
       go-tui: ${{ steps.all.outputs.go_tui || steps.filter.outputs.go_tui }}
       plugin: ${{ steps.all.outputs.plugin || steps.filter.outputs.plugin }}
       smoke: ${{ steps.all.outputs.smoke || steps.filter.outputs.smoke }}
-      perf: ${{ steps.all.outputs.perf || steps.filter.outputs.perf }}
       shared: ${{ steps.all.outputs.shared || steps.filter.outputs.shared }}
     steps:
       # dorny/paths-filter reads changed files over REST on pull_request events.
@@ -56,7 +55,7 @@ jobs:
         id: all
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
-          for key in go_core go_acp go_opencode go_tui plugin smoke perf shared; do
+          for key in go_core go_acp go_opencode go_tui plugin smoke shared; do
             echo "${key}=true" >> "$GITHUB_OUTPUT"
           done
 
