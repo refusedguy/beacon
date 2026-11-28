@@ -198,8 +198,10 @@ func mergeSyncStatus(fileStatus, owned string) string {
 // status through SetTaskStatus, so a merge keeps the stored status when it is
 // Beacon-authoritative: a task with a live or finished run stays done even if
 // a stale working tree still reports it available. Other fields always follow
-// the file. Rows and dependencies absent from tasks are removed, so deletions
-// still take effect. The statements are prepared once by the caller.
+// the file. Beacon-owned rows are also kept by the prune, so a card absent from
+// tasks is not deleted and later reinserted as available. Rows and dependencies
+// absent from tasks and not Beacon-owned are removed, so deletions still take
+// effect. The statements are prepared once by the caller.
 func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []core.Task, owned map[string]string) error {
 	ids := make([]string, 0, len(tasks))
 	for _, t := range tasks {
@@ -208,7 +210,7 @@ func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []
 		}
 		ids = append(ids, string(t.ID))
 	}
-	return pruneSyncRows(ctx, tx, ids)
+	return pruneSyncRows(ctx, tx, ids, owned)
 }
 
 // writeSyncTask upserts one card and its dependency edges. A stale working
@@ -265,9 +267,23 @@ func logDanglingEdges(ctx context.Context, tx *sql.Tx, ids []string) error {
 	return rows.Err()
 }
 
-// pruneSyncRows removes every stored row and edge not named by ids.
-func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string) error {
-	if len(ids) == 0 {
+// pruneSyncRows removes every stored row and edge whose card is neither in ids
+// nor Beacon-owned. A done or claimed row written by SetTaskStatus stays, so a
+// sync whose source no longer lists that card cannot delete it and let a stale
+// available frontmatter reinsert it as ready.
+func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string, owned map[string]string) error {
+	keep := append([]string(nil), ids...)
+	seen := make(map[string]bool, len(keep)+len(owned))
+	for _, id := range keep {
+		seen[id] = true
+	}
+	for id := range owned {
+		if !seen[id] {
+			seen[id] = true
+			keep = append(keep, id)
+		}
+	}
+	if len(keep) == 0 {
 		if err := logDanglingEdges(ctx, tx, nil); err != nil {
 			return err
 		}
@@ -277,13 +293,13 @@ func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string) error {
 		_, err := tx.ExecContext(ctx, `DELETE FROM tasks`)
 		return err
 	}
-	marks := make([]string, len(ids))
-	args := make([]any, 0, 2*len(ids))
-	for i, id := range ids {
+	marks := make([]string, len(keep))
+	args := make([]any, 0, 2*len(keep))
+	for i, id := range keep {
 		marks[i] = "?"
 		args = append(args, id)
 	}
-	if err := logDanglingEdges(ctx, tx, ids); err != nil {
+	if err := logDanglingEdges(ctx, tx, keep); err != nil {
 		return err
 	}
 	depsArgs := append(append([]any(nil), args...), args...)
