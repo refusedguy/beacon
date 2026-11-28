@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -81,6 +82,18 @@ func publishPath(ctx context.Context, ws PathCommitter, root core.Workspace, pat
 	return publishWithNFFRetry(ctx, ws, root, base, pathspec, message)
 }
 
+// checkCardMarkers refuses to write a card corpus that holds an unresolved
+// conflict marker. A marked card can fail YAML parsing or lose edits to a
+// conflict, so publish and merge stop before they commit it. The error names
+// the file and line so the caller can find the marker.
+func checkCardMarkers(workspacePath string) error {
+	path, line, found := core.CheckCardMarkers(filepath.Join(workspacePath, cardsPath))
+	if !found {
+		return nil
+	}
+	return core.Errorf(core.CodeConflict, "task card has conflict marker at %s:%d", path, line)
+}
+
 // publishWithNFFRetry commits pathspec and retries the push once when the
 // remote ref advanced. Task creation and the reconciler share it. The caller
 // chooses the rebase base: task creation passes publishBase(root), the
@@ -88,6 +101,9 @@ func publishPath(ctx context.Context, ws PathCommitter, root core.Workspace, pat
 // makes it clear why a retry rebased onto a particular ref. The retry itself
 // runs under the bounded context in retryPublish.
 func publishWithNFFRetry(ctx context.Context, ws PathCommitter, root core.Workspace, base, pathspec, message string) error {
+	if err := checkCardMarkers(root.Path); err != nil {
+		return err
+	}
 	if err := ws.CommitPath(ctx, root, pathspec, message); err != nil {
 		var nff *NonFastForwardError
 		if !errors.As(err, &nff) {
