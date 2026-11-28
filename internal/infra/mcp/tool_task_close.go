@@ -20,7 +20,7 @@ func registerTaskClose(s *msdk.Server, sv Services) {
 		}
 		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
 			return closeTasks(ctx, sv.TaskUpdater, a)
-		})
+		}, taskGraphRecovery(sv))
 	})
 }
 

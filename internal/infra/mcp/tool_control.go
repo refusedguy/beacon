@@ -227,9 +227,13 @@ func controlMany(ctx context.Context, journal *opJournal, sv Services, a Control
 	if err := requireService("control service", sv.Remote, sv.Control); err != nil {
 		return nil, nil, err
 	}
+	var recovery []recoveryFunc
+	if core.ParseControlAction(a.Action) == core.ControlCancel {
+		recovery = append(recovery, cancelCleanupRecovery(sv, a.RunIDs))
+	}
 	out, err := journal.run(ctx, a.OperationID, func(ctx context.Context) (any, error) {
 		return applyControlBatch(ctx, sv, a)
-	})
+	}, recovery...)
 	if err != nil {
 		return nil, nil, err
 	}

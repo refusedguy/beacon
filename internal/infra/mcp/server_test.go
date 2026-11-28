@@ -1515,6 +1515,286 @@ func BenchmarkJSONResult(b *testing.B) {
 	})
 }
 
+// TestOpJournalReplayRunsRecoveryOncePerReplay pins the contract of the
+// recovery callback: it runs after lookup finds a stored outcome, the mutation
+// is never run again, and a failed repair does not replace the stored result.
+func TestOpJournalReplayRunsRecoveryOncePerReplay(t *testing.T) {
+	j := newOpJournal()
+	mutations, recoveries := 0, 0
+	first, err := j.run(context.Background(), "op-recover", func(context.Context) (any, error) {
+		mutations++
+		return app.DeleteResult{Pushed: true}, nil
+	}, func(context.Context) error {
+		recoveries++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("first j.run: %v", err)
+	}
+	if got := first.(app.DeleteResult); got.Status != "applied" {
+		t.Fatalf("first status = %q, want applied", got.Status)
+	}
+
+	// The retry supplies no callback. The one stored with the outcome must
+	// still run before the duplicate result reaches the caller.
+	again, err := j.run(context.Background(), "op-recover", func(context.Context) (any, error) {
+		t.Fatal("replay reapplied the committed mutation")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("replay j.run: %v", err)
+	}
+	if got := again.(app.DeleteResult); got.Status != "duplicate" {
+		t.Fatalf("replay status = %q, want duplicate", got.Status)
+	}
+	if mutations != 1 || recoveries != 1 {
+		t.Fatalf("mutations = %d, recoveries = %d, want 1 and 1", mutations, recoveries)
+	}
+}
+
+func TestOpJournalDurableReplayUsesCallerRecovery(t *testing.T) {
+	store := journalTestStore(t)
+	j := newOpJournal(store)
+	if _, err := j.run(context.Background(), "op-durable", func(context.Context) (any, error) {
+		return app.DeleteResult{Pushed: true}, nil
+	}); err != nil {
+		t.Fatalf("first j.run: %v", err)
+	}
+
+	// A fresh journal has no in-memory callback or entry. The caller supplies
+	// a recovery and a failed repair leaves the stored result and its duplicate
+	// status intact.
+	replay := newOpJournal(store)
+	recoveries := 0
+	again, err := replay.run(context.Background(), "op-durable", func(context.Context) (any, error) {
+		t.Fatal("replay reapplied the committed mutation")
+		return nil, nil
+	}, func(context.Context) error {
+		recoveries++
+		return errors.New("cleanup still failed")
+	})
+	if err != nil {
+		t.Fatalf("replay j.run: %v", err)
+	}
+	wire, err := json.Marshal(again)
+	if err != nil {
+		t.Fatalf("json.Marshal(again): %v", err)
+	}
+	if !strings.Contains(string(wire), `"status":"duplicate"`) {
+		t.Fatalf("replay result = %s, want duplicate status", wire)
+	}
+	if recoveries != 1 {
+		t.Fatalf("recoveries = %d, want 1", recoveries)
+	}
+
+	// A failed mutation keeps its error on replay, and its recovery still runs.
+	failed := newOpJournal()
+	_, err = failed.run(context.Background(), "op-failed", func(context.Context) (any, error) {
+		return nil, errors.New("rollback failed")
+	}, func(context.Context) error {
+		recoveries++
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("first failed run: %v", err)
+	}
+	_, err = failed.run(context.Background(), "op-failed", func(context.Context) (any, error) {
+		t.Fatal("replay reapplied the failed mutation")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("failed replay lost the stored error: %v", err)
+	}
+	if recoveries != 2 {
+		t.Fatalf("recoveries = %d, want 2 across both replays", recoveries)
+	}
+}
+
+// onceFailHarness fails its first Stop so replay can prove the cleanup was
+// retried. It embeds the port to keep the fixture focused on Stop.
+type onceFailHarness struct {
+	core.AgentHarness
+	mu     sync.Mutex
+	stops  int
+	failed chan struct{}
+}
+
+func (h *onceFailHarness) Stop(context.Context, string) error {
+	h.mu.Lock()
+	h.stops++
+	first := h.stops == 1
+	h.mu.Unlock()
+	if first {
+		close(h.failed)
+		return errors.New("session stop failed")
+	}
+	return nil
+}
+
+func (h *onceFailHarness) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stops
+}
+
+type onceFailWorkspace struct {
+	core.WorkspaceManager
+	mu      sync.Mutex
+	removes int
+	failed  chan struct{}
+}
+
+func (w *onceFailWorkspace) Remove(context.Context, core.Workspace) error {
+	w.mu.Lock()
+	w.removes++
+	first := w.removes == 1
+	w.mu.Unlock()
+	if first {
+		close(w.failed)
+		return errors.New("workspace removal failed")
+	}
+	return nil
+}
+
+func (w *onceFailWorkspace) count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.removes
+}
+
+func TestCancelBatchReplayRetriesCleanup(t *testing.T) {
+	store := newControlStore()
+	run := core.NewRun("r1", "T-1", time.Now())
+	run.SessionID = "sess-1"
+	run.WorkspacePath = "/ws/T-1"
+	store.add(run)
+	h := &onceFailHarness{failed: make(chan struct{})}
+	ws := &onceFailWorkspace{failed: make(chan struct{})}
+	sv := Services{Control: &app.Control{Store: store, Harness: h, Workspace: ws}}
+	cs := controlClient(t, sv)
+	args := map[string]any{
+		"action": "cancel", "run_ids": []any{"r1"}, "operation_id": "op-cancel-cleanup",
+	}
+
+	first := parseControlBatch(t, callControl(t, cs, args))
+	if len(first.Results) != 1 || first.Results[0].Status != "ok" {
+		t.Fatalf("first batch = %+v", first)
+	}
+	// App cleanup runs in the background; wait for its failed first pass so
+	// the counts below compare a failed cleanup with the replay's retry.
+	for _, signal := range []<-chan struct{}{h.failed, ws.failed} {
+		select {
+		case <-signal:
+		case <-time.After(3 * time.Second):
+			t.Fatal("first cleanup never ran")
+		}
+	}
+
+	second := parseControlBatch(t, callControl(t, cs, args))
+	if second.Status != "duplicate" || len(second.Results) != 1 || second.Results[0].Status != "ok" {
+		t.Fatalf("replayed batch = %+v", second)
+	}
+	if h.count() != 2 || ws.count() != 2 {
+		t.Fatalf("cleanup attempts: stops = %d, removals = %d, want 2 each", h.count(), ws.count())
+	}
+	got, err := store.Get(context.Background(), "r1")
+	if err != nil {
+		t.Fatalf("store.Get(r1): %v", err)
+	}
+	if got.State != core.RunClosed || got.SessionID != "sess-1" {
+		t.Fatalf("replay changed committed cancel state: %+v", got)
+	}
+}
+
+// restoringGraphStore fails one graph restore, then records the graph a replay
+// syncs. It doubles as the active-run finder a task deleter needs.
+type restoringGraphStore struct {
+	deleteRunStore
+	mu     sync.Mutex
+	syncs  int
+	failAt int
+	last   []core.Task
+}
+
+func (s *restoringGraphStore) SyncTasks(_ context.Context, tasks []core.Task) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncs++
+	s.last = append([]core.Task(nil), tasks...)
+	if s.syncs == s.failAt {
+		return errors.New("graph restore failed")
+	}
+	return nil
+}
+
+func (s *restoringGraphStore) state() (int, []core.Task) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncs, append([]core.Task(nil), s.last...)
+}
+
+type fixedTaskSource struct{ tasks []core.Task }
+
+func (s *fixedTaskSource) ListAvailable(context.Context) ([]core.Task, error) {
+	return s.tasks, nil
+}
+
+func TestTaskMutationReplayRepairsFailedRollback(t *testing.T) {
+	dir := t.TempDir()
+	writeDeleteCards(t, dir, "T-A", "T-KEEP")
+	before := []core.Task{{ID: "T-A", Status: core.TaskAvailable}}
+	store := &restoringGraphStore{failAt: 2}
+	committer := &deleteCommitter{err: errors.New("push failed")}
+	deleter := &app.TaskDeleter{
+		Store: store, Source: &fixedTaskSource{tasks: before}, Workspace: committer,
+		Root: core.Workspace{Path: dir, Branch: "main"},
+	}
+	cs := deleteClient(t, Services{TaskDeleter: deleter})
+	args := map[string]any{"ids": []any{"T-A"}, "operation_id": "op-delete-repair"}
+
+	call := func() *msdk.CallToolResult {
+		t.Helper()
+		res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+			Name:      "beacon_task_delete",
+			Meta:      msdk.Meta{"beacon/agent": "orchestrator"},
+			Arguments: args,
+		})
+		if err != nil {
+			t.Fatalf("cs.CallTool(beacon_task_delete): %v", err)
+		}
+		return res
+	}
+
+	first := call()
+	if !first.IsError {
+		t.Fatal("first delete reported success despite a failed publish and rollback")
+	}
+	if !cardExistsAt(t, dir, "T-A") {
+		t.Fatal("failed publish did not restore the card")
+	}
+	if syncs, _ := store.state(); syncs != 2 {
+		t.Fatalf("graph syncs = %d, want a sync and a failed restore", syncs)
+	}
+
+	second := call()
+	if !second.IsError {
+		t.Fatal("replay hid the stored mutation error")
+	}
+	syncs, graph := store.state()
+	if syncs != 3 {
+		t.Fatalf("graph syncs after replay = %d, want 3", syncs)
+	}
+	if len(graph) != 1 || graph[0].ID != "T-A" {
+		t.Fatalf("replayed graph = %+v, want the restored card", graph)
+	}
+	if committer.calls != 1 {
+		t.Fatalf("publish calls = %d, want 1", committer.calls)
+	}
+	if !cardExistsAt(t, dir, "T-A") || !cardExistsAt(t, dir, "T-KEEP") {
+		t.Fatal("replay changed committed cards")
+	}
+}
+
 // BenchmarkOpJournalDuplicate measures the hot path for repeated operation ids:
 // a full journal and a batch of duplicate claims that only touch the LRU.
 func BenchmarkOpJournalDuplicate(b *testing.B) {
