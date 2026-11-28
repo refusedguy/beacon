@@ -202,10 +202,7 @@ func (cw *configWatcher) reload() bool {
 		// The running services were wired with the previous values for these
 		// fields. Storing the new config would make the snapshot disagree with
 		// what the services use, so keep the whole previous config instead.
-		for _, field := range restart {
-			slog.Warn("config watch: change needs restart, kept previous config", "field", field,
-				"action", "restart beacon mcp and reconnect OpenCode")
-		}
+		warnRestart(restart)
 		return false
 	}
 	if modelOnly {
@@ -214,14 +211,7 @@ func (cw *configWatcher) reload() bool {
 		// config with the existing services and advance the generation to
 		// invalidate the resolver cache. No new harness, no policy rebuild and
 		// no reload broadcast: the watchers keep watching the same harness.
-		state := &liveState{
-			cfg:        cfg,
-			harness:    previous.harness,
-			policy:     previous.policy,
-			relay:      previous.relay,
-			generation: cw.generations + 1,
-		}
-		cw.live.Store(state)
+		cw.live.Store(cw.keepServicesState(cfg, previous, previous.policy))
 		cw.generations++
 		return true
 	}
@@ -231,42 +221,37 @@ func (cw *configWatcher) reload() bool {
 		// reloadablePolicy wrapper reads the policy from live state on every
 		// evaluation. Keep the harness and the event relay, rebuild just the
 		// policy, and do not broadcast a reload: no service is replaced.
-		state := &liveState{
-			cfg:        cfg,
-			harness:    previous.harness,
-			policy:     mergePolicy(cfg),
-			relay:      previous.relay,
-			generation: cw.generations + 1,
-		}
-		cw.live.Store(state)
+		cw.live.Store(cw.keepServicesState(cfg, previous, mergePolicy(cfg)))
 		cw.generations++
 		return true
 	}
 	if capOnlyChange(previous.cfg, cfg) {
-		// The reconciler holds a provider that reads the cap from live state
-		// on every tick. Store the new config with the current services and
-		// skip the harness rebuild and the reload broadcast.
-		state := &liveState{
-			cfg:        cfg,
-			harness:    previous.harness,
-			policy:     previous.policy,
-			relay:      previous.relay,
-			generation: cw.generations + 1,
-		}
-		cw.live.Store(state)
+		// The reconciler reads the cap from live state on every tick, so a
+		// cap-only edit keeps the current services and needs no broadcast.
+		cw.live.Store(cw.keepServicesState(cfg, previous, previous.policy))
 		cw.generations++
 		return true
 	}
-	state := cw.build(cfg, root)
+	state := cw.rebuildLiveState(cfg, root, previous)
 	if state == nil {
 		return false
 	}
-	state.relay = previous.relay
-	state.generation = cw.generations + 1
 	cw.live.Store(state)
 	state.relay.signalReload()
 	cw.generations++
 	return true
+}
+
+// rebuildLiveState builds a fresh harness and policy for cfg and keeps the
+// relay from the previous state so watchers do not retarget on a reload.
+func (cw *configWatcher) rebuildLiveState(cfg config.Config, root string, previous *liveState) *liveState {
+	state := cw.build(cfg, root)
+	if state == nil {
+		return nil
+	}
+	state.relay = previous.relay
+	state.generation = cw.generations + 1
+	return state
 }
 
 // build constructs a new live state for cfg, or nil when the harness needs a restart.
@@ -365,6 +350,28 @@ func capOnlyChange(old, next config.Config) bool {
 	probe := old
 	probe.Merge.MaxAutoRebases = next.Merge.MaxAutoRebases
 	return reflect.DeepEqual(probe, next)
+}
+
+// warnRestart names every field that needs a restart and tells the operator
+// what to do. Values are never logged.
+func warnRestart(restart []string) {
+	for _, field := range restart {
+		slog.Warn("config watch: change needs restart, kept previous config", "field", field,
+			"action", "restart beacon mcp and reconnect OpenCode")
+	}
+}
+
+// keepServicesState builds a snapshot that applies cfg without replacing the
+// harness or the relay. A caller that needs new merge settings passes a new
+// policy; the others pass the previous one.
+func (cw *configWatcher) keepServicesState(cfg config.Config, previous *liveState, policy core.MergePolicy) *liveState {
+	return &liveState{
+		cfg:        cfg,
+		harness:    previous.harness,
+		policy:     policy,
+		relay:      previous.relay,
+		generation: cw.generations + 1,
+	}
 }
 
 // restartFields names changed fields that cannot be applied without replacing
