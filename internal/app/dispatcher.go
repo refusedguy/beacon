@@ -110,10 +110,13 @@ type branchEnsure struct {
 }
 
 // plannedRun pairs a created run with the card it will start. The run is
-// already reserved when it reaches the launcher.
+// already reserved when it reaches the launcher. agent records the slot class
+// chosen under slotsMu at planning time, so the launcher never re-locks to ask
+// for it again.
 type plannedRun struct {
-	run  *core.Run
-	task core.Task
+	run   *core.Run
+	task  core.Task
+	agent bool
 }
 
 var _ core.AgentSlots = (*Dispatcher)(nil)
@@ -282,7 +285,7 @@ func (d *Dispatcher) planDispatch(ctx context.Context, n int) (*dispatchBatch, e
 		}
 		d.reserved[run.ID] = &slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: agent}
 		batch.reserved = append(batch.reserved, run.ID)
-		batch.planned = append(batch.planned, plannedRun{run: run, task: task})
+		batch.planned = append(batch.planned, plannedRun{run: run, task: task, agent: agent})
 	}
 	return batch, nil
 }
@@ -336,21 +339,11 @@ func (d *Dispatcher) releaseReservations(batch *dispatchBatch) {
 	}
 }
 
-// hasAgent reports whether run holds an agent slot. The read is under
-// slotsMu, so a concurrent batch cannot claim the slot between this check and
-// the start.
-func (d *Dispatcher) hasAgent(runID core.RunID) bool {
-	d.slotsMu.Lock()
-	defer d.slotsMu.Unlock()
-	res := d.reserved[runID]
-	return res != nil && res.agent
-}
-
-// claimSlots re-reads the active list after a failed start and upgrades the
-// next still-pending planned runs into agent slots. The check and the upgrades
+// claimSlots re-reads the active list once after the launch wave and upgrades
+// still-pending planned runs into freed agent slots. The check and the upgrades
 // share one slotsMu critical section, so another batch cannot take a freed
 // slot between the read and the upgrade.
-func (d *Dispatcher) claimSlots(ctx context.Context, batch *dispatchBatch, from int) {
+func (d *Dispatcher) claimSlots(ctx context.Context, batch *dispatchBatch) {
 	d.slotsMu.Lock()
 	defer d.slotsMu.Unlock()
 	active, err := d.Store.ListActive(ctx)
@@ -358,7 +351,7 @@ func (d *Dispatcher) claimSlots(ctx context.Context, batch *dispatchBatch, from 
 		return
 	}
 	free := d.availableFrom(d.withReserved(active))
-	for i := from; i < len(batch.planned) && free > 0; i++ {
+	for i := 0; i < len(batch.planned) && free > 0; i++ {
 		res := d.reserved[batch.planned[i].run.ID]
 		if res == nil || res.agent {
 			continue
@@ -368,14 +361,15 @@ func (d *Dispatcher) claimSlots(ctx context.Context, batch *dispatchBatch, from 
 	}
 }
 
-// launch starts the reserved runs without holding slotsMu. Runs holding an
-// agent slot start in one wave so their Create and Spawn calls overlap. Each
-// goroutine writes only its own result slot; the caller merges the slots in
-// planned order after the wave, which keeps the result deterministic without a
-// shared lock on out. A failed start frees its agent slot, so claimSlots runs
-// once after the wave rather than once per failure. Pending runs only persist
-// a row and stay on the caller, so a batch with one agent slot does not fan
-// out store writes.
+// launch starts the reserved runs without holding slotsMu. The planner already
+// recorded which runs hold an agent slot, so neither launch nor launchOne
+// re-locks slotsMu to ask again. Agent runs start in one wave so their Create
+// and Spawn calls overlap. Each goroutine writes only its own result slot; the
+// caller merges the slots in planned order after the wave, which keeps the
+// result deterministic without a shared lock on out. A failed start frees its
+// agent slot, so claimSlots runs once after the wave rather than once per
+// failure. Pending runs only persist a row and stay on the caller, so a batch
+// with one agent slot does not fan out store writes.
 func (d *Dispatcher) launch(ctx context.Context, batch *dispatchBatch, out *DispatchResult) error {
 	type startResult struct {
 		out    DispatchResult
@@ -385,7 +379,7 @@ func (d *Dispatcher) launch(ctx context.Context, batch *dispatchBatch, out *Disp
 	results := make([]startResult, len(batch.planned))
 	var wg sync.WaitGroup
 	for i, p := range batch.planned {
-		if !d.hasAgent(p.run.ID) {
+		if !p.agent {
 			results[i].failed, results[i].err = d.launchOne(ctx, batch, p, &results[i].out)
 			continue
 		}
@@ -415,7 +409,7 @@ func (d *Dispatcher) launch(ctx context.Context, batch *dispatchBatch, out *Disp
 		return firstErr
 	}
 	if anyFailed {
-		d.claimSlots(ctx, batch, 0)
+		d.claimSlots(ctx, batch)
 	}
 	return nil
 }
@@ -437,7 +431,7 @@ func (d *Dispatcher) launchOne(ctx context.Context, batch *dispatchBatch, p plan
 		d.Decisions.logDispatchSkip(ctx, skip)
 		return false, nil
 	}
-	if d.hasAgent(run.ID) {
+	if p.agent {
 		if err := d.startOne(ctx, batch, run, task); err != nil {
 			out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
 			d.handleStartFailure(ctx, run, err)
@@ -516,7 +510,7 @@ func (d *Dispatcher) planPromotion(ctx context.Context) (*dispatchBatch, error) 
 		}
 		d.reserved[run.ID] = &slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: true}
 		batch.reserved = append(batch.reserved, run.ID)
-		batch.planned = append(batch.planned, plannedRun{run: run, task: task})
+		batch.planned = append(batch.planned, plannedRun{run: run, task: task, agent: true})
 		budget--
 	}
 	return batch, nil
