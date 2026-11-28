@@ -83,7 +83,8 @@ func parseCard(content, path string) (core.Task, bool) {
 
 // parseCardFields parses one card and also reports whether it carried YAML
 // frontmatter. Callers that need the format reuse this result instead of
-// splitting the same text a second time.
+// splitting the same text a second time. Both the YAML and the flat-line
+// fields go through the decoders shared with the issue reader.
 func parseCardFields(content, path string) (core.Task, bool, bool) {
 	dir := filepath.Dir(path)
 	lines := cardLines(content)
@@ -95,28 +96,14 @@ func parseCardFields(content, path string) (core.Task, bool, bool) {
 			slog.Warn("tasksource: malformed card frontmatter", "path", path, "error", err)
 			return t, false, hasFM
 		}
-		t.ID = core.TaskID(core.FirstNonEmpty(strings.TrimSpace(fm.TaskID), strings.TrimSpace(fm.ID)))
-		t.Title = strings.TrimSpace(fm.Title)
-		t.Status = normalizeStatus(fm.Status)
-		t.Parent = core.TaskID(strings.TrimSpace(fm.Parent))
-		t.Priority = fm.Priority
-		t.Kind = normalizeKind(fm.Kind)
-		t.BaseBranch = strings.TrimSpace(fm.BaseBranch)
-		t.RequireReview = normalizeReview(fm.RequireReview)
-		t.WorkerAgent = strings.TrimSpace(fm.WorkerAgent)
-		t.WorkerPrompt = strings.TrimSpace(fm.WorkerPrompt)
-		t.Plan = childSpecs(fm.Plan, dir)
-		t.Scope = scopePaths(fm.combinedScope(), dir)
-		for _, d := range append(fm.Depends, fm.DependsOn...) {
-			if d = strings.TrimSpace(d); d != "" {
-				t.DependsOn = append(t.DependsOn, core.TaskID(d))
-			}
+		fields := decodeSchema(fm, dir)
+		decodeAliases(cardLines(body), dir, "", &fields)
+		t = fields.task(dir)
+		if fields.Phase != "" {
+			body = "Phase: " + fields.Phase + "\n" + body
 		}
-		if fm.Phase != "" {
-			body = "Phase: " + fm.Phase + "\n" + body
-		}
-		if fm.SourceRef != "" {
-			body = "SourceRef: " + fm.SourceRef + "\n" + body
+		if fields.SourceRef != "" {
+			body = "SourceRef: " + fields.SourceRef + "\n" + body
 		}
 		t.Body = strings.TrimSpace(body)
 		if t.ID == "" {
@@ -144,25 +131,20 @@ func headingIDLines(lines []string) (core.TaskID, string) {
 	return "", ""
 }
 
-// parseLegacyLines parses a card without frontmatter from pre-split lines.
+// parseLegacyLines parses a card without frontmatter from pre-split lines. It
+// uses the same alias decoder as issue bodies, so a legacy card and an issue
+// carrying the same flat fields produce the same task.
 func parseLegacyLines(lines []string, dir string) core.Task {
-	t := core.Task{}
-	t.ID, t.Title = headingIDLines(lines)
+	var fields taskFields
+	decodeAliases(lines, dir, "", &fields)
+	t := fields.task(dir)
+	if t.ID == "" {
+		t.ID, t.Title = headingIDLines(lines)
+	}
 	var extra []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "Статус:"):
-			t.Status = normalizeStatus(strings.TrimPrefix(line, "Статус:"))
-		case strings.HasPrefix(line, "Владелец файлов:"):
-			for _, p := range splitList(strings.TrimPrefix(line, "Владелец файлов:")) {
-				t.Scope = append(t.Scope, scopeForPath(p, dir))
-			}
-		case strings.HasPrefix(line, "Зависимости:"):
-			for _, d := range splitList(strings.TrimPrefix(line, "Зависимости:")) {
-				t.DependsOn = append(t.DependsOn, core.TaskID(d))
-			}
-		case strings.HasPrefix(line, "Фаза:"), strings.HasPrefix(line, "Ссылка:"):
+		if strings.HasPrefix(line, "Фаза:") || strings.HasPrefix(line, "Ссылка:") {
 			extra = append(extra, line)
 		}
 	}

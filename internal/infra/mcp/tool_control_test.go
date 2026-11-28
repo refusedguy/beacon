@@ -754,3 +754,121 @@ func TestOrchestratorToolsRejectWorkerCaller(t *testing.T) {
 		})
 	}
 }
+
+func TestControlBatchReplayAfterRestart(t *testing.T) {
+	store := journalTestStore(t)
+	ctx := context.Background()
+	for _, id := range []core.RunID{"r1", "r2"} {
+		if err := store.Save(ctx, core.NewRun(id, "T-1", time.Now().UTC())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := map[string]any{
+		"action":       "cancel",
+		"run_ids":      []any{"r1", "r2"},
+		"operation_id": "op-cancel-restart",
+	}
+	firstServer := controlClient(t, Services{Control: &app.Control{Store: store}})
+	first := parseControlBatch(t, callControl(t, firstServer, args))
+	if first.Status != "applied" || len(first.Results) != 2 {
+		t.Fatalf("first batch = %+v", first)
+	}
+
+	// A fresh server has a fresh in-memory journal but reads the same database.
+	secondServer := controlClient(t, Services{Control: &app.Control{Store: store}})
+	res := callControl(t, secondServer, args)
+	second := parseControlBatch(t, res)
+	if second.Status != "duplicate" || second.OperationID != "op-cancel-restart" {
+		t.Fatalf("replayed metadata = %+v", second)
+	}
+	if res.IsError {
+		t.Fatal("replayed batch reported an error")
+	}
+	if len(second.Results) != len(first.Results) {
+		t.Fatalf("replayed results = %+v, want %+v", second.Results, first.Results)
+	}
+	for i := range first.Results {
+		if second.Results[i] != first.Results[i] {
+			t.Fatalf("result %d changed: %+v vs %+v", i, second.Results[i], first.Results[i])
+		}
+		if second.Results[i].Reason != "" {
+			t.Fatalf("replayed result %d was reapplied: %+v", i, second.Results[i])
+		}
+	}
+}
+
+func TestControlBatchReplayKeepsPartialFailure(t *testing.T) {
+	store := journalTestStore(t)
+	ctx := context.Background()
+	if err := store.Save(ctx, core.NewRun("r1", "T-1", time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	args := map[string]any{
+		"action":       "cancel",
+		"run_ids":      []any{"r1", "missing"},
+		"operation_id": "op-partial-restart",
+	}
+	firstServer := controlClient(t, Services{Control: &app.Control{Store: store}})
+	firstRes := callControl(t, firstServer, args)
+	first := parseControlBatch(t, firstRes)
+	if !firstRes.IsError || len(first.Results) != 2 {
+		t.Fatalf("first batch = %+v, result = %+v", first, firstRes)
+	}
+
+	secondServer := controlClient(t, Services{Control: &app.Control{Store: store}})
+	res := callControl(t, secondServer, args)
+	second := parseControlBatch(t, res)
+	if !res.IsError {
+		t.Fatal("replayed partial batch lost IsError")
+	}
+	if len(second.Results) != len(first.Results) {
+		t.Fatalf("replayed results = %+v, want %+v", second.Results, first.Results)
+	}
+	for i := range first.Results {
+		if second.Results[i] != first.Results[i] {
+			t.Fatalf("result %d changed: %+v vs %+v", i, second.Results[i], first.Results[i])
+		}
+	}
+}
+
+func TestControlBatchRetryKeepsSucceededIDs(t *testing.T) {
+	store := newControlStore()
+	store.add(core.NewRun("r1", "T-1", time.Now()))
+	cs := controlClient(t, newControlServices(store))
+
+	args := map[string]any{"action": "cancel", "run_ids": []any{"r1", "missing"}}
+	first := parseControlBatch(t, callControl(t, cs, args))
+	if first.Results[0].Status != "ok" || first.Results[1].Status != "error" {
+		t.Fatalf("first results = %+v", first.Results)
+	}
+
+	// A new operation id reissues the batch. The already cancelled run is a
+	// no-op success, so it does not flip to an error on the retry.
+	args["operation_id"] = "op-retry-partial"
+	res := callControl(t, cs, args)
+	second := parseControlBatch(t, res)
+	if !res.IsError || len(second.Results) != 2 {
+		t.Fatalf("retry = %+v", res)
+	}
+	if second.Results[0].ID != "r1" || second.Results[0].Status != "ok" ||
+		second.Results[0].Reason != "already_closed" {
+		t.Fatalf("cancelled id changed: %+v", second.Results[0])
+	}
+	if second.Results[1].ID != "missing" || second.Results[1].Status != "error" {
+		t.Fatalf("missing id result = %+v", second.Results[1])
+	}
+}
+
+func TestControlSingleRepeatCancelStillReturnsOK(t *testing.T) {
+	store := newControlStore()
+	run := core.NewRun("r1", "T-1", time.Now())
+	run.State = core.RunClosed
+	run.Reason = "cancelled by operator"
+	store.add(run)
+	cs := controlClient(t, newControlServices(store))
+
+	res := callControl(t, cs, map[string]any{"action": "cancel", "run_id": "r1"})
+	if res.IsError || controlText(t, res) != "ok" {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+}

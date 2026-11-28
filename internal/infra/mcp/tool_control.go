@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 
 	msdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,27 +30,62 @@ func ControlMessage(ctx context.Context) string {
 
 // ControlArgs is the input schema for beacon_control. RunIDs is optional;
 // when present it replaces RunID and the call returns one result per id.
+// OperationID journals a batch so a retry returns the stored per-id outcomes.
 type ControlArgs struct {
-	Action  string   `json:"action,omitempty"`
-	RunID   string   `json:"run_id,omitempty"`
-	RunIDs  []string `json:"run_ids,omitempty"`
-	SHA     string   `json:"sha,omitempty"`
-	PR      int      `json:"pr,omitempty"`
-	Message string   `json:"message,omitempty"`
+	Action      string   `json:"action,omitempty"`
+	RunID       string   `json:"run_id,omitempty"`
+	RunIDs      []string `json:"run_ids,omitempty"`
+	SHA         string   `json:"sha,omitempty"`
+	PR          int      `json:"pr,omitempty"`
+	Message     string   `json:"message,omitempty"`
+	OperationID string   `json:"operation_id,omitempty"`
 }
 
 type controlItem struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type controlBatch struct {
 	Action  string        `json:"action"`
 	Results []controlItem `json:"results"`
+	app.OperationMeta
+}
+
+// WithMeta lets the mutation journal stamp idempotency metadata on a batch
+// without knowing the concrete result type.
+func (b controlBatch) WithMeta(id, status string) any {
+	b.Status, b.OperationID = status, id
+	return b
+}
+
+// hasError reports whether any id failed. One failed id makes the whole call
+// an error even when the other ids succeeded.
+func (b controlBatch) hasError() bool {
+	for _, item := range b.Results {
+		if item.Status == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+// controlOperationStore returns the durable journal store behind the control
+// service. Control shares the state store with the task mutations, so a batch
+// replay survives a restart. Without a durable store the journal stays in memory.
+func controlOperationStore(sv Services) operationStore {
+	if sv.Control != nil {
+		if store, ok := sv.Control.Store.(operationStore); ok && store != nil {
+			return store
+		}
+	}
+	return journalStore(sv)
 }
 
 func registerControl(s *msdk.Server, sv Services) {
+	journal := newOpJournal(controlOperationStore(sv))
 	msdk.AddTool(s, catalogTool("beacon_control"), func(ctx context.Context, req *msdk.CallToolRequest, a ControlArgs) (*msdk.CallToolResult, any, error) {
 		action := core.ParseControlAction(a.Action)
 		if !action.Valid() {
@@ -63,12 +100,25 @@ func registerControl(s *msdk.Server, sv Services) {
 		ctx = app.WithControlActor(ctx, metaString(req, "beacon/agent", "ai.opencode/agent"))
 		if a.RunIDs == nil {
 			if err := applyControl(ctx, sv, a.Action, a.RunID, a.PR, a.SHA, a.Message); err != nil {
+				if _, ok := noticeReason(err); ok {
+					return textResult("ok"), nil, nil
+				}
 				return nil, nil, err
 			}
 			return textResult("ok"), nil, nil
 		}
-		return controlMany(ctx, sv, a)
+		return controlMany(ctx, journal, sv, a)
 	})
+}
+
+// noticeReason reports a control action that needed no change. Boundaries
+// present it as success with the reason attached so a retry converges.
+func noticeReason(err error) (string, bool) {
+	var notice *app.ControlNotice
+	if errors.As(err, &notice) {
+		return notice.Reason, true
+	}
+	return "", false
 }
 
 // applyControl forwards one action either to the loopback API or to the local
@@ -92,7 +142,41 @@ func applyLocal(ctx context.Context, control *app.Control, action, id, sha strin
 	})
 }
 
-func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToolResult, any, error) {
+// applyControlBatch applies one verb to each id and keeps the outcome per id.
+// A no-op notice is success with a reason, never a failed id.
+func applyControlBatch(ctx context.Context, sv Services, a ControlArgs) (any, error) {
+	results := make([]controlItem, 0, len(a.RunIDs))
+	for _, id := range a.RunIDs {
+		item := controlItem{ID: id, Status: "ok"}
+		if err := applyControl(ctx, sv, a.Action, id, a.PR, a.SHA, a.Message); err != nil {
+			if reason, ok := noticeReason(err); ok {
+				item.Reason = reason
+			} else {
+				item.Status = "error"
+				item.Error = err.Error()
+			}
+		}
+		results = append(results, item)
+	}
+	return controlBatch{Action: a.Action, Results: results}, nil
+}
+
+// batchFailed reads the outcome back from the wire form. A replay from the
+// durable store returns raw JSON rather than a controlBatch value, so the
+// check cannot type-assert the Go value.
+func batchFailed(out any) bool {
+	wire, err := json.Marshal(out)
+	if err != nil {
+		return false
+	}
+	var batch controlBatch
+	return json.Unmarshal(wire, &batch) == nil && batch.hasError()
+}
+
+// controlMany journals the batch when the caller supplies an operation id. A
+// replay returns the stored per-id results without re-applying any cancel,
+// unblock or retry, and keeps IsError when an id failed.
+func controlMany(ctx context.Context, journal *opJournal, sv Services, a ControlArgs) (*msdk.CallToolResult, any, error) {
 	if len(a.RunIDs) == 0 {
 		return nil, nil, core.Errorf(core.CodeInvalidInput, "run_ids must not be empty")
 	}
@@ -102,21 +186,15 @@ func controlMany(ctx context.Context, sv Services, a ControlArgs) (*msdk.CallToo
 	if err := requireService("control service", sv.Remote, sv.Control); err != nil {
 		return nil, nil, err
 	}
-	results := make([]controlItem, 0, len(a.RunIDs))
-	for _, id := range a.RunIDs {
-		item := controlItem{ID: id, Status: "ok"}
-		if err := applyControl(ctx, sv, a.Action, id, a.PR, a.SHA, a.Message); err != nil {
-			item.Status = "error"
-			item.Error = err.Error()
-		}
-		results = append(results, item)
+	out, err := journal.run(ctx, a.OperationID, func(ctx context.Context) (any, error) {
+		return applyControlBatch(ctx, sv, a)
+	})
+	if err != nil {
+		return nil, nil, err
 	}
-	result := jsonResult(controlBatch{Action: a.Action, Results: results})
-	for _, item := range results {
-		if item.Status == "error" {
-			result.IsError = true
-			break
-		}
+	result := jsonResult(out)
+	if batchFailed(out) {
+		result.IsError = true
 	}
 	return result, nil, nil
 }

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -102,6 +103,20 @@ func syncFingerprint(tasks []core.Task) ([]byte, error) {
 	return json.Marshal(tasks)
 }
 
+// validateUniqueTaskIDs rejects a graph that names one ID twice. SQLite stores
+// one row per ID through the tasks primary key, so a duplicate would make the
+// index's first-path-wins answer disagree with the row written last.
+func validateUniqueTaskIDs(tasks []core.Task) error {
+	seen := make(map[core.TaskID]bool, len(tasks))
+	for _, t := range tasks {
+		if seen[t.ID] {
+			return core.Errorf(core.CodeInvalidInput, "duplicate task id %q", t.ID)
+		}
+		seen[t.ID] = true
+	}
+	return nil
+}
+
 // syncStatements are the two inserts reused for every card in one sync.
 type syncStatements struct {
 	task *sql.Stmt
@@ -135,23 +150,48 @@ func (st *syncStatements) close() {
 	_ = st.deps.Close()
 }
 
-// beaconDoneTasks returns the ids of stored cards Beacon marked done. A card
-// whose status is done in SQLite is authoritative over a stale working tree.
-func beaconDoneTasks(ctx context.Context, db *sql.DB) (map[string]bool, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id FROM tasks WHERE status=?`, statusDone)
+// beaconOwnedStatuses returns the status Beacon wrote for each stored card.
+// A claimed or done status in SQLite is authoritative over a stale working
+// tree: the worker changes the card in its own worktree, so main can still
+// report the older status while a run is in flight.
+func beaconOwnedStatuses(ctx context.Context, db *sql.DB) (map[string]string, error) {
+	query, args := inQuery(`SELECT id, status FROM tasks WHERE status IN (%s)`,
+		[]string{statusDone, string(core.TaskClaimed)})
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make(map[string]bool)
+	out := make(map[string]string)
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, status string
+		if err := rows.Scan(&id, &status); err != nil {
 			return nil, err
 		}
-		out[id] = true
+		out[id] = status
 	}
 	return out, rows.Err()
+}
+
+// mergeSyncStatus keeps a Beacon-written status when the file still reports an
+// unclaimed status. A file that already reports claimed, done or dropped is
+// newer than the stored row and wins. Other statuses follow the file.
+func mergeSyncStatus(fileStatus, owned string) string {
+	status := fileStatus
+	if status == "" {
+		status = statusAvailable
+	}
+	switch owned {
+	case statusDone:
+		if status != statusDone && status != statusDropped {
+			return statusDone
+		}
+	case string(core.TaskClaimed):
+		if status == statusAvailable || status == statusTodo {
+			return string(core.TaskClaimed)
+		}
+	}
+	return status
 }
 
 // writeSyncRows merges the current cards into the stored graph. Beacon controls
@@ -160,10 +200,10 @@ func beaconDoneTasks(ctx context.Context, db *sql.DB) (map[string]bool, error) {
 // a stale working tree still reports it available. Other fields always follow
 // the file. Rows and dependencies absent from tasks are removed, so deletions
 // still take effect. The statements are prepared once by the caller.
-func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []core.Task, done map[string]bool) error {
+func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []core.Task, owned map[string]string) error {
 	ids := make([]string, 0, len(tasks))
 	for _, t := range tasks {
-		if err := writeSyncTask(ctx, st, t, done); err != nil {
+		if err := writeSyncTask(ctx, st, t, owned[string(t.ID)]); err != nil {
 			return err
 		}
 		ids = append(ids, string(t.ID))
@@ -172,8 +212,8 @@ func writeSyncRows(ctx context.Context, tx *sql.Tx, st *syncStatements, tasks []
 }
 
 // writeSyncTask upserts one card and its dependency edges. A stale working
-// tree cannot revert a card Beacon already marked done.
-func writeSyncTask(ctx context.Context, st *syncStatements, t core.Task, done map[string]bool) error {
+// tree cannot revert a status Beacon already wrote to the stored card.
+func writeSyncTask(ctx context.Context, st *syncStatements, t core.Task, owned string) error {
 	scope, err := json.Marshal(t.Scope)
 	if err != nil {
 		return err
@@ -182,13 +222,7 @@ func writeSyncTask(ctx context.Context, st *syncStatements, t core.Task, done ma
 	if err != nil {
 		return err
 	}
-	status := string(t.Status)
-	if status == "" {
-		status = statusAvailable
-	}
-	if done[string(t.ID)] && status != statusDone && status != statusDropped {
-		status = statusDone
-	}
+	status := mergeSyncStatus(string(t.Status), owned)
 	kind := string(t.Kind)
 	if kind == "" {
 		kind = "task"
@@ -206,9 +240,37 @@ func writeSyncTask(ctx context.Context, st *syncStatements, t core.Task, done ma
 	return nil
 }
 
+// logDanglingEdges names an edge whose target card is no longer in the graph
+// before pruning removes it. The log gives an operator a clear reason why the
+// dependency stopped blocking the task in both readers.
+func logDanglingEdges(ctx context.Context, tx *sql.Tx, ids []string) error {
+	query := `SELECT task_id, depends_on FROM task_deps`
+	var args []any
+	if len(ids) > 0 {
+		q, a := inQuery(`SELECT task_id, depends_on FROM task_deps WHERE depends_on NOT IN (%s)`, ids)
+		query, args = q, a
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var task, dep string
+		if err := rows.Scan(&task, &dep); err != nil {
+			return err
+		}
+		slog.Warn("sqlite: dropping dependency on missing card", "task", task, "depends_on", dep)
+	}
+	return rows.Err()
+}
+
 // pruneSyncRows removes every stored row and edge not named by ids.
 func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string) error {
 	if len(ids) == 0 {
+		if err := logDanglingEdges(ctx, tx, nil); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps`); err != nil {
 			return err
 		}
@@ -220,6 +282,9 @@ func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string) error {
 	for i, id := range ids {
 		marks[i] = "?"
 		args = append(args, id)
+	}
+	if err := logDanglingEdges(ctx, tx, ids); err != nil {
+		return err
 	}
 	depsArgs := append(append([]any(nil), args...), args...)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM task_deps WHERE task_id NOT IN (`+strings.Join(marks, ",")+`) OR depends_on NOT IN (`+strings.Join(marks, ",")+`)`, depsArgs...); err != nil {
@@ -237,6 +302,9 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	// Reject an impossible graph before touching the cache or the tables, so a
 	// failed sync leaves both the stored graph and the fingerprint unchanged.
 	if err := core.ValidateTaskGraph(tasks); err != nil {
+		return err
+	}
+	if err := validateUniqueTaskIDs(tasks); err != nil {
 		return err
 	}
 	fp, err := syncFingerprint(tasks)
@@ -259,7 +327,7 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return err
 	}
-	done, err := beaconDoneTasks(ctx, s.db)
+	owned, err := beaconOwnedStatuses(ctx, s.db)
 	if err != nil {
 		return err
 	}
@@ -273,7 +341,7 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 		return err
 	}
 	defer stmts.close()
-	if err := writeSyncRows(ctx, tx, stmts, tasks, done); err != nil {
+	if err := writeSyncRows(ctx, tx, stmts, tasks, owned); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -283,19 +351,27 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	return nil
 }
 
-// readyTasksQuery selects tasks with no unresolved dependency. A task blocked
-// through a chain is already blocked by its direct dependency, whose status is
-// not resolved, so a one-hop check covers the same set without walking the
-// graph to a depth limit. Status lists are bound parameters built from the
-// shared definitions, so no caller value is interpolated into the SQL.
+// unresolvedDependencies is the one predicate that decides whether a
+// dependency still blocks a task. An INNER JOIN drops an edge whose target
+// card was deleted, so a dangling dependency is treated as gone by both the
+// dispatcher and the monitor. SyncTasks logs the edge before it prunes it,
+// which gives that decision a clear reason in the daemon log. A task blocked
+// through a chain is already blocked by its direct dependency, so this
+// one-hop check covers the same set without walking the graph to a depth
+// limit. Status lists are bound parameters built from the shared definitions.
+const unresolvedDependencies = `FROM task_deps d
+    JOIN tasks dep ON dep.id = d.depends_on
+    WHERE dep.status NOT IN (%s)`
+
+// readyTasksQuery selects tasks with no unresolved dependency. It shares the
+// dependency predicate with ListQueueTasks so their verdicts cannot drift.
 var readyTasksQuery, readyTasksArgs = inQuery(`
 SELECT id, title, body, priority, scope_json, source_ref, kind, parent, base_branch, require_review, plan_json, worker_agent, worker_prompt
 FROM tasks t
 WHERE t.status IN (%s)
   AND NOT EXISTS (
-    SELECT 1 FROM task_deps d
-    JOIN tasks dep ON dep.id = d.depends_on
-    WHERE d.task_id = t.id AND dep.status NOT IN (%s)
+    SELECT 1 `+unresolvedDependencies+`
+    AND d.task_id = t.id
   )
 ORDER BY priority DESC, id`, openTaskStatuses, resolvedTaskStatuses)
 

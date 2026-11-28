@@ -31,6 +31,21 @@ func TestRegistryUniqueKeys(t *testing.T) {
 	}
 }
 
+// TestRegistryThresholdsArePinned keeps the advisory thresholds at their
+// reviewed values. A threshold only checked for positivity can be raised
+// silently and change which regressions pass, so the numbers live here too.
+func TestRegistryThresholdsArePinned(t *testing.T) {
+	const wantThreshold = 15
+	for _, spec := range Registry() {
+		if spec.ThresholdPct != wantThreshold {
+			t.Errorf("%s threshold = %v, want %v", spec.Key, spec.ThresholdPct, wantThreshold)
+		}
+	}
+	if got := DefaultNoisePolicy().DefaultFloorPct; got != 2 {
+		t.Errorf("default floor = %v, want 2", got)
+	}
+}
+
 func TestRegistryValidPlacement(t *testing.T) {
 	valid := map[string]bool{PlacementPR: true, PlacementNightly: true, PlacementBoth: true}
 	for _, spec := range Registry() {
@@ -163,6 +178,7 @@ var harnessSources = []string{
 	"ui_bench.js",
 	"run_watcher_bench.js",
 	"../infra/workspace/git_worktree_test.go",
+	"../infra/mcp/duplicate_encode_bench_test.go",
 	"../infra/notify/telegram_bench_test.go",
 	"../infra/notify/telegram_test.go",
 	"../../cmd/beacon/http_test.go",
@@ -214,6 +230,47 @@ func TestHarnessKeysAreRegistered(t *testing.T) {
 	}
 	for _, path := range prBenchSources {
 		checkKeys(path)
+	}
+}
+
+// TestJournalMirrorMatchesProduction pins the benchmark journal mirror to the
+// journal in internal/infra/mcp/server.go. The limit and the LRU body are
+// copied by hand, so a production change the mirror misses fails this source
+// check instead of quietly benchmarking a different algorithm.
+func TestJournalMirrorMatchesProduction(t *testing.T) {
+	server, err := os.ReadFile("../infra/mcp/server.go")
+	if err != nil {
+		t.Fatalf("read production journal source: %v", err)
+	}
+	models, err := os.ReadFile("models.go")
+	if err != nil {
+		t.Fatalf("read mirror source: %v", err)
+	}
+	serverSource, mirrorSource := string(server), string(models)
+
+	limit := "operationJournalLimit = " + strconv.Itoa(operationJournalLimit)
+	for label, source := range map[string]string{"production": serverSource, "mirror": mirrorSource} {
+		if !strings.Contains(source, limit) {
+			t.Errorf("%s journal does not declare %q", label, limit)
+		}
+	}
+
+	for _, fragment := range []struct{ label, body string }{
+		{"claim signature", "func (j *opJournal) claim(id string) (<-chan struct{}, bool) {"},
+		{"touch move", "j.order.MoveToBack(elem)"},
+		{"touch insert", "j.index[id] = j.order.PushBack(id)"},
+		{"eviction bound", "for len(j.done) > operationJournalLimit {"},
+		{"eviction remove", "j.order.Remove(oldest)"},
+		{"eviction index", "delete(j.index, key)"},
+		{"eviction done", "delete(j.done, key)"},
+		{"cache lookup", "entry, ok := j.done[id]"},
+	} {
+		if !strings.Contains(serverSource, fragment.body) {
+			t.Errorf("production journal lost the %s: %q", fragment.label, fragment.body)
+		}
+		if !strings.Contains(mirrorSource, fragment.body) {
+			t.Errorf("journal mirror lost the %s: %q", fragment.label, fragment.body)
+		}
 	}
 }
 

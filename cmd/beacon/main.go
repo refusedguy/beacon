@@ -297,7 +297,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		Store: infra.store, Source: infra.source, Workspace: infra.workspace, Root: workspaceRoot,
 	}
 	updater := &app.TaskUpdater{
-		Store: infra.store, Workspace: infra.workspace, Root: workspaceRoot,
+		Store: infra.store, Source: infra.source, Workspace: infra.workspace, Root: workspaceRoot,
 	}
 	disp := &app.Dispatcher{
 		Source:    infra.source,

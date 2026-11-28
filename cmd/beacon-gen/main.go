@@ -91,14 +91,13 @@ func buildGenerated(specs []mcp.ToolSpec) generated {
 		if !spec.OrchestratorOnly {
 			continue
 		}
-		g.actions[spec.Name] = true
-		// The old generator emitted a second beacon_ prefix. Keep it in the
-		// owned set so an existing config loses that stale entry on rewrite.
-		g.actions["beacon_"+spec.Name] = true
 		g.global = append(g.global, permission(spec.Name, "deny"))
 		g.allow = append(g.allow, permission(spec.Name, "allow"))
 		g.worker = append(g.worker, permission(spec.Name, "deny"))
 	}
+	// The owned-action rule, including the stale doubled prefix, belongs to
+	// the catalog package. This generator and the library merge now share it.
+	g.actions = mcp.OwnedActions(mcp.GeneratedPermissions(sorted).Global)
 	return g
 }
 
