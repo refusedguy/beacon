@@ -1,7 +1,7 @@
 ---
 id: T-1bf3c4d9
 title: 'P10: Dispatcher launch and sync cuts'
-status: available
+status: dropped
 scope:
     - internal/app/dispatcher.go
     - internal/app/dispatcher_test.go
@@ -11,6 +11,7 @@ depends:
 priority: 12
 kind: task
 require_review: llm
+status_reason: "PR 2880 closed: advisory flat on deciding dispatch row and root app -race blocked by pre-existing mocks race"
 ---
 
 Goal: cut launch serialization and claimSlots reads once counters are wired.
