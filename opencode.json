@@ -10,7 +10,22 @@
           "resource": "*"
         },
         {
+          "action": "beacon_beacon_dispatch",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_recent",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
           "action": "beacon_beacon_reconcile",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_status",
           "effect": "allow",
           "resource": "*"
         },
@@ -51,7 +66,22 @@
           "resource": "*"
         },
         {
+          "action": "beacon_beacon_dispatch",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_recent",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
           "action": "beacon_beacon_reconcile",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_status",
           "effect": "allow",
           "resource": "*"
         },
@@ -88,11 +118,26 @@
       "permissions": [
         {
           "action": "beacon_beacon_control",
-          "effect": "allow",
+          "effect": "deny",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_dispatch",
+          "effect": "deny",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_recent",
+          "effect": "deny",
           "resource": "*"
         },
         {
           "action": "beacon_beacon_reconcile",
+          "effect": "deny",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_status",
           "effect": "deny",
           "resource": "*"
         },
@@ -126,7 +171,27 @@
   },
   "permissions": [
     {
+      "action": "beacon_beacon_control",
+      "effect": "deny",
+      "resource": "*"
+    },
+    {
+      "action": "beacon_beacon_dispatch",
+      "effect": "deny",
+      "resource": "*"
+    },
+    {
+      "action": "beacon_beacon_recent",
+      "effect": "deny",
+      "resource": "*"
+    },
+    {
       "action": "beacon_beacon_reconcile",
+      "effect": "deny",
+      "resource": "*"
+    },
+    {
+      "action": "beacon_beacon_status",
       "effect": "deny",
       "resource": "*"
     },

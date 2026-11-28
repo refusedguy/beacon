@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -102,6 +104,43 @@ func TestOrchestratorToolRefusesAbsentMetadata(t *testing.T) {
 	for _, want := range []string{string(core.CodePermissionDenied), "observed role \"absent\"", "required role \"orchestrator\""} {
 		if !strings.Contains(text.Text, want) {
 			t.Errorf("text %q does not contain %q", text.Text, want)
+		}
+	}
+}
+
+// TestWorkerToolsArePinnedToBindingAndWaiting pins the worker tool set. A worker
+// binds its pull request and waits for a verdict. Every other tool, including
+// control, stays with the orchestrator.
+func TestWorkerToolsArePinnedToBindingAndWaiting(t *testing.T) {
+	var worker []string
+	for _, spec := range ToolCatalog() {
+		if !spec.OrchestratorOnly {
+			worker = append(worker, spec.Name)
+		}
+	}
+	sort.Strings(worker)
+	want := []string{"beacon_wait", "beacon_watch_pr"}
+	if !slices.Equal(worker, want) {
+		t.Fatalf("worker tools = %q, want %q", worker, want)
+	}
+}
+
+// TestNoControlVerbStaysWithWorkers checks the permission gate for every verb
+// core advertises. All verbs share one action, so a worker denied that action
+// cannot reach any of them through the client.
+func TestNoControlVerbStaysWithWorkers(t *testing.T) {
+	verbs := core.ControlActionNames()
+	if len(verbs) == 0 {
+		t.Fatal("core advertises no control verbs")
+	}
+	workerEffects := make(map[string]string)
+	for _, p := range GeneratedPermissions(ToolCatalog()).Deny {
+		workerEffects[p.Action] = p.Effect
+	}
+	action := mcpAction("beacon_control")
+	for _, verb := range verbs {
+		if got := workerEffects[action]; got != "deny" {
+			t.Errorf("worker action %q for verb %q = %q, want deny", action, verb, got)
 		}
 	}
 }

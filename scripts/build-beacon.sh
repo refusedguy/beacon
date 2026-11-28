@@ -43,7 +43,7 @@ compute_build_hash() {
 # Self-contained shell test. Stub `go`, build twice with unchanged sources,
 # then build once after a source change. The stub records every invocation.
 self_test() {
-  local tmp calls stub script first recorded computed second
+  local tmp calls ldflags stub script first recorded computed second
   tmp="$(mktemp -d)"
   trap "rm -rf '$tmp'" EXIT
 
@@ -57,6 +57,8 @@ self_test() {
 
   calls="$tmp/go-calls"
   : > "$calls"
+  ldflags="$tmp/go-ldflags"
+  : > "$ldflags"
   stub="$tmp/stubbin/go"
   cat > "$stub" <<'STUB'
 #!/usr/bin/env bash
@@ -69,6 +71,11 @@ while [ "$#" -gt 0 ]; do
     shift 2
     continue
   fi
+  if [ "$1" = "-ldflags" ]; then
+    printf '%s\n' "$2" >> "$BEACON_TEST_LDFLAGS"
+    shift 2
+    continue
+  fi
   shift
 done
 [ -n "$out" ] || { echo "stub go: no -o argument" >&2; exit 1; }
@@ -78,6 +85,7 @@ STUB
   chmod +x "$stub"
 
   export BEACON_TEST_CALLS="$calls"
+  export BEACON_TEST_LDFLAGS="$ldflags"
   export PATH="$tmp/stubbin:$PATH"
   script="$tmp/scripts/build-beacon.sh"
 
@@ -95,6 +103,14 @@ STUB
     echo "self-test: build-sha does not describe the computed hash" >&2
     exit 1
   fi
+  if [ "$(wc -l < "$ldflags" | tr -d '[:space:]')" -ne 1 ]; then
+    echo "self-test: expected one embedded hash after two identical builds" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "main.sourceBuildHash=$computed" "$ldflags"; then
+    echo "self-test: build did not embed the computed hash" >&2
+    exit 1
+  fi
 
   printf '// changed\n' >> "$tmp/cmd/beacon/main.go"
   bash "$script" >/dev/null
@@ -108,6 +124,14 @@ STUB
   computed="$(bash "$script" --hash)"
   if [ "$recorded" != "$computed" ]; then
     echo "self-test: build-sha is stale after a source change" >&2
+    exit 1
+  fi
+  if [ "$(wc -l < "$ldflags" | tr -d '[:space:]')" -ne 2 ]; then
+    echo "self-test: expected a second embedded hash after a source change" >&2
+    exit 1
+  fi
+  if ! tail -n 1 "$ldflags" | grep -Fq -- "main.sourceBuildHash=$computed"; then
+    echo "self-test: build did not embed the refreshed hash after a source change" >&2
     exit 1
   fi
 
@@ -142,7 +166,7 @@ fi
 tmpdir="$(mktemp -d .opencode/bin/.build.XXXXXX)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-go build -o "$tmpdir/beacon" ./cmd/beacon
+go build -ldflags "-X main.sourceBuildHash=$hash" -o "$tmpdir/beacon" ./cmd/beacon
 mv -f "$tmpdir/beacon" .opencode/bin/beacon
 
 # Publish the hash only after the rename succeeds. A failed build or rename

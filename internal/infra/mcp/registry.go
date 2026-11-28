@@ -77,12 +77,12 @@ var toolRegistrations []func(*msdk.Server, Services)
 // catalogTool, which reads the table.
 func init() {
 	toolSpecs = []ToolSpec{
-		{Name: "beacon_dispatch", Description: "Pick up to N non-overlapping tasks and start agents.", Register: registerDispatch},
+		{Name: "beacon_dispatch", Description: "Pick up to N non-overlapping tasks and start agents.", OrchestratorOnly: true, Register: registerDispatch},
 		{Name: "beacon_watch_pr", Description: "Bind a pull request to a running task.", Register: registerWatchPR},
-		{Name: "beacon_status", Description: "List active runs, PRs and blockers.", Register: registerStatus},
-		{Name: "beacon_recent", Description: "List the most recently finished runs.", Register: registerRecent},
+		{Name: "beacon_status", Description: "List active runs, PRs and blockers.", OrchestratorOnly: true, Register: registerStatus},
+		{Name: "beacon_recent", Description: "List the most recently finished runs.", OrchestratorOnly: true, Register: registerRecent},
 		{Name: "beacon_wait", Description: "Wait for a run to reach an active verdict or a terminal state.", Register: registerWait},
-		{Name: "beacon_control", Description: controlDescription(), AllowAll: true, Register: registerControl},
+		{Name: "beacon_control", Description: controlDescription(), OrchestratorOnly: true, Register: registerControl},
 		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskCreate},
 		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskDelete},
 		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskUpdate},

@@ -68,11 +68,18 @@ func TestToolCatalogMatchesRegisteredTools(t *testing.T) {
 			orchestratorOnly++
 		}
 	}
-	if orchestratorOnly != 6 || !byName["beacon_task_create"].OrchestratorOnly ||
-		!byName["beacon_task_delete"].OrchestratorOnly || !byName["beacon_task_update"].OrchestratorOnly ||
-		!byName["beacon_task_close"].OrchestratorOnly || !byName["beacon_task_start"].OrchestratorOnly ||
-		!byName["beacon_reconcile"].OrchestratorOnly {
-		t.Fatalf("only task creation, deletion, update, close, start and reconcile should be orchestrator-only: %+v", catalog)
+	wantOrchestratorOnly := []string{
+		"beacon_control", "beacon_dispatch", "beacon_recent", "beacon_reconcile",
+		"beacon_status", "beacon_task_close", "beacon_task_create", "beacon_task_delete",
+		"beacon_task_start", "beacon_task_update",
+	}
+	for _, name := range wantOrchestratorOnly {
+		if !byName[name].OrchestratorOnly {
+			t.Errorf("%s is not orchestrator-only", name)
+		}
+	}
+	if orchestratorOnly != len(wantOrchestratorOnly) {
+		t.Fatalf("orchestrator-only count = %d, want %d: %+v", orchestratorOnly, len(wantOrchestratorOnly), catalog)
 	}
 }
 
@@ -80,10 +87,6 @@ func TestToolCatalogMatchesRegisteredTools(t *testing.T) {
 // by name. A worker tool added, removed or renamed changes the permission gate,
 // so it must land with a catalog edit and a regenerated opencode.json.
 var workerToolNames = []string{
-	"beacon_control",
-	"beacon_dispatch",
-	"beacon_recent",
-	"beacon_status",
 	"beacon_wait",
 	"beacon_watch_pr",
 }
