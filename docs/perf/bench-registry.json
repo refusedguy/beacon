@@ -62,7 +62,7 @@
     },
     {
       "key": "scm-observe",
-      "limiter": "loopback PR + compare + checks + files round trips",
+      "limiter": "loopback PR + paginated checks/reviews/files + parallel fetchSignals",
       "unit": "ns",
       "workMetric": "scm-observe-work",
       "errMetric": "scm-observe-errs",
@@ -80,7 +80,7 @@
     },
     {
       "key": "http-snapshot-assembly",
-      "limiter": "groupHistory + json reflection",
+      "limiter": "status.Active + core.NewWireRuns + json.Marshal",
       "unit": "ns",
       "workMetric": "http-snapshot-assembly-work",
       "errMetric": "http-snapshot-assembly-errs",
@@ -98,7 +98,7 @@
     },
     {
       "key": "snapshot-reads",
-      "limiter": "WAL page reads",
+      "limiter": "SQLite VM, syscalls and event sort",
       "unit": "ns",
       "workMetric": "snapshot-reads-work",
       "errMetric": "snapshot-errs",
@@ -116,7 +116,7 @@
     },
     {
       "key": "snapshot-total",
-      "limiter": "sum of both phases",
+      "limiter": "derived sum of reads and assembly, not a measured pass",
       "unit": "ns",
       "workMetric": "",
       "errMetric": "",
@@ -125,7 +125,7 @@
     },
     {
       "key": "snapshot",
-      "limiter": "SQLite VM, ListRunEvents sort and JSON reflection",
+      "limiter": "SQLite VM, syscalls and event sort",
       "unit": "ns",
       "workMetric": "work",
       "errMetric": "errs",

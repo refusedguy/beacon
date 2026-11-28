@@ -218,6 +218,33 @@ func TestCanonicalRowsOnePerSnapshotPhase(t *testing.T) {
 	}
 }
 
+// TestCardParseCorpusIsFreshPerPass proves each card-parse pass gets a new
+// body with frontmatter and a plan, and that the work count stays fixed.
+func TestCardParseCorpusIsFreshPerPass(t *testing.T) {
+	first := cardParseCorpus(fixtureCards, 1)
+	second := cardParseCorpus(fixtureCards, 2)
+	if len(first) != fixtureCards || len(second) != fixtureCards {
+		t.Fatalf("corpus sizes = %d and %d, want %d", len(first), len(second), fixtureCards)
+	}
+	for i := range first {
+		if first[i] == second[i] {
+			t.Fatalf("card %d reused its body across passes", i)
+		}
+		if !strings.Contains(first[i], "```yaml") || !strings.Contains(first[i], "plan:") {
+			t.Fatalf("card %d has no frontmatter or plan block", i)
+		}
+	}
+	e := &env{cards: cardFixtures(fixtureCards)}
+	w1, err1 := runCardParse(e)
+	w2, err2 := runCardParse(e)
+	if err1 != 0 || err2 != 0 {
+		t.Fatalf("card parse errs = %d and %d", err1, err2)
+	}
+	if w1 != w2 {
+		t.Fatalf("card parse work drifted: %d then %d", w1, w2)
+	}
+}
+
 // emitHotPathsReport writes the human report to w. Benchmarks pass stderr:
 // testing.B writes its result line to stdout when the benchmark function
 // returns, so a report on stdout lands on that line and benchstat drops
@@ -289,7 +316,7 @@ func BenchmarkHotPaths(b *testing.B) {
 	e := newEnv(b)
 	scm := newSCMObserveHarness(b)
 	cards := newCardLocalBench(b)
-	snapshot := newHTTPSnapshotBench(b, e)
+	snapshot := newHTTPSnapshotBench(b)
 	spawn := newSpawnHarnessBench(b)
 	if !smokeMode() {
 		warmup(e, scm, cards, snapshot, spawn)
