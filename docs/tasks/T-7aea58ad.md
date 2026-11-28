@@ -1,7 +1,7 @@
 ---
 id: T-7aea58ad
 title: Make worker fix prompts match the actual situation
-status: available
+status: done
 scope:
     - pkg/core/prompt_text.go
     - internal/app/reconciler.go
