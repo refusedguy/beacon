@@ -34,6 +34,9 @@ Clients read the current token from that file after each restart.`,
 			dir := stateDir(w.cfg)
 			lock, err := acquireLock(dir)
 			if err != nil {
+				// A losing opener leaves its own process-keyed diagnostic. The
+				// winner clears only its key, so this record survives startup.
+				writeDaemonError(dir, "lock", err)
 				return err
 			}
 			defer lock.Close()
