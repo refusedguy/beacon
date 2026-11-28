@@ -195,7 +195,7 @@ func (r *Reconciler) handleNeedsAgentFix(
 	if fresh != nil {
 		run = fresh
 	}
-	return decision, r.wake(ctx, run, obs, decision.Reason)
+	return decision, r.wake(ctx, run, obs, decision.Reason, core.WakeActionFor(decision))
 }
 
 func (r *Reconciler) handleBlocked(ctx context.Context, run *core.Run, obs core.Observation, decision core.MergeDecision) (core.MergeDecision, error) {

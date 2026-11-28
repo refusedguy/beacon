@@ -457,6 +457,7 @@ func (c *Control) Nudge(ctx context.Context, id core.RunID, message string) erro
 		RunID: run.ID, PRNumber: run.PRNumber, HeadSHA: run.HeadSHA,
 		Reason: "operator guidance", Excerpt: message,
 		Workspace: run.WorkspacePath, Branch: run.Branch,
+		Action: core.WakeGuidance,
 	})
 }
 

@@ -610,6 +610,8 @@ func TestRebaseFailureDoesNotRetrySameSHA(t *testing.T) {
 	scm := newChangingSCM("sha2")
 	scm.updateErr = errors.New("rebase conflict")
 	r.SCM = scm
+	n := &fakeNotifier{}
+	r.Notifier = n
 
 	for i := 0; i < 5; i++ {
 		if _, err := r.Reconcile(context.Background(), 42); err != nil {
@@ -621,6 +623,12 @@ func TestRebaseFailureDoesNotRetrySameSHA(t *testing.T) {
 	}
 	if len(h.wakes) != 0 {
 		t.Fatalf("agent woken %d times after failed rebase", len(h.wakes))
+	}
+	if n.count != 1 {
+		t.Fatalf("operator notifications = %d, want 1 for the provider failure", n.count)
+	}
+	if got := store.runs["r1"]; got.FixAttempts != 0 {
+		t.Fatalf("fix attempts = %d, want none for a provider failure", got.FixAttempts)
 	}
 	if got := store.runs["r1"]; got.ObservedSHA != "sha2" {
 		t.Fatalf("ObservedSHA = %q, want sha2", got.ObservedSHA)
@@ -881,8 +889,12 @@ func TestEpicLLMReviewIsDefaultAndAutoMergesOnApproval(t *testing.T) {
 	if len(h.sessions) != 1 {
 		t.Fatalf("reviewer sessions = %d, want 1", len(h.sessions))
 	}
-	if !strings.Contains(h.prompts[0], "55") || !strings.Contains(h.prompts[0], "sha1") {
-		t.Fatalf("review prompt = %q, want PR and SHA", h.prompts[0])
+	for _, want := range []string{
+		"55", "sha1", "Criteria:", "do not approve", "Report the failing criteria",
+	} {
+		if !strings.Contains(h.prompts[0], want) {
+			t.Errorf("review prompt = %q, want %q", h.prompts[0], want)
+		}
 	}
 
 	if err := store.SetApproval(ctx, "epic-1", "sha1"); err != nil {

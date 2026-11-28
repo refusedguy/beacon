@@ -277,28 +277,27 @@ func TestSqliteChecksRoundTripsUTF8AndControlCharacters(t *testing.T) {
 	}
 }
 
-func TestFixerPromptCarriesValidFailedCheckJSON(t *testing.T) {
-	names := []string{"ci\vbuild", "日本語"}
-	raw := sqliteChecks(names)
-	base := core.BaseStatus{BaseBranch: "main", FailureExcerpt: "boom"}
-	in := &core.BaseIncident{FailedChecksJSON: raw}
-	prompt := fixerPrompt(base, in, core.Task{}, "")
+func TestFixerPromptCarriesBaseFailedChecks(t *testing.T) {
+	base := core.BaseStatus{
+		BaseBranch: "main", HeadSHA: "base-sha", FailureExcerpt: "boom",
+		FailedChecks: []core.CheckResult{
+			{Name: "ci-build", State: core.CheckFailure},
+			{Name: "日本語", State: core.CheckFailure},
+		},
+	}
+	in := &core.BaseIncident{FailedChecksJSON: "[]"}
+	prompt := fixerPrompt(base, in, core.Task{}, "", "fix-run-1", base.HeadSHA)
 
-	const marker = "Failed checks: "
-	i := strings.Index(prompt, marker)
-	if i < 0 {
-		t.Fatalf("prompt missing failed checks: %q", prompt)
+	for _, want := range []string{
+		"ci-build", "日本語", "base-sha", "fix-run-1", "boom",
+		core.OpenPRAndWatchInstruction,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("fixer prompt missing %q: %s", want, prompt)
+		}
 	}
-	line := prompt[i+len(marker):]
-	if end := strings.IndexByte(line, '\n'); end >= 0 {
-		line = line[:end]
-	}
-	var got []string
-	if err := json.Unmarshal([]byte(line), &got); err != nil {
-		t.Fatalf("fixer prompt JSON %q is invalid: %v", line, err)
-	}
-	if !reflect.DeepEqual(got, names) {
-		t.Fatalf("fixer prompt checks = %q, want %q", got, names)
+	if strings.Contains(prompt, "Failed checks: []") {
+		t.Fatalf("fixer prompt used the incident's PR checks: %s", prompt)
 	}
 }
 
@@ -538,7 +537,7 @@ func BenchmarkBaseRedChecks500Pairs(b *testing.B) {
 				b.Fatal("no overlap between identical check lists")
 			}
 			base := core.BaseStatus{BaseBranch: "main", FailureExcerpt: p.excerpt}
-			_ = fixerPrompt(base, in, task, "")
+			_ = fixerPrompt(base, in, task, "", "fix-run-1", base.HeadSHA)
 		}
 	}
 }

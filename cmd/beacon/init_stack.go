@@ -27,7 +27,7 @@ func (s stackInfo) workerInstructions(weakPC bool) string {
 // hint names one local check command; the weak-machine rule comes from core.
 func detectStack(root string) stackInfo {
 	if existsIn(root, "go.mod") {
-		return stackInfo{"go", "For Go, run go test for the packages you changed."}
+		return stackInfo{"go", "For Go, run gofmt -l on the changed Go files and go test for the changed packages. Both must pass before you open a pull request; if either fails, fix it and run it again."}
 	}
 	if existsIn(root, "package.json") {
 		return stackInfo{"node", "For Node, run the targeted tests for the files you changed; do not run a full npm run build."}
