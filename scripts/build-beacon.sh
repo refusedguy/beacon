@@ -40,19 +40,108 @@ compute_build_hash() {
   } | sha256sum | cut -d' ' -f1
 }
 
-if [ "${1:-}" = "--hash" ]; then
-  compute_build_hash
-  exit 0
-fi
+# Self-contained shell test. Stub `go`, build twice with unchanged sources,
+# then build once after a source change. The stub records every invocation.
+self_test() {
+  local tmp calls stub script first recorded computed second
+  tmp="$(mktemp -d)"
+  trap "rm -rf '$tmp'" EXIT
+
+  mkdir -p "$tmp/scripts" "$tmp/cmd/beacon" "$tmp/internal" "$tmp/pkg" \
+    "$tmp/harnesses" "$tmp/ui/tui" "$tmp/stubbin"
+  cp "${BASH_SOURCE[0]}" "$tmp/scripts/build-beacon.sh"
+  printf 'package main\n' > "$tmp/cmd/beacon/main.go"
+  printf 'module example.com/fake\n' > "$tmp/go.mod"
+  : > "$tmp/go.sum"
+  printf 'go 1.22\n' > "$tmp/go.work"
+
+  calls="$tmp/go-calls"
+  : > "$calls"
+  stub="$tmp/stubbin/go"
+  cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'called\n' >> "$BEACON_TEST_CALLS"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+[ -n "$out" ] || { echo "stub go: no -o argument" >&2; exit 1; }
+printf '#!/bin/sh\n' > "$out"
+chmod +x "$out"
+STUB
+  chmod +x "$stub"
+
+  export BEACON_TEST_CALLS="$calls"
+  export PATH="$tmp/stubbin:$PATH"
+  script="$tmp/scripts/build-beacon.sh"
+
+  bash "$script" >/dev/null
+  bash "$script" >/dev/null
+  first="$(wc -l < "$calls" | tr -d '[:space:]')"
+  if [ "$first" -ne 1 ]; then
+    echo "self-test: expected 1 go invocation after two identical builds, got $first" >&2
+    exit 1
+  fi
+
+  recorded="$(cat "$tmp/.opencode/bin/beacon.build-sha")"
+  computed="$(bash "$script" --hash)"
+  if [ "$recorded" != "$computed" ]; then
+    echo "self-test: build-sha does not describe the computed hash" >&2
+    exit 1
+  fi
+
+  printf '// changed\n' >> "$tmp/cmd/beacon/main.go"
+  bash "$script" >/dev/null
+  second="$(wc -l < "$calls" | tr -d '[:space:]')"
+  if [ "$second" -ne 2 ]; then
+    echo "self-test: expected 2 go invocations after a source change, got $second" >&2
+    exit 1
+  fi
+
+  recorded="$(cat "$tmp/.opencode/bin/beacon.build-sha")"
+  computed="$(bash "$script" --hash)"
+  if [ "$recorded" != "$computed" ]; then
+    echo "self-test: build-sha is stale after a source change" >&2
+    exit 1
+  fi
+
+  echo "self-test: ok"
+}
+
+case "${1:-}" in
+  --hash)
+    compute_build_hash
+    exit 0
+    ;;
+  --self-test)
+    self_test
+    exit 0
+    ;;
+esac
 
 mkdir -p .opencode/bin
+
+# Nothing to do when the binary exists and its recorded hash matches the
+# current sources. Print the hash so the fast path stays observable.
+hash="$(compute_build_hash)"
+if [ -f .opencode/bin/beacon ] &&
+   [ -f .opencode/bin/beacon.build-sha ] &&
+   [ "$(cat .opencode/bin/beacon.build-sha)" = "$hash" ]; then
+  printf '%s\n' "$hash"
+  exit 0
+fi
 
 # Build next to the destination and rename into place. Writing straight to
 # .opencode/bin/beacon fails with ETXTBSY while that binary is running.
 tmpdir="$(mktemp -d .opencode/bin/.build.XXXXXX)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-hash="$(compute_build_hash)"
 go build -o "$tmpdir/beacon" ./cmd/beacon
 mv -f "$tmpdir/beacon" .opencode/bin/beacon
 
@@ -60,3 +149,5 @@ mv -f "$tmpdir/beacon" .opencode/bin/beacon
 # leaves the old hash, which still describes the binary on disk.
 printf '%s\n' "$hash" > "$tmpdir/beacon.build-sha"
 mv -f "$tmpdir/beacon.build-sha" .opencode/bin/beacon.build-sha
+
+printf '%s\n' "$hash"
