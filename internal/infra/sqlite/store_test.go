@@ -15,7 +15,7 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-func TestRecursiveReadyTasks(t *testing.T) {
+func TestReadyTasksTransitiveUnblock(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open(filepath.Join(t.TempDir(), \"state.db\")): %v", err)
@@ -31,6 +31,12 @@ func TestRecursiveReadyTasks(t *testing.T) {
 		{ID: "E", Status: core.TaskAvailable, DependsOn: []core.TaskID{"D"}, Scope: []core.ScopePath{core.ScopeFile("e.go")}},
 		{ID: "F", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("f.go")}},
 	}
+	if err := store.SyncTasks(ctx, tasks); core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("cyclic graph error = %v, want CodeInvalidInput", err)
+	}
+
+	// Break the cycle so the graph can be stored. E now depends on a done card.
+	tasks[4].DependsOn = []core.TaskID{"A"}
 	if err := store.SyncTasks(ctx, tasks); err != nil {
 		t.Fatalf("store.SyncTasks(ctx, tasks): %v", err)
 	}
@@ -38,7 +44,7 @@ func TestRecursiveReadyTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.ListReadyTasks(ctx): %v", err)
 	}
-	if len(ready) != 2 || ready[0].ID != "B" || ready[1].ID != "F" {
+	if len(ready) != 3 || ready[0].ID != "B" || ready[1].ID != "E" || ready[2].ID != "F" {
 		t.Fatalf("ready = %+v", ready)
 	}
 
@@ -55,8 +61,8 @@ func TestRecursiveReadyTasks(t *testing.T) {
 		if r.ID == "C" {
 			found = true
 		}
-		if r.ID == "D" || r.ID == "E" {
-			t.Fatalf("cycle leaked into ready set: %s", r.ID)
+		if r.ID == "D" {
+			t.Fatalf("blocked task D leaked into ready set: %s", r.ID)
 		}
 	}
 	if !found {

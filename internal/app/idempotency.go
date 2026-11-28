@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"strings"
 	"sync"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -114,9 +113,10 @@ func (r CreateBatchResult) WithMeta(id, status string) any {
 
 // idempotencyKey keys the created cache by epic ID and content. The derived
 // ID is content-based, so the key is stable across days; an explicit ID still
-// distinguishes two epics that share a title and plan.
+// distinguishes two epics that share a title and plan. The child key includes
+// dependencies, so a changed child dependency does not hit an older result.
 func idempotencyKey(epicID core.TaskID, title string, plan []core.ChildSpec) string {
-	return string(epicID) + "|" + title + "|" + strings.Join(childTitles(plan), "\x00")
+	return string(epicID) + "|" + title + "|" + core.ChildKey(plan)
 }
 
 func lookupCreated(ctx context.Context, writer CardWriter, cache *IdempotencyCache, key string, id core.TaskID, children []core.Task) ([]core.Task, bool) {
@@ -130,7 +130,7 @@ func lookupCreated(ctx context.Context, writer CardWriter, cache *IdempotencyCac
 	}
 	for _, task := range available {
 		if task.ID != id || task.Kind != core.TaskKindEpic ||
-			strings.Join(childTitles(task.Plan), "\x00") != strings.Join(taskTitles(children), "\x00") {
+			core.ChildKey(task.Plan) != core.ChildTaskKey(children) {
 			continue
 		}
 		out := make([]core.Task, 0, len(children)+1)

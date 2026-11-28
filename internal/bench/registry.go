@@ -54,13 +54,27 @@ const (
 // apart. The benchmark prints this string in its canonical row.
 const telegramNotifyLimiter = "redact regexp chain + json.Marshal + loopback POST"
 
+// The CLI-only benchmarks live in internal/bench and cmd/beacon. Their
+// limiters live here beside the keys so the registry and the canonical rows a
+// benchmark prints cannot drift apart. The drift tests in registry_test.go
+// cross-check each literal against the benchmark source.
+const (
+	openPreparedDBLimiter    = "open-prepared-limiter-ddl-scans"
+	statusCLIPathsLimiter    = "json-reflection-plus-sqlite-read"
+	configWatchReloadLimiter = "os.ReadFile + sha256 + loadConfig re-read + forwarder cancel and drain"
+	controlNoDaemonLimiter   = "two config loads + one Control.Apply per action"
+)
+
 // prBenchLimiters are the canonical keys and limiter strings published by the
-// in-package benchmarks. They run only in the advisory two-tree job, so their
-// registry placement is pr. reconcile-tick-counts keeps a green base as the
-// no-red regression guard; the two base-red keys run on a red base so their
-// own counters can earn a calls-reduced verdict. The assembly row covers
-// status.go and metrics.go work without SQLite or HTTP noise. The telegram row
-// covers the redact, marshal and POST chain on the notification send path.
+// benchmarks that run only in the advisory two-tree job, so their registry
+// placement is pr. reconcile-tick-counts keeps a green base as the no-red
+// regression guard; the two base-red keys run on a red base so their own
+// counters can earn a calls-reduced verdict. The assembly row covers status.go
+// and metrics.go work without SQLite or HTTP noise. The telegram row covers
+// the redact, marshal and POST chain on the notification send path. The four
+// CLI rows price the hot paths outside BenchmarkSQLiteSnapshot: the prepared
+// open, the three status read paths, a changed-config reload and the local
+// no-daemon control path.
 var prBenchLimiters = []struct{ key, limiter string }{
 	{"reconcile-tick-counts", reconcileTickLimiter},
 	{"base-red-check", baseRedCheckLimiter},
@@ -69,6 +83,10 @@ var prBenchLimiters = []struct{ key, limiter string }{
 	{"dispatch-prompt", dispatchPromptLimiter},
 	{nameAssembly, limiterAssembly},
 	{"telegram-notify", telegramNotifyLimiter},
+	{"open-prepared-db", openPreparedDBLimiter},
+	{"status-cli-paths", statusCLIPathsLimiter},
+	{"config-watch-reload", configWatchReloadLimiter},
+	{"control-no-daemon", controlNoDaemonLimiter},
 }
 
 // The pure control benchmark owns no Beacon code, so its canonical name and

@@ -301,6 +301,7 @@ func BenchmarkConfigWatchReload(b *testing.B) {
 	errs := totalErrs / int64(b.N)
 	median := configWatchBenchMedian(durations)
 	printConfigWatchReport(os.Stdout, configWatchPrefix, median, work, errs)
+	printPerfRow(os.Stdout, "config-watch-reload", durations, work, errs, configWatchLimiterName)
 	b.ReportMetric(float64(median.Nanoseconds()), configWatchPrefix+"-median-ns")
 	b.ReportMetric(float64(work), configWatchPrefix+"-work")
 	b.ReportMetric(float64(errs), configWatchPrefix+"-errs")

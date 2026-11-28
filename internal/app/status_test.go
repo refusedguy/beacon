@@ -146,7 +146,7 @@ func TestMakeRunSnapshotMapsChecksWithoutSCM(t *testing.T) {
 		{Name: "build", State: core.CheckSuccess, StartedAt: start, CompletedAt: start.Add(28 * time.Second)},
 		{Name: "lint", State: core.CheckPending},
 	}
-	got := makeRunSnapshot(run, nil, nil, now)
+	got := makeRunSnapshot(run, nil, nil, now, "")
 	if len(got.Checks) != 2 {
 		t.Fatalf("checks = %+v", got.Checks)
 	}
@@ -165,7 +165,7 @@ func TestRunSnapshotCarriesCIWallSeconds(t *testing.T) {
 		{Name: "lint", StartedAt: now, CompletedAt: now.Add(20 * time.Second)},
 		{Name: "test", StartedAt: now.Add(15 * time.Second), CompletedAt: now.Add(time.Minute)},
 	}
-	got := makeRunSnapshot(run, nil, nil, now)
+	got := makeRunSnapshot(run, nil, nil, now, "")
 	if got.CIWallSeconds != 60 {
 		t.Fatalf("ci wall seconds = %d, want 60", got.CIWallSeconds)
 	}
@@ -197,7 +197,7 @@ func TestRunSnapshotReportsStagedJobCriticalPath(t *testing.T) {
 		{Name: "rebase", State: core.CheckSuccess, StartedAt: at(35), CompletedAt: at(90)},
 		{Name: "fix", State: core.CheckSuccess, StartedAt: at(95), CompletedAt: at(420)},
 	}
-	got := makeRunSnapshot(run, nil, nil, now)
+	got := makeRunSnapshot(run, nil, nil, now, "")
 	if got.CIWallSeconds != 420 {
 		t.Fatalf("ci wall seconds = %d, want 420", got.CIWallSeconds)
 	}
@@ -286,7 +286,7 @@ func TestSnapshotAggregatesCICycles(t *testing.T) {
 		{State: string(core.RunWaitingCI), At: now.Add(-60 * time.Second)},
 		{State: string(core.RunMerged), At: now.Add(-30 * time.Second)},
 	}
-	snap := makeRunSnapshot(run, map[string][]RunEvent{string(run.ID): events}, nil, now)
+	snap := makeRunSnapshot(run, map[string][]RunEvent{string(run.ID): events}, nil, now, "")
 	m := makeMetrics([]RunSnapshot{snap}, nil, nil, nil, nil)
 	if m.CIWaitInitial != 30 || m.CIWaitRebase != 30 || m.CIWaitFix != 0 {
 		t.Fatalf("cycle metrics = %d/%d/%d, want 30/30/0", m.CIWaitInitial, m.CIWaitRebase, m.CIWaitFix)
@@ -305,7 +305,7 @@ func TestRunSnapshotCarriesSessionIncidentAndPRURL(t *testing.T) {
 	run.IsFixer = true
 	run.BlockedIncidentID = "inc-7"
 
-	got := makeRunSnapshot(run, nil, nil, now, "owner/repo")
+	got := makeRunSnapshot(run, nil, nil, now, prBase("owner/repo"))
 	if got.SessionID != "sess-fields" || !got.IsFixer || got.BlockedIncidentID != "inc-7" {
 		t.Fatalf("run fields = %+v", got)
 	}
@@ -436,7 +436,7 @@ func TestSnapshotWithoutOptionalStoresStillHasNonNullCollections(t *testing.T) {
 func TestRunSnapshotJSONChecksContract(t *testing.T) {
 	now := time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)
 	run := core.NewRun("run-checks", "T-CHECK", now)
-	got := makeRunSnapshot(run, nil, nil, now)
+	got := makeRunSnapshot(run, nil, nil, now, "")
 	if got.Checks == nil || len(got.Checks) != 0 {
 		t.Fatalf("old run checks = %+v, want empty array", got.Checks)
 	}
@@ -464,9 +464,9 @@ func TestRunSnapshotJSONChecksContract(t *testing.T) {
 	}
 
 	run.Checks = []core.CheckResult{{Name: "ci", State: core.CheckFailure}}
-	b, err = json.Marshal(makeRunSnapshot(run, nil, nil, now))
+	b, err = json.Marshal(makeRunSnapshot(run, nil, nil, now, ""))
 	if err != nil {
-		t.Fatalf(`json.Marshal(makeRunSnapshot(run, nil, nil, now)): %v`, err)
+		t.Fatalf(`json.Marshal(makeRunSnapshot(run, nil, nil, now, "")): %v`, err)
 	}
 	if err := json.Unmarshal(b, &decoded); err != nil {
 		t.Fatalf(`json.Unmarshal(b, &decoded): %v`, err)
@@ -543,7 +543,7 @@ func TestBlockedMetricMapStaysBoundedWithDistinctReasons(t *testing.T) {
 
 	snapshots := make([]RunSnapshot, 0, len(active))
 	for _, run := range active {
-		snapshots = append(snapshots, makeRunSnapshot(run, nil, nil, now))
+		snapshots = append(snapshots, makeRunSnapshot(run, nil, nil, now, ""))
 	}
 	m := makeMetrics(snapshots, nil, nil, histories, nil)
 	if len(m.Blocked) > 6 {
@@ -674,7 +674,7 @@ func TestMetricsConsumeSnapshotDurations(t *testing.T) {
 	run.UpdatedAt = now.Add(-5 * time.Minute)
 	snap := makeRunSnapshot(run, map[string][]RunEvent{
 		string(run.ID): {{State: string(core.RunWaitingCI), At: run.UpdatedAt}},
-	}, nil, now)
+	}, nil, now, "")
 
 	// A timeline that would yield 60 seconds if metrics walked it again. The
 	// snapshot carries 300 seconds, and metrics must use that value.

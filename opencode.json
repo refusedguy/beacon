@@ -10,6 +10,11 @@
           "resource": "*"
         },
         {
+          "action": "beacon_task_close",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
           "action": "beacon_task_create",
           "effect": "allow",
           "resource": "*"
@@ -32,6 +37,11 @@
       "permissions": [
         {
           "action": "beacon_reconcile",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_task_close",
           "effect": "allow",
           "resource": "*"
         },
@@ -62,6 +72,11 @@
           "resource": "*"
         },
         {
+          "action": "beacon_task_close",
+          "effect": "deny",
+          "resource": "*"
+        },
+        {
           "action": "beacon_task_create",
           "effect": "deny",
           "resource": "*"
@@ -82,6 +97,11 @@
   "permissions": [
     {
       "action": "beacon_reconcile",
+      "effect": "deny",
+      "resource": "*"
+    },
+    {
+      "action": "beacon_task_close",
       "effect": "deny",
       "resource": "*"
     },

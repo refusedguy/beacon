@@ -241,6 +241,42 @@
       "thresholdPct": 15
     },
     {
+      "key": "open-prepared-db",
+      "limiter": "open-prepared-limiter-ddl-scans",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "status-cli-paths",
+      "limiter": "json-reflection-plus-sqlite-read",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "config-watch-reload",
+      "limiter": "os.ReadFile + sha256 + loadConfig re-read + forwarder cancel and drain",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
+      "key": "control-no-daemon",
+      "limiter": "two config loads + one Control.Apply per action",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
       "key": "json-control",
       "limiter": "encoding/json reflection over a fixed struct",
       "unit": "ns",
