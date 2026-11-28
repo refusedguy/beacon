@@ -12,8 +12,7 @@ priority: 1
 kind: task
 require_review: llm
 ---
-
-Goal: reject oversized cards before they enter dispatch.
-Evidence: 113 pairs of available cards overlap on at least one path. ci.yml and reconciler.go are each named by 9 cards. T-8b02b25b had 15 files and 8273 lines. AGENTS.md:104 only asks for narrow scope; planner.go checks overlap but never size.
-Steps: add a 3-2-1200 cap in TaskCreator.Create, where 3 is total scope paths, 2 is production files excluding tests and data, and 1200 is summed line count; add a skip code beside SkipNoScope in planner.go and reject oversize hand-edited cards in GreedyPlanner.Select; replace the ad hoc hot-file list in AGENTS.md with the cap and a singleton rule for files longer than 600 lines or named by 3 or more nonterminal cards; add tests for rejection and for a passing narrow card.
-Accept: a card with 4 paths, 3 production files or more than 1200 scoped lines fails creation and cannot be dispatched.
+Goal: reject oversized cards before they enter dispatch, including children inside epics.
+Evidence: 113 pairs of available cards overlap on at least one path. ci.yml and reconciler.go are each named by 9 cards. T-8b02b25b had 15 files and 8273 lines. AGENTS.md:104 only asks for narrow scope; planner.go checks overlap but never size. An epic stores its own scope separately from each plan child at internal/app/taskcreate.go:169-172, and core.ExpandChildren turns children into independent cards at pkg/core/task_rules.go:152-170, so a summed epic cap would wrongly reject a valid epic with several narrow children.
+Steps: add a 3-2-1200 cap of at most 3 scope paths, 2 production files and 1200 summed lines; apply it per card in the expanded graph after epicChildren and before writer.Write, so it covers the epic own scope and every child scope independently, never their aggregate; add a skip code beside SkipNoScope in planner.go as a runtime backstop for hand-edited cards; expand directory and glob scopes to concrete files before counting production files and lines; replace the ad hoc hot-file list in AGENTS.md with the cap and a singleton rule for files longer than 600 lines or named by 3 or more nonterminal cards; add tests for rejection of a standalone oversize card, rejection of an oversize child, and acceptance of an epic with three narrow children.
+Accept: a card with 4 paths, 3 production files or more than 1200 scoped lines fails creation, while an epic with three valid children and no epic-level scope passes.
