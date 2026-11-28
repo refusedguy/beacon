@@ -48,6 +48,18 @@ type sqliteCodedError interface {
 	Code() int
 }
 
+// casStore is the optional compare-and-swap capability of a run store. The
+// SQLite store checks the version it reads before it writes, so a control call
+// cannot overwrite a state written after its own read. A store without this
+// capability keeps the plain save.
+type casStore interface {
+	SaveCAS(ctx context.Context, r *core.Run, expectedUpdatedAt int64, expectedHeadSHA string) error
+}
+
+// errStaleWrite marks a save that lost its version check. It stays internal to
+// the control retry loop. A caller sees a coded conflict once retries run out.
+var errStaleWrite = errors.New("stale control write")
+
 // ControlStore is the store surface Control uses to apply one operator action.
 // Control reads one run, checks a PR owner, persists state and records an
 // approval. The active-run lookup that Retry needs stays an optional capability
@@ -161,7 +173,8 @@ func (c *Control) Apply(ctx context.Context, action core.ControlAction, args Con
 }
 
 // write serializes control mutations and retries transient SQLite lock
-// conflicts. Read-only services never take this lock. The lock covers one
+// conflicts and stale version checks. Both conditions make a fresh read and
+// decision safe. Read-only services never take this lock. The lock covers one
 // store call at a time, never a backoff sleep, so concurrent writers do not
 // serialize each other's retries.
 func (c *Control) write(ctx context.Context, fn func() error) error {
@@ -171,7 +184,12 @@ func (c *Control) write(ctx context.Context, fn func() error) error {
 	defer timer.Stop()
 	for attempt := 0; attempt < controlWriteAttempts; attempt++ {
 		err = c.writeOnce(fn)
-		if !isBusy(err) {
+		switch {
+		case err == nil:
+			return nil
+		case isBusy(err), errors.Is(err, errStaleWrite):
+			// Retry from the current state on a lock conflict or a stale write.
+		default:
 			return err
 		}
 		if attempt+1 < controlWriteAttempts {
@@ -182,6 +200,9 @@ func (c *Control) write(ctx context.Context, fn func() error) error {
 			case <-timer.C:
 			}
 		}
+	}
+	if errors.Is(err, errStaleWrite) {
+		return core.Errorf(core.CodeConflict, "run changed since it was read; retry the control action")
 	}
 	return err
 }
@@ -220,6 +241,30 @@ func (c *Control) get(ctx context.Context, id core.RunID) (*core.Run, error) {
 	return run, nil
 }
 
+// save persists run only while the row still carries the version the caller
+// read. A stale version returns errStaleWrite so the write loop can read and
+// decide again. A store without compare-and-swap keeps the plain save.
+func (c *Control) save(ctx context.Context, run *core.Run, expectedAt int64, expectedSHA string) error {
+	cas, ok := c.Store.(casStore)
+	if !ok {
+		return c.Store.Save(ctx, run)
+	}
+	err := cas.SaveCAS(ctx, run, expectedAt, expectedSHA)
+	if core.CodeOf(err) != core.CodeConflict {
+		return err
+	}
+	// SaveCAS also refuses a PR owned by another active run. Only a changed
+	// version is worth retrying; return every other conflict unchanged.
+	current, getErr := c.Store.Get(ctx, run.ID)
+	if getErr != nil {
+		return getErr
+	}
+	if current != nil && (current.UpdatedAt.UnixNano() != expectedAt || current.HeadSHA != expectedSHA) {
+		return errStaleWrite
+	}
+	return err
+}
+
 // WatchPR binds a pull request to a run and subscribes it to reconciliation.
 // A running run takes the usual pr_registered transition. Every other
 // nonterminal state binds with MarkExternal so the operator can rebind a PR
@@ -235,6 +280,7 @@ func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 	if err != nil {
 		return err
 	}
+	expectedAt, expectedSHA := run.UpdatedAt.UnixNano(), run.HeadSHA
 	if pr <= 0 {
 		return core.Errorf(core.CodeInvalidInput, "pr must be positive")
 	}
@@ -264,7 +310,7 @@ func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 			return err
 		}
 	}
-	if err := c.Store.Save(ctx, run); err != nil {
+	if err := c.save(ctx, run, expectedAt, expectedSHA); err != nil {
 		return err
 	}
 	c.signal(run)
@@ -282,6 +328,7 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 		if err != nil {
 			return err
 		}
+		expectedAt, expectedSHA := run.UpdatedAt.UnixNano(), run.HeadSHA
 		if run.State == core.RunClosed {
 			// The cancel is already applied. A repeat is a no-op so a retried
 			// batch converges instead of reporting invalid_transition.
@@ -290,7 +337,7 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 		if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: "cancelled by operator"}); err != nil {
 			return err
 		}
-		if err := c.Store.Save(ctx, run); err != nil {
+		if err := c.save(ctx, run, expectedAt, expectedSHA); err != nil {
 			return err
 		}
 		saved = run
@@ -335,10 +382,11 @@ func (c *Control) Unblock(ctx context.Context, id core.RunID) error {
 		if err != nil {
 			return err
 		}
+		expectedAt, expectedSHA := run.UpdatedAt.UnixNano(), run.HeadSHA
 		if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "unblocked by operator"}); err != nil {
 			return err
 		}
-		if err := c.Store.Save(ctx, run); err != nil {
+		if err := c.save(ctx, run, expectedAt, expectedSHA); err != nil {
 			return err
 		}
 		c.signal(run)
@@ -387,6 +435,7 @@ func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 		if err != nil {
 			return err
 		}
+		expectedAt, expectedSHA := run.UpdatedAt.UnixNano(), run.HeadSHA
 		switch {
 		case run.State.Blocked():
 			if err := run.RetryBlocked("retried by operator"); err != nil {
@@ -399,7 +448,7 @@ func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 		default:
 			return core.Errorf(core.CodeConflict, "run %s is not blocked or closed", id)
 		}
-		if err := c.Store.Save(ctx, run); err != nil {
+		if err := c.save(ctx, run, expectedAt, expectedSHA); err != nil {
 			return err
 		}
 		c.signal(run)
@@ -424,43 +473,46 @@ func (c *Control) retryClosed(ctx context.Context, run *core.Run) error {
 
 // Nudge sends operator guidance to the live session of an active run.
 func (c *Control) Nudge(ctx context.Context, id core.RunID, message string) error {
-	run, err := c.get(ctx, id)
-	if err != nil {
-		return err
-	}
-	if run.State.Terminal() {
-		return core.Errorf(core.CodeConflict, "run %s is %s", id, run.State)
-	}
-	if run.SessionID == "" {
-		return core.Errorf(core.CodeConflict, "run %s has no session", id)
-	}
-	if message == "" {
-		return core.Errorf(core.CodeInvalidInput, "message is required")
-	}
-	if c.Harness == nil {
-		return core.Errorf(core.CodeConflict, "harness is not configured")
-	}
-	if slots := c.slotReserver(); slots != nil {
-		if !slots.ReserveForWake(ctx, run.ID) {
+	return c.write(ctx, func() error {
+		run, err := c.get(ctx, id)
+		if err != nil {
+			return err
+		}
+		expectedAt, expectedSHA := run.UpdatedAt.UnixNano(), run.HeadSHA
+		if run.State.Terminal() {
+			return core.Errorf(core.CodeConflict, "run %s is %s", id, run.State)
+		}
+		if run.SessionID == "" {
+			return core.Errorf(core.CodeConflict, "run %s has no session", id)
+		}
+		if message == "" {
+			return core.Errorf(core.CodeInvalidInput, "message is required")
+		}
+		if c.Harness == nil {
+			return core.Errorf(core.CodeConflict, "harness is not configured")
+		}
+		if slots := c.slotReserver(); slots != nil {
+			if !slots.ReserveForWake(ctx, run.ID) {
+				return core.Errorf(core.CodeConflict, "no agent slot free for run %s", id)
+			}
+			defer slots.ReleaseWake(ctx, run.ID)
+		} else if c.AgentSlots != nil && c.AgentSlots.Available(ctx) <= 0 {
 			return core.Errorf(core.CodeConflict, "no agent slot free for run %s", id)
 		}
-		defer slots.ReleaseWake(ctx, run.ID)
-	} else if c.AgentSlots != nil && c.AgentSlots.Available(ctx) <= 0 {
-		return core.Errorf(core.CodeConflict, "no agent slot free for run %s", id)
-	}
-	// A nudge keeps the existing session live, so it holds the run's slot.
-	// The saved marker lets the monitor show that guidance was delivered;
-	// no observation stamp is written because the nudge observes no PR.
-	run.HoldAgent()
-	run.MarkNudged()
-	if err := c.Store.Save(ctx, run); err != nil {
-		return err
-	}
-	return c.Harness.Wake(ctx, run.SessionID, core.WakeContext{
-		RunID: run.ID, PRNumber: run.PRNumber, HeadSHA: run.HeadSHA,
-		Reason: "operator guidance", Excerpt: message,
-		Workspace: run.WorkspacePath, Branch: run.Branch,
-		Action: core.WakeGuidance,
+		// A nudge keeps the existing session live, so it holds the run's slot.
+		// The saved marker lets the monitor show that guidance was delivered;
+		// no observation stamp is written because the nudge observes no PR.
+		run.HoldAgent()
+		run.MarkNudged()
+		if err := c.save(ctx, run, expectedAt, expectedSHA); err != nil {
+			return err
+		}
+		return c.Harness.Wake(ctx, run.SessionID, core.WakeContext{
+			RunID: run.ID, PRNumber: run.PRNumber, HeadSHA: run.HeadSHA,
+			Reason: "operator guidance", Excerpt: message,
+			Workspace: run.WorkspacePath, Branch: run.Branch,
+			Action: core.WakeGuidance,
+		})
 	})
 }
 
