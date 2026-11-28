@@ -96,19 +96,24 @@ func (p *guardStartPromoter) PromotePending(ctx context.Context) ([]*core.Run, e
 	return nil, nil
 }
 
-// runGuardTicks starts a reconciler with a short interval and stops it after
-// the caller has observed the requested number of promotion reports.
-func runGuardTicks(t *testing.T, r *Reconciler, ticks <-chan struct{}, n int) {
+// runGuardTicks starts a reconciler with a short interval and returns a stop
+// function. The caller must stop the loop before reading sink or store state,
+// so assertions never race with a later tick.
+func runGuardTicks(t *testing.T, r *Reconciler, ticks <-chan struct{}, n int) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- r.Run(ctx, make(chan int)) }()
-	t.Cleanup(func() {
-		cancel()
-		if err := <-done; !errors.Is(err, context.Canceled) {
-			t.Errorf("Run error = %v, want context.Canceled", err)
-		}
-	})
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Errorf("Run error = %v, want context.Canceled", err)
+			}
+		})
+	}
+	t.Cleanup(stop)
 	for i := 0; i < n; i++ {
 		select {
 		case <-ticks:
@@ -121,6 +126,7 @@ func runGuardTicks(t *testing.T, r *Reconciler, ticks <-chan struct{}, n int) {
 	case <-ticks:
 	case <-time.After(50 * time.Millisecond):
 	}
+	return stop
 }
 
 func TestAutoDispatchDisabledByDefault(t *testing.T) {
@@ -130,7 +136,8 @@ func TestAutoDispatchDisabledByDefault(t *testing.T) {
 		Store: newFakeStore(), Interval: time.Millisecond,
 		Promoter: promoter, Dispatch: port,
 	}
-	runGuardTicks(t, r, promoter.ticks, 2)
+	stop := runGuardTicks(t, r, promoter.ticks, 2)
+	stop()
 	if calls := port.budgets(); len(calls) != 0 {
 		t.Fatalf("dispatch budgets = %v, want no calls while disabled", calls)
 	}
@@ -144,7 +151,8 @@ func TestAutoDispatchBrakeFreezesIntakeOnly(t *testing.T) {
 		Promoter: promoter, Dispatch: port,
 		AutoDispatchEnabled: true, DispatchOpen: false,
 	}
-	runGuardTicks(t, r, promoter.ticks, 2)
+	stop := runGuardTicks(t, r, promoter.ticks, 2)
+	stop()
 	if calls := port.budgets(); len(calls) != 0 {
 		t.Fatalf("dispatch budgets = %v, want no calls with dispatch_open false", calls)
 	}
@@ -166,7 +174,8 @@ func TestAutoDispatchStartsUpToBudget(t *testing.T) {
 		AutoDispatchEnabled: true, DispatchOpen: true,
 		Decisions: DecisionLogger{Sink: sink},
 	}
-	runGuardTicks(t, r, promoter.ticks, 2)
+	stop := runGuardTicks(t, r, promoter.ticks, 2)
+	stop()
 	calls := port.budgets()
 	if len(calls) == 0 || calls[len(calls)-1] != 3 {
 		t.Fatalf("dispatch budgets = %v, want the three free slots", calls)
@@ -193,7 +202,8 @@ func TestAutoDispatchBatchSizeCapsBudget(t *testing.T) {
 		Promoter: promoter, Dispatch: port,
 		AutoDispatchEnabled: true, DispatchOpen: true, AutoDispatchBatchSize: 2,
 	}
-	runGuardTicks(t, r, promoter.ticks, 2)
+	stop := runGuardTicks(t, r, promoter.ticks, 2)
+	stop()
 	calls := port.budgets()
 	if len(calls) == 0 || calls[len(calls)-1] != 2 {
 		t.Fatalf("dispatch budgets = %v, want the batch size 2", calls)
@@ -218,7 +228,8 @@ func TestAutoDispatchDoesNotRestartPromotedTask(t *testing.T) {
 		Promoter: promoter, Dispatch: disp,
 		AutoDispatchEnabled: true, DispatchOpen: true,
 	}
-	runGuardTicks(t, r, promoter.ticks, 2)
+	stop := runGuardTicks(t, r, promoter.ticks, 2)
+	stop()
 
 	var started int
 	for _, run := range store.runs {
