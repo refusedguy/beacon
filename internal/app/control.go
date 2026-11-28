@@ -198,8 +198,11 @@ func (c *Control) get(ctx context.Context, id core.RunID) (*core.Run, error) {
 }
 
 // WatchPR binds a pull request to a run and subscribes it to reconciliation.
-// WatchPR reopens a run closed by workspace cleanup. The reconciler skips
-// terminal runs, so a binding stored on a closed run is never finalized.
+// A running run takes the usual pr_registered transition. Every other
+// nonterminal state binds with MarkExternal so the operator can rebind a PR
+// after a check failure, a rebase or a block. WatchPR also reopens a run closed
+// by workspace cleanup. The reconciler skips terminal runs, so a binding stored
+// on a closed run is never finalized.
 func (c *Control) WatchPR(ctx context.Context, id core.RunID, pr int) error {
 	return c.write(ctx, func() error { return c.watchPR(ctx, id, pr) })
 }
@@ -215,20 +218,22 @@ func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 	if run.PRNumber != 0 && run.PRNumber != pr {
 		return core.Errorf(core.CodeConflict, "run %s already watches PR %d", id, run.PRNumber)
 	}
+	if run.PRNumber == 0 {
+		bound, err := c.Store.FindByPR(ctx, pr)
+		if err != nil {
+			return err
+		}
+		if bound != nil && bound.ID != run.ID {
+			return core.Errorf(core.CodeConflict, "PR %d belongs to run %s", pr, bound.ID)
+		}
+	}
 	if err := run.Apply(core.Event{Kind: core.EvPRRegistered, PRNumber: pr}); err != nil {
 		switch {
-		case run.State == core.RunWaitingCI:
+		case !run.State.Terminal():
 			if err := run.MarkExternal(pr); err != nil {
 				return err
 			}
 		case run.State == core.RunClosed && strings.HasPrefix(run.Reason, "workspace:"):
-			bound, err := c.Store.FindByPR(ctx, pr)
-			if err != nil {
-				return err
-			}
-			if bound != nil && bound.ID != run.ID {
-				return core.Errorf(core.CodeConflict, "PR %d belongs to run %s", pr, bound.ID)
-			}
 			if err := run.ReopenWithPR(pr); err != nil {
 				return err
 			}

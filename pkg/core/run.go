@@ -122,9 +122,9 @@ var transitions = map[RunState]map[EventKind]RunState{
 	RunPending:       {EvStart: RunRunning, EvCancel: RunClosed},
 	RunRunning:       {EvIdleNudge: RunRunning, EvPRRegistered: RunWaitingCI, EvChecksPending: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvChecksFailed: RunNeedsAgentFix, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
 	RunWaitingCI:     {EvChecksPending: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvChecksFailed: RunNeedsAgentFix, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
-	RunNeedsRebase:   {EvRebased: RunWaitingCI, EvRebaseFailed: RunNeedsAgentFix, EvBlock: RunBlocked, EvCancel: RunClosed},
+	RunNeedsRebase:   {EvRebased: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvRebaseFailed: RunNeedsAgentFix, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
 	RunNeedsAgentFix: {EvAgentFixed: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
-	RunBlocked:       {EvUnblock: RunWaitingCI, EvCancel: RunClosed},
+	RunBlocked:       {EvUnblock: RunWaitingCI, EvCancel: RunClosed, EvMerged: RunMerged},
 }
 
 // canTake reports whether transitions accepts kind from s. Each exported query
@@ -146,13 +146,18 @@ func (s RunState) CanTakeCheckPending() bool { return s.canTake(EvChecksPending)
 
 // Run is the full persisted state of one task execution.
 type Run struct {
-	ID                RunID
-	TaskID            TaskID
-	State             RunState
-	PRNumber          int
-	HeadSHA           string
-	ObservedSHA       string
-	ObservedBaseSHA   string
+	ID              RunID
+	TaskID          TaskID
+	State           RunState
+	PRNumber        int
+	HeadSHA         string
+	ObservedSHA     string
+	ObservedBaseSHA string
+	// ObservedIdentity is the dedup key of the last processed observation. It
+	// includes check conclusions and conflict state, so a changed conclusion on
+	// the same SHA is not skipped as a duplicate. A restart rebuilds it on the
+	// next observation, so the value needs no column or migration.
+	ObservedIdentity  string
 	SessionID         string
 	ParentSessionID   string
 	AgentIdentity     string
@@ -283,23 +288,34 @@ func (r *Run) ResetAttempts() {
 
 // Retry re-arms a closed run. A run that already has a PR returns to
 // waiting_ci so the reconciler can finalize it. A run without a PR returns to
-// pending with its session and worktree cleared, ready for PromotePending to
-// spawn a fresh worker.
+// pending. Either way the old session and worktree are dropped, so a retried
+// run cannot wake a dead worker or reuse a stale workspace.
 func (r *Run) Retry(reason string) error {
 	if r.State != RunClosed {
 		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot retry run %s in %s", r.ID, r.State)}
 	}
 	r.ResetAttempts()
+	r.clearRetryResidue()
 	if r.PRNumber > 0 {
 		r.State = RunWaitingCI
 	} else {
 		r.State = RunPending
-		r.SessionID = ""
-		r.WorkspacePath = ""
 	}
 	r.Reason = reason
 	r.UpdatedAt = time.Now().UTC()
 	return nil
+}
+
+// clearRetryResidue drops state that belongs to the previous execution. A
+// retried run gets a fresh session, workspace and observation from the next
+// dispatch or reconcile, never the ones left by the run it replaces.
+func (r *Run) clearRetryResidue() {
+	r.SessionID = ""
+	r.WorkspacePath = ""
+	r.BlockedIncidentID = ""
+	r.ObservedSHA = ""
+	r.ObservedBaseSHA = ""
+	r.ObservedIdentity = ""
 }
 
 // ExternalFinalize moves a run to a terminal state after its PR was merged or
@@ -342,6 +358,7 @@ func (r *Run) RetryBlocked(reason string) error {
 		return &AppError{Code: CodeInvalidTransition, Message: fmt.Sprintf("cannot retry run %s in %s", r.ID, r.State)}
 	}
 	r.ResetAttempts()
+	r.clearRetryResidue()
 	return r.Apply(Event{Kind: EvUnblock, Reason: reason})
 }
 
@@ -384,6 +401,12 @@ func (r *Run) Apply(e Event) error {
 		}
 		r.FixAttempts++
 	}
+	// Every route out of blocked goes through EvUnblock. Clearing the incident
+	// here keeps retry, operator unblock and base recovery from leaving a
+	// waiting_ci run tagged as still blocked by an old incident.
+	if e.Kind == EvUnblock {
+		r.BlockedIncidentID = ""
+	}
 	if e.HeadSHA != "" {
 		r.HeadSHA = e.HeadSHA
 	}
@@ -406,11 +429,23 @@ func (r *Run) Apply(e Event) error {
 // reports whether either value changed. It is the single place that stamps an
 // observation, so head, base and timestamp always move together.
 func (r *Run) NoteObservation(headSHA, baseSHA string) bool {
-	if headSHA == r.ObservedSHA && baseSHA == r.ObservedBaseSHA {
+	return r.NoteObservationIdentity(headSHA, baseSHA, r.ObservedIdentity)
+}
+
+// NoteObservationIdentity stamps a full observation identity. Callers that know
+// the check conclusions and conflict state pass them as identity so the next
+// poll can tell a changed verdict from a duplicate of the same SHA pair.
+func (r *Run) NoteObservationIdentity(headSHA, baseSHA, identity string) bool {
+	// A run restored from an older database has no identity. The SHA pair still
+	// describes its last observation, so treat that run as unchanged rather
+	// than writing a row on the first tick after an upgrade.
+	unchanged := r.ObservedIdentity == "" || identity == r.ObservedIdentity
+	if headSHA == r.ObservedSHA && baseSHA == r.ObservedBaseSHA && unchanged {
 		return false
 	}
 	r.ObservedSHA = headSHA
 	r.ObservedBaseSHA = baseSHA
+	r.ObservedIdentity = identity
 	r.UpdatedAt = time.Now().UTC()
 	return true
 }
