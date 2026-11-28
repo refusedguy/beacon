@@ -25,6 +25,9 @@ func newMCPCommand(configPath *string) *cobra.Command {
 		Use:   "mcp",
 		Short: "Serve six worker and read-only MCP tools plus four orchestrator tools over stdio",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := refuseStaleBinary(); err != nil {
+				return err
+			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 			parent := parentSessionFromEnv()
