@@ -31,6 +31,7 @@ var bareRules = []rule{
 	newRule(`sk-[A-Za-z0-9_-]{20,}`, Marker),
 	newRule(`AIza[A-Za-z0-9_-]{30,}`, Marker),
 	newRule(`[0-9]+:[A-Za-z0-9_-]{35}`, Marker),
+	newRule(`opencode:[A-Fa-f0-9]{8,}`, Marker),
 }
 
 // urlRule drops the user and password from a URL but keeps the scheme and host.

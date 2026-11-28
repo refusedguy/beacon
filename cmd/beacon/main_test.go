@@ -106,12 +106,90 @@ func TestNewHarnessBuildsACPProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newHarness(cfg, \"\", \"ses_parent\", \"\"): %v", err)
 	}
-	ah, ok := h.(*acp.Harness)
+	rh, ok := h.(redactingHarness)
 	if !ok {
-		t.Fatalf("harness for acp provider = %T, want *acp.Harness", h)
+		t.Fatalf("harness for acp provider = %T, want redactingHarness", h)
+	}
+	ah, ok := rh.AgentHarness.(*acp.Harness)
+	if !ok {
+		t.Fatalf("wrapped acp harness = %T, want *acp.Harness", rh.AgentHarness)
 	}
 	if ah.Command != "fake-agent --acp" {
 		t.Fatalf("acp harness command = %q, want fake-agent --acp", ah.Command)
+	}
+}
+
+// recordingHarness captures what a harness receives and echoes it in an
+// error, so the wrapper has to clean both directions.
+type recordingHarness struct {
+	bareHarness
+	prompt string
+	wake   core.WakeContext
+}
+
+func (h *recordingHarness) Spawn(_ context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.prompt = req.Prompt
+	return core.Session{}, errors.New("spawn failed: " + req.Prompt)
+}
+
+func (h *recordingHarness) Wake(_ context.Context, _ string, w core.WakeContext) error {
+	h.wake = w
+	return errors.New("wake failed: " + w.Reason)
+}
+
+func TestRedactingRunStoreRedactsReasonBeforeSQLite(t *testing.T) {
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer store.Close()
+
+	run := core.NewRun("run-secret", "T-1", time.Now().UTC())
+	run.State = core.RunWaitingCI
+	run.Reason = "ci failed with token " + secret
+	if err := (redactingRunStore{store}).Save(context.Background(), run); err != nil {
+		t.Fatalf("redactingRunStore.Save: %v", err)
+	}
+
+	got, err := store.Get(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got == nil {
+		t.Fatal("stored run is nil")
+	}
+	if strings.Contains(got.Reason, secret) {
+		t.Fatalf("stored reason leaked a secret: %q", got.Reason)
+	}
+	if !strings.Contains(got.Reason, "[REDACTED]") {
+		t.Fatalf("stored reason = %q, want a redaction marker", got.Reason)
+	}
+	if !strings.Contains(run.Reason, secret) {
+		t.Fatal("Save mutated the caller's run")
+	}
+}
+
+func TestRedactingHarnessCleansPromptsAndErrors(t *testing.T) {
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+	inner := &recordingHarness{}
+	h := redactingHarness{inner}
+	ctx := context.Background()
+
+	_, spawnErr := h.Spawn(ctx, core.SpawnRequest{Prompt: "fix token " + secret})
+	if inner.prompt != "fix token [REDACTED]" {
+		t.Fatalf("inner prompt = %q, want a redacted prompt", inner.prompt)
+	}
+	if strings.Contains(spawnErr.Error(), secret) {
+		t.Fatalf("spawn error leaked a secret: %q", spawnErr.Error())
+	}
+
+	wakeErr := h.Wake(ctx, "s1", core.WakeContext{Reason: "reason " + secret, Excerpt: "excerpt " + secret})
+	if strings.Contains(inner.wake.Reason, secret) || strings.Contains(inner.wake.Excerpt, secret) {
+		t.Fatalf("inner wake context leaked a secret: %+v", inner.wake)
+	}
+	if strings.Contains(wakeErr.Error(), secret) {
+		t.Fatalf("wake error leaked a secret: %q", wakeErr.Error())
 	}
 }
 

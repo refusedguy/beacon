@@ -97,7 +97,7 @@ type observationErrors []string
 
 func (e *observationErrors) add(part string, err error) {
 	if err != nil {
-		*e = append(*e, part+": "+err.Error())
+		*e = append(*e, part+": "+redact.Redact(err.Error()))
 	}
 }
 
@@ -168,7 +168,7 @@ func applyChecks(o *core.Observation, checks []core.CheckResult, excerpt string,
 	o.FailureExcerpt = excerpt
 	if excerpt == "" {
 		if failedCheck, ok := o.Failure(); ok {
-			o.FailureExcerpt = failedCheck.Output
+			o.FailureExcerpt = redact.Redact(failedCheck.Output)
 		}
 	}
 }
