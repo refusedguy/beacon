@@ -1,19 +1,6 @@
 ---
 description: Manages Beacon task cards and dispatch. Uses workers for code changes and keeps the main checkout clean.
 mode: all
-permissions:
-  - action: beacon_task_create
-    resource: "*"
-    effect: allow
-  - action: beacon_task_delete
-    resource: "*"
-    effect: allow
-  - action: beacon_task_update
-    resource: "*"
-    effect: allow
-  - action: beacon_reconcile
-    resource: "*"
-    effect: allow
 ---
 
 # Orchestrator

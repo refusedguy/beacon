@@ -46,5 +46,17 @@ if [ "${1:-}" = "--hash" ]; then
 fi
 
 mkdir -p .opencode/bin
-go build -o .opencode/bin/beacon ./cmd/beacon
-compute_build_hash > .opencode/bin/beacon.build-sha
+
+# Build next to the destination and rename into place. Writing straight to
+# .opencode/bin/beacon fails with ETXTBSY while that binary is running.
+tmpdir="$(mktemp -d .opencode/bin/.build.XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+hash="$(compute_build_hash)"
+go build -o "$tmpdir/beacon" ./cmd/beacon
+mv -f "$tmpdir/beacon" .opencode/bin/beacon
+
+# Publish the hash only after the rename succeeds. A failed build or rename
+# leaves the old hash, which still describes the binary on disk.
+printf '%s\n' "$hash" > "$tmpdir/beacon.build-sha"
+mv -f "$tmpdir/beacon.build-sha" .opencode/bin/beacon.build-sha

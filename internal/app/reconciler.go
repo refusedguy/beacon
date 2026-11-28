@@ -216,6 +216,9 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 		return err
 	} else if !ok {
 		r.Decisions.logTransitionDeliveryClaim(ctx, run.ID, obs.PRNumber, false)
+		if err := r.Store.SetTaskStatus(ctx, run.TaskID, "done"); err != nil {
+			return err
+		}
 		return nil
 	}
 	r.Decisions.logTransitionDeliveryClaim(ctx, run.ID, obs.PRNumber, true)

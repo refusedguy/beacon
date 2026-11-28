@@ -147,6 +147,7 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_create",
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{
 			"id":    "T-EPIC",
 			"title": "Epic",
@@ -198,6 +199,7 @@ func TestTaskCreateExpandsEpicOverInMemoryTransport(t *testing.T) {
 
 	res, err = cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_create",
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{
 			"id": "T-EPIC", "title": "Epic", "kind": "epic",
 			"plan": []any{
@@ -246,6 +248,7 @@ func TestTaskCreateChildBodiesOverInMemoryTransport(t *testing.T) {
 
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_create",
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{
 			"id": "T-EPIC", "title": "Epic", "kind": "epic",
 			"plan": []any{
@@ -377,6 +380,7 @@ func callDelete(t *testing.T, cs *msdk.ClientSession, ids ...string) app.DeleteR
 	}
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name:      "beacon_task_delete",
+		Meta:      msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{"ids": args},
 	})
 	if err != nil {
@@ -498,6 +502,7 @@ func TestTaskDeleteRollsBackWhenCommitFails(t *testing.T) {
 
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name:      "beacon_task_delete",
+		Meta:      msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{"ids": []any{"T-A", "T-B"}},
 	})
 	if err != nil {
@@ -539,6 +544,7 @@ func callUpdate(t *testing.T, cs *msdk.ClientSession, updates ...map[string]any)
 	}
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name:      "beacon_task_update",
+		Meta:      msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{"updates": args},
 	})
 	if err != nil {
@@ -682,6 +688,7 @@ func TestTaskUpdateRollsBackWhenCommitFails(t *testing.T) {
 
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_update",
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{
 			"updates": []any{map[string]any{"id": "T-A", "title": "New"}},
 		},
@@ -718,6 +725,7 @@ func callReconcile(t *testing.T, cs *msdk.ClientSession, pr int) app.ReconcileRe
 	t.Helper()
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name:      "beacon_reconcile",
+		Meta:      msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{"pr": pr},
 	})
 	if err != nil {
@@ -785,6 +793,7 @@ func TestReconcileRedactsDecisionReasonAndError(t *testing.T) {
 
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name:      "beacon_reconcile",
+		Meta:      msdk.Meta{"beacon/agent": "orchestrator"},
 		Arguments: map[string]any{"pr": 42},
 	})
 	if err != nil {
@@ -822,6 +831,7 @@ func callCreateBatch(t *testing.T, cs *msdk.ClientSession, args map[string]any) 
 	t.Helper()
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_create", Arguments: args,
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 	})
 	if err != nil {
 		t.Fatalf("cs.CallTool(Name: \"beacon_task_create\"): %v", err)
@@ -977,6 +987,7 @@ func callUpdateArgs(t *testing.T, cs *msdk.ClientSession, args map[string]any) a
 	t.Helper()
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_update", Arguments: args,
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 	})
 	if err != nil {
 		t.Fatalf("cs.CallTool(Name: \"beacon_task_update\"): %v", err)
@@ -988,6 +999,7 @@ func callDeleteArgs(t *testing.T, cs *msdk.ClientSession, args map[string]any) a
 	t.Helper()
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
 		Name: "beacon_task_delete", Arguments: args,
+		Meta: msdk.Meta{"beacon/agent": "orchestrator"},
 	})
 	if err != nil {
 		t.Fatalf("cs.CallTool(Name: \"beacon_task_delete\"): %v", err)
