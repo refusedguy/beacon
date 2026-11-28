@@ -116,7 +116,30 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS decisions_run_at_idx ON decisions(run_id, at);
 CREATE INDEX IF NOT EXISTS decisions_kind_at_idx ON decisions(kind, at);
 CREATE INDEX IF NOT EXISTS decisions_at_idx ON decisions(at);
+` + waitlistDDL
+
+// waitlistDDL holds one row per card waiting on a scope path. waiting_since is
+// the age key: a smaller timestamp waited longer, so equal-priority cards keep
+// their order. The same DDL runs on a fresh schema and on every open, so an
+// older state database gains the table without losing its rows.
+const waitlistDDL = `
+CREATE TABLE IF NOT EXISTS waitlist (
+  path TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  waiting_since INTEGER NOT NULL,
+  PRIMARY KEY (path, task_id)
+);
+CREATE INDEX IF NOT EXISTS waitlist_path_age_idx ON waitlist(path, waiting_since, task_id);
 `
+
+// ensureWaitlist adds the waitlist table to a state database opened before the
+// table existed. It runs outside the schema version marker, the same way
+// operation_results does, so an already prepared database gains the table on
+// open.
+func ensureWaitlist(db *sql.DB) error {
+	_, err := db.Exec(waitlistDDL)
+	return err
+}
 
 // dsn builds a SQLite file URI. The path is escaped as a URL path so a name
 // containing ? or # stays part of the filename instead of becoming a query or
