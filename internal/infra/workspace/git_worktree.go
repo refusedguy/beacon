@@ -471,12 +471,49 @@ func (g *GitWorktree) RebaseBase(ctx context.Context, ws core.Workspace, base st
 	if _, err := g.runInDir(ctx, ws.Path, args...); err != nil {
 		return core.JoinWith(err, "abort rebase", g.abortRebase(ctx, ws.Path))
 	}
+	// An autostash apply can conflict while git still exits zero. The conflict
+	// leaves unmerged paths and markers in the worktree, which a later
+	// CommitPath would stage and publish. Stop the caller before that happens.
+	unmerged, err := g.unmergedPaths(ctx, ws.Path)
+	if err != nil {
+		return err
+	}
+	if len(unmerged) > 0 {
+		conflict := core.Errorf(core.CodeConflict, "rebase left unmerged paths: %s", strings.Join(unmerged, ", "))
+		return core.JoinWith(conflict, "abort rebase", g.abortRebase(ctx, ws.Path))
+	}
 	return nil
+}
+
+// unmergedPaths lists the distinct paths git reports with unmerged stages.
+// ls-files prints one line per stage, so a path can appear up to three times.
+func (g *GitWorktree) unmergedPaths(ctx context.Context, path string) ([]string, error) {
+	out, err := g.runInDir(ctx, path, "ls-files", "--unmerged")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		_, name, found := strings.Cut(line, "\t")
+		if !found {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		paths = append(paths, name)
+	}
+	return paths, nil
 }
 
 // abortRebase returns the worktree to a non-rebase state. A failed abort can
 // leave git's rebase state behind and block the next rebase, so a quit follows
-// as a fallback. Every failure is reported, none is dropped.
+// as a fallback. A completed rebase has no state to abort or quit; an autostash
+// apply conflict is that case, and a reset clears unmerged paths when present.
+// Every failure is reported, none is dropped.
 func (g *GitWorktree) abortRebase(ctx context.Context, path string) error {
 	_, abortErr := g.runInDir(ctx, path, "rebase", "--abort")
 	if abortErr == nil {
@@ -485,6 +522,16 @@ func (g *GitWorktree) abortRebase(ctx context.Context, path string) error {
 	errs := []error{fmt.Errorf("rebase --abort: %w", abortErr)}
 	if _, err := g.runInDir(ctx, path, "rebase", "--quit"); err != nil {
 		errs = append(errs, fmt.Errorf("rebase --quit: %w", err))
+		// A completed autostash rebase has no state to abort or quit. Its
+		// conflict stays in the index and worktree, so clear it when present.
+		// The probe keeps an unrelated failure from discarding uncommitted
+		// work; the autostash still holds the local changes for a later pop.
+		unmerged, probeErr := g.unmergedPaths(ctx, path)
+		if probeErr == nil && len(unmerged) > 0 {
+			if _, resetErr := g.runInDir(ctx, path, "reset", "--hard", "HEAD"); resetErr != nil {
+				errs = append(errs, fmt.Errorf("reset --hard: %w", resetErr))
+			}
+		}
 	}
 	return errors.Join(errs...)
 }
