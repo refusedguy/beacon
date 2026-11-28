@@ -38,6 +38,38 @@ func TestRunTransitions(t *testing.T) {
 	}
 }
 
+func TestBlockReleasesHeldAgentSlot(t *testing.T) {
+	for _, from := range []RunState{RunRunning, RunWaitingCI, RunNeedsRebase, RunNeedsAgentFix} {
+		t.Run(string(from), func(t *testing.T) {
+			r := &Run{ID: "r1", State: from, MaxAttempts: 3}
+			r.HoldAgent()
+			if err := r.Apply(Event{Kind: EvBlock}); err != nil {
+				t.Fatalf("Apply block from %s: %v", from, err)
+			}
+			if r.State != RunBlocked {
+				t.Fatalf("state = %s, want blocked", r.State)
+			}
+			if r.AgentHeld || r.SessionLive || r.HoldsAgent() {
+				t.Fatalf("blocked run still holds a slot from %s: held=%v live=%v", from, r.AgentHeld, r.SessionLive)
+			}
+		})
+	}
+}
+
+func TestWaitingCIRetainsHeldAgentSlot(t *testing.T) {
+	r := &Run{ID: "r1", State: RunRunning, MaxAttempts: 3}
+	r.HoldAgent()
+	if err := r.Apply(Event{Kind: EvChecksPassed}); err != nil {
+		t.Fatalf("Apply checks passed: %v", err)
+	}
+	if r.State != RunWaitingCI {
+		t.Fatalf("state = %s, want waiting_ci", r.State)
+	}
+	if !r.AgentHeld || !r.SessionLive || !r.HoldsAgent() {
+		t.Fatalf("waiting_ci run lost its slot: held=%v live=%v", r.AgentHeld, r.SessionLive)
+	}
+}
+
 func TestIdleNudgeSpendsBoundedFixAttempt(t *testing.T) {
 	r := &Run{ID: "r1", State: RunRunning, MaxAttempts: 2}
 	for i := 1; i <= 2; i++ {

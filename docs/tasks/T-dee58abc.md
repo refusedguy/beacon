@@ -1,7 +1,7 @@
 ---
 id: T-dee58abc
 title: Enforce 3-2-1200 scope cap at card creation
-status: available
+status: done
 scope:
     - internal/app/taskcreate.go
     - internal/app/taskcreate_test.go

@@ -111,7 +111,9 @@ The operator works in the default `build` agent. That agent gets orchestrator ru
 
 - Do not dispatch a task again after `workspace conflict` or `dirty worktree` until you find the cause. A repeated dispatch does not clear a stale worktree. Diagnose in this order: `beacon status --snapshot` for the run's `state` and `reason`, `beacon status --daemon` for a missing reconciler (`cmd/beacon/lock.go:250-282`), `git status --short` inside `.beacon/worktrees/<id>` for uncommitted files (`pkg/core/errors.go:51-54`, `internal/infra/workspace/git_worktree.go:468-482`). Clear or preserve that work explicitly, then re-arm the blocked or closed run with `beacon_control {"action":"retry","run_id":"..."}` (`internal/app/control.go:288-315`).
 - Before `beacon_task_create`, check `git log -n 10 --oneline`, `beacon_status` and `beacon_recent`. Do not recreate a card for work that is in flight or already merged.
-- Give each card a narrow, disjoint `Scope`. Never run two cards that touch `ui.js`, `ui_view.js` or `reconciler.go` at the same time.
+- Keep every card inside the 3-2-1200 cap: at most 3 `Scope` paths, 2 production files and 1200 summed lines after directories and globs expand to files. The cap applies to an epic and to each plan child separately, never to their sum.
+- A hot file such as `internal/app/reconciler.go` or `.github/workflows/ci.yml` is a singleton. One card owns it and lists no other path in its `Scope`. Do not scope that file in another card until the owner merges.
+- Use `Depends` only to order a card behind the owner whose output it needs. Do not use `Depends` to serialize peers. Peers take disjoint `Scope` paths and dispatch in parallel once their owner is done.
 - After Go code lands on `main`, run `bash scripts/build-beacon.sh`, then tell the operator to restart the MCP daemon and the OpenCode TUI once. Go code is not hot-reloaded.
 
 ## Shell guards

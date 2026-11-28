@@ -1247,3 +1247,171 @@ func TestTaskCreatorUsesInjectedRoles(t *testing.T) {
 		t.Fatalf("injected publisher still used the workspace: %+v", ws.commits)
 	}
 }
+
+func TestTaskCreatorRejectsOversizeCard(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws,
+		Root: core.Workspace{Path: t.TempDir()}}
+
+	_, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Four paths",
+		Scope: []string{"docs/a.md", "docs/b.md", "docs/c.md", "docs/d.md"},
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v, want CodeInvalidInput", err)
+	}
+	if len(src.log.items) != 0 || len(ws.commits) != 0 {
+		t.Fatalf("oversize card wrote cards = %v, commits = %d", src.log.items, len(ws.commits))
+	}
+}
+
+func TestTaskCreatorRejectsOversizeProductionFiles(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws,
+		Root: core.Workspace{Path: t.TempDir()}}
+
+	_, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Three production files",
+		Scope: []string{"a.go", "b.go", "c.go"},
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v, want CodeInvalidInput", err)
+	}
+	if !strings.Contains(err.Error(), "3 production files") {
+		t.Fatalf("error = %q, want the measured production file count", err)
+	}
+	if len(src.log.items) != 0 || len(ws.commits) != 0 {
+		t.Fatalf("oversize card wrote cards = %v, commits = %d", src.log.items, len(ws.commits))
+	}
+}
+
+func TestTaskCreatorRejectsOversizeLines(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "big.go"), []byte(strings.Repeat("x\n", 1201)), 0o644); err != nil {
+		t.Fatalf(`os.WriteFile(...): %v`, err)
+	}
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: dir}}
+
+	_, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Too many lines",
+		Scope: []string{"big.go"},
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v, want CodeInvalidInput", err)
+	}
+	if !strings.Contains(err.Error(), "1201 lines") {
+		t.Fatalf("error = %q, want the measured line count", err)
+	}
+	if len(src.log.items) != 0 || len(ws.commits) != 0 {
+		t.Fatalf("oversize card wrote cards = %v, commits = %d", src.log.items, len(ws.commits))
+	}
+}
+
+func TestTaskCreatorRejectsOversizeChild(t *testing.T) {
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &branchWorkspace{fakeWorkspace: &fakeWorkspace{log: &callLog{}}}
+	creator := &TaskCreator{Source: src, Workspace: ws,
+		Root: core.Workspace{Path: t.TempDir()}}
+	plan := []core.ChildSpec{
+		{Title: "Narrow child", Scope: []core.ScopePath{core.ScopeFile("a.go")}},
+		{Title: "Wide child", Scope: []core.ScopePath{
+			core.ScopeFile("w.md"), core.ScopeFile("x.md"),
+			core.ScopeFile("y.md"), core.ScopeFile("z.md"),
+		}},
+	}
+
+	_, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic, Plan: plan,
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v, want CodeInvalidInput", err)
+	}
+	if !strings.Contains(err.Error(), "T-EPIC-02") {
+		t.Fatalf("error = %q, want the offending child id", err)
+	}
+	if len(src.log.items) != 0 || len(ws.commits) != 0 || len(ws.branches) != 0 {
+		t.Fatalf("oversize child wrote cards = %v, commits = %d, branches = %v",
+			src.log.items, len(ws.commits), ws.branches)
+	}
+}
+
+func TestTaskCreatorAcceptsEpicWithThreeNarrowChildren(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"epic.go", "one.go", "two.go", "three.go"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package demo\n"), 0o644); err != nil {
+			t.Fatalf(`os.WriteFile(%q): %v`, name, err)
+		}
+	}
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: dir}}
+	plan := []core.ChildSpec{
+		{Title: "One", Scope: []core.ScopePath{core.ScopeFile("one.go")}},
+		{Title: "Two", Scope: []core.ScopePath{core.ScopeFile("two.go")}},
+		{Title: "Three", Scope: []core.ScopePath{core.ScopeFile("three.go")}},
+	}
+
+	got, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Epic", ID: "T-EPIC", Kind: core.TaskKindEpic,
+		Scope: []string{"epic.go", "notes.md"}, Plan: plan,
+	})
+	if err != nil {
+		t.Fatalf(`creator.Create(...): %v`, err)
+	}
+	if len(src.created) != 4 || len(got.IDs) != 4 || len(got.Children) != 3 {
+		t.Fatalf("created = %d, results = %+v", len(src.created), got)
+	}
+}
+
+func TestTaskCreatorCountsExpandedGlobScope(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatalf(`os.MkdirAll(...): %v`, err)
+	}
+	for _, name := range []string{"a.go", "b.go", "c.go"} {
+		path := filepath.Join(dir, "src", name)
+		if err := os.WriteFile(path, []byte("package demo\n"), 0o644); err != nil {
+			t.Fatalf(`os.WriteFile(%q): %v`, path, err)
+		}
+	}
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: dir}}
+
+	_, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Glob over three production files",
+		Scope: []string{"src/**/*.go"},
+	})
+	if core.CodeOf(err) != core.CodeInvalidInput {
+		t.Fatalf("error = %v, want CodeInvalidInput", err)
+	}
+	if !strings.Contains(err.Error(), "3 production files") {
+		t.Fatalf("error = %q, want expanded glob files counted", err)
+	}
+}
+
+func TestTaskCreatorAcceptsExactScopeCap(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a.go", "b.go"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Repeat("x\n", 600)), 0o644); err != nil {
+			t.Fatalf(`os.WriteFile(%q): %v`, name, err)
+		}
+	}
+	src := &recordingEpicSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: dir}}
+
+	if _, err := creator.Create(context.Background(), CreateTaskInput{
+		Title: "Exactly at the cap",
+		Scope: []string{"a.go", "b.go"},
+	}); err != nil {
+		t.Fatalf(`creator.Create(...): %v`, err)
+	}
+	if len(src.created) != 1 {
+		t.Fatalf("created = %d, want one card", len(src.created))
+	}
+}

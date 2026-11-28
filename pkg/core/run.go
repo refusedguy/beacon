@@ -459,7 +459,10 @@ func (r *Run) Apply(e Event) error {
 		r.Reason = ""
 	}
 	r.State = next
-	if next.Terminal() {
+	// A blocked run has no agent doing work, even when a wake or nudge held a
+	// slot before the block. Free the slot now instead of waiting for the orphan
+	// sweep to confirm a dead session. waiting_ci keeps its session on purpose.
+	if next.Terminal() || next.Blocked() {
 		r.ReleaseAgent()
 	}
 	r.UpdatedAt = time.Now().UTC()
