@@ -25,6 +25,14 @@ func observationIdentity(obs core.Observation) string {
 	return obs.HeadSHA + "|" + obs.BaseSHA + "|" + conflict + "|" + strings.Join(pairs, ",")
 }
 
+// attemptedRebaseObservation keeps the head and base of a failed branch update
+// but drops its check conclusions. The save that applies EvRebaseFailed records
+// the attempted pair, so the same update is not retried, while a wake carrying
+// the full observation still sees a changed identity and reaches the fixer.
+func attemptedRebaseObservation(obs core.Observation) core.Observation {
+	return core.Observation{HeadSHA: obs.HeadSHA, BaseSHA: obs.BaseSHA}
+}
+
 // sameObservation reports whether the run already processed this observation.
 // The key covers check conclusions and conflict state as well as the SHA pair,
 // so a green check on the same commit is not skipped as a duplicate of the
