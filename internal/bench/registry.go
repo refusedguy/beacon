@@ -30,7 +30,7 @@ type Spec struct {
 // print in their canonical rows. Those harnesses live outside the bench
 // package, so registry.go owns the strings instead of report.go.
 var prHarnessLimiters = []struct{ key, limiter string }{
-	{"snapshot", "SQLite VM, ListRunEvents sort and JSON reflection"},
+	{"snapshot", "SQLite VM, syscalls and event sort"},
 	{"worktree-remove", "git subprocess spawn and worktree metadata"},
 	{"tui-view", "normalizeSnapshot + render"},
 	{"run-watcher-fp", "JSON.stringify character volume"},

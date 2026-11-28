@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
@@ -78,11 +79,62 @@ func runSQLiteSnapshot(e *env) (int64, int64) {
 	return work, errs
 }
 
-// runCardParse parses every fixture card the way a task source refresh does.
-// Work counts parsed scope, dependency and plan entries.
+// cardParsePass increments once per card-parse pass. Appending the pass to
+// every body makes tasksource's parse key unique, so a timed pass runs
+// yaml.Unmarshal and the line scan named by the limiter instead of returning a
+// cached clone.
+var cardParsePass atomic.Uint64
+
+// cardParseCorpus builds n bodies with a fenced YAML block that carries a plan
+// and with the flat Scope and Depends lines the parser reads after the block.
+// pass changes only marker text, so work stays fixed while every parse misses
+// the field cache.
+func cardParseCorpus(n int, pass uint64) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		dep := fmt.Sprintf("T-%06d", (i+n-1)%n)
+		out = append(out, fmt.Sprintf(`# T-%06d. Parse corpus %d
+
+Scope: internal/bench/**, docs/perf/**
+Depends: %s
+Priority: %d
+Kind: task
+
+`+"```yaml"+`
+id: T-%06d
+scope:
+  - internal/bench/%02d.go
+  - docs/perf/dossier.md
+depends:
+  - %s
+priority: %d
+kind: task
+plan:
+  - title: measure the production path
+    body: parse this child without a cache hit
+    scope:
+      - internal/bench/%02d.go
+    depends:
+      - %s
+    priority: %d
+`+"```"+`
+
+Goal: decode frontmatter, a plan and flat lines on every pass.
+
+Pass: %d
+`, i, pass, dep, 50+i%50, i, i%20, dep, 50+i%50, i%20, dep, 50+i%50, pass))
+	}
+	return out
+}
+
+// runCardParse parses a fresh corpus the way a task source refresh parses
+// edited cards. Work counts parsed scope, dependency and plan entries and
+// stays fixed across passes.
 func runCardParse(e *env) (int64, int64) {
+	pass := cardParsePass.Add(1)
+	cards := cardParseCorpus(len(e.cards), pass)
 	var work, errs int64
-	for _, card := range e.cards {
+	for _, card := range cards {
 		fields := tasksource.ParseTaskFields(card, "docs/tasks", "")
 		if fields.ID == "" {
 			errs++

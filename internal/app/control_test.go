@@ -72,6 +72,28 @@ func TestCancelRetriesTransientBusy(t *testing.T) {
 	}
 }
 
+func TestCancelAlreadyClosedIsNoop(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	run := core.NewRun("r-closed", "T-1", time.Now().UTC())
+	run.State = core.RunClosed
+	run.Reason = "cancelled by operator"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatalf(`store.Save(ctx, run): %v`, err)
+	}
+
+	c := &Control{Store: store}
+	err := c.Cancel(ctx, "r-closed")
+	var notice *ControlNotice
+	if !errors.As(err, &notice) || notice.Reason != "already_closed" {
+		t.Fatalf("error = %v, want already_closed notice", err)
+	}
+	got := store.runs["r-closed"]
+	if got.State != core.RunClosed || got.Reason != "cancelled by operator" {
+		t.Fatalf("run = %+v, want unchanged closed run", got)
+	}
+}
+
 func TestCancelReturnsPersistentBusyAfterBoundedRetries(t *testing.T) {
 	ctx := context.Background()
 	store := newBusyStore()

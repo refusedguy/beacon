@@ -104,9 +104,9 @@ var limiters = map[string]string{
 	nameRedact:       "regexp pass chain",
 	nameJournal:      "mutex + indexed LRU",
 	nameFanout:       "json.Marshal + subscriber maps + slow-view drop",
-	nameSCM:          "loopback PR + compare + checks + files round trips",
+	nameSCM:          "loopback PR + paginated checks/reviews/files + parallel fetchSignals",
 	nameCardLocal:    "yaml.Unmarshal + per-scope os.Stat",
-	nameHTTPSnapshot: "groupHistory + json reflection",
+	nameHTTPSnapshot: "status.Active + core.NewWireRuns + json.Marshal",
 	nameSpawn:        "loopback create + model POST + deferred move",
 }
 
@@ -196,9 +196,9 @@ const (
 )
 
 var snapshotLimiters = map[string]string{
-	phaseReads:    "WAL page reads",
+	phaseReads:    "SQLite VM, syscalls and event sort",
 	phaseAssembly: "groupHistory + json reflection",
-	phaseTotal:    "sum of both phases",
+	phaseTotal:    "derived sum of reads and assembly, not a measured pass",
 }
 
 // phaseSample is one timed phase of one alternating pass.
