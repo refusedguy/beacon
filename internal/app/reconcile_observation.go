@@ -181,6 +181,15 @@ func (r *Reconciler) handleNeedsAgentFix(
 	decision core.MergeDecision,
 ) (core.MergeDecision, error) {
 	if sameObservation(run, obs) {
+		// A new decision can change the reason without changing the observation.
+		// Save the fresher reason but leave the observation stamp and wake guard
+		// alone so the agent is not woken twice.
+		if decision.Reason != run.Reason {
+			run.Reason = decision.Reason
+			if err := r.Store.Save(ctx, run); err != nil {
+				return decision, err
+			}
+		}
 		return decision, nil
 	}
 	if run.State.CanTakeCheckFailed() {
