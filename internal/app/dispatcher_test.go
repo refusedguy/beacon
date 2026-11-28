@@ -1717,6 +1717,34 @@ func TestSelectDispatchCandidatesSelection(t *testing.T) {
 	}
 }
 
+// TestSelectDispatchCandidatesRejectsUnscopedUnderStrict proves strict mode
+// drops a ready task with no explicit scope before it can widen to an all-files
+// claim that collides with every active run.
+func TestSelectDispatchCandidatesRejectsUnscopedUnderStrict(t *testing.T) {
+	unscoped := core.Task{ID: "T-empty", Status: core.TaskAvailable}
+	scoped := core.Task{ID: "T-scoped", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("scoped.go")}}
+	ready := []core.Task{unscoped, scoped}
+	active := []*core.Run{busyRun("r-1", "R-1"), busyRun("r-2", "R-2")}
+
+	sel, err := selectDispatchCandidates(NewPlanner(nil), ready, active, 5, 3, true)
+	if err != nil {
+		t.Fatalf("selectDispatchCandidates: %v", err)
+	}
+	if len(sel.Chosen) != 1 || sel.Chosen[0].ID != scoped.ID {
+		t.Fatalf("chosen = %+v, want only T-scoped", sel.Chosen)
+	}
+	if len(sel.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want one no-scope skip", sel.Skipped)
+	}
+	skip := sel.Skipped[0]
+	if skip.TaskID != unscoped.ID || skip.Code != SkipNoScope {
+		t.Fatalf("skip = %+v, want T-empty with code %s", skip, SkipNoScope)
+	}
+	if skip.BlockedBy != "" || skip.BlockedByRun != "" || len(skip.Overlap) != 0 {
+		t.Fatalf("no-scope skip carries conflict data: %+v", skip)
+	}
+}
+
 func TestSelectDispatchCandidatesPropagatesPlannerError(t *testing.T) {
 	planner := &failingPlanner{}
 	_, err := selectDispatchCandidates(planner, []core.Task{{ID: "T-1"}}, nil, 1, 1, false)
