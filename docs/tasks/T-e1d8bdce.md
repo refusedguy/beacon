@@ -1,7 +1,7 @@
 ---
 id: T-e1d8bdce
 title: Validate task dependency cycles and @N references
-status: in_progress
+status: done
 scope:
     - internal/infra/sqlite/tasks.go
     - internal/app/taskcreate_batch.go
