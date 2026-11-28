@@ -79,6 +79,10 @@ type WakeContext struct {
 	Branch    string
 	RebaseTry int
 	FixTry    int
+	// Action is the single instruction the worker should carry out. Renderers
+	// use it to choose a prompt that matches the wake instead of appending the
+	// same fix-and-PR command to every case.
+	Action WakeAction
 }
 
 // HarnessEvent is an event emitted by an agent harness.
