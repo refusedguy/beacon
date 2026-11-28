@@ -19,6 +19,21 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/shared"
 )
 
+func TestPrintDoctorChecksRedactsDetails(t *testing.T) {
+	const secret = "opencode:deadbeef0123456789"
+	var out bytes.Buffer
+	printDoctorChecks(&out, []doctorCheck{
+		{name: "config", level: checkFail, detail: "cannot parse token " + secret},
+	})
+	text := out.String()
+	if strings.Contains(text, secret) {
+		t.Fatalf("doctor output leaked a secret: %q", text)
+	}
+	if !strings.Contains(text, "[REDACTED]") {
+		t.Fatalf("doctor output = %q, want a redaction marker", text)
+	}
+}
+
 func TestDoctorExitCode(t *testing.T) {
 	cases := []struct {
 		name   string

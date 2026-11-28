@@ -15,7 +15,30 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
+
+// redactErr keeps a provider error intact when its message carries no secret.
+// A typed error stays available to callers that branch on it; a message that
+// embeds a token becomes a plain error so the token cannot reach a run reason.
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	text := err.Error()
+	if clean := redact.Redact(text); clean != text {
+		return errors.New(clean)
+	}
+	return err
+}
+
+// redactCheckOutputs cleans every provider check output at the adapter
+// boundary. The excerpt and the stored checks both come from this slice.
+func redactCheckOutputs(checks []core.CheckResult) {
+	for i := range checks {
+		checks[i].Output = redact.Redact(checks[i].Output)
+	}
+}
 
 // GitHub implements core.ScmGateway against the GitHub REST API.
 type GitHub struct {
@@ -149,7 +172,7 @@ func paginate[T any](br *gobreaker.CircuitBreaker[any], fetch func(*github.ListO
 func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) {
 	p, err := g.getPR(ctx, pr)
 	if err != nil {
-		return core.Observation{}, err
+		return core.Observation{}, redactErr(err)
 	}
 	sha := p.GetHead().GetSHA()
 	state := p.GetState()
@@ -183,13 +206,14 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 	// first error. Capped reads are kept and marked incomplete instead.
 	var failed observationErrors
 	if signals.checksErr != nil {
-		return o, signals.checksErr
+		return o, redactErr(signals.checksErr)
 	}
 	o.Checks = signals.checks
+	redactCheckOutputs(o.Checks)
 	if signals.checksCapped {
 		failed.add("checks", errCappedRead)
 	}
-	for _, c := range signals.checks {
+	for _, c := range o.Checks {
 		if c.State == core.CheckFailure {
 			o.FailureExcerpt = c.Output
 			break
@@ -197,11 +221,11 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 	}
 	if state == "open" && len(signals.checks) == 0 {
 		if err := g.observeWorkflowSkipped(ctx, &o, pr, &failed); err != nil {
-			return o, err
+			return o, redactErr(err)
 		}
 	}
 	if signals.approvalsErr != nil {
-		return o, signals.approvalsErr
+		return o, redactErr(signals.approvalsErr)
 	}
 	if signals.approvalsCapped {
 		failed.add("reviews", errCappedRead)
@@ -494,7 +518,7 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 	// conditional GET instead of refetching the whole pull request.
 	p, err := g.getPR(ctx, pr)
 	if err != nil {
-		return "", err
+		return "", redactErr(err)
 	}
 	nodeID := p.GetNodeID()
 	if nodeID == "" {
@@ -507,16 +531,16 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 	}
 	req, err := g.Client.NewRequest(ctx, http.MethodPost, "graphql", payload)
 	if err != nil {
-		return "", err
+		return "", redactErr(err)
 	}
 	var result updateBranchResponse
 	if _, err := guarded(g.br, func() (*github.Response, error) {
 		return g.Client.Do(req, &result)
 	}); err != nil {
-		return "", err
+		return "", redactErr(err)
 	}
 	if len(result.Errors) > 0 {
-		return "", core.Errorf(core.CodeUnavailable, "update branch: %s", result.Errors[0].Message)
+		return "", core.Errorf(core.CodeUnavailable, "update branch: %s", redact.Redact(result.Errors[0].Message))
 	}
 	sha := result.Data.UpdatePullRequestBranch.PullRequest.HeadRefOid
 	if sha == "" {
@@ -542,7 +566,7 @@ func (g *GitHub) Merge(ctx context.Context, pr int, expectedSHA, title string) e
 		return m, err
 	})
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	if !merged.GetMerged() {
 		return core.Errorf(core.CodeConflict, "merge of PR %d was rejected", pr)

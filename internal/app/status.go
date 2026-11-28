@@ -9,7 +9,23 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
+
+// redactRuns copies runs with clean reasons. Callers that hand runs to the
+// loopback API must not mutate the store's copies.
+func redactRuns(runs []*core.Run) []*core.Run {
+	out := make([]*core.Run, len(runs))
+	for i, run := range runs {
+		if run == nil {
+			continue
+		}
+		clean := *run
+		clean.Reason = redact.Redact(clean.Reason)
+		out[i] = &clean
+	}
+	return out
+}
 
 // Shared zero-length slices keep empty JSON collections non-null without an
 // allocation per snapshot field or queue item.
@@ -48,7 +64,11 @@ type DecisionCount struct {
 
 // Active returns the runs that have not reached a terminal state.
 func (s StatusService) Active(ctx context.Context) ([]*core.Run, error) {
-	return s.Store.ListActive(ctx)
+	runs, err := s.Store.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return redactRuns(runs), nil
 }
 
 // Recent returns finished runs, using DefaultRecentLimit when limit is not positive.
@@ -56,7 +76,11 @@ func (s StatusService) Recent(ctx context.Context, limit int) ([]*core.Run, erro
 	if limit <= 0 {
 		limit = DefaultRecentLimit
 	}
-	return s.Store.ListRecent(ctx, limit)
+	runs, err := s.Store.ListRecent(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	return redactRuns(runs), nil
 }
 
 // TickReconciler is the part of the reconciler a forced tick needs.
@@ -458,7 +482,7 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		PR: run.PRNumber, PRURL: link, HeadSHA: run.HeadSHA, Branch: run.Branch,
 		SessionID: run.SessionID, IsFixer: run.IsFixer,
 		LaunchSource: string(run.LaunchSource), AgentIdentity: run.AgentIdentity,
-		BlockedIncidentID: run.BlockedIncidentID, Reason: run.Reason,
+		BlockedIncidentID: run.BlockedIncidentID, Reason: redact.Redact(run.Reason),
 		RebaseAttempts: run.RebaseAttempts, FixAttempts: run.FixAttempts,
 		MaxAttempts: run.MaxAttempts, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 		Durations: deriveDurations(run, events, now), Timeline: events, Decisions: decisions,
