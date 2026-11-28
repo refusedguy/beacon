@@ -89,7 +89,7 @@ beacon init [--yes]                 # set up the current git project; --yes skip
 beacon doctor                       # check the setup, exit 1 on FAIL
 beacon dispatch [n]                 # start up to n tasks; n defaults to 1 and 0 starts none
 beacon serve                        # daemon; writes address and token to .beacon/connection.json
-beacon mcp                          # ten MCP tools over stdio
+beacon mcp                          # MCP tools over stdio
 beacon status                       # print active runs as JSON
 beacon status --snapshot --recent-limit 5 --decisions-limit 20
 beacon status --recent              # recently finished runs as a bare JSON array
@@ -112,20 +112,24 @@ beacon gc                           # remove unused worktrees; silent on success
 
 ## MCP tools
 
-`beacon mcp` serves ten tools over stdio. `ToolCatalog()` in `internal/infra/mcp/registry.go` declares them and marks the orchestrator-only ones. Six tools handle runs and are available to every agent. Four tools manage task cards or force reconciliation and are denied globally except for `orchestrator` and `build`.
+<!-- BEGIN BEACON DOCS: readme-tools -->
+`beacon mcp` serves 12 tools over stdio. `ToolCatalog()` in `internal/infra/mcp/registry.go` declares them and marks the orchestrator-only ones. 6 tools handle runs and are available to every agent. 6 tools manage task cards or force reconciliation and are denied globally except for `orchestrator` and `build`.
 
 | Tool | Role | What it does |
 | --- | --- | --- |
-| `beacon_dispatch` | worker | Pick up to N non-overlapping tasks and start runs. |
-| `beacon_watch_pr` | worker | Bind a run ID to a pull request number. |
-| `beacon_status` | worker | List active runs, pull requests and blockers. |
+| `beacon_dispatch` | worker | Pick up to N non-overlapping tasks and start agents. |
+| `beacon_watch_pr` | worker | Bind a pull request to a running task. |
+| `beacon_status` | worker | List active runs, PRs and blockers. |
 | `beacon_recent` | worker | List the most recently finished runs. |
-| `beacon_wait` | worker | Wait for a run to reach a verdict or a terminal state. |
-| `beacon_control` | worker | Approve, unblock, cancel, retry, nudge or watch a run. Pass `run_ids` to apply one verb to several runs. |
-| `beacon_task_create` | orchestrator | Create one card or a batch of cards in one commit and push. |
-| `beacon_task_delete` | orchestrator | Delete several cards in one commit and push. |
-| `beacon_task_update` | orchestrator | Edit several cards in one commit and push. Omitted fields stay unchanged. |
-| `beacon_reconcile` | orchestrator | Force one reconciler tick for a PR and report its decision. |
+| `beacon_wait` | worker | Wait for a run to reach an active verdict or a terminal state. |
+| `beacon_control` | worker | Control a run: approve, unblock, cancel, retry, nudge or watch. |
+| `beacon_task_create` | orchestrator only | Create and publish a task card. Orchestrator only. |
+| `beacon_task_delete` | orchestrator only | Delete task cards in one commit and push. Orchestrator only. |
+| `beacon_task_update` | orchestrator only | Update task cards in one commit and push. Orchestrator only. |
+| `beacon_task_close` | orchestrator only | Close task cards with a status and reason in one commit and push. Orchestrator only. |
+| `beacon_task_start` | orchestrator only | Start one specific task by ID. Orchestrator only. |
+| `beacon_reconcile` | orchestrator only | Force one reconciler tick for a PR and report its decision. Orchestrator only. |
+<!-- END BEACON DOCS: readme-tools -->
 
 The control vocabulary is the six verbs in `pkg/core/control.go:8-26`; the CLI, the loopback API and the MCP tool all parse it through `ParseControlAction` (`internal/infra/mcp/tool_control.go:59-65`, `cmd/beacon/http.go:422-424`). A batch call sends `run_ids` instead of `run_id` and returns `{"action":"...","results":[{"id":"...","status":"ok|error","error":"..."}]}` (`internal/infra/mcp/tool_control.go:12-32`, `internal/infra/mcp/tool_control.go:67-86`).
 
@@ -179,7 +183,7 @@ The OpenCode adapter talks to the running OpenCode background server. Set `harne
 
 Both fields accept any value `time.ParseDuration` understands. Config load rejects a malformed value instead of substituting a default.
 
-`beacon init` writes `harness.provider: opencode` and `harness.command: worker`. The OpenCode harness passes the command as the session agent, so workers inherit the global deny rules for the four orchestrator-only tools. A worker must never create, delete or update task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
+`beacon init` writes `harness.provider: opencode` and `harness.command: worker`. The OpenCode harness passes the command as the session agent, so workers inherit the global deny rules for the orchestrator-only tools. A worker must never create, delete or update task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
 
 The default worker instructions are language agnostic: "Worker environment: weak PC. Run targeted tests only for the files or packages you changed; leave full test suites, full builds and full repo linters to CI." `beacon init` replaces this default with stack-specific instructions when it detects a supported stack. Set `harness.worker_instructions` to override both. With `--weak-pc=false`, `beacon init` writes instructions that run the full suite, the full build, and the repository linters.
 
@@ -231,7 +235,7 @@ After a stale worktree conflict, inspect the directory and use `beacon_control {
 
 ### Preflight for tools and the panel
 
-Run `beacon doctor` from the project root when the ten tools or the status panel do not appear. The preflight lines name the prerequisite and put the manual fix on the same line. A failed prerequisite that blocks tool or panel loading exits 1.
+Run `beacon doctor` from the project root when the MCP tools or the status panel do not appear. The preflight lines name the prerequisite and put the manual fix on the same line. A failed prerequisite that blocks tool or panel loading exits 1.
 
 | Prerequisite | What doctor checks | Fix named on failure |
 | --- | --- | --- |
