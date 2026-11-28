@@ -2,6 +2,8 @@ package tasksource
 
 import (
 	"context"
+	"hash/fnv"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,12 +13,26 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// indexedCard is one parsed card together with the mtime its text was read at.
-// The mtime lets a lookup detect an external edit to that one card without
-// re-reading every card in the directory.
+// cardFingerprint identifies the bytes of one card. Size alone misses an
+// equal-length edit and mtime alone misses a rewrite that restores the old
+// timestamp, so a lookup compares both size and a content hash.
+type cardFingerprint struct {
+	size int64
+	hash uint64
+}
+
+func fingerprint(b []byte) cardFingerprint {
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return cardFingerprint{size: int64(len(b)), hash: h.Sum64()}
+}
+
+// indexedCard is one parsed card together with the fingerprint of the text it
+// was read from. The fingerprint lets a lookup detect an in-place edit without
+// re-parsing every card in the directory.
 type indexedCard struct {
 	card
-	mod time.Time
+	fp cardFingerprint
 }
 
 // cardIndex is the in-memory index of one card directory. Lookups go through
@@ -56,7 +72,9 @@ func cardModTime(path string) time.Time {
 }
 
 // buildCardIndex walks the directory once and parses every card. Unreadable or
-// malformed cards are skipped, matching the old find behavior.
+// malformed cards are skipped, matching the old find behavior. A duplicate ID
+// is rejected as well: the index answers by ID and SQLite stores one row per
+// ID, so two cards claiming the same ID cannot both be served.
 func buildCardIndex(dir string) (*cardIndex, error) {
 	cardScanCount.Add(1)
 	paths, err := (CardStore{Dir: dir}).cards()
@@ -78,14 +96,15 @@ func buildCardIndex(dir string) (*cardIndex, error) {
 		if !ok {
 			continue
 		}
+		if other, exists := idx.byID[t.ID]; exists {
+			slog.Warn("tasksource: duplicate task id skipped", "id", t.ID, "path", path, "kept", other)
+			continue
+		}
 		idx.byPath[path] = indexedCard{
 			card: card{path: path, task: t, content: content, hasFM: hasFM},
-			mod:  cardModTime(path),
+			fp:   fingerprint(b),
 		}
-		// The old find returned the first match in sorted path order.
-		if _, exists := idx.byID[t.ID]; !exists {
-			idx.byID[t.ID] = path
-		}
+		idx.byID[t.ID] = path
 	}
 	idx.dirMod = cardModTime(dir)
 	return idx, nil
@@ -123,31 +142,49 @@ func hasMissingCard(idx *cardIndex) bool {
 	return false
 }
 
-// refreshIndexedCard re-reads path only when its mtime moved since it was
-// indexed. Callers hold the cache lock.
+// removeIndexedPath drops a card from both index maps. Callers hold the cache
+// lock, so no reader sees a half-removed entry.
+func removeIndexedPath(idx *cardIndex, path string) {
+	entry, ok := idx.byPath[path]
+	if !ok {
+		return
+	}
+	if id := entry.task.ID; id != "" && idx.byID[id] == path {
+		delete(idx.byID, id)
+	}
+	delete(idx.byPath, path)
+}
+
+// refreshIndexedCard re-reads path when its bytes moved since the index was
+// built. A missing or unreadable file is dropped, so no caller can find a
+// deleted card through a cached entry. Callers hold the cache lock.
 func refreshIndexedCard(idx *cardIndex, path string) (indexedCard, bool) {
 	entry, ok := idx.byPath[path]
 	if !ok {
 		return indexedCard{}, false
 	}
-	mod := cardModTime(path)
-	if mod.Equal(entry.mod) {
-		return entry, true
-	}
 	b, err := os.ReadFile(path)
 	if err != nil {
+		removeIndexedPath(idx, path)
+		return indexedCard{}, false
+	}
+	fp := fingerprint(b)
+	if fp == entry.fp {
 		return entry, true
 	}
 	content := string(b)
 	t, parsed, hasFM := parseCardFields(content, path)
 	if !parsed {
-		return entry, true
+		removeIndexedPath(idx, path)
+		return indexedCard{}, false
 	}
-	if old := entry.task.ID; old != t.ID && idx.byID[old] == path {
-		delete(idx.byID, old)
+	removeIndexedPath(idx, path)
+	if other, exists := idx.byID[t.ID]; exists && other != path {
+		slog.Warn("tasksource: duplicate task id skipped", "id", t.ID, "path", path, "kept", other)
+		return indexedCard{}, false
 	}
 	entry.card = card{path: path, task: t, content: content, hasFM: hasFM}
-	entry.mod = mod
+	entry.fp = fp
 	idx.byPath[path] = entry
 	idx.byID[t.ID] = path
 	return entry, true
@@ -175,16 +212,26 @@ func noteParsedCard(dir, path, content string, t core.Task, hasFM bool) {
 	if !ok {
 		return
 	}
-	if old := idx.byPath[path]; old.task.ID != "" && old.task.ID != t.ID && idx.byID[old.task.ID] == path {
-		delete(idx.byID, old.task.ID)
-	}
+	removeIndexedPath(idx, path)
 	idx.byPath[path] = indexedCard{
 		card: card{path: path, task: t, content: content, hasFM: hasFM},
-		mod:  cardModTime(path),
+		fp:   fingerprint([]byte(content)),
 	}
 	// Leave dirMod alone. A new card may have arrived from outside this
 	// package; the next lookup must rescan to discover it.
 	idx.byID[t.ID] = path
+}
+
+// noteCardDirMod records the directory mtime after a write through this
+// package. A rename creates and removes a temporary file, which moves the
+// directory mtime; without this update the next lookup would rescan for a
+// change this package already folded into the index.
+func noteCardDirMod(dir string) {
+	cardIndexCache.mu.Lock()
+	defer cardIndexCache.mu.Unlock()
+	if idx, ok := cardIndexCache.byDir[cardIndexKey(dir)]; ok {
+		idx.dirMod = cardModTime(dir)
+	}
 }
 
 // indexedFind locates a card by parsed ID using the index.
@@ -203,6 +250,30 @@ func (s CardStore) indexedFind(id core.TaskID) (card, error) {
 		return nil
 	})
 	return out, err
+}
+
+// writeCardAtomic writes content through a temporary file in the same
+// directory and renames it into place. A reader never observes a truncated
+// card, which matters because status writes can race with a snapshot read.
+func writeCardAtomic(path, content string) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".beacon-card-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // indexedPatchStatus rewrites one card's status through the index. Claim,
@@ -232,13 +303,16 @@ func (s CardStore) indexedPatchStatus(ctx context.Context, id core.TaskID, statu
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+	if err := writeCardAtomic(path, updated); err != nil {
 		return err
 	}
-	// rewriteStatus only touches the status line, so the task parsed before
-	// the write stays valid once its status is replaced. This avoids a second
-	// YAML decode of the rewritten text.
-	entry.task.Status = normalizeStatus(status)
-	noteParsedCard(s.Dir, path, updated, entry.task, entry.hasFM)
+	// Re-read the renamed file so the index holds the bytes actually on disk.
+	// A rename replaces the inode, so the old fingerprint no longer applies.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	noteIndexedCard(s.Dir, path, string(b))
+	noteCardDirMod(s.Dir)
 	return nil
 }
