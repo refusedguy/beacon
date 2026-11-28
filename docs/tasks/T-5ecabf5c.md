@@ -1,7 +1,7 @@
 ---
 id: T-5ecabf5c
 title: Make the nightly perf gate enforce per-key thresholds and break baseline wedges
-status: available
+status: dropped
 scope:
     - scripts/check-bench-regression.sh
     - .github/workflows/ci.yml
@@ -12,6 +12,7 @@ scope:
 priority: 2
 kind: task
 require_review: llm
+status_reason: Superseded by atomic split cards that satisfy the 3-2-1200 scope cap; intent preserved in the new cards.
 ---
 
 Goal: make the nightly gate test the registry thresholds it claims to enforce and stop a single spike from wedging future nights.
