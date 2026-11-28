@@ -535,7 +535,8 @@ func (r *Reconciler) finalizeExternal(ctx context.Context, run *core.Run, obs co
 	if merged && !run.IsFixer {
 		if err := r.Source.Complete(ctx, run.TaskID); err != nil {
 			slog.Error("complete externally merged task", "run", run.ID, "error", err)
-		} else if err := r.Store.SetTaskStatus(ctx, run.TaskID, "done"); err != nil {
+		}
+		if err := r.Store.SetTaskStatus(ctx, run.TaskID, "done"); err != nil {
 			slog.Error("set task status", "run", run.ID, "error", err)
 		}
 	}
