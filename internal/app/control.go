@@ -66,6 +66,15 @@ type ControlArgs struct {
 	Message string
 }
 
+// ControlNotice reports a control action that needs no change because the run
+// is already in the requested state. Boundaries present it as success with the
+// reason attached, so a retried batch does not flip an applied id to an error.
+type ControlNotice struct {
+	Reason string
+}
+
+func (n *ControlNotice) Error() string { return n.Reason }
+
 // controlActorKey carries the agent that initiated a control action. A
 // boundary sets it from caller metadata without changing the ControlPort
 // methods. Control uses it to reject a worker that acts on its own run.
@@ -242,6 +251,11 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 		run, err := c.get(ctx, id)
 		if err != nil {
 			return err
+		}
+		if run.State == core.RunClosed {
+			// The cancel is already applied. A repeat is a no-op so a retried
+			// batch converges instead of reporting invalid_transition.
+			return &ControlNotice{Reason: "already_closed"}
 		}
 		if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: "cancelled by operator"}); err != nil {
 			return err
