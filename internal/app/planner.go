@@ -53,6 +53,17 @@ func (s SkippedTask) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
+// setNextActions fills the next action for skips that do not carry one yet.
+// The planner builds skips by code, so one pass at the end keeps Select short
+// and gives every skip an instruction before it leaves Select.
+func setNextActions(skipped []SkippedTask) {
+	for i := range skipped {
+		if skipped[i].Next == "" {
+			skipped[i].Next = nextActionFor(skipped[i].Code)
+		}
+	}
+}
+
 // nextActionFor maps a skip code to the step that clears it. An unknown code
 // still gets an instruction so callers never have to invent one.
 func nextActionFor(code SkipCode) string {
@@ -123,7 +134,6 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 				TaskID: t.ID,
 				Code:   SkipBadStatus,
 				Reason: "task status is " + string(t.Status),
-				Next:   nextActionFor(SkipBadStatus),
 			})
 			continue
 		}
@@ -134,7 +144,6 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 				BlockedBy:    t.ID,
 				BlockedByRun: activeRun.ID,
 				Reason:       "task already has an active run",
-				Next:         nextActionFor(SkipActiveRun),
 			})
 			continue
 		}
@@ -144,7 +153,6 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 					TaskID: t.ID,
 					Code:   SkipNoScope,
 					Reason: "task has no scope and strict_scope is enabled",
-					Next:   nextActionFor(SkipNoScope),
 				})
 				continue
 			}
@@ -162,7 +170,6 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 				BlockedByRun: blocker.ID,
 				Overlap:      paths,
 				Reason:       "scope overlaps " + string(blocker.TaskID) + overlapSuffix(paths),
-				Next:         nextActionFor(SkipActiveScopeOverlap),
 			})
 			continue
 		}
@@ -176,7 +183,6 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 					BlockedBy: s.ID,
 					Overlap:   paths,
 					Reason:    "scope overlaps " + string(s.ID) + overlapSuffix(paths),
-					Next:      nextActionFor(SkipSelectedScopeOverlap),
 				})
 				conflict = true
 				break
@@ -187,6 +193,7 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 		}
 		selected = append(selected, t)
 	}
+	setNextActions(skipped)
 	return selected, skipped, nil
 }
 
@@ -203,7 +210,6 @@ func oversizedSkip(t core.Task) (SkippedTask, bool) {
 		Code:   SkipOversizedScope,
 		Reason: fmt.Sprintf("scope breaks the 3-2-1200 cap: %d paths, %d production files",
 			budget.paths, budget.files),
-		Next: nextActionFor(SkipOversizedScope),
 	}, true
 }
 
