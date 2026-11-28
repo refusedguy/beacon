@@ -30,13 +30,16 @@ const STATE_BAR_LETTER = Object.freeze({
   pending: "P", running: "R", waiting_ci: "C", needs_rebase: "E",
   needs_agent_fix: "F", blocked: "B", merged: "M", closed: "X",
 })
+export const STATE_LEGEND_KEY = Object.freeze(
+  "P pending · R running · C CI · E rebase · F fix · B blocked · M merged · X closed",
+)
 
 const STATE_VIEW = Object.freeze({
   pending: { marker: "○", color: "muted", label: "PEND" },
   running: { marker: "●", color: "success", label: "RUN" },
   waiting_ci: { marker: "◐", color: "info", label: "CI" },
   needs_rebase: { marker: "◆", color: "warning", label: "REBASE" },
-  needs_agent_fix: { marker: "◆", color: "warning", label: "FIX" },
+  needs_agent_fix: { marker: "◆", color: "warning", label: "AGENT FIX" },
   blocked: { marker: "▲", color: "error", label: "BLK" },
   merged: { marker: "✔", color: MERGED_COLOR, label: "MERGED" },
   closed: { marker: "✖", color: "muted", label: "CLOSED" },
@@ -50,7 +53,8 @@ function recentBadge(run) {
   const reason = str(run?.reason)
   if (/already merged|duplicate/i.test(reason)) return "DUP"
   if (state === "merged") return "OK"
-  if (state === "closed" || state === "blocked" || state === "needs_agent_fix") return "ERR"
+  if (state === "needs_agent_fix") return "FIXING"
+  if (state === "closed" || state === "blocked") return "ERR"
   const label = stateView(state).label
   return label === "?" ? "OK" : label
 }
@@ -101,21 +105,47 @@ export function checksForRun(run) {
   return { checks, stale }
 }
 
+// A bare "CI wait 38m" has no cause and no attempt. Name both when the run
+// carries them, so the operator can tell which round is still running.
+function ciWaitSuffix(run) {
+  const attempt = run?.attempt ?? {}
+  const number = Number(attempt.number)
+  const kind = str(attempt.kind).toLowerCase()
+  const { checks } = checksForRun(run)
+  const parts = []
+  if (Number.isFinite(number) && (number > 1 || kind === "fix")) {
+    parts.push(`#${number}${kind && kind !== "initial" ? ` ${kind}` : ""}`)
+  }
+  if (checks.length > 1) {
+    const passed = checks.filter((check) => str(check?.state).toLowerCase() === "success").length
+    parts.push(`${passed}/${checks.length} checks`)
+  }
+  return parts.join(" · ")
+}
+
 export function phaseLabel(run, now = Date.now()) {
   const d = phaseDurations(run, now)
   const state = str(run.state).toLowerCase()
   const phase = state === "waiting_ci" ? ["CI wait", d.waitingCI]
     : state === "blocked" ? ["block", d.blocked]
       : state === "running" ? ["run", d.running] : null
-  if (phase && Number(phase[1]) > 0) return `${phase[0]} ${elapsed(Number(phase[1]) * 1000)}`
+  if (phase && Number(phase[1]) > 0) {
+    const label = `${phase[0]} ${elapsed(Number(phase[1]) * 1000)}`
+    const suffix = state === "waiting_ci" ? ciWaitSuffix(run) : ""
+    return suffix ? `${label} · ${suffix}` : label
+  }
   return ageOf(run, now)
 }
 export const mergedReason = (run) => str(run?.reason).trim() || (run?.pr ? `merged PR #${run.pr}` : "merged to main")
 
 const BADGE_LABEL = Object.freeze({
   pending: "PEND", running: "RUN", waiting_ci: "CI", needs_rebase: "REBASE",
-  needs_agent_fix: "FIX", blocked: "BLOCKED", merged: "MERGED", closed: "CLOSED",
+  needs_agent_fix: "AGENT FIX", blocked: "BLOCKED", merged: "MERGED", closed: "CLOSED",
 })
+// Finished rows keep short badges. A fix that still needs an agent reads as an
+// action in progress, not as an error with no way forward.
+const SHORT_BADGES = Object.freeze({ OK: MERGED_COLOR, ERR: "error", DUP: "muted", FIXING: "warning" })
+const SHORT_MARKERS = Object.freeze({ OK: "✔", ERR: "✖", DUP: "✖", FIXING: "◆" })
 function heroBadge(run, now = Date.now()) {
   const v = stateView(run.state)
   const label = BADGE_LABEL[str(run.state).toLowerCase()] || v.label
@@ -180,11 +210,13 @@ function stateBarFromView(view, active = activeFromView(view), recent = recentFr
   if (!active.length) parts.push("0 active")
   if (counts.running) parts.push(`${counts.running} running`)
   if (counts.waiting_ci) parts.push(`${counts.waiting_ci} in CI`)
+  if (counts.needs_rebase) parts.push(`${counts.needs_rebase} rebases`)
+  if (counts.needs_agent_fix) parts.push(`${counts.needs_agent_fix} agent fixes`)
   if (counts.blocked) parts.push(`${counts.blocked} blocked`)
   if (counts.merged) parts.push(`${counts.merged} done`)
   const summary = parts.length ? parts.join(" · ") : "no runs"
   return {
-    segments, bar, counts, mergeTotal, total, filled, legend, summary,
+    segments, bar, counts, mergeTotal, total, filled, legend, legendKey: STATE_LEGEND_KEY, summary,
     content: `states ${bar} ${legend}`,
     fg: counts.blocked > 0 ? "error" : "base",
   }
@@ -239,9 +271,9 @@ export function runLineItems(run, now = Date.now(), recent = false) {
     color: "muted", statusColor: errorReason ? "error" : "muted", runID: run.id }
   if (recent) {
     const badge = recentBadge(run)
-    const short = badge === "OK" || badge === "ERR" || badge === "DUP"
-    const tone = short ? (badge === "DUP" ? "muted" : badge === "ERR" ? "error" : MERGED_COLOR) : v.color
-    const marker = short ? (badge === "OK" ? "✔" : "✖") : v.marker
+    const short = Object.hasOwn(SHORT_BADGES, badge)
+    const tone = short ? SHORT_BADGES[badge] : v.color
+    const marker = short ? SHORT_MARKERS[badge] : v.marker
     return [
       { marker, markerSpace: true, name: title, status: badge,
         color: tone, markerColor: tone, nameColor: "muted", nameBold: false, statusColor: tone,
@@ -317,6 +349,12 @@ export function sidebarModel(snapshot = EMPTY_SNAPSHOT, error = null, now = Date
     { marker: "", name: "Beacon", status: bar.summary, color: "action", bold: true },
     { marker: "", name: bar.legend, status: "", color: "muted" },
   ]
+  // The E and F letters are the ones an operator cannot guess. Explain them
+  // in one line when either state is present, without adding noise to a quiet
+  // sidebar.
+  if (bar.counts.needs_rebase || bar.counts.needs_agent_fix) {
+    items.push({ marker: "", name: STATE_LEGEND_KEY, status: "", color: "muted" })
+  }
   if (error) {
     items.push({ marker: "", name: `[stale] ${truncate(error, REASON_WIDTH)}`, status: "", color: "warning" })
     items.push({ marker: "", name: STALE_ACTION, status: "", color: "action", banner: true })
