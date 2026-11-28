@@ -1,7 +1,7 @@
 ---
 id: T-0fe7ce45
 title: Keep Beacon-owned done rows through SyncTasks prune
-status: in_progress
+status: done
 scope:
     - internal/infra/sqlite/tasks.go
     - internal/infra/sqlite/tasks_test.go
