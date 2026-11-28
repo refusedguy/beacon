@@ -5,9 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -48,10 +46,11 @@ func (defaultIDFactory) ForBatch(seed string, index int) core.TaskID {
 	return batchTaskID(seed, index)
 }
 
-// epicTaskID derives the ID from the title and sorted child titles alone. No
-// clock is read, so creating the same epic on a later day keeps its ID.
+// epicTaskID derives the ID from the title and the canonical child key. The
+// key carries child dependencies, so editing one creates a new epic instead of
+// silently reusing an older card. No clock is read, so a later day keeps the ID.
 func epicTaskID(title string, plan []core.ChildSpec) core.TaskID {
-	sum := sha256.Sum256([]byte(title + "\x00" + strings.Join(childTitles(plan), "\x00")))
+	sum := sha256.Sum256([]byte(title + "\x00" + core.ChildKey(plan)))
 	return core.TaskID("T-" + hex.EncodeToString(sum[:4]))
 }
 
@@ -60,26 +59,6 @@ func epicTaskID(title string, plan []core.ChildSpec) core.TaskID {
 func batchTaskID(seed string, index int) core.TaskID {
 	sum := sha256.Sum256([]byte(seed + "\x00" + strconv.Itoa(index)))
 	return core.TaskID("T-" + hex.EncodeToString(sum[:4]))
-}
-
-// childTitles returns the trimmed child titles in sorted order.
-func childTitles(specs []core.ChildSpec) []string {
-	out := make([]string, 0, len(specs))
-	for _, spec := range specs {
-		out = append(out, strings.TrimSpace(spec.Title))
-	}
-	sort.Strings(out)
-	return out
-}
-
-// taskTitles returns the trimmed task titles in sorted order.
-func taskTitles(tasks []core.Task) []string {
-	out := make([]string, 0, len(tasks))
-	for _, task := range tasks {
-		out = append(out, strings.TrimSpace(task.Title))
-	}
-	sort.Strings(out)
-	return out
 }
 
 // newTaskID assigns an unconstrained random ID. The date is explicit so a

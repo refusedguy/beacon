@@ -119,20 +119,82 @@ func resolveBatchInputs(inputs []CreateTaskInput, ids []core.TaskID) ([]CreateTa
 		in.ID = string(ids[i])
 		deps := make([]string, 0, len(in.Depends))
 		for _, dep := range in.Depends {
-			dep = strings.TrimSpace(dep)
-			if n, ok := localRefIndex(dep); ok {
-				if n < 1 || n > i {
-					return nil, core.Errorf(core.CodeInvalidInput,
-						"depends %q in task %d must refer to an earlier task in this batch", dep, i+1)
-				}
-				dep = string(ids[n-1])
+			value, err := resolveLocalRef(dep, i, ids)
+			if err != nil {
+				return nil, err
 			}
-			deps = append(deps, dep)
+			deps = append(deps, value)
 		}
 		in.Depends = deps
+		body, err := resolveBodyRefs(in.Body, i, ids)
+		if err != nil {
+			return nil, err
+		}
+		in.Body = body
+		plan, err := resolvePlanRefs(in.Plan, i, ids)
+		if err != nil {
+			return nil, err
+		}
+		in.Plan = plan
 		resolved[i] = in
 	}
 	return resolved, nil
+}
+
+// resolveLocalRef resolves one trimmed value against the earlier cards in a
+// batch. A value that is not a local ref passes through unchanged. A value that
+// starts with @ but is not an accepted @N is an error, so @0 and @01 cannot
+// escape as dangling IDs.
+func resolveLocalRef(value string, index int, ids []core.TaskID) (string, error) {
+	ref := strings.TrimSpace(value)
+	if !strings.HasPrefix(ref, "@") {
+		return ref, nil
+	}
+	n, ok := localRefIndex(ref)
+	if !ok {
+		return "", core.Errorf(core.CodeInvalidInput, "invalid local reference %q", ref)
+	}
+	if n < 1 || n > index {
+		return "", core.Errorf(core.CodeInvalidInput,
+			"local reference %q must name an earlier task in this batch", ref)
+	}
+	return string(ids[n-1]), nil
+}
+
+// resolveBodyRefs rewrites @N tokens in a card body the same way depends are
+// rewritten. It reports the first bad reference and still returns the text.
+func resolveBodyRefs(body string, index int, ids []core.TaskID) (string, error) {
+	var firstErr error
+	resolved := bodyRefPattern.ReplaceAllStringFunc(body, func(token string) string {
+		out, err := resolveLocalRef(token, index, ids)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return out
+	})
+	return resolved, firstErr
+}
+
+// resolvePlanRefs rewrites @N in every plan child's dependencies. The index is
+// the epic's position in the batch, so a child can name an earlier batch card.
+func resolvePlanRefs(plan []core.ChildSpec, index int, ids []core.TaskID) ([]core.ChildSpec, error) {
+	out := make([]core.ChildSpec, len(plan))
+	for j, spec := range plan {
+		out[j] = spec
+		if len(spec.Depends) == 0 {
+			continue
+		}
+		deps := make([]core.TaskID, len(spec.Depends))
+		for k, dep := range spec.Depends {
+			value, err := resolveLocalRef(string(dep), index, ids)
+			if err != nil {
+				return nil, err
+			}
+			deps[k] = core.TaskID(value)
+		}
+		out[j].Depends = deps
+	}
+	return out, nil
 }
 
 // batchGroupTasks builds the cards for one input. An epic contributes its
@@ -281,6 +343,11 @@ func batchSeed(inputs []CreateTaskInput) string {
 		for _, child := range in.Plan {
 			b.WriteString(child.Title)
 			b.WriteByte('\x1f')
+			for _, dep := range child.Depends {
+				b.WriteString(string(dep))
+				b.WriteByte('\x1f')
+			}
+			b.WriteByte('\x1e')
 		}
 		b.WriteByte('\x1e')
 	}
@@ -289,6 +356,11 @@ func batchSeed(inputs []CreateTaskInput) string {
 }
 
 var localRefPattern = regexp.MustCompile(`^@([1-9][0-9]*)$`)
+
+// bodyRefPattern finds @N-shaped tokens in free text so references in a card
+// body get the same check as references in depends. The word boundary stops a
+// token like @1abc from being rewritten partially.
+var bodyRefPattern = regexp.MustCompile(`@[0-9]+\b`)
 
 func localRefIndex(value string) (int, bool) {
 	match := localRefPattern.FindStringSubmatch(value)
