@@ -17,6 +17,10 @@ import (
 const (
 	nameOpenPrepared    = "open-prepared"
 	limiterOpenPrepared = "open-prepared-limiter-ddl-scans"
+
+	// nameOpenPreparedDB is the canonical advisory key. The registry owns the
+	// limiter text and placement; this file owns the row printed under the key.
+	nameOpenPreparedDB = "open-prepared-db"
 )
 
 // openPreparedEnv holds one seeded database that already carries the current
@@ -165,7 +169,20 @@ func BenchmarkOpenPreparedDB(b *testing.B) {
 	b.StopTimer()
 
 	median := medianDuration(durations)
+	var min, max time.Duration
+	if len(durations) > 0 {
+		min, max = durations[0], durations[0]
+		for _, d := range durations[1:] {
+			if d < min {
+				min = d
+			}
+			if d > max {
+				max = d
+			}
+		}
+	}
 	printOpenPreparedReport(os.Stdout, median, e.work, errs)
+	printPerfRow(os.Stdout, nameOpenPreparedDB, median, min, max, e.work, errs, limiterOpenPrepared)
 	b.ReportMetric(float64(median.Nanoseconds()), nameOpenPrepared+"-median-ns")
 	b.ReportMetric(float64(e.work), nameOpenPrepared+"-work")
 	b.ReportMetric(float64(errs), nameOpenPrepared+"-errs")

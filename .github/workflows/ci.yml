@@ -437,7 +437,7 @@ jobs:
           while IFS= read -r path; do
             case "$path" in
               internal/bench/ui_bench.js) continue ;;
-              internal/bench/*|docs/perf/*|internal/infra/workspace/git_worktree_test.go|internal/infra/notify/telegram_bench_test.go|internal/infra/notify/telegram_test.go|cmd/beacon/http_test.go|ui/tui/model_test.go|ui/tui/refresh_bench_test.go)
+              internal/bench/*|docs/perf/*|internal/infra/workspace/git_worktree_test.go|internal/infra/notify/telegram_bench_test.go|internal/infra/notify/telegram_test.go|cmd/beacon/http_test.go|cmd/beacon/status_cli_bench_test.go|cmd/beacon/config_watch_bench_test.go|cmd/beacon/control_dispatch_bench_test.go|ui/tui/model_test.go|ui/tui/refresh_bench_test.go)
                 if [[ -f "$RUNNER_TEMP/perf-head/$path" ]]; then
                   mkdir -p "$RUNNER_TEMP/perf-base/$(dirname "$path")"
                   cp "$RUNNER_TEMP/perf-head/$path" "$RUNNER_TEMP/perf-base/$path"
@@ -492,6 +492,9 @@ jobs:
                   internal/infra/notify/telegram_bench_test.go \
                   internal/infra/notify/telegram_test.go \
                   cmd/beacon/http_test.go \
+                  cmd/beacon/status_cli_bench_test.go \
+                  cmd/beacon/config_watch_bench_test.go \
+                  cmd/beacon/control_dispatch_bench_test.go \
                   ui/tui/model_test.go \
                   ui/tui/refresh_bench_test.go \
                   go.mod go.sum go.work go.work.sum
@@ -563,6 +566,18 @@ jobs:
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkOpenPreparedDB$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkStatusCLIPaths$' -benchtime=1x -count=10 -benchmem ./cmd/beacon/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_CACHE=warm go test -vet=off -run '^$' \
+                -bench '^BenchmarkConfigWatchReload$' -benchtime=2000x -count=1 -benchmem ./cmd/beacon/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkControlNoDaemon$' -benchtime=1x -count=1 -benchmem ./cmd/beacon/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/perf-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_CACHE=warm go test -vet=off -run '^$' \
                 -bench '^BenchmarkTelegramNotify$' -benchtime=100x -count=1 -benchmem ./internal/infra/notify/) \
@@ -832,6 +847,10 @@ jobs:
             'http-frame-emission': 'HTTPFramesEmission',
             'go-tui-view': 'GoTUIView',
             'telegram-notify': 'TelegramNotify',
+            'open-prepared-db': 'OpenPreparedDB',
+            'status-cli-paths': 'StatusCLIPaths',
+            'config-watch-reload': 'ConfigWatchReload',
+            'control-no-daemon': 'ControlNoDaemon',
           };
           // Deterministic call counters each key owns. The reconcile tick
           // counts guard the green-base path. The two base-red keys publish
@@ -1318,6 +1337,18 @@ jobs:
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
                 -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkOpenPreparedDB$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkStatusCLIPaths$' -benchtime=1x -count=10 -benchmem ./cmd/beacon/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_CACHE=warm go test -vet=off -run '^$' \
+                -bench '^BenchmarkConfigWatchReload$' -benchtime=2000x -count=1 -benchmem ./cmd/beacon/) \
+                || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
+              (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+                -bench '^BenchmarkControlNoDaemon$' -benchtime=1x -count=1 -benchmem ./cmd/beacon/) \
                 || echo "abort $side" >> "$RUNNER_TEMP/floor-status"
               (cd "$dir" && taskset -c "$cpu" env BEACON_BENCH_CACHE=warm go test -vet=off -run '^$' \
                 -bench '^BenchmarkTelegramNotify$' -benchtime=100x -count=1 -benchmem ./internal/infra/notify/) \

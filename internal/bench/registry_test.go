@@ -85,6 +85,10 @@ func TestRegistryPRBenchSpecs(t *testing.T) {
 		{"dispatch-prompt", dispatchPromptLimiter},
 		{nameAssembly, limiterAssembly},
 		{"telegram-notify", telegramNotifyLimiter},
+		{"open-prepared-db", openPreparedDBLimiter},
+		{"status-cli-paths", statusCLIPathsLimiter},
+		{"config-watch-reload", configWatchReloadLimiter},
+		{"control-no-daemon", controlNoDaemonLimiter},
 	} {
 		spec, ok := byKey[tc.key]
 		if !ok {
@@ -123,6 +127,31 @@ func TestRegistryTelegramNotifyLimiter(t *testing.T) {
 	}
 }
 
+// TestRegistryCLIBenchLimiters ties each CLI registry key and limiter to the
+// literal its benchmark prints. The three cmd/beacon benchmarks and the open
+// benchmark live outside registry.go, so this source check keeps the registry
+// the single owner of both strings.
+func TestRegistryCLIBenchLimiters(t *testing.T) {
+	for _, tc := range []struct{ path, key, limiter string }{
+		{"open_bench_test.go", "open-prepared-db", openPreparedDBLimiter},
+		{"../../cmd/beacon/status_cli_bench_test.go", "status-cli-paths", statusCLIPathsLimiter},
+		{"../../cmd/beacon/config_watch_bench_test.go", "config-watch-reload", configWatchReloadLimiter},
+		{"../../cmd/beacon/control_dispatch_bench_test.go", "control-no-daemon", controlNoDaemonLimiter},
+	} {
+		data, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.path, err)
+		}
+		source := string(data)
+		if !strings.Contains(source, strconv.Quote(tc.key)) {
+			t.Errorf("%s has no canonical key %q", tc.path, tc.key)
+		}
+		if !strings.Contains(source, strconv.Quote(tc.limiter)) {
+			t.Errorf("%s has no limiter %q", tc.path, tc.limiter)
+		}
+	}
+}
+
 // harnessSources are the files that print canonical perf rows. Go benchmarks
 // print through printPerfRow; the Node harnesses, the workspace latency test,
 // the HTTP frame harness and the Go TUI view harness print the payload
@@ -137,6 +166,9 @@ var harnessSources = []string{
 	"../infra/notify/telegram_bench_test.go",
 	"../infra/notify/telegram_test.go",
 	"../../cmd/beacon/http_test.go",
+	"../../cmd/beacon/status_cli_bench_test.go",
+	"../../cmd/beacon/config_watch_bench_test.go",
+	"../../cmd/beacon/control_dispatch_bench_test.go",
 	"../../ui/tui/model_test.go",
 }
 
