@@ -184,7 +184,13 @@ INSERT INTO run_events (run_id, kind, state, at, head_sha, pr_number, reason) VA
 }
 
 // Save prepares a row, writes it and records a state event in one transaction.
+// An active run may not take a PR another active run already owns. Dispatch
+// binds a PR at spawn and WatchPR binds one by operator action, and both call
+// Save, so the guard keeps one active owner per PR at both entry points.
 func (s *Store) Save(ctx context.Context, r *core.Run) error {
+	if err := s.checkActivePR(ctx, r); err != nil {
+		return err
+	}
 	row, err := prepareSaveRow(r, time.Now().UTC())
 	if err != nil {
 		return err
@@ -202,6 +208,26 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// checkActivePR refuses a second active run on a PR. A terminal run keeps its
+// PR number as history, so only nonterminal rows take part in the lookup.
+func (s *Store) checkActivePR(ctx context.Context, r *core.Run) error {
+	if r.State.Terminal() || r.PRNumber <= 0 {
+		return nil
+	}
+	query, states := inQuery(`SELECT id FROM runs WHERE pr_number=? AND id<>? AND state NOT IN (%s)
+ORDER BY updated_at DESC LIMIT 1`, activeExcludedStates)
+	var owner string
+	err := s.db.QueryRowContext(ctx, query, append([]any{r.PRNumber, string(r.ID)}, states...)...).Scan(&owner)
+	switch {
+	case err == nil:
+		return core.Errorf(core.CodeConflict, "PR %d already belongs to active run %s", r.PRNumber, owner)
+	case err == sql.ErrNoRows:
+		return nil
+	default:
+		return err
+	}
 }
 
 // stateEventKind names the timeline entry recorded when a run enters a state.
@@ -254,6 +280,15 @@ func (s *Store) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
 func (s *Store) FindByPR(ctx context.Context, pr int) (*core.Run, error) {
 	query, states := inQuery(`SELECT `+runColumns+` FROM runs WHERE pr_number=? AND state NOT IN (%s) ORDER BY updated_at DESC LIMIT 1`, activeExcludedStates)
 	return s.queryOne(ctx, query, append([]any{pr}, states...)...)
+}
+
+// ActiveRunsByPR returns every active run bound to pr, oldest first. A
+// reconciler uses it to detect a duplicate binding that the newest-row lookup
+// in FindByPR would otherwise hide.
+func (s *Store) ActiveRunsByPR(ctx context.Context, pr int) ([]*core.Run, error) {
+	query, states := inQuery(`SELECT `+runColumns+` FROM runs WHERE pr_number=? AND state NOT IN (%s)
+ORDER BY updated_at`, activeExcludedStates)
+	return s.queryAll(ctx, query, append([]any{pr}, states...)...)
 }
 
 // FindActiveByTask returns the newest nonterminal run for task.

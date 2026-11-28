@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -42,6 +43,28 @@ type ReconcilerStore interface {
 // that only the daemon tick needs.
 type stalePruner interface {
 	PruneStale(ctx context.Context, retention time.Duration) (int64, error)
+}
+
+// prOwnerFinder is the optional store capability for reading every active run
+// bound to one PR. The reconciler type-asserts it so adapters without the
+// method keep working. FindByPR returns only the newest owner, so a second
+// active run on the same PR would otherwise stay invisible.
+type prOwnerFinder interface {
+	ActiveRunsByPR(ctx context.Context, pr int) ([]*core.Run, error)
+}
+
+// warnDuplicatePROwners logs the active owners of one PR. New bindings are
+// refused by the store, so duplicates here are older rows that need an
+// operator's attention instead of a silent newest-row mask.
+func warnDuplicatePROwners(pr int, owners []*core.Run) {
+	if len(owners) < 2 {
+		return
+	}
+	ids := make([]string, 0, len(owners))
+	for _, owner := range owners {
+		ids = append(ids, string(owner.ID))
+	}
+	slog.Warn("multiple active runs bound to PR", "pr", pr, "runs", strings.Join(ids, ","))
 }
 
 // ReconcilerPolicy is the policy surface the reconciler uses. It composes the
@@ -116,6 +139,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	if run == nil || run.State.Terminal() {
 		return core.MergeDecision{Verdict: core.VerdictNoop}, nil
 	}
+	if finder, ok := r.Store.(prOwnerFinder); ok {
+		owners, err := finder.ActiveRunsByPR(ctx, pr)
+		if err != nil {
+			return core.MergeDecision{}, err
+		}
+		warnDuplicatePROwners(pr, owners)
+	}
 	ctx = WithCycleID(ctx, string(run.ID))
 	obs, err := r.SCM.Observe(ctx, pr)
 	if err != nil {
@@ -151,13 +181,13 @@ func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Eve
 		}
 	}
 	if obs.HeadSHA != "" || obs.BaseSHA != "" {
-		run.NoteObservation(obs.HeadSHA, obs.BaseSHA)
+		run.NoteObservationIdentity(obs.HeadSHA, obs.BaseSHA, observationIdentity(obs))
 	}
 	return r.Store.Save(ctx, run)
 }
 
 func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation, isEpic bool) error {
-	run.NoteObservation(obs.HeadSHA, obs.BaseSHA)
+	run.NoteObservationIdentity(obs.HeadSHA, obs.BaseSHA, observationIdentity(obs))
 	if !run.IsFixer && !isEpic && run.WorkspacePath != "" {
 		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {
 			return err
