@@ -24,10 +24,22 @@ const (
 	controlWriteAttempts = 3
 	controlRetryBase     = 10 * time.Millisecond
 
+	// cleanupTimeout bounds the background cleanup that follows a saved cancel.
+	// It is long enough for a slow stop or worktree removal, short enough that a
+	// hung step cannot occupy the process forever.
+	cleanupTimeout = 30 * time.Second
+
 	// sqliteBusyCode is the SQLite SQLITE_BUSY result code. It belongs to the
 	// SQLite API, so a driver can reword its message without changing it.
 	sqliteBusyCode = 5
 )
+
+// committingWorkspace is the richer workspace capability that reclaims a
+// stale worktree without losing committed work. A workspace without it falls
+// back to Remove.
+type committingWorkspace interface {
+	Reclaim(ctx context.Context, ws core.Workspace, base string) error
+}
 
 // sqliteCodedError is the shape of a driver error that carries a result code.
 // Declaring it here keeps the app layer independent of a concrete driver.
@@ -259,8 +271,10 @@ func (c *Control) watchPR(ctx context.Context, id core.RunID, pr int) error {
 	return nil
 }
 
-// Cancel closes a run, then stops its worker session and removes its workspace.
-// Cleanup failures are logged and do not undo the saved cancellation.
+// Cancel closes a run, then cleans up its worker and workspace in the
+// background. The state is saved before cleanup starts, so a slow stop or a
+// blocked worktree removal cannot delay the response or turn a saved cancel
+// into a deadline error. Cleanup failures are logged, never returned.
 func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 	var saved *core.Run
 	err := c.write(ctx, func() error {
@@ -285,19 +299,33 @@ func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
 	if err != nil {
 		return err
 	}
-	if saved.SessionID != "" {
-		bestEffort("cancel session stop", func() error {
-			return c.Harness.Stop(ctx, saved.SessionID)
-		}, "run", saved.ID, "task", saved.TaskID)
-	}
-	if saved.WorkspacePath != "" {
-		// The cancel is already saved. A failed remove leaves a worktree for the
-		// next cleanup sweep, so it must not turn a successful cancel into an error.
-		bestEffort("cancel workspace remove", func() error {
-			return c.Workspace.Remove(ctx, core.Workspace{Path: saved.WorkspacePath, Branch: saved.Branch})
-		}, "run", saved.ID, "task", saved.TaskID)
+	if saved.SessionID != "" || saved.WorkspacePath != "" {
+		go c.cleanup(ctx, saved)
 	}
 	return nil
+}
+
+// cleanup stops the worker and reclaims the workspace after the cancel is
+// saved. It keeps the caller's values but detaches from its cancellation, so a
+// client that times out cannot cut cleanup short. The caller never waits on it.
+func (c *Control) cleanup(ctx context.Context, run *core.Run) {
+	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if run.SessionID != "" && c.Harness != nil {
+		bestEffort("cancel session stop", func() error {
+			return c.Harness.Stop(cleanCtx, run.SessionID)
+		}, "run", run.ID, "task", run.TaskID)
+	}
+	if run.WorkspacePath == "" || c.Workspace == nil {
+		return
+	}
+	ws := core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}
+	bestEffort("cancel workspace reclaim", func() error {
+		if reclaiming, ok := c.Workspace.(committingWorkspace); ok {
+			return reclaiming.Reclaim(cleanCtx, ws, "")
+		}
+		return c.Workspace.Remove(cleanCtx, ws)
+	}, "run", run.ID, "task", run.TaskID)
 }
 
 // Unblock moves a blocked run back to waiting_ci.

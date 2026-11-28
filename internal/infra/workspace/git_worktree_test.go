@@ -229,6 +229,77 @@ func TestGitWorktreeCreateRecoversFromDeadAdminEntry(t *testing.T) {
 	}
 }
 
+func TestGitWorktreeCreateAfterInitializingLock(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	task := core.Task{ID: "T-INIT-LOCK"}
+	ws, err := wt.Create(ctx, task)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	// A killed add leaves the worktree locked with this exact reason. Prune
+	// does not clear it, so a plain add would fail on the next dispatch.
+	gitCmd(t, repo, "worktree", "lock", "--reason", "initializing", ws.Path)
+	if listing := gitCmd(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(listing, "locked initializing") {
+		t.Fatalf("worktree was not locked: %s", listing)
+	}
+
+	recreated, err := wt.Create(ctx, task)
+	if err != nil {
+		t.Fatalf("Create() after an initializing lock: %v", err)
+	}
+	if _, err := os.Stat(recreated.Path); err != nil {
+		t.Fatalf("worktree missing after Create(): %v", err)
+	}
+	if listing := gitCmd(t, repo, "worktree", "list", "--porcelain"); strings.Contains(listing, "locked initializing") {
+		t.Fatalf("initializing lock survived Create(): %s", listing)
+	}
+}
+
+func TestGitWorktreeCreateKeepsWorktreesLockedBySomeoneElse(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	task := core.Task{ID: "T-OTHER-LOCK"}
+	ws, err := wt.Create(ctx, task)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	gitCmd(t, repo, "worktree", "lock", "--reason", "operator", ws.Path)
+
+	if _, err := wt.Create(ctx, task); err == nil {
+		t.Fatal("Create() removed a worktree locked with another reason")
+	}
+	if listing := gitCmd(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(listing, "locked operator") {
+		t.Fatalf("operator lock was released: %s", listing)
+	}
+}
+
+func TestGitWorktreeForceRemovePreservesUnpushedCommit(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-UNPUSHED"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.Path, "work.txt"), []byte("worker work\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(work.txt): %v", err)
+	}
+	gitCmd(t, ws.Path, "add", "work.txt")
+	gitCmd(t, ws.Path, "commit", "-m", "worker work")
+	head := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD"))
+
+	if err := wt.ForceRemove(ctx, ws); err != nil {
+		t.Fatalf("ForceRemove() error = %v", err)
+	}
+	if _, err := os.Stat(ws.Path); !os.IsNotExist(err) {
+		t.Fatalf("worktree survived ForceRemove(): %v", err)
+	}
+	remote := strings.TrimSpace(gitCmd(t, wt.Repo, "ls-remote", "origin", "refs/heads/"+ws.Branch))
+	if !strings.HasPrefix(remote, head) {
+		t.Fatalf("unpushed commit %s not preserved on origin: %q", head, remote)
+	}
+}
+
 func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 	wt, repo := newTestGitWorktree(t)
 	ctx := context.Background()
