@@ -45,15 +45,15 @@ func newMCPCommand(configPath *string) *cobra.Command {
 
 // mcpServicesForDaemon points MCP control calls at the live daemon. It never
 // takes the reconciler lock: beacon serve is the only lock owner. Without a
-// daemon it fails with a recorded error instead of becoming a second owner
-// that serves tools while active runs freeze.
+// daemon it returns no services at all, so no tool can fall back to a local
+// write that bypasses the daemon's serialization.
 func mcpServicesForDaemon(w *wiring) (beaconmcp.Services, error) {
-	services := mcpServices(w)
 	info, ok := liveDaemon(w.cfg)
 	if !ok {
 		writeDaemonError(stateDir(w.cfg), "daemon", errNoLiveDaemon)
-		return services, fmt.Errorf("beacon mcp needs a live daemon: %w", errNoLiveDaemon)
+		return beaconmcp.Services{}, fmt.Errorf("beacon mcp needs a live daemon: %w", errNoLiveDaemon)
 	}
+	services := mcpServices(w)
 	client := &remoteClient{info: info, http: bearerClient(5 * time.Second)}
 	services.Remote = client.call
 	return services, nil

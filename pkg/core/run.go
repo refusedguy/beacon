@@ -280,6 +280,28 @@ func (r *Run) RecordLaunch(source LaunchSource, agent string) {
 	r.AgentIdentity = strings.TrimSpace(agent)
 }
 
+// NudgeMarker is the reason prefix stamped when an operator nudge reaches a
+// live session. The monitor renders reason, so the prefix makes delivery
+// visible while the text after it keeps any real failure reason intact.
+const NudgeMarker = "nudged"
+
+// MarkNudged records that operator guidance was delivered to the run. It
+// prefixes the existing reason instead of replacing it, so a failure reason
+// stays readable in the monitor. Repeated nudges do not stack markers. It
+// stamps only the update time: a nudge observes no PR, so observation identity
+// stays as the reconciler last set it.
+func (r *Run) MarkNudged() {
+	prefix := NudgeMarker + ": "
+	if r.Reason != NudgeMarker && !strings.HasPrefix(r.Reason, prefix) {
+		if r.Reason == "" {
+			r.Reason = NudgeMarker
+		} else {
+			r.Reason = prefix + r.Reason
+		}
+	}
+	r.UpdatedAt = time.Now().UTC()
+}
+
 // HoldAgent marks the run as holding a live agent session.
 func (r *Run) HoldAgent() {
 	r.AgentHeld = true

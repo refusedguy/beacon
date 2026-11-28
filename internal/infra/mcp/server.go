@@ -23,10 +23,80 @@ import (
 // NewServer builds the MCP server and registers every tool in the catalog.
 func NewServer(sv Services) *msdk.Server {
 	s := msdk.NewServer(&msdk.Implementation{Name: "beacon", Version: "v1.0.0"}, nil)
+	// The SDK flattens a handler error into text before the caller sees it.
+	// Keep a daemon refusal structured at this boundary so the action, run id
+	// and reason survive the trip.
+	s.AddReceivingMiddleware(preserveControlRefusalReason)
 	for _, register := range toolRegistrations {
 		register(s, sv)
 	}
 	return s
+}
+
+// preserveControlRefusalReason replaces the SDK's text-only error result for
+// a refused beacon_control call with the daemon's wire refusal. The SDK keeps
+// the handler error on the result, so the server can still read it after the
+// handler has run. A bare status code or an unrelated error stays plain.
+func preserveControlRefusalReason(next msdk.MethodHandler) msdk.MethodHandler {
+	return func(ctx context.Context, method string, req msdk.Request) (msdk.Result, error) {
+		res, err := next(ctx, method, req)
+		if err != nil || method != "tools/call" {
+			return res, err
+		}
+		call, ok := req.(*msdk.CallToolRequest)
+		if !ok || call.Params == nil || call.Params.Name != "beacon_control" {
+			return res, err
+		}
+		result, ok := res.(*msdk.CallToolResult)
+		if !ok || !result.IsError {
+			return res, err
+		}
+		action, id := controlCallTarget(call.Params.Arguments)
+		out, ok := controlRefusalResult(action, id, result.GetError())
+		if !ok {
+			return res, err
+		}
+		return out, nil
+	}
+}
+
+// controlCallTarget reads the action and run id from a control call. Arguments
+// arrive as raw JSON on the server, so both fields decode from one object.
+func controlCallTarget(args json.RawMessage) (string, string) {
+	var input struct {
+		Action string `json:"action"`
+		RunID  string `json:"run_id"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return "", ""
+	}
+	return input.Action, input.RunID
+}
+
+// controlRefusalResult maps a control error carrying a daemon reason into a
+// wire refusal with the caller's action and run id. The loopback adapter puts
+// the reason in the error text after the status code. A status line without a
+// reason is not a refusal and stays a plain error.
+func controlRefusalResult(action, id string, err error) (*msdk.CallToolResult, bool) {
+	if err == nil {
+		return nil, false
+	}
+	const prefix = "beacon API status "
+	msg := err.Error()
+	if !strings.HasPrefix(msg, prefix) {
+		return nil, false
+	}
+	_, reason, ok := strings.Cut(msg[len(prefix):], ": ")
+	if !ok {
+		return nil, false
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return nil, false
+	}
+	result := jsonResult(core.NewWireControlRefusal(core.ParseControlAction(action), core.RunID(id), reason))
+	result.IsError = true
+	return result, true
 }
 
 func registerTaskCreate(s *msdk.Server, sv Services) {
