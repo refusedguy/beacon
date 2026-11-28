@@ -1,7 +1,7 @@
 ---
 id: T-1bde70ab
 title: Split store.go into single-owner seam files
-status: in_progress
+status: done
 scope:
     - internal/infra/sqlite/store.go
     - internal/infra/sqlite/store_runs.go
