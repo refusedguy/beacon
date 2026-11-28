@@ -58,6 +58,16 @@ type Dispatcher struct {
 	ResolveModel       ModelResolver
 	Decisions          DecisionLogger
 
+	// DispatchOpen gates both intake paths. A nil pointer means open, so a
+	// Dispatcher built without the auto-dispatch config keeps its old behavior.
+	// The composition root wires the configured value by address.
+	DispatchOpen *bool
+
+	// WaiterSource names the longest-waiting card for a set of scope paths. An
+	// empty task ID means no card waits on them. The composition root adapts
+	// the sqlite waitlist store here, so app imports no infra package.
+	WaiterSource func(ctx context.Context, paths []core.ScopePath) (core.TaskID, error)
+
 	// StartCooldown is how long a task cancelled by the operator stays
 	// ineligible for a fresh start. A non-positive value uses
 	// defaultStartCooldown. An explicit retry is the way out before it expires.
@@ -236,6 +246,11 @@ const defaultStartCooldown = 15 * time.Minute
 // is deliberately larger than the status default so a busy tick cannot hide a
 // fresh cancel behind unrelated finished runs.
 const cooldownRecentLimit = 100
+
+// waiterRecentLimit bounds the finished-run scan that frees scope paths for
+// waiters. It matches the cooldown window so a busy tick cannot hide a recent
+// terminal run behind unrelated finished runs.
+const waiterRecentLimit = 100
 
 // cancelledByOperator is the reason Control.Cancel stamps on a closed run. It
 // is the only close reason that triggers the start cooldown.
@@ -453,6 +468,83 @@ func formatStartBlockers(blockers []StartBlocker) string {
 	return strings.Join(parts, ", ")
 }
 
+// dispatchOpen reports whether the dispatcher may start new runs. A nil
+// DispatchOpen keeps the gate open for callers that do not wire the flag.
+func (d *Dispatcher) dispatchOpen() bool {
+	return d.DispatchOpen == nil || *d.DispatchOpen
+}
+
+// releasedPaths returns the scope paths of recent terminal runs that no
+// active run still claims. A terminal run leaves the active index, so its
+// claims free up without a store write.
+func (d *Dispatcher) releasedPaths(ctx context.Context, view []*core.Run) []core.ScopePath {
+	recent, err := d.Store.ListRecent(ctx, waiterRecentLimit)
+	if err != nil {
+		return nil
+	}
+	claimed := make(map[core.ScopePath]struct{})
+	for _, run := range view {
+		if run == nil {
+			continue
+		}
+		for _, path := range run.Scope {
+			claimed[path] = struct{}{}
+		}
+	}
+	var out []core.ScopePath
+	seen := make(map[core.ScopePath]struct{})
+	for _, run := range recent {
+		if run == nil || !run.State.Terminal() {
+			continue
+		}
+		for _, path := range run.Scope {
+			if _, ok := claimed[path]; ok {
+				continue
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+// withWaiter moves the longest waiter for released paths to the front of
+// ready, so the unchanged planner selects it under the same conflict rules.
+func (d *Dispatcher) withWaiter(ctx context.Context, ready []core.Task, view []*core.Run) []core.Task {
+	if d.WaiterSource == nil {
+		return ready
+	}
+	paths := d.releasedPaths(ctx, view)
+	if len(paths) == 0 {
+		return ready
+	}
+	id, err := d.WaiterSource(ctx, paths)
+	if err != nil {
+		slog.WarnContext(ctx, "waiter lookup", "error", err)
+		return ready
+	}
+	if id == "" {
+		return ready
+	}
+	for i, task := range ready {
+		if task.ID != id {
+			continue
+		}
+		if i == 0 {
+			return ready
+		}
+		out := make([]core.Task, 0, len(ready))
+		out = append(out, ready[i])
+		out = append(out, ready[:i]...)
+		out = append(out, ready[i+1:]...)
+		return out
+	}
+	return ready
+}
+
 // planDispatch selects and reserves one batch under slotsMu. The reservation
 // is visible to other batches before the lock is released, so none of them
 // can select a reserved task or spend a reserved slot while this batch runs
@@ -462,6 +554,9 @@ func (d *Dispatcher) planDispatch(ctx context.Context, n int) (*dispatchBatch, e
 	defer d.slotsMu.Unlock()
 
 	batch := &dispatchBatch{}
+	if !d.dispatchOpen() {
+		return batch, nil
+	}
 	tasks, err := d.Source.ListAvailable(ctx)
 	if err != nil {
 		return nil, err
@@ -478,6 +573,7 @@ func (d *Dispatcher) planDispatch(ctx context.Context, n int) (*dispatchBatch, e
 		return nil, err
 	}
 	view := d.withReserved(stored)
+	ready = d.withWaiter(ctx, ready, view)
 	sel, err := selectDispatchCandidates(d.Planner, ready, view, n, d.inFlightLimit(), d.StrictScope)
 	if err != nil {
 		return nil, err

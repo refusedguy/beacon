@@ -122,6 +122,9 @@ func (d *Dispatcher) planPromotion(ctx context.Context) (*dispatchBatch, error) 
 	defer d.slotsMu.Unlock()
 
 	batch := &dispatchBatch{}
+	if !d.dispatchOpen() {
+		return batch, nil
+	}
 	stored, err := d.Store.ListActive(ctx)
 	if err != nil {
 		return nil, err
