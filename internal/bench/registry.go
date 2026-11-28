@@ -33,7 +33,7 @@ var prHarnessLimiters = []struct{ key, limiter string }{
 	{"snapshot", "SQLite VM, syscalls and event sort"},
 	{"worktree-remove", "git subprocess spawn and worktree metadata"},
 	{"tui-view", "normalizeSnapshot + render"},
-	{"run-watcher-fp", "JSON.stringify character volume"},
+	{"run-watcher-fp", runWatcherFPLimiter},
 	{"http-frame-emission", "json.Marshal + eight-subscriber lossy fanout"},
 	{"go-tui-view", "truncate + padding cache + reused row buffer"},
 }
@@ -54,13 +54,14 @@ const (
 // apart. The benchmark prints this string in its canonical row.
 const telegramNotifyLimiter = "redact regexp chain + json.Marshal + loopback POST"
 
-// The CLI-only benchmarks live in internal/bench and cmd/beacon. Their
-// limiters live here beside the keys so the registry and the canonical rows a
-// benchmark prints cannot drift apart. The drift tests in registry_test.go
-// cross-check each literal against the benchmark source.
+// The CLI benchmarks and the run-watcher Node harness publish canonical rows
+// outside this package. Their limiters live here beside the keys so the
+// registry and the printed rows cannot drift apart. The drift tests in
+// registry_test.go cross-check each literal against the emitting source.
 const (
 	openPreparedDBLimiter    = "open-prepared-limiter-ddl-scans"
 	statusCLIPathsLimiter    = "json-reflection-plus-sqlite-read"
+	runWatcherFPLimiter      = "JSON.stringify character volume"
 	configWatchReloadLimiter = "os.ReadFile + sha256 + loadConfig re-read + forwarder cancel and drain"
 	controlNoDaemonLimiter   = "two config loads + one Control.Apply per action"
 )
