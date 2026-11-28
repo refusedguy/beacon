@@ -24,8 +24,10 @@ func registerWait(s *msdk.Server, sv Services) {
 			return nil, nil, core.Errorf(core.CodeInvalidInput,
 				"timeout_ms must be between 1 and %d", maxWaitMS)
 		}
-		if err := requireService("wait service", sv.Wait); err != nil {
-			return nil, nil, err
+		// WaitService is a value, so requireService cannot see an unwired
+		// store through the interface check. Test the store directly instead.
+		if sv.Wait.Store == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "wait service is not configured")
 		}
 		cctx, cancel := context.WithTimeout(ctx, time.Duration(a.TimeoutMS)*time.Millisecond)
 		defer cancel()

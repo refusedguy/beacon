@@ -542,6 +542,57 @@ test("RPC handler logs the 400 reason with durationMs", async () => {
   assert.match(failed, /n must be positive/)
 })
 
+test("the RPC snapshot handler forwards the configured limits when input is omitted", async () => {
+  const calls = []
+  const logs = []
+  const limits = { recentLimit: 3, decisionsLimit: 7 }
+  const handlers = createStatusRpcHandlers({
+    snapshot: async (input) => { calls.push(input); return { active: [], recent: [], input } },
+    control: async () => ({}),
+    dispatch: async () => ({}),
+  }, { limits, log: (line) => logs.push(line) })
+
+  const result = await handlers.snapshot()
+  assert.deepEqual(calls, [limits])
+  assert.deepEqual(result.input, limits)
+  assert.ok(logs.some((line) => /snapshot ok/.test(line)))
+
+  await handlers.snapshot({ recentLimit: 1 })
+  assert.deepEqual(calls[1], { recentLimit: 1 }, "caller input replaces the limits instead of merging")
+})
+
+test("the RPC control handler forwards the caller input and defaults to empty", async () => {
+  const calls = []
+  const logs = []
+  const handlers = createStatusRpcHandlers({
+    snapshot: async () => ({}),
+    control: async (input) => { calls.push(input); return { ok: true, input } },
+    dispatch: async () => ({}),
+  }, { log: (line) => logs.push(line) })
+
+  const approve = { action: "approve", run_id: "run-1", sha: "abc" }
+  assert.deepEqual(await handlers.control(approve), { ok: true, input: approve })
+  assert.deepEqual(await handlers.control(), { ok: true, input: {} })
+  assert.deepEqual(calls, [approve, {}])
+  assert.equal(logs.filter((line) => /control ok/.test(line)).length, 2)
+})
+
+test("a failed control RPC logs the rejection body and rethrows", async () => {
+  const logs = []
+  const rejection = { type: "rpc.unavailable", status: 400, message: "control refused" }
+  const handlers = createStatusRpcHandlers({
+    snapshot: async () => ({}),
+    control: async () => { throw rejection },
+    dispatch: async () => ({}),
+  }, { log: (line) => logs.push(line) })
+
+  await assert.rejects(() => handlers.control({ action: "approve", run_id: "run-1" }),
+    (error) => error === rejection)
+  const failed = logs.find((line) => /control failed/.test(line))
+  assert.ok(failed)
+  assert.match(failed, /control refused/)
+})
+
 test("CLI source logs the exit duration with the click id and no arguments", async () => {
   const logs = []
   let tick = 100

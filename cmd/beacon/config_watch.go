@@ -294,37 +294,45 @@ func (cw *configWatcher) modelResolver(parent string) core.ModelRef {
 	return ref
 }
 
+// restartField is one config field whose edit cannot be applied without
+// replacing a service the MCP server holds. Values are never reported.
+type restartField struct {
+	name  string
+	equal func(old, next config.Config) bool
+}
+
+// restartFieldChecks is the complete classification of restart fields. The
+// reload test walks this table and mutates every field, so adding a field here
+// without a matching mutation case there fails instead of passing silently.
+var restartFieldChecks = []restartField{
+	{"harness.worker_instructions", func(a, b config.Config) bool { return a.Harness.WorkerInstructions == b.Harness.WorkerInstructions }},
+	{"harness.command", func(a, b config.Config) bool { return a.Harness.Command == b.Harness.Command }},
+	{"harness.prompt_template", func(a, b config.Config) bool { return a.Harness.PromptTemplate == b.Harness.PromptTemplate }},
+	{"harness.parent_session_id", func(a, b config.Config) bool { return a.Harness.ParentSessionID == b.Harness.ParentSessionID }},
+	{"concurrency.max_in_flight", func(a, b config.Config) bool { return a.Concurrency.MaxInFlight == b.Concurrency.MaxInFlight }},
+	{"concurrency.max_active_agents", func(a, b config.Config) bool { return a.Concurrency.MaxActiveAgents == b.Concurrency.MaxActiveAgents }},
+	{"merge.max_attempts", func(a, b config.Config) bool { return a.Merge.MaxAttempts == b.Merge.MaxAttempts }},
+	{"merge.auto_rebase", func(a, b config.Config) bool { return a.Merge.AutoRebase == b.Merge.AutoRebase }},
+	{"on_base_red.mode", func(a, b config.Config) bool { return a.OnBaseRed.Mode == b.OnBaseRed.Mode }},
+	{"on_base_red.max_fix_attempts", func(a, b config.Config) bool { return a.OnBaseRed.MaxFixAttempts == b.OnBaseRed.MaxFixAttempts }},
+	{"base_branch", func(a, b config.Config) bool { return a.BaseBranch == b.BaseBranch }},
+	{"state_db", func(a, b config.Config) bool { return a.StateDB == b.StateDB }},
+	{"workspace_dir", func(a, b config.Config) bool { return a.WorkspaceDir == b.WorkspaceDir }},
+	{"strict_scope", func(a, b config.Config) bool { return a.StrictScope == b.StrictScope }},
+	{"poll_interval", func(a, b config.Config) bool { return a.PollInterval == b.PollInterval }},
+	{"task_source", func(a, b config.Config) bool { return reflect.DeepEqual(a.TaskSource, b.TaskSource) }},
+	{"scm", func(a, b config.Config) bool { return reflect.DeepEqual(a.SCM, b.SCM) }},
+	{"notify", func(a, b config.Config) bool { return reflect.DeepEqual(a.Notify, b.Notify) }},
+	{"webhook", func(a, b config.Config) bool { return reflect.DeepEqual(a.Webhook, b.Webhook) }},
+}
+
 // restartFields names changed fields that cannot be applied without replacing
 // a service the MCP server holds. Values are never included in the result.
 func restartFields(old, next config.Config) []string {
-	checks := []struct {
-		name  string
-		equal bool
-	}{
-		{"harness.worker_instructions", old.Harness.WorkerInstructions == next.Harness.WorkerInstructions},
-		{"harness.command", old.Harness.Command == next.Harness.Command},
-		{"harness.prompt_template", old.Harness.PromptTemplate == next.Harness.PromptTemplate},
-		{"harness.parent_session_id", old.Harness.ParentSessionID == next.Harness.ParentSessionID},
-		{"concurrency.max_in_flight", old.Concurrency.MaxInFlight == next.Concurrency.MaxInFlight},
-		{"concurrency.max_active_agents", old.Concurrency.MaxActiveAgents == next.Concurrency.MaxActiveAgents},
-		{"merge.max_attempts", old.Merge.MaxAttempts == next.Merge.MaxAttempts},
-		{"merge.auto_rebase", old.Merge.AutoRebase == next.Merge.AutoRebase},
-		{"on_base_red.mode", old.OnBaseRed.Mode == next.OnBaseRed.Mode},
-		{"on_base_red.max_fix_attempts", old.OnBaseRed.MaxFixAttempts == next.OnBaseRed.MaxFixAttempts},
-		{"base_branch", old.BaseBranch == next.BaseBranch},
-		{"state_db", old.StateDB == next.StateDB},
-		{"workspace_dir", old.WorkspaceDir == next.WorkspaceDir},
-		{"strict_scope", old.StrictScope == next.StrictScope},
-		{"poll_interval", old.PollInterval == next.PollInterval},
-		{"task_source", reflect.DeepEqual(old.TaskSource, next.TaskSource)},
-		{"scm", reflect.DeepEqual(old.SCM, next.SCM)},
-		{"notify", reflect.DeepEqual(old.Notify, next.Notify)},
-		{"webhook", reflect.DeepEqual(old.Webhook, next.Webhook)},
-	}
 	var out []string
-	for _, check := range checks {
-		if !check.equal {
-			out = append(out, check.name)
+	for _, field := range restartFieldChecks {
+		if !field.equal(old, next) {
+			out = append(out, field.name)
 		}
 	}
 	return out
