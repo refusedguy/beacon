@@ -68,10 +68,11 @@ func TestToolCatalogMatchesRegisteredTools(t *testing.T) {
 			orchestratorOnly++
 		}
 	}
-	if orchestratorOnly != 5 || !byName["beacon_task_create"].OrchestratorOnly ||
+	if orchestratorOnly != 6 || !byName["beacon_task_create"].OrchestratorOnly ||
 		!byName["beacon_task_delete"].OrchestratorOnly || !byName["beacon_task_update"].OrchestratorOnly ||
-		!byName["beacon_task_close"].OrchestratorOnly || !byName["beacon_reconcile"].OrchestratorOnly {
-		t.Fatalf("only task creation, deletion, update, close and reconcile should be orchestrator-only: %+v", catalog)
+		!byName["beacon_task_close"].OrchestratorOnly || !byName["beacon_task_start"].OrchestratorOnly ||
+		!byName["beacon_reconcile"].OrchestratorOnly {
+		t.Fatalf("only task creation, deletion, update, close, start and reconcile should be orchestrator-only: %+v", catalog)
 	}
 }
 

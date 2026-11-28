@@ -124,6 +124,7 @@ func TestGeneratedPermissionsUseNamespacedActions(t *testing.T) {
 		"beacon_beacon_task_close",
 		"beacon_beacon_task_create",
 		"beacon_beacon_task_delete",
+		"beacon_beacon_task_start",
 		"beacon_beacon_task_update",
 	}
 	global := actionEffects(set.Global)
@@ -137,7 +138,7 @@ func TestGeneratedPermissionsUseNamespacedActions(t *testing.T) {
 	}
 	for _, action := range []string{
 		"beacon_reconcile", "beacon_task_close", "beacon_task_create",
-		"beacon_task_delete", "beacon_task_update",
+		"beacon_task_delete", "beacon_task_start", "beacon_task_update",
 	} {
 		if _, ok := global[action]; ok {
 			t.Errorf("global contains unprefixed %q", action)

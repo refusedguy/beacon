@@ -2,16 +2,57 @@ package app
 
 import (
 	"context"
+	"sort"
+	"strings"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// sameObservation reports whether the run already recorded the exact head and
-// base SHA pair from obs. It only reads the pair written by NoteObservation, so
-// a duplicate observation skips rebase and wake work without stamping the run
-// a second time.
+// observationIdentity is the part of obs that decides what the reconciler does
+// next: the head and base commits, the branch conflict flag and each check's
+// conclusion. Provider check order is not stable, so pairs are sorted before
+// they are joined. Output text and approval counts stay out of the key.
+func observationIdentity(obs core.Observation) string {
+	pairs := make([]string, 0, len(obs.Checks))
+	for _, c := range obs.Checks {
+		pairs = append(pairs, c.Name+"="+string(c.State))
+	}
+	sort.Strings(pairs)
+	conflict := "0"
+	if obs.Conflict {
+		conflict = "1"
+	}
+	return obs.HeadSHA + "|" + obs.BaseSHA + "|" + conflict + "|" + strings.Join(pairs, ",")
+}
+
+// sameObservation reports whether the run already processed this observation.
+// The key covers check conclusions and conflict state as well as the SHA pair,
+// so a green check on the same commit is not skipped as a duplicate of the
+// failure that woke the agent.
 func sameObservation(run *core.Run, obs core.Observation) bool {
-	return run.ObservedSHA == obs.HeadSHA && run.ObservedBaseSHA == obs.BaseSHA
+	if run.ObservedSHA != obs.HeadSHA || run.ObservedBaseSHA != obs.BaseSHA {
+		return false
+	}
+	// A run restored from an older database has no identity yet. Its SHA pair
+	// is still authoritative until the next observation replaces it.
+	return run.ObservedIdentity == "" || run.ObservedIdentity == observationIdentity(obs)
+}
+
+// finalizeIfTerminal re-observes pr and finalizes run when the provider has
+// closed or merged it. needs_rebase and blocked have no local finality event,
+// so a failed first finality check must not leave an active run on a terminal
+// pull request. A transient observe error falls back to the earlier snapshot.
+func (r *Reconciler) finalizeIfTerminal(ctx context.Context, run *core.Run, obs core.Observation) (core.MergeDecision, bool, error) {
+	fresh, err := r.SCM.Observe(ctx, obs.PRNumber)
+	if err != nil {
+		fresh = obs
+	}
+	if !core.DecideFinalState(fresh.PRState).Closed {
+		return core.MergeDecision{}, false, nil
+	}
+	fresh.PRNumber = obs.PRNumber
+	decision := core.MergeDecision{Verdict: core.VerdictWait, Reason: "pull request " + fresh.PRState}
+	return decision, true, r.finalizeExternal(ctx, run, fresh)
 }
 
 // DefaultMaxAutoRebases is the fallback automatic branch-update cap for
@@ -50,7 +91,7 @@ func (r *Reconciler) applyDecision(
 	case core.DispatchFix:
 		return r.handleNeedsAgentFix(ctx, run, obs, decision)
 	case core.DispatchBlock:
-		return r.handleBlocked(ctx, run, decision)
+		return r.handleBlocked(ctx, run, obs, decision)
 	default:
 		return r.handlePending(ctx, run, obs, decision)
 	}
@@ -64,6 +105,9 @@ func (r *Reconciler) handleNeedsRebase(
 	obs core.Observation,
 	decision core.MergeDecision,
 ) (core.MergeDecision, error) {
+	if terminal, done, err := r.finalizeIfTerminal(ctx, run, obs); done || err != nil {
+		return terminal, err
+	}
 	if !r.AutoRebase {
 		return core.MergeDecision{Verdict: core.VerdictWait, Reason: "auto_rebase disabled"}, nil
 	}
@@ -154,7 +198,10 @@ func (r *Reconciler) handleNeedsAgentFix(
 	return decision, r.wake(ctx, run, obs, decision.Reason)
 }
 
-func (r *Reconciler) handleBlocked(ctx context.Context, run *core.Run, decision core.MergeDecision) (core.MergeDecision, error) {
+func (r *Reconciler) handleBlocked(ctx context.Context, run *core.Run, obs core.Observation, decision core.MergeDecision) (core.MergeDecision, error) {
+	if terminal, done, err := r.finalizeIfTerminal(ctx, run, obs); done || err != nil {
+		return terminal, err
+	}
 	if !run.State.Blocked() {
 		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}, core.Observation{}); err != nil {
 			return decision, err
@@ -183,7 +230,7 @@ func (r *Reconciler) handlePending(
 			return decision, err
 		}
 	}
-	if run.ObserveSHA(obs.HeadSHA, obs.BaseSHA) {
+	if obs.HeadSHA != "" && run.NoteObservationIdentity(obs.HeadSHA, obs.BaseSHA, observationIdentity(obs)) {
 		return decision, r.Store.Save(ctx, run)
 	}
 	return decision, nil

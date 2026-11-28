@@ -1,13 +1,14 @@
 ---
 id: T-79faadd4
 title: Extract shared perf harness setup into one script
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
     - scripts/perf-harness.sh
 priority: 5
 kind: task
 require_review: llm
+status_reason: Already delivered in PR 2882 (commit cbac2f91); worker found no remaining work
 ---
 
 Goal: remove duplicated perf harness setup from ci.yml without changing any required check name or workflow trigger.
