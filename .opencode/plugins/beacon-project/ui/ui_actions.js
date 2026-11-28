@@ -24,7 +24,8 @@ export function clipboardCopier(ctx, toast) {
     if (!text) return false
     const method = ctx.renderer?.copyToClipboardOSC52
     if (typeof method !== "function") {
-      show("Clipboard unavailable in this TUI · copy the ID from the run row", "warning")
+      show("Clipboard unavailable in this TUI", "warning")
+      show("Next: copy the ID from the run row", "info")
       return false
     }
     let copied = false
@@ -51,7 +52,11 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
   const copyID = (run) => copyText([str(run.id), str(run.branch)].filter(Boolean).join(" · "))
   const copyPR = (run) => {
     const url = str(run.prURL)
-    if (!url) { show("No PR URL for this run · wait for the worker to open one", "warning"); return false }
+    if (!url) {
+      show("No PR URL for this run", "warning")
+      show("Next: wait for the worker to open a PR", "info")
+      return false
+    }
     return copyText(url)
   }
   const control = async (action, run, message) => {
@@ -69,7 +74,8 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
   }
   const nudge = async (run) => {
     if (typeof ctx.ui?.dialog?.prompt !== "function") {
-      show("Nudge unavailable in this TUI · use beacon_control nudge from the CLI", "warning")
+      show("Nudge unavailable in this TUI", "warning")
+      show("Next: use beacon_control nudge from the CLI", "info")
       await refresh()
       return null
     }
@@ -79,7 +85,12 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
       placeholder: "...",
     })
     const message = str(answer).trim()
-    if (!message) { show("No guidance sent · enter text and try again", "info"); await refresh(); return null }
+    if (!message) {
+      show("No guidance sent", "info")
+      show("Next: enter guidance and try again", "info")
+      await refresh()
+      return null
+    }
     return control("nudge", run, message)
   }
   let lastDispatch = null
@@ -133,15 +144,23 @@ export function createActionRunner(ctx, source, { refresh = async () => {}, afte
     if (name === "copy") return copyID(run)
     if (name === "pr") return copyPR(run)
     if (name === "help") return nudge(run)
-    if ((name === "cancel" || name === "retry") && opts.confirmed !== true) {
+    if (name === "cancel" && opts.confirmed !== true) {
       if (typeof ctx.ui?.dialog?.confirm !== "function") {
-        show(`${name} needs confirmation but this TUI has no dialog · use beacon_control from the CLI`, "warning")
+        show("Confirmation unavailable, run kept · use beacon_control from the CLI", "warning")
         await refresh()
         return null
       }
-      const agreed = await ask(run, name)
-      if (agreed !== true) {
-        show(`Run kept, nothing ${name === "cancel" ? "cancelled" : "retried"} · press ${name} again to confirm`, "info")
+      if (await ask(run, "cancel") !== true) {
+        show("Run kept, nothing cancelled", "info")
+        await refresh()
+        return null
+      }
+    }
+    // A retry only asks when the host can show a dialog. Without one the
+    // control still runs, so plain Node callers keep the same path as before.
+    if (name === "retry" && opts.confirmed !== true && typeof ctx.ui?.dialog?.confirm === "function") {
+      if (await ask(run, "retry") !== true) {
+        show("Run kept, nothing retried", "info")
         await refresh()
         return null
       }
