@@ -238,8 +238,16 @@ func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte
 	return data, resp.StatusCode, nil
 }
 
-// prompt posts a steering prompt to an OpenCode session.
+// prompt posts a steering prompt to an OpenCode session. A 409 means this
+// message id was already delivered, so a spawn retry treats it as success.
 func (h *Harness) prompt(ctx context.Context, session, text, id string) error {
+	return h.deliver(ctx, session, text, id, true)
+}
+
+// deliver posts a prompt and decides whether a 409 counts as delivery. Wake
+// cannot accept a 409: the id belongs to an earlier turn and the nudge would
+// never reach a live worker.
+func (h *Harness) deliver(ctx context.Context, session, text, id string, acceptConflict bool) error {
 	path := "/api/session/" + url.PathEscape(session) + "/prompt"
 	body := map[string]any{
 		"id":       id,
@@ -248,7 +256,7 @@ func (h *Harness) prompt(ctx context.Context, session, text, id string) error {
 		"resume":   true,
 	}
 	_, status, err := h.do(ctx, http.MethodPost, path, body)
-	if status == http.StatusConflict {
+	if status == http.StatusConflict && acceptConflict {
 		return nil
 	}
 	return err
@@ -343,7 +351,7 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 func (h *Harness) Wake(ctx context.Context, sessionID string, w core.WakeContext) error {
 	h.init()
 	h.bind(sessionID, w.RunID)
-	return h.prompt(ctx, sessionID, core.WakeTextLimited(w, h.ExcerptLimit), messageID("wake"))
+	return h.deliver(ctx, sessionID, core.WakeTextLimited(w, h.ExcerptLimit), messageID("wake"), false)
 }
 
 // Stop deletes an OpenCode session.
@@ -359,12 +367,13 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	return err
 }
 
-// IsAlive reports whether an OpenCode session still exists.
+// IsAlive reports whether an OpenCode session still has a worker. A cancelled
+// session stays in storage and answers 200, so existence alone is not liveness.
 func (h *Harness) IsAlive(ctx context.Context, sessionID string) (bool, error) {
 	if sessionID == "" {
 		return false, nil
 	}
-	_, status, err := h.do(ctx, http.MethodGet, "/api/session/"+url.PathEscape(sessionID), nil)
+	data, status, err := h.do(ctx, http.MethodGet, "/api/session/"+url.PathEscape(sessionID), nil)
 	if status == http.StatusNotFound {
 		h.unbind(sessionID)
 		return false, nil
@@ -372,7 +381,27 @@ func (h *Harness) IsAlive(ctx context.Context, sessionID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if sessionEnded(data) {
+		h.unbind(sessionID)
+		return false, nil
+	}
 	return true, nil
+}
+
+// sessionEnded reads the terminal outcome OpenCode records for a cancelled
+// session. A busy session carries no such outcome.
+func sessionEnded(data []byte) bool {
+	var info struct {
+		Outcome string `json:"outcome"`
+	}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return false
+	}
+	switch info.Outcome {
+	case "interrupted", "cancelled", "canceled":
+		return true
+	}
+	return false
 }
 
 // canonicalPath resolves symlinks in path, falling back to a clean path.
