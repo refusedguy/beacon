@@ -11,6 +11,17 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+// refuseStaleBinary stops a daemon or MCP process whose binary no longer
+// matches the sources before it can take the lock, bind a port or serve tools.
+// A binary built by go run has no stamped hash and passes the check.
+func refuseStaleBinary() error {
+	root, err := projectRoot()
+	if err != nil {
+		return err
+	}
+	return buildHashMismatch(root)
+}
+
 func newServeCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
@@ -19,6 +30,9 @@ func newServeCommand(configPath *string) *cobra.Command {
 Set BEACON_API_ADDR to change the listen address; it defaults to 127.0.0.1:7432. BEACON_API_ADDR is the only way to set it.
 Clients read the current token from that file after each restart.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := refuseStaleBinary(); err != nil {
+				return err
+			}
 			parent := parentSessionFromEnv()
 			w, err := wire(*configPath, parent)
 			if err != nil {
