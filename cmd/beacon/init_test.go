@@ -225,18 +225,30 @@ func TestMergeOpenCodeConfigPreservesUserKeys(t *testing.T) {
 		t.Errorf("worker agent keys changed: %v", worker)
 	}
 	perms, _ := worker["permissions"].([]any)
-	foundCustom, foundDeny := false, false
+	foundCustom := false
+	effects := map[string]string{}
 	for _, entry := range perms {
 		obj, _ := entry.(map[string]any)
-		switch obj["action"] {
-		case "custom":
-			foundCustom = obj["effect"] == "allow"
-		case "beacon_task_create":
-			foundDeny = obj["effect"] == "deny"
+		action, _ := obj["action"].(string)
+		effect, _ := obj["effect"].(string)
+		effects[action] = effect
+		if action == "custom" {
+			foundCustom = effect == "allow"
 		}
 	}
-	if !foundCustom || !foundDeny {
-		t.Errorf("worker permissions lost user entries or generated rules: %v", perms)
+	if !foundCustom {
+		t.Errorf("worker permissions lost the custom user entry: %v", perms)
+	}
+	wantEffects := map[string]string{
+		"beacon_beacon_control":     "allow",
+		"beacon_beacon_reconcile":   "deny",
+		"beacon_beacon_task_create": "deny",
+		"beacon_beacon_task_start":  "deny",
+	}
+	for action, want := range wantEffects {
+		if effects[action] != want {
+			t.Errorf("worker permission %s effect = %q, want %q (all permissions: %v)", action, effects[action], want, perms)
+		}
 	}
 	mcpMap, _ := doc["mcp"].(map[string]any)
 	beacon, _ := mcpMap["beacon"].(map[string]any)
@@ -250,6 +262,44 @@ func TestMergeOpenCodeConfigPreservesUserKeys(t *testing.T) {
 	env, _ := beacon["environment"].(map[string]any)
 	if env["BEACON_PROJECT_ROOT"] != dir {
 		t.Errorf("BEACON_PROJECT_ROOT = %v, want %v", env["BEACON_PROJECT_ROOT"], dir)
+	}
+}
+
+func TestMergeOpenCodeConfigUsesNamespacedActions(t *testing.T) {
+	dir := t.TempDir()
+	original := `{"permissions":[{"action":"beacon_task_create","effect":"allow","resource":"*"}],"agents":{"worker":{"permissions":[{"action":"beacon_task_start","effect":"allow","resource":"*"}]}}}`
+	if err := os.WriteFile(filepath.Join(dir, "opencode.json"), []byte(original), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(filepath.Join(dir, \"opencode.json\"), []byte(original), 0o644): %v", err)
+	}
+	if err := mergeOpenCodeConfig(dir); err != nil {
+		t.Fatalf("mergeOpenCodeConfig(dir): %v", err)
+	}
+	doc := readOpenCode(t, dir)
+	lists := [][]any{}
+	if root, ok := doc["permissions"].([]any); ok {
+		lists = append(lists, root)
+	}
+	agents, _ := doc["agents"].(map[string]any)
+	for name, value := range agents {
+		agent, _ := value.(map[string]any)
+		perms, _ := agent["permissions"].([]any)
+		if perms == nil {
+			t.Errorf("agents.%s has no permissions", name)
+			continue
+		}
+		lists = append(lists, perms)
+	}
+	if len(lists) < 4 {
+		t.Fatalf("found %d permission lists, want the global list plus three agent lists", len(lists))
+	}
+	for _, list := range lists {
+		for _, entry := range list {
+			obj, _ := entry.(map[string]any)
+			action, _ := obj["action"].(string)
+			if strings.HasPrefix(action, "beacon_") && !strings.HasPrefix(action, "beacon_beacon_") {
+				t.Errorf("generated config contains unprefixed beacon action %q", action)
+			}
+		}
 	}
 }
 
