@@ -449,7 +449,10 @@ func (c *Control) Nudge(ctx context.Context, id core.RunID, message string) erro
 		return core.Errorf(core.CodeConflict, "no agent slot free for run %s", id)
 	}
 	// A nudge keeps the existing session live, so it holds the run's slot.
+	// The saved marker lets the monitor show that guidance was delivered;
+	// no observation stamp is written because the nudge observes no PR.
 	run.HoldAgent()
+	run.MarkNudged()
 	if err := c.Store.Save(ctx, run); err != nil {
 		return err
 	}
