@@ -11,6 +11,7 @@ depends:
 priority: 1
 kind: task
 require_review: llm
+status_reason: "Delivered in PR #2946: generated marker blocks and worker prose agree with ToolCatalog."
 ---
 
 Goal: publish the worker tool list after T-4e71b0d2 changes ToolCatalog.
