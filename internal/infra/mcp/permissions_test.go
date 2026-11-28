@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -44,34 +43,122 @@ func TestPermissionsUpToDate(t *testing.T) {
 	}
 }
 
-func TestGeneratedPermissionsUseRealActionNames(t *testing.T) {
-	var names []string
-	for _, spec := range ToolCatalog() {
-		if spec.OrchestratorOnly {
-			names = append(names, spec.Name)
+// TestRegenerationKeepsNamespacedActions proves a rewrite restores a namespaced
+// action instead of dropping it as owned. It also proves the stale unprefixed
+// name from the previous generator is removed.
+func TestRegenerationKeepsNamespacedActions(t *testing.T) {
+	const committed = "../../../opencode.json"
+	base, err := os.ReadFile(committed)
+	if err != nil {
+		t.Fatalf("read %s: %v", committed, err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(base, &doc); err != nil {
+		t.Fatalf("decode %s: %v", committed, err)
+	}
+
+	namespaced := map[string]any{"action": "beacon_beacon_task_create", "effect": "allow", "resource": "*"}
+	stale := map[string]any{"action": "beacon_task_create", "effect": "allow", "resource": "*"}
+	list, _ := doc["permissions"].([]any)
+	doc["permissions"] = append([]any{namespaced, stale}, list...)
+	input, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatalf("encode input document: %v", err)
+	}
+	input = append(input, '\n')
+
+	tmp := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(tmp, input, 0o600); err != nil {
+		t.Fatalf("write temp document: %v", err)
+	}
+	cmd := exec.Command("go", "run", "../../../cmd/beacon-gen", "-out", tmp)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run beacon-gen: %v\n%s", err, stderr.String())
+	}
+	got, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read generated document: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatalf("decode generated document: %v", err)
+	}
+	effects := map[string]string{}
+	if entries, ok := out["permissions"].([]any); ok {
+		for _, entry := range entries {
+			obj, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			action, _ := obj["action"].(string)
+			effect, _ := obj["effect"].(string)
+			effects[action] = effect
 		}
 	}
-	sort.Strings(names)
+	if effects["beacon_beacon_task_create"] != "deny" {
+		t.Errorf("namespaced action was not kept: %v", effects)
+	}
+	if _, ok := effects["beacon_task_create"]; ok {
+		t.Errorf("stale unprefixed action survived regeneration: %v", effects)
+	}
+}
+
+// actionEffects indexes a permission list by action for order-free checks.
+func actionEffects(perms []Permission) map[string]string {
+	out := make(map[string]string, len(perms))
+	for _, p := range perms {
+		out[p.Action] = p.Effect
+	}
+	return out
+}
+
+// TestGeneratedPermissionsUseNamespacedActions pins the exact action strings
+// OpenCode checks. The CLI joins the server name and the MCP tool name, so the
+// beacon server turns beacon_task_create into beacon_beacon_task_create.
+func TestGeneratedPermissionsUseNamespacedActions(t *testing.T) {
+	set := GeneratedPermissions(ToolCatalog())
+	wantGlobal := []string{
+		"beacon_beacon_reconcile",
+		"beacon_beacon_task_close",
+		"beacon_beacon_task_create",
+		"beacon_beacon_task_delete",
+		"beacon_beacon_task_update",
+	}
+	global := actionEffects(set.Global)
+	if len(global) != len(wantGlobal) {
+		t.Fatalf("global has %d entries, want %d: %v", len(global), len(wantGlobal), global)
+	}
+	for _, action := range wantGlobal {
+		if global[action] != "deny" {
+			t.Errorf("global %q = %q, want deny", action, global[action])
+		}
+	}
+	for _, action := range []string{
+		"beacon_reconcile", "beacon_task_close", "beacon_task_create",
+		"beacon_task_delete", "beacon_task_update",
+	} {
+		if _, ok := global[action]; ok {
+			t.Errorf("global contains unprefixed %q", action)
+		}
+	}
+}
+
+// TestGeneratedPermissionsAllowWorkerControl keeps the control tool free of
+// permission prompts. Control is a worker tool, so every role gets an allow.
+func TestGeneratedPermissionsAllowWorkerControl(t *testing.T) {
 	set := GeneratedPermissions(ToolCatalog())
 	for _, group := range []struct {
-		name   string
-		perms  []Permission
-		effect string
+		name  string
+		perms []Permission
 	}{
-		{"global", set.Global, "deny"},
-		{"allow", set.Allow, "allow"},
-		{"deny", set.Deny, "deny"},
+		{"allow", set.Allow},
+		{"deny", set.Deny},
 	} {
-		if len(group.perms) != len(names) {
-			t.Fatalf("%s has %d entries, want %d", group.name, len(group.perms), len(names))
-		}
-		for i, perm := range group.perms {
-			if perm.Action != names[i] {
-				t.Errorf("%s[%d] action = %q, want %q", group.name, i, perm.Action, names[i])
-			}
-			if perm.Effect != group.effect {
-				t.Errorf("%s[%d] effect = %q, want %q", group.name, i, perm.Effect, group.effect)
-			}
+		effects := actionEffects(group.perms)
+		if got := effects["beacon_beacon_control"]; got != "allow" {
+			t.Errorf("%s beacon_beacon_control = %q, want allow", group.name, got)
 		}
 	}
 }
@@ -95,7 +182,7 @@ func canonicalJSON(t *testing.T, data []byte) []byte {
 
 // TestGeneratorMatchesLibraryPermissions feeds one document through both
 // permission writers and diffs the bytes. The document carries a user
-// permission that both writers must keep and a stale beacon_beacon_task_create
+// permission that both writers must keep and a stale unprefixed beacon_task_create
 // entry that both must drop. A rule changed in one writer and not the other
 // fails here, so the owned-action rule cannot drift between them.
 func TestGeneratorMatchesLibraryPermissions(t *testing.T) {
@@ -110,7 +197,7 @@ func TestGeneratorMatchesLibraryPermissions(t *testing.T) {
 	}
 
 	custom := map[string]any{"action": "custom", "effect": "allow", "resource": "*"}
-	legacy := map[string]any{"action": "beacon_beacon_task_create", "effect": "deny", "resource": "*"}
+	legacy := map[string]any{"action": "beacon_task_create", "effect": "deny", "resource": "*"}
 	inject := func(value any) any {
 		list, _ := value.([]any)
 		return append([]any{custom, legacy}, list...)
@@ -184,7 +271,7 @@ func TestGeneratorMatchesLibraryPermissions(t *testing.T) {
 
 func TestMergePermissionsDropsLegacyActionNames(t *testing.T) {
 	want := GeneratedPermissions(ToolCatalog()).Global
-	legacy := map[string]any{"action": "beacon_beacon_task_create", "effect": "deny", "resource": "*"}
+	legacy := map[string]any{"action": "beacon_task_create", "effect": "deny", "resource": "*"}
 	custom := map[string]any{"action": "custom", "effect": "allow", "resource": "*"}
 
 	got := MergePermissions([]any{legacy, custom}, want)
@@ -199,7 +286,7 @@ func TestMergePermissionsDropsLegacyActionNames(t *testing.T) {
 		}
 	}
 	if foundLegacy {
-		t.Error("legacy beacon_beacon_ entry survived rewrite")
+		t.Error("legacy unprefixed beacon_ entry survived rewrite")
 	}
 	if !foundCustom {
 		t.Error("custom permission was dropped")
