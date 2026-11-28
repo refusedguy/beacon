@@ -1,11 +1,19 @@
 // Import the model directly so the server half can load this module without
 // pulling in the TUI runtime through ui/ui.js.
-import { REFRESH_MS, changedRuns, normalizeSnapshot } from "./ui/ui_model.js"
+import { REFRESH_MS, changedRuns, joinKey, normalizeSnapshot } from "./ui/ui_model.js"
 
-// Serializing the raw snapshot is much cheaper than rebuilding the normalized
-// runs, queue and metrics on an idle tick. An unchanged fingerprint means the
-// previous normalized snapshot and its diff are still valid.
-export const snapshotFingerprint = (raw) => JSON.stringify(raw ?? null)
+// Only the run identity decides whether the watcher has work to do. The daemon
+// stamps generatedAt on every snapshot, so serializing the whole payload makes
+// every idle tick look changed. Fall back to the raw field names for sources
+// that have not gone through CliStatusSource yet.
+export const snapshotFingerprint = (raw) => JSON.stringify(
+  [...(raw?.active ?? []), ...(raw?.recent ?? [])].map((run) => joinKey(
+    run?.id,
+    run?.sha ?? run?.head_sha,
+    run?.state,
+    run?.updatedAt ?? run?.updated_at,
+  )),
+)
 
 // The Beacon daemon runs in the background, so this plugin cannot read the
 // reconciler's event stream. Watch successful snapshot diffs instead and emit

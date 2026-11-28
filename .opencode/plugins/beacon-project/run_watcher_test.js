@@ -15,6 +15,30 @@ test("snapshotFingerprint compares raw snapshots by value", () => {
   assert.equal(snapshotFingerprint(undefined), snapshotFingerprint(null))
 })
 
+test("snapshotFingerprint uses ordered run keys and ignores generatedAt", () => {
+  const base = { active: [run("r")], recent: [] }
+  assert.equal(snapshotFingerprint(base), snapshotFingerprint({ ...base, generatedAt: "later" }))
+  assert.equal(snapshotFingerprint(base), snapshotFingerprint({ ...base, queue: [{ id: "T-r" }], metrics: { n: 1 } }))
+  assert.notEqual(snapshotFingerprint(base), snapshotFingerprint({ ...base, active: [run("r", "done")] }))
+  assert.notEqual(snapshotFingerprint(base), snapshotFingerprint({ ...base, active: [{ ...run("r"), sha: "def456" }] }))
+  assert.notEqual(snapshotFingerprint(base), snapshotFingerprint({ ...base, active: [{ ...run("r"), updatedAt: "later" }] }))
+  assert.notEqual(snapshotFingerprint(base), snapshotFingerprint({ ...base, active: [run("r"), run("r2")] }))
+})
+
+test("a moving generatedAt does not re-normalize unchanged runs", async () => {
+  let tick = 0
+  let normalizations = 0
+  const watcher = createRunChangeWatcher({
+    snapshot: async () => ({ active: [run("run-1")], recent: [], generatedAt: `t${tick++}` }),
+  }, {
+    emit: () => {},
+    deps: { normalizeSnapshot: (value) => { normalizations++; return normalizeSnapshot(value) } },
+  })
+  await watcher.tick()
+  for (let i = 0; i < 100; i++) await watcher.tick()
+  assert.equal(normalizations, 1, "generatedAt churn cannot defeat the idle skip")
+})
+
 test("the identity normalizer leaves a CliStatusSource snapshot untouched", async () => {
   // CliStatusSource.snapshot() returns an already-normalized object. The
   // operator watcher passes an identity normalizer so it is not rebuilt again.
