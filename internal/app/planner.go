@@ -140,6 +140,13 @@ func (p GreedyPlanner) queueWait(skip SkippedTask) {
 	}
 }
 
+// addSkip records a lost scope claim and appends its skip. Conflict branches
+// use it so one skipped card costs one statement in Select.
+func (p GreedyPlanner) addSkip(skipped []SkippedTask, skip SkippedTask) []SkippedTask {
+	p.queueWait(skip)
+	return append(skipped, skip)
+}
+
 // Probe IDs keep an active-scope comparison path-only. They cannot collide with
 // a real card ID or appear in a real DependsOn list, so identity and dependency
 // rules in an injected checker cannot fire.
@@ -197,31 +204,27 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 			continue
 		}
 		if blocker, paths := p.activeConflict(t, index); blocker != nil {
-			skip := SkippedTask{
+			skipped = p.addSkip(skipped, SkippedTask{
 				TaskID:       t.ID,
 				Code:         SkipActiveScopeOverlap,
 				BlockedBy:    blocker.TaskID,
 				BlockedByRun: blocker.ID,
 				Overlap:      paths,
 				Reason:       "scope overlaps " + string(blocker.TaskID) + overlapSuffix(paths),
-			}
-			skipped = append(skipped, skip)
-			p.queueWait(skip)
+			})
 			continue
 		}
 		conflict := false
 		for _, s := range selected {
 			if p.Overlap(t, s) {
 				paths := intersectScopes(t.Scope, s.Scope)
-				skip := SkippedTask{
+				skipped = p.addSkip(skipped, SkippedTask{
 					TaskID:    t.ID,
 					Code:      SkipSelectedScopeOverlap,
 					BlockedBy: s.ID,
 					Overlap:   paths,
 					Reason:    "scope overlaps " + string(s.ID) + overlapSuffix(paths),
-				}
-				skipped = append(skipped, skip)
-				p.queueWait(skip)
+				})
 				conflict = true
 				break
 			}
