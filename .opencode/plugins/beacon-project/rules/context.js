@@ -3,6 +3,25 @@ import { join } from "node:path"
 import { BEACON_BUILD_SCRIPT } from "../mcp/mcp.js"
 import { ORCHESTRATOR_ROLE, WORKER_ROLE, agentRole, resolveAgent, sessionIDOf } from "../state/session_identity.js"
 
+// BEGIN BEACON DOCS: context-tools
+const WORKER_TOOLS = [
+  "beacon_dispatch",
+  "beacon_watch_pr",
+  "beacon_status",
+  "beacon_recent",
+  "beacon_wait",
+  "beacon_control",
+]
+const ORCHESTRATOR_TOOLS = [
+  "beacon_task_create",
+  "beacon_task_delete",
+  "beacon_task_update",
+  "beacon_task_close",
+  "beacon_task_start",
+  "beacon_reconcile",
+]
+// END BEACON DOCS: context-tools
+
 export const SURVIVAL_KEY = "beacon/survival-rules"
 export const ORCHESTRATOR_KEY = "beacon/orchestrator-rules"
 export const BUILD_REMINDER = `After a change lands on main, rebuild the local binary with bash ${BEACON_BUILD_SCRIPT}, then tell the operator to restart the MCP daemon and the OpenCode TUI.`
@@ -13,7 +32,7 @@ export const SURVIVAL_RULES = [
   '2) Edit only the files listed in Scope: of your task card.',
   '3) Format changed files with the project formatter and run targeted tests for changed packages only. Leave full builds, full test suites and repo-wide linters to CI on weak machines.',
   '4) Use rg -n PATTERN <explicit-directory>. Do not grep -r the whole tree or find /.',
-  '5) Worker tools: beacon_dispatch, beacon_watch_pr, beacon_status, beacon_recent, beacon_wait and beacon_control. beacon_task_create, beacon_task_delete, beacon_task_update and beacon_reconcile are for the orchestrator only. No other Beacon tool exists.',
+  `5) Worker tools: ${WORKER_TOOLS.join(", ")}. ${ORCHESTRATOR_TOOLS.join(", ")} are for the orchestrator only. No other Beacon tool exists.`,
   '6) After opening a pull request, call beacon_watch_pr with your real run ID and PR number.',
   '7) Use beacon_wait to wait and beacon_status or beacon_recent to inspect. No gh pr checks --watch and no sleep loop.',
   '8) Use beacon_control only for approve, unblock, cancel and retry on a run.',
@@ -25,7 +44,7 @@ export const ORCHESTRATOR_RULES = [
   '1) Stay on the main checkout. Workers own their worktrees; do not edit their files.',
   '2) Decompose work into task cards with a narrow Scope: and explicit Depends:.',
   '3) Check the board with beacon_status and beacon_recent before beacon_dispatch, so you do not duplicate active work.',
-  '4) You may use beacon_task_create, beacon_task_delete, beacon_task_update and beacon_reconcile. Workers may not. beacon_task_create accepts {"tasks": [...]}; @N in depends means the Nth card in that batch (1-based).',
+  `4) You may use ${ORCHESTRATOR_TOOLS.join(", ")}. Workers may not. beacon_task_create accepts {"tasks": [...]}; @N in depends means the Nth card in that batch (1-based).`,
   '5) Use beacon_reconcile with {"pr": N} to force one reconciler tick on a waiting PR and diagnose its decision. The result carries the decision, state and error, and a failed tick never stops the daemon loop.',
   '6) Write prose with unslop: no em dashes, simple words, active voice, no filler.',
   '7) Do not re-dispatch a task that failed with workspace conflict or dirty worktree until you find and remove the cause.',
