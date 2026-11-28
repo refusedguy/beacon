@@ -5,11 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/infra/checksource"
 	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/internal/infra/policy"
 	"github.com/refusedguy/beacon/internal/infra/shared"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 // workflowFixture contains a plain job, a matrix job whose strategy also has
@@ -33,6 +36,23 @@ const advisoryWorkflowFixture = "name: CI\njobs:\n" +
 const reusableWorkflowFixture = "name: Reusable\n" +
 	"on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\n" +
 	"jobs:\n  inner:\n    runs-on: ubuntu-latest\n"
+
+// matrixFixture mirrors the shape of ci.yml: a gated job whose strategy puts
+// fail-fast before an include list, plus an aggregator. GitHub reports one
+// check per include entry, named with the entry values in declaration order.
+const matrixFixture = "name: CI\njobs:\n" +
+	"  test-modules:\n" +
+	"    if: github.event_name != 'schedule'\n" +
+	"    runs-on: ubuntu-latest\n" +
+	"    strategy:\n      fail-fast: false\n      matrix:\n        include:\n" +
+	"          - module: root app\n            filter: go-core\n            race: true\n" +
+	"          - module: tui\n            filter: go-tui\n            race: false\n" +
+	"  test:\n    needs: test-modules\n    runs-on: ubuntu-latest\n"
+
+var matrixCellNames = []string{
+	"test-modules (root app, go-core, true)",
+	"test-modules (tui, go-tui, false)",
+}
 
 func writeWorkflow(t *testing.T, content string) string {
 	t.Helper()
@@ -179,5 +199,66 @@ func TestDetectUnreportableJobNames(t *testing.T) {
 	want := []string{"inner", "test-modules"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("DetectUnreportableJobNames = %v, want %v", got, want)
+	}
+}
+
+func TestMatrixCellsAreRequiredChecks(t *testing.T) {
+	root := writeWorkflow(t, matrixFixture)
+	want := append([]string{"test"}, matrixCellNames...)
+
+	got := shared.DetectWorkflowJobNames(root)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DetectWorkflowJobNames = %v, want %v", got, want)
+	}
+	if fromConfig := config.DetectRequiredChecks(root); !reflect.DeepEqual(fromConfig, want) {
+		t.Fatalf("config resolved %v, want %v", fromConfig, want)
+	}
+	fromSource, err := (checksource.Workflow{Root: root}).Names(context.Background())
+	if err != nil {
+		t.Fatalf("Workflow.Names: %v", err)
+	}
+	if !reflect.DeepEqual(fromSource, want) {
+		t.Fatalf("check source resolved %v, want %v", fromSource, want)
+	}
+}
+
+func TestMatrixCellsInheritJobIfGate(t *testing.T) {
+	root := writeWorkflow(t, matrixFixture)
+	src := checksource.Workflow{Root: root}
+	gated, err := src.ConditionalNames(context.Background())
+	if err != nil {
+		t.Fatalf("ConditionalNames: %v", err)
+	}
+	if !reflect.DeepEqual(gated, matrixCellNames) {
+		t.Fatalf("ConditionalNames = %v, want %v", gated, matrixCellNames)
+	}
+}
+
+func TestFailedMatrixCellBlocksMerge(t *testing.T) {
+	root := writeWorkflow(t, matrixFixture)
+	source := checksource.Workflow{Root: root}
+	obs := core.Observation{
+		PRState: "open",
+		Checks: []core.CheckResult{
+			{Name: "test", State: core.CheckSuccess},
+			{Name: matrixCellNames[0], State: core.CheckFailure},
+			{Name: matrixCellNames[1], State: core.CheckSuccess},
+		},
+	}
+
+	verdict, reason := (policy.SourceChecksRule{Source: source}).Evaluate(obs)
+	if verdict != core.VerdictWait {
+		t.Fatalf("verdict with red cell = %s (%s), want %s", verdict, reason, core.VerdictWait)
+	}
+	if !strings.Contains(reason, matrixCellNames[0]) {
+		t.Fatalf("reason = %q, want the failing cell name", reason)
+	}
+	if decision := policy.New(policy.Config{RequiredCheckSource: source}).Evaluate(obs); decision.Verdict == core.VerdictMerge {
+		t.Fatalf("policy merged a red matrix cell: %+v", decision)
+	}
+
+	obs.Checks[1].State = core.CheckSuccess
+	if decision := policy.New(policy.Config{RequiredCheckSource: source}).Evaluate(obs); decision.Verdict != core.VerdictMerge {
+		t.Fatalf("policy verdict with green cells = %+v, want merge", decision)
 	}
 }

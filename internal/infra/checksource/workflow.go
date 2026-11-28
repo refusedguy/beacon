@@ -74,9 +74,10 @@ func (w Workflow) ConditionalNames(ctx context.Context) ([]string, error) {
 	return conditional, nil
 }
 
-// DetectConditionalJobNames returns the job names that declare a job-level if
-// gate in any workflow file under root. A step-level if is ignored because its
-// job still reports a check to GitHub.
+// DetectConditionalJobNames returns the check names that declare a job-level
+// if gate in any workflow file under root. Matrix cells inherit their parent's
+// gate because GitHub skips or omits the cells when the condition is false. A
+// step-level if is ignored because its job still reports a check to GitHub.
 func DetectConditionalJobNames(root string) []string {
 	files, err := filepath.Glob(filepath.Join(root, ".github", "workflows", "*.y*ml"))
 	if err != nil {
@@ -89,6 +90,9 @@ func DetectConditionalJobNames(root string) []string {
 			continue
 		}
 		for _, name := range conditionalJobs(string(data)) {
+			seen[name] = true
+		}
+		for _, name := range shared.ParseConditionalCellNames(string(data)) {
 			seen[name] = true
 		}
 	}
