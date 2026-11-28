@@ -8,7 +8,7 @@ on:
       - '**.md'
       - '!AGENTS.md'
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, closed]
     paths-ignore:
       - 'docs/**'
       - '**.md'
@@ -21,13 +21,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  # A push supersedes an earlier push or PR run, but it must not cancel a
+  # nightly or a manual run that is still measuring.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   # One shared filter feeds every gate. Output names are pinned here so a typo
   # in a consumer cannot silently turn into a skipped job.
   changes:
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -40,7 +43,10 @@ jobs:
       perf: ${{ steps.all.outputs.perf || steps.filter.outputs.perf }}
       shared: ${{ steps.all.outputs.shared || steps.filter.outputs.shared }}
     steps:
+      # dorny/paths-filter reads changed files over REST on pull_request events.
+      # The full-history checkout is only needed for push, where it uses git.
       - uses: actions/checkout@v4
+        if: github.event_name == 'push'
         with:
           fetch-depth: 0
 
@@ -97,6 +103,7 @@ jobs:
     # Perf PRs are intentionally skipped: their worker sets the label after
     # the last variant has been measured.
     if: >-
+      github.event.action != 'closed' &&
       github.event_name == 'pull_request' &&
       !contains(github.event.pull_request.labels.*.name, 'perf')
     runs-on: ubuntu-latest
@@ -367,6 +374,7 @@ jobs:
     # Two-tree, alternating comparison for a labeled PR. It never gates merge,
     # adds no required Criterion name, and always exits zero.
     if: >-
+      github.event.action != 'closed' &&
       github.event_name == 'pull_request' &&
       contains(github.event.pull_request.labels.*.name, 'perf')
     runs-on: ubuntu-latest
@@ -395,7 +403,15 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Cache benchstat
+        id: benchstat-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/benchstat
+          key: benchstat-${{ runner.os }}-v0.0.0-20261117185222-4febdb082b2c
+
       - name: Install benchstat
+        if: steps.benchstat-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
 
@@ -452,6 +468,7 @@ jobs:
       # instead. The source stays inline below so the base ref can supply it.
       - name: Extract advisory scripts from base ref
         id: base_scripts
+        if: steps.trees.outputs.ci_changed != 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -479,6 +496,7 @@ jobs:
       # the Node harnesses and the workspace latency test. Production code
       # stays at each tree's own revision, so it is deliberately not hashed.
       - name: Hash measurement files
+        if: steps.trees.outputs.ci_changed != 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -515,6 +533,7 @@ jobs:
           fi
 
       - name: Run five low-noise passes per side
+        if: steps.trees.outputs.ci_changed != 'true'
         continue-on-error: true
         run: bash scripts/perf-harness.sh "$RUNNER_TEMP" perf
 
@@ -524,6 +543,7 @@ jobs:
       # with a golden benchstat file and the very functions the comment builder
       # uses. The parser is extracted between markers instead of copied.
       - name: Golden compare.csv parser test
+        if: steps.trees.outputs.ci_changed != 'true'
         continue-on-error: true
         run: |
           node - <<'NODE'
@@ -599,6 +619,7 @@ jobs:
           NODE
 
       - name: Write per-side CSV and comparison
+        if: steps.trees.outputs.ci_changed != 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -1384,8 +1405,16 @@ jobs:
           echo "::error::Nightly baseline is missing; refusing a green run without a comparison."
           exit 1
 
-      - name: Install benchstat
+      - name: Cache benchstat
+        id: benchstat-cache
         if: steps.baseline.outcome == 'success'
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/benchstat
+          key: benchstat-${{ runner.os }}-v0.0.0-20261117185222-4febdb082b2c
+
+      - name: Install benchstat
+        if: steps.baseline.outcome == 'success' && steps.benchstat-cache.outputs.cache-hit != 'true'
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
 
       - name: Measure current HEAD
@@ -1406,15 +1435,11 @@ jobs:
           # script; it also rejects a baseline far above the recorded medians.
           bash scripts/check-bench-regression.sh bench-results/compare.csv
 
-      - name: Full ten-plan suite on manual dispatch
-        if: github.event_name == 'workflow_dispatch'
-        run: bash scripts/bench-e2e.sh --full
-
       - name: Upload benchstat artifacts
         if: steps.compare.outcome == 'success' || steps.compare.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: benchstat-nightly-${{ github.run_number }}
+          name: benchstat-nightly
           path: bench-results/
           retention-days: 30
           overwrite: true
@@ -1425,4 +1450,36 @@ jobs:
         with:
           name: bench-baseline
           path: bench-results/current.txt
+          retention-days: 30
           overwrite: true
+
+  cache-cleanup:
+    # PR caches are scoped to refs/pull/<n>/merge and cannot be reused by the
+    # next PR. Delete them on close so they stop consuming the included quota.
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Delete caches for this pull request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ref = `refs/pull/${{ github.event.pull_request.number }}/merge`;
+            const caches = await github.paginate(github.rest.actions.getActionsCacheList, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref,
+              per_page: 100,
+            });
+            for (const cache of caches) {
+              core.info(`deleting cache ${cache.id} (${cache.key})`);
+              await github.rest.actions.deleteActionsCacheById({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                cache_id: cache.id,
+              });
+            }
