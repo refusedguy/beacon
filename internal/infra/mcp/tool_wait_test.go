@@ -18,6 +18,7 @@ import (
 // moves from running to waiting_ci while the call is in progress.
 type waitToolStore struct {
 	states []core.RunState
+	reason string
 	calls  int
 }
 
@@ -32,6 +33,7 @@ func (s *waitToolStore) Get(_ context.Context, id core.RunID) (*core.Run, error)
 	}
 	run := core.NewRun(id, "T-wait", time.Now().UTC())
 	run.State = s.states[index]
+	run.Reason = s.reason
 	return run, nil
 }
 
@@ -98,11 +100,54 @@ func TestBeaconWaitRejectsInvalidTimeoutAndMissingService(t *testing.T) {
 	}
 }
 
-func TestBeaconWaitReportsDeadline(t *testing.T) {
-	store := &waitToolStore{states: []core.RunState{core.RunRunning}}
+func TestBeaconWaitReturnsStructuredResultOnDeadline(t *testing.T) {
+	store := &waitToolStore{
+		states: []core.RunState{core.RunRunning},
+		reason: "worker is idle",
+	}
 	cs := deleteClient(t, Services{Wait: app.WaitService{Store: store, Interval: time.Millisecond}})
 
 	res := callWait(t, cs, map[string]any{"run_id": "run-stuck", "timeout_ms": 20})
+	if res.IsError || len(res.Content) == 0 {
+		t.Fatalf("unexpected tool result: %+v", res)
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatalf("content[0] = %T, want *msdk.TextContent", res.Content[0])
+	}
+	var got waitTimeoutResult
+	if err := json.Unmarshal([]byte(text.Text), &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", text.Text, err)
+	}
+	if got.RunID != "run-stuck" || got.LastState != string(core.RunRunning) {
+		t.Fatalf("result = %+v, want run-stuck in running", got)
+	}
+	if got.Reason != "worker is idle" {
+		t.Fatalf("reason = %q, want %q", got.Reason, "worker is idle")
+	}
+	if !got.TimedOut {
+		t.Fatalf("timed_out = false, want true")
+	}
+	if !strings.Contains(got.Next, "beacon_watch_pr") {
+		t.Fatalf("next = %q, want a watch_pr instruction", got.Next)
+	}
+	if store.calls < 2 {
+		t.Fatalf("Get calls = %d, want the run polled until the deadline", store.calls)
+	}
+}
+
+// failingWaitStore turns every read into an ordinary store error, distinct
+// from a wait deadline.
+type failingWaitStore struct{}
+
+func (failingWaitStore) Get(context.Context, core.RunID) (*core.Run, error) {
+	return nil, core.Errorf(core.CodeUnavailable, "store is down")
+}
+
+func TestBeaconWaitReportsStoreFailure(t *testing.T) {
+	cs := deleteClient(t, Services{Wait: app.WaitService{Store: failingWaitStore{}, Interval: time.Millisecond}})
+
+	res := callWait(t, cs, map[string]any{"run_id": "run-stuck", "timeout_ms": 100})
 	if !res.IsError || len(res.Content) == 0 {
 		t.Fatalf("unexpected tool result: %+v", res)
 	}
@@ -110,7 +155,10 @@ func TestBeaconWaitReportsDeadline(t *testing.T) {
 	if !ok {
 		t.Fatalf("content[0] = %T, want *msdk.TextContent", res.Content[0])
 	}
-	if !strings.Contains(text.Text, "deadline") {
-		t.Fatalf("result = %q, want a deadline error", text.Text)
+	if !strings.Contains(text.Text, "store is down") {
+		t.Fatalf("result = %q, want the store failure", text.Text)
+	}
+	if strings.Contains(text.Text, "timed_out") {
+		t.Fatalf("result = %q, want an error, not a timeout result", text.Text)
 	}
 }

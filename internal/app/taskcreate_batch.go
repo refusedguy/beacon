@@ -36,7 +36,10 @@ func (c *TaskCreator) CreateBatch(ctx context.Context, inputs []CreateTaskInput)
 	}
 
 	writer := c.writer()
-	available, existing, results := c.existingBatchCards(ctx, writer, ids)
+	available, existing, results, err := c.existingBatchCards(ctx, writer, ids)
+	if err != nil {
+		return nil, err
+	}
 	graph, groups := batchGraph(resolved, ids, existing)
 	if len(graph) == 0 {
 		c.Cache.RememberBatch(ids, results)
@@ -219,13 +222,14 @@ func batchGroupTasks(in CreateTaskInput, id core.TaskID) []core.Task {
 	return append(children, task)
 }
 
-// existingBatchCards resolves all already known cards in one source read.
-func (c *TaskCreator) existingBatchCards(ctx context.Context, writer CardWriter, ids []core.TaskID) ([]core.Task, []bool, []CreatedTask) {
+// existingBatchCards resolves all already known cards in one source read. A
+// failed read is returned to the caller so no card is written on stale data.
+func (c *TaskCreator) existingBatchCards(ctx context.Context, writer CardWriter, ids []core.TaskID) ([]core.Task, []bool, []CreatedTask, error) {
 	batch := c.Cache.Batch(ids)
 
 	available, err := writer.Available(ctx)
 	if err != nil {
-		available = nil
+		return nil, nil, nil, err
 	}
 	byID := make(map[core.TaskID]core.Task, len(available))
 	for _, task := range available {
@@ -247,7 +251,7 @@ func (c *TaskCreator) existingBatchCards(ctx context.Context, writer CardWriter,
 			results[i], exists[i] = CreatedTask{ID: string(id), Path: path, Pushed: true}, true
 		}
 	}
-	return available, exists, results
+	return available, exists, results, nil
 }
 
 func (c *TaskCreator) ensureBatchBranches(ctx context.Context, resolved []CreateTaskInput, ids []core.TaskID, existing []bool) error {
