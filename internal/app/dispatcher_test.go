@@ -2015,3 +2015,157 @@ func TestDispatchSeamFilesReachable(t *testing.T) {
 		}
 	})
 }
+
+// cancelledRun builds a finished run that carries the operator cancel reason.
+// The caller sets UpdatedAt to place it inside or outside the cooldown window.
+func cancelledRun(id core.RunID, task core.TaskID, at time.Time) *core.Run {
+	run := core.NewRun(id, task, at)
+	run.State = core.RunClosed
+	run.Reason = cancelledByOperator
+	return run
+}
+
+func TestRecentlyCancelledHonorsTaskStateReasonAndWindow(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	d := &Dispatcher{StartCooldown: 10 * time.Minute}
+	fresh := cancelledRun("r-fresh", "T-1", now.Add(-9*time.Minute))
+	boundary := cancelledRun("r-boundary", "T-2", now.Add(-10*time.Minute))
+	stale := cancelledRun("r-stale", "T-3", now.Add(-11*time.Minute))
+	otherReason := cancelledRun("r-other", "T-4", now)
+	otherReason.Reason = "pull request closed"
+	otherTask := cancelledRun("r-task", "T-5", now)
+	stillRunning := cancelledRun("r-live", "T-6", now)
+	stillRunning.State = core.RunRunning
+	recent := []*core.Run{nil, fresh, boundary, stale, otherReason, otherTask, stillRunning}
+
+	for _, tc := range []struct {
+		name string
+		task core.TaskID
+		want core.RunID
+	}{
+		{"inside window", "T-1", "r-fresh"},
+		{"exactly at cutoff", "T-2", "r-boundary"},
+		{"outside window", "T-3", ""},
+		{"other close reason", "T-4", ""},
+		{"other task", "T-9", ""},
+		{"not closed", "T-6", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := d.recentlyCancelled(recent, tc.task, now)
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("recentlyCancelled = %+v, want none", got)
+				}
+				return
+			}
+			if got == nil || got.ID != tc.want {
+				t.Fatalf("recentlyCancelled = %+v, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecentlyCancelledReturnsNewestMatch(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	d := &Dispatcher{StartCooldown: time.Hour}
+	older := cancelledRun("r-older", "T-1", now.Add(-20*time.Minute))
+	newer := cancelledRun("r-newer", "T-1", now.Add(-2*time.Minute))
+	got := d.recentlyCancelled([]*core.Run{older, newer}, "T-1", now)
+	if got == nil || got.ID != "r-newer" {
+		t.Fatalf("recentlyCancelled = %+v, want r-newer", got)
+	}
+}
+
+func TestStartOneRefusesRecentlyCancelledTask(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	if err := store.Save(ctx, cancelledRun("r-cancelled", "T-CANCEL", time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{
+		Source:  &fakeSource{tasks: []core.Task{{ID: "T-CANCEL", Status: core.TaskAvailable}}},
+		Planner: NewPlanner(nil), Workspace: &fakeWorkspace{}, Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	out, err := d.StartOne(ctx, "T-CANCEL")
+	if err != nil {
+		t.Fatalf("StartOne: %v", err)
+	}
+	if out.Code != string(StartRecentlyClosed) {
+		t.Fatalf("code = %q, want %q", out.Code, StartRecentlyClosed)
+	}
+	if out.RunID != "r-cancelled" {
+		t.Fatalf("run id = %q, want r-cancelled", out.RunID)
+	}
+	if !strings.Contains(out.Reason, "retry") {
+		t.Fatalf("reason = %q, want a retry hint", out.Reason)
+	}
+	if len(out.Blockers) != 1 || out.Blockers[0].Status != string(core.RunClosed) {
+		t.Fatalf("blockers = %+v, want one closed blocker", out.Blockers)
+	}
+	if active, err := store.ListActive(ctx); err != nil || len(active) != 0 {
+		t.Fatalf("active runs = %d, err=%v, want 0 (no new run was started)", len(active), err)
+	}
+}
+
+func TestStartOneRetryReleasesCooldown(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	if err := store.Save(ctx, cancelledRun("r-cancelled", "T-CANCEL", time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{
+		Source:  &fakeSource{tasks: []core.Task{{ID: "T-CANCEL", Status: core.TaskAvailable}}},
+		Planner: NewPlanner(nil), Workspace: &fakeWorkspace{}, Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	first, err := d.StartOne(ctx, "T-CANCEL")
+	if err != nil || first.Code != string(StartRecentlyClosed) {
+		t.Fatalf("first start = %+v, err=%v, want recently closed", first, err)
+	}
+
+	c := &Control{Store: store}
+	if err := c.Retry(ctx, "r-cancelled"); err != nil {
+		t.Fatalf("Retry: %v", err)
+	}
+	retried := store.runs["r-cancelled"]
+	if retried.State != core.RunPending || retried.Reason != "retried by operator" {
+		t.Fatalf("retried run = %s/%q, want pending/retried by operator", retried.State, retried.Reason)
+	}
+
+	second, err := d.StartOne(ctx, "T-CANCEL")
+	if err != nil {
+		t.Fatalf("StartOne after retry: %v", err)
+	}
+	if second.Code == string(StartRecentlyClosed) {
+		t.Fatalf("code after retry = %q, cooldown should be released", second.Code)
+	}
+	if second.Code != string(SkipActiveRun) {
+		t.Fatalf("code after retry = %q, want %q (the retried run owns the task)", second.Code, SkipActiveRun)
+	}
+}
+
+func TestStartOneAllowsTaskAfterCooldownExpires(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	stale := cancelledRun("r-old", "T-OLD", time.Now().UTC().Add(-time.Hour))
+	if err := store.Save(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{
+		Source:  &fakeSource{tasks: []core.Task{{ID: "T-OLD", Status: core.TaskAvailable}}},
+		Planner: NewPlanner(nil), Workspace: &fakeWorkspace{}, Harness: &fakeHarness{}, Store: store,
+		Concurrency:   core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+		StartCooldown: time.Minute,
+	}
+	out, err := d.StartOne(ctx, "T-OLD")
+	if err != nil {
+		t.Fatalf("StartOne: %v", err)
+	}
+	if out.Code == string(StartRecentlyClosed) {
+		t.Fatalf("expired cooldown still refused the task: %+v", out)
+	}
+	if out.RunID == "" {
+		t.Fatalf("no run started after the cooldown expired: %+v", out)
+	}
+}
