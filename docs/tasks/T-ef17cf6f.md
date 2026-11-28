@@ -1,7 +1,7 @@
 ---
 id: T-ef17cf6f
 title: Retry pending cleanup on operation journal replay
-status: available
+status: in_progress
 scope:
     - internal/infra/mcp/server.go
     - internal/infra/mcp/server_test.go

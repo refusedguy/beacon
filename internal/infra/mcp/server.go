@@ -112,7 +112,7 @@ func registerTaskCreate(s *msdk.Server, sv Services) {
 		}
 		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
 			return createTasks(ctx, sv.TaskCreator, a)
-		})
+		}, taskGraphRecovery(sv))
 	})
 }
 
@@ -162,7 +162,7 @@ func registerTaskUpdate(s *msdk.Server, sv Services) {
 		}
 		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
 			return updateTasks(ctx, sv.TaskUpdater, a)
-		})
+		}, taskGraphRecovery(sv))
 	})
 }
 
@@ -190,7 +190,7 @@ func registerTaskDelete(s *msdk.Server, sv Services) {
 		}
 		return mutationTool(ctx, journal, a.OperationID, func(ctx context.Context) (any, error) {
 			return deleteTasks(ctx, sv.TaskDeleter, a)
-		})
+		}, taskGraphRecovery(sv))
 	})
 }
 
@@ -235,12 +235,18 @@ func journalStore(sv Services) operationStore {
 	return nil
 }
 
+// recoveryFunc retries side work that a journaled operation logged but did not
+// finish. It must never reapply the committed mutation: replaying a create or
+// a cancel returns the stored outcome and only repairs what was left behind.
+type recoveryFunc func(context.Context) error
+
 // journalEntry is one in-memory operation outcome. Failure entries are kept so
 // a duplicate caller receives the original error instead of re-running the
-// mutation.
+// mutation. recover carries the side-work retry to every replay of this id.
 type journalEntry struct {
-	result any
-	err    error
+	result  any
+	err     error
+	recover recoveryFunc
 }
 
 // opJournal stores the result of each completed mutation by operation id. A
@@ -300,7 +306,7 @@ func (j *opJournal) touch(id string) {
 
 // finish records the outcome in memory and in the durable store, then releases
 // every waiter. A panic path passes keep=false so a later call can retry it.
-func (j *opJournal) finish(ctx context.Context, id string, result any, err error, keep bool) {
+func (j *opJournal) finish(ctx context.Context, id string, result any, err error, keep bool, recover recoveryFunc) {
 	status := "applied"
 	if ctx.Err() != nil {
 		status = "recovered"
@@ -315,7 +321,7 @@ func (j *opJournal) finish(ctx context.Context, id string, result any, err error
 	wait := j.inflight[id]
 	delete(j.inflight, id)
 	if keep {
-		j.done[id] = journalEntry{result: result, err: err}
+		j.done[id] = journalEntry{result: result, err: err, recover: recover}
 		j.touch(id)
 		for len(j.done) > operationJournalLimit {
 			oldest := j.order.Front()
@@ -367,9 +373,12 @@ func (j *opJournal) entry(id string) (journalEntry, bool) {
 }
 
 // storedOutcome is an outcome recovered from one of the two journal layers.
+// The in-memory layer also carries its recovery callback; a durable outcome
+// relies on the replaying caller to supply one.
 type storedOutcome struct {
-	value any
-	err   error
+	value   any
+	err     error
+	recover recoveryFunc
 }
 
 // lookup checks memory first, then the durable store. A failed operation is a
@@ -377,9 +386,9 @@ type storedOutcome struct {
 func (j *opJournal) lookup(ctx context.Context, id string) (storedOutcome, bool) {
 	if entry, ok := j.entry(id); ok {
 		if entry.err != nil {
-			return storedOutcome{err: entry.err}, true
+			return storedOutcome{err: entry.err, recover: entry.recover}, true
 		}
-		return storedOutcome{value: withMeta(entry.result, id, "duplicate")}, true
+		return storedOutcome{value: withMeta(entry.result, id, "duplicate"), recover: entry.recover}, true
 	}
 	if j.store == nil {
 		return storedOutcome{}, false
@@ -430,12 +439,38 @@ func restoreOperationError(text string) error {
 	}
 }
 
+// applyRecovery runs the side-work retry attached to an outcome. The callback
+// stored with the in-memory outcome wins: a replaying caller may pass the same
+// repair again, and running both would perform the cleanup twice. A durable
+// replay has no stored callback, so the caller's one is used. A recovery
+// failure is logged, never returned: the stored outcome is the committed
+// result, so a failed repair must not turn it into an error or hide the
+// original error of a failed mutation.
+func applyRecovery(ctx context.Context, id string, stored recoveryFunc, supplied []recoveryFunc) {
+	if stored != nil {
+		runRecovery(ctx, id, stored)
+		return
+	}
+	for _, rec := range supplied {
+		if rec != nil {
+			runRecovery(ctx, id, rec)
+		}
+	}
+}
+
+func runRecovery(ctx context.Context, id string, rec recoveryFunc) {
+	if err := rec(ctx); err != nil {
+		slog.WarnContext(ctx, "operation journal recovery", "operation_id", id, "error", err)
+	}
+}
+
 // run applies fn once per operation id. Repeats and concurrent callers reuse
-// the stored result or error with a duplicate status. A caller cancelled after
-// its commit records a recovered status, since the push finished in a detached
-// context. A cancelled waiter returns ctx.Err. A panic in fn is recovered into
-// an error and still releases every waiter, so a later call can retry.
-func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context) (any, error)) (out any, err error) {
+// the stored result or error with a duplicate status, then retry the side work
+// attached to that outcome. A caller cancelled after its commit records a
+// recovered status, since the push finished in a detached context. A cancelled
+// waiter returns ctx.Err. A panic in fn is recovered into an error and still
+// releases every waiter, so a later call can retry.
+func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context) (any, error), recovery ...recoveryFunc) (out any, err error) {
 	if id == "" {
 		return fn(ctx)
 	}
@@ -443,6 +478,7 @@ func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context)
 		return nil, core.Errorf(core.CodeInvalidInput, "operation_id is too long")
 	}
 	if stored, ok := j.lookup(ctx, id); ok {
+		applyRecovery(ctx, id, stored.recover, recovery)
 		return stored.value, stored.err
 	}
 	wait, owner := j.claim(id)
@@ -455,6 +491,7 @@ func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context)
 			}
 		}
 		if stored, ok := j.lookup(ctx, id); ok {
+			applyRecovery(ctx, id, stored.recover, recovery)
 			return stored.value, stored.err
 		}
 		return nil, core.Errorf(core.CodeUnavailable, "operation %q did not complete", id)
@@ -466,7 +503,11 @@ func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context)
 			err = core.Errorf(core.CodeUnavailable, "operation %q panicked: %v", id, rec)
 			keep = false
 		}
-		j.finish(ctx, id, result, err, keep)
+		var attached recoveryFunc
+		if len(recovery) > 0 {
+			attached = recovery[0]
+		}
+		j.finish(ctx, id, result, err, keep, attached)
 	}()
 	result, err = fn(ctx)
 	if err != nil {
@@ -479,12 +520,106 @@ func (j *opJournal) run(ctx context.Context, id string, fn func(context.Context)
 	return withMeta(result, id, status), nil
 }
 
-func mutationTool(ctx context.Context, journal *opJournal, id string, fn func(context.Context) (any, error)) (*msdk.CallToolResult, any, error) {
-	result, err := journal.run(ctx, id, fn)
+func mutationTool(ctx context.Context, journal *opJournal, id string, fn func(context.Context) (any, error), recovery ...recoveryFunc) (*msdk.CallToolResult, any, error) {
+	result, err := journal.run(ctx, id, fn, recovery...)
 	if err != nil {
 		return nil, nil, err
 	}
 	return jsonResult(result), nil, nil
+}
+
+// availableTaskLister is the part of a task source a replay needs to rebuild
+// the SQLite graph from the cards that are on disk now.
+type availableTaskLister interface {
+	ListAvailable(ctx context.Context) ([]core.Task, error)
+}
+
+// graphPorts finds the graph store and card source carried by the wired task
+// services. Every task service is built on the same pair, so any configured
+// port can repair the graph after a replay.
+func graphPorts(sv Services) (app.TaskGraphStore, availableTaskLister) {
+	if c := sv.TaskCreator; c != nil && c.Store != nil {
+		if source, ok := c.Source.(availableTaskLister); ok {
+			return c.Store, source
+		}
+	}
+	if u := sv.TaskUpdater; u != nil && u.Source != nil {
+		if store, ok := u.Store.(app.TaskGraphStore); ok {
+			return store, u.Source
+		}
+	}
+	if d := sv.TaskDeleter; d != nil && d.Source != nil {
+		if store, ok := d.Store.(app.TaskGraphStore); ok {
+			return store, d.Source
+		}
+	}
+	return nil, nil
+}
+
+// taskGraphRecovery converges the SQLite graph with the card files on a
+// replay. A mutation that failed its publish already rolled back its files and
+// graph; a close that took a no-op path skipped the graph sync altogether.
+// Reading the current source and syncing once repairs both without rewriting
+// a card the first call committed.
+func taskGraphRecovery(sv Services) recoveryFunc {
+	return func(ctx context.Context) error {
+		store, source := graphPorts(sv)
+		if store == nil || source == nil {
+			return nil
+		}
+		tasks, err := source.ListAvailable(ctx)
+		if err != nil {
+			return fmt.Errorf("list available tasks: %w", err)
+		}
+		return store.SyncTasks(ctx, tasks)
+	}
+}
+
+// reclaimWorkspace mirrors the app cleanup path: it prefers a reclaim that
+// keeps committed work and falls back to a plain removal.
+func reclaimWorkspace(ctx context.Context, manager core.WorkspaceManager, ws core.Workspace) error {
+	if reclaiming, ok := manager.(interface {
+		Reclaim(context.Context, core.Workspace, string) error
+	}); ok {
+		return reclaiming.Reclaim(ctx, ws, "")
+	}
+	return manager.Remove(ctx, ws)
+}
+
+// cancelCleanupRecovery retries session stop and workspace cleanup for the
+// runs in a cancelled batch. Their closed state is already committed, so the
+// retry touches only the session and worktree a failed best-effort cleanup left
+// behind. Failures are joined into one log line; the stored ok result stands.
+func cancelCleanupRecovery(sv Services, ids []string) recoveryFunc {
+	return func(ctx context.Context) error {
+		control := sv.Control
+		if control == nil || control.Store == nil || len(ids) == 0 {
+			return nil
+		}
+		var errs []error
+		for _, id := range ids {
+			run, err := control.Store.Get(ctx, core.RunID(id))
+			if err != nil {
+				errs = append(errs, fmt.Errorf("read run %s: %w", id, err))
+				continue
+			}
+			if run == nil || run.State != core.RunClosed {
+				continue
+			}
+			if run.SessionID != "" && control.Harness != nil {
+				if err := control.Harness.Stop(ctx, run.SessionID); err != nil {
+					errs = append(errs, fmt.Errorf("stop session %s: %w", run.SessionID, err))
+				}
+			}
+			if run.WorkspacePath != "" && control.Workspace != nil {
+				ws := core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}
+				if err := reclaimWorkspace(ctx, control.Workspace, ws); err != nil {
+					errs = append(errs, fmt.Errorf("remove workspace %s: %w", run.WorkspacePath, err))
+				}
+			}
+		}
+		return errors.Join(errs...)
+	}
 }
 
 // withMeta sets idempotency metadata through the shared result contract. It
