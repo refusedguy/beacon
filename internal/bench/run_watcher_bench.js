@@ -117,10 +117,20 @@ if (MOVING) {
   }
   assert.deepEqual(moving.before[0].rendered, moving.after[0].rendered)
   assert.deepEqual(moving.after[0].rendered, moving.production[0].rendered)
-  // A moving generated_at changes the key on every tick, so every tick
-  // normalizes. This count belongs to the moving arm alone; it is not part of
-  // the stable arm's equal-work assertion above.
-  for (const s of ["before", "after", "production"]) assert.equal(moving[s][0].norm, TICKS)
+  // Each arm keeps its own expected normalization count. A whole-snapshot
+  // fingerprint changes with generated_at on every tick; an ordered run-key
+  // fingerprint skips the unchanged ticks. The counts are a property of the
+  // fingerprint, so derive them from the fixture instead of assuming one shared
+  // number. They are the arm's own work, not part of the equal-work gate below.
+  const expectedNorm = (fn) => {
+    let previous = null, count = 0
+    for (let t = 0; t < TICKS; t += 1) {
+      const key = fn(movingAt(t))
+      if (key !== previous) { count += 1; previous = key }
+    }
+    return count
+  }
+  for (const s of ["before", "after", "production"]) assert.equal(moving[s][0].norm, expectedNorm(sides[s]))
   for (const k of ["snapshots", "emissions", "errs"]) for (const s of ["after", "production"]) assert.equal(moving.before[0][k], moving[s][0][k])
   const m = summary("production", moving)
   console.log(`${MOVING_KEY}: median ${m.ms.toFixed(2)} ms, normalizations=${m.norm}, errors=${m.errs}`)
@@ -129,7 +139,10 @@ if (MOVING) {
     median_ms: m.ms,
     min_ms: m.min,
     max_ms: m.max,
-    work: m.snapshots + m.norm + m.emissions,
+    // Normalizations stay off the work field on purpose. They are the arm's
+    // expected work and differ when the fingerprint skip fires, so folding
+    // them in would turn the equal-work gate into a verdict on the skip.
+    work: m.snapshots + m.emissions,
     errs: m.errs,
     limiter: "generated_at timestamp churn",
     cache: CACHE,
