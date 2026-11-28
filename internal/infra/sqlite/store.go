@@ -213,14 +213,14 @@ func (s *Store) AddWaitEntry(ctx context.Context, taskID core.TaskID, paths []co
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx, `
 INSERT INTO waitlist (path, task_id, waiting_since) VALUES (?, ?, ?)
 ON CONFLICT (path, task_id) DO UPDATE SET waiting_since = excluded.waiting_since`)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	for _, p := range paths {
 		if _, err := stmt.ExecContext(ctx, string(p), string(taskID), waitingSince); err != nil {
 			return err
