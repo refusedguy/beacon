@@ -5,18 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
-	"github.com/refusedguy/beacon/pkg/core"
 )
+
+// errNoLiveDaemon records why beacon mcp refuses to serve. Only beacon serve
+// owns the reconciler lock and writes the connection record, so a tool process
+// without a live daemon has no reconciler to forward control calls to.
+var errNoLiveDaemon = errors.New("no live beacon daemon")
 
 func newMCPCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
@@ -31,48 +33,30 @@ func newMCPCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer w.close()
-			go w.watcher.Run(ctx)
-
-			services := mcpServices(w)
-			dir := stateDir(w.cfg)
-			if info, ok := liveDaemon(w.cfg); ok {
-				client := &remoteClient{info: info, http: bearerClient(5 * time.Second)}
-				services.Remote = client.call
-			} else if lock, err := acquireLock(dir); err != nil {
-				// A second daemon with no live owner cannot take the lock. Fail
-				// rather than serve tools without a reconciler, which would
-				// freeze active runs while looking healthy.
-				writeDaemonError(dir, "lock", err)
-				return fmt.Errorf("acquire daemon lock: %w", err)
-			} else {
-				defer lock.Close()
-				slog.Info("daemon acquired reconciler lock", "pid", os.Getpid())
-				defer slog.Info("daemon released reconciler lock", "pid", os.Getpid())
-				tracker, stateErr := startDaemonState(dir)
-				if stateErr != nil {
-					writeDaemonError(dir, "state", stateErr)
-					return fmt.Errorf("write daemon state: %w", stateErr)
-				}
-				defer tracker.Close()
-				if h, ok := w.harness.(*reloadableHarness); ok {
-					defer h.stop()
-				}
-				if watcher, ok := w.harness.(core.IdleWatcher); ok {
-					go watcher.WatchIdle(ctx)
-				}
-				go func() {
-					err := w.recon.Run(ctx, w.changes)
-					if err != nil && !errors.Is(err, context.Canceled) {
-						slog.Error("reconciler loop stopped", "error", err)
-						writeDaemonError(dir, "reconciler", err)
-					} else {
-						slog.Info("reconciler loop exited", "error", err)
-					}
-				}()
+			services, err := mcpServicesForDaemon(w)
+			if err != nil {
+				return err
 			}
+			go w.watcher.Run(ctx)
 			return beaconmcp.ServeStdio(beaconmcp.NewServer(services))
 		},
 	}
+}
+
+// mcpServicesForDaemon points MCP control calls at the live daemon. It never
+// takes the reconciler lock: beacon serve is the only lock owner. Without a
+// daemon it fails with a recorded error instead of becoming a second owner
+// that serves tools while active runs freeze.
+func mcpServicesForDaemon(w *wiring) (beaconmcp.Services, error) {
+	services := mcpServices(w)
+	info, ok := liveDaemon(w.cfg)
+	if !ok {
+		writeDaemonError(stateDir(w.cfg), "daemon", errNoLiveDaemon)
+		return services, fmt.Errorf("beacon mcp needs a live daemon: %w", errNoLiveDaemon)
+	}
+	client := &remoteClient{info: info, http: bearerClient(5 * time.Second)}
+	services.Remote = client.call
+	return services, nil
 }
 
 func mcpServices(w *wiring) beaconmcp.Services {

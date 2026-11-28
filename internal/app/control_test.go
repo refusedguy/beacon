@@ -412,8 +412,12 @@ func TestNudgeCallsWakeWithOperatorGuidance(t *testing.T) {
 	w := h.wakes[0]
 	if w.RunID != "r-nudge" || w.PRNumber != 42 || w.HeadSHA != "sha42" ||
 		w.Reason != "operator guidance" || w.Excerpt != "please rebase first" ||
-		w.Workspace != "/ws/T-1" || w.Branch != "beacon/T-1" {
+		w.Workspace != "/ws/T-1" || w.Branch != "beacon/T-1" ||
+		w.Action != core.WakeGuidance {
 		t.Fatalf("wake = %+v", w)
+	}
+	if text := core.WakeText(w); strings.Contains(text, "Fix the issue") || strings.Contains(text, "pull request") {
+		t.Fatalf("guidance wake was rewritten into a fix command: %q", text)
 	}
 }
 
