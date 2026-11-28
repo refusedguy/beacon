@@ -415,6 +415,12 @@ jobs:
         continue-on-error: true
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c
 
+      # perf-status is the one note channel for the advisory. Create it before
+      # the hash step so every later step appends to the same file.
+      - name: Initialize perf status notes
+        run: |
+          : > "$RUNNER_TEMP/perf-status"
+
       - name: Build two detached worktrees
         id: trees
         continue-on-error: true
@@ -541,6 +547,12 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
+          # The shared harness truncates <prefix>-status on startup. Move the
+          # earlier notes aside so the hash step's evidence survives the passes.
+          : > "$RUNNER_TEMP/perf-status.earlier"
+          if [[ -f "$RUNNER_TEMP/perf-status" ]]; then
+            cat "$RUNNER_TEMP/perf-status" >> "$RUNNER_TEMP/perf-status.earlier"
+          fi
           allowed="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
           cpu="${allowed%%,*}"; cpu="${cpu%%-*}"; [[ -n "$cpu" ]] || cpu=0
           model="$(awk -F: '/^model name[[:space:]]*:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
@@ -556,7 +568,14 @@ jobs:
             printf 'pinned_cpu=%s\n' "$cpu"
             printf 'test_args=%s\n' 'bash scripts/perf-harness.sh "$RUNNER_TEMP" perf'
           } | tee "$RUNNER_TEMP/perf-env.txt"
+          set +e
           bash scripts/perf-harness.sh "$RUNNER_TEMP" perf
+          harness_rc=$?
+          set -e
+          if [[ -s "$RUNNER_TEMP/perf-status.earlier" ]]; then
+            cat "$RUNNER_TEMP/perf-status.earlier" >> "$RUNNER_TEMP/perf-status"
+          fi
+          exit "$harness_rc"
 
       # The benchmarks now write their reports to stderr, so the result lines
       # benchstat reads are clean and no post-processing is needed. The
@@ -712,6 +731,7 @@ jobs:
       # One comment per PR. A spread rule decides a verdict; the range relation
       # is supporting text only.
       - name: Build comparison comment
+        id: build_comment
         if: steps.trees.outputs.ci_changed != 'true' && steps.base_scripts.outputs.unsafe != 'true'
         continue-on-error: true
         env:
@@ -1287,6 +1307,54 @@ jobs:
           // advisory-script:comment-builder:end
           NODE
 
+      # A failed builder must not leave the reader with "see the artifact"
+      # when the artifact cannot explain the failure. Publish the failure and
+      # every accumulated note as the advisory comment instead.
+      - name: Record comment builder failure
+        if: always() && steps.build_comment.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          mkdir -p perf-results
+          {
+            printf '%s\n' '<!-- beacon-pr-perf -->' \
+              '### Advisory perf comparison, base vs head' \
+              '' \
+              'No comparison was produced: the comment builder failed.' \
+              'The perf-compare artifact holds the raw pass logs.'
+            if [[ -s "$RUNNER_TEMP/perf-status" ]]; then
+              printf '\nAdvisory notes:\n'
+              while IFS= read -r note; do
+                [[ -n "$note" ]] || continue
+                printf '%s\n' "- $note"
+              done < "$RUNNER_TEMP/perf-status"
+            fi
+          } > perf-results/comment.md
+
+      # The artifact must always carry evidence: either a comparison row or an
+      # explicit marker that says no baseline was measured and why.
+      - name: Publish baseline evidence
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p perf-results
+          baseline=none
+          if [[ -f perf-results/compare.csv ]] &&
+            awk -F, '$1 != "" && $2 ~ /^[0-9]/ { found = 1; exit } END { exit found ? 0 : 1 }' perf-results/compare.csv; then
+            baseline=compared
+          fi
+          {
+            printf 'baseline: %s\n' "$baseline"
+            if [[ "$baseline" == compared ]]; then
+              printf '%s\n' 'Comparison rows are in perf-results/compare.csv.'
+            else
+              printf '%s\n' 'NO BASELINE: no comparison row was measured for this PR.'
+              if [[ -s "$RUNNER_TEMP/perf-status" ]]; then
+                printf 'Advisory notes:\n'
+                sed 's/^/- /' "$RUNNER_TEMP/perf-status"
+              fi
+            fi
+          } > perf-results/baseline.txt
+
       - name: Upload comparison artifacts
         if: always()
         continue-on-error: true
@@ -1299,7 +1367,7 @@ jobs:
             ${{ runner.temp }}/perf-head.txt
             ${{ runner.temp }}/perf-env.txt
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: error
 
       - name: Post or update perf comment
         if: always()
@@ -1310,9 +1378,20 @@ jobs:
             const fs = require('fs');
             const marker = '<!-- beacon-pr-perf -->';
             const path = 'perf-results/comment.md';
+            const statusPath = `${process.env.RUNNER_TEMP}/perf-status`;
+            const notes = fs.existsSync(statusPath)
+              ? fs.readFileSync(statusPath, 'utf8').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+              : [];
+            const fallback = [
+              marker,
+              '### Advisory perf comparison',
+              '',
+              'No comparison was produced. The perf-compare artifact records why.',
+              ...(notes.length ? ['', 'Advisory notes:', '', ...notes.map(n => `- ${n}`)] : []),
+            ].join('\n');
             const body = fs.existsSync(path)
               ? fs.readFileSync(path, 'utf8')
-              : marker + '\n### Advisory perf comparison\n\nNo comparable rows; see the artifact.';
+              : fallback;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(github.rest.issues.listComments, {
