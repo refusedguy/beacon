@@ -757,6 +757,30 @@ FROM decisions WHERE run_id=? ORDER BY at DESC, id DESC LIMIT 1`, runID)
 	return d, err
 }
 
+// RunExplain implements app.RunExplainStore. It reads one run by primary key,
+// its timeline through run_events_run_at_idx and its newest decision through
+// decisions_run_at_idx. It never lists runs or scans another run's history.
+func (s *Store) RunExplain(ctx context.Context, id core.RunID) (*app.RunExplainData, error) {
+	run, err := s.Get(ctx, id)
+	if err != nil || run == nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, kind, state, at, head_sha, pr_number, reason
+FROM run_events WHERE run_id=? ORDER BY at, id`, string(id))
+	if err != nil {
+		return nil, err
+	}
+	events, err := collectRows(rows, scanRunEvent)
+	if err != nil {
+		return nil, err
+	}
+	decision, err := s.LastDecision(ctx, string(id))
+	if err != nil {
+		return nil, err
+	}
+	return &app.RunExplainData{Run: run, Events: events, Decision: decision}, nil
+}
+
 // DecisionsSince returns every decision recorded at or after since, oldest
 // first. Unlike ListDecisions it has no per-run cap: the window is bounded by
 // retention and a report needs the whole set for its counts.

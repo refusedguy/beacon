@@ -139,17 +139,19 @@ type statusFlags struct {
 	recentLimit    int
 	decisionsLimit int
 	daemon         bool
+	explain        string
 }
 
 func newStatusCommand(configPath *string) *cobra.Command {
 	f := &statusFlags{}
 	cmd := &cobra.Command{
-		Use:   "status [--snapshot | --recent | --daemon]",
-		Short: "Print active runs; --snapshot adds history and metrics, --daemon prints liveness",
+		Use:   "status [--snapshot | --recent | --daemon | --explain <run-id>]",
+		Short: "Print active runs; --snapshot adds history, --daemon prints liveness, --explain answers why one run is in its state",
 		Long: `status prints active runs as JSON.
 --snapshot prints one batched object with runs, bounded history and metric totals.
 --recent prints recently finished runs as a bare JSON array.
 --daemon prints daemon liveness and heartbeat age instead of runs.
+--explain <run-id> prints short text explaining one run's state, with the control action that applies.
 --recent-limit and --decisions-limit cap a snapshot; 0 uses the default.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if f.daemon {
@@ -158,6 +160,23 @@ func newStatusCommand(configPath *string) *cobra.Command {
 					return err
 				}
 				return printJSON(readDaemonStatus(stateDir(cfg)))
+			}
+			if cmd.Flags().Changed("explain") {
+				id := strings.TrimSpace(f.explain)
+				if id == "" {
+					return errors.New("--explain needs a run id")
+				}
+				_, store, _, err := wireReadOnly(*configPath)
+				if err != nil {
+					return err
+				}
+				defer store.Close()
+				text, err := (app.StatusExplainService{Store: store}).Explain(cmd.Context(), core.RunID(id), time.Time{})
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), strings.TrimSuffix(text, "\n"))
+				return nil
 			}
 			cfg, store, _, err := wireReadOnly(*configPath)
 			if err != nil {
@@ -194,6 +213,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 	cmd.Flags().IntVar(&f.recentLimit, "recent-limit", 0, "cap finished runs in a snapshot (0 uses the default)")
 	cmd.Flags().IntVar(&f.decisionsLimit, "decisions-limit", 0, "cap decisions per run and run-less decisions in a snapshot (0 uses the default)")
 	cmd.Flags().BoolVar(&f.daemon, "daemon", false, "print daemon liveness and heartbeat age instead of runs")
+	cmd.Flags().StringVar(&f.explain, "explain", "", "print short text explaining why one run is in its state")
 	return cmd
 }
 
