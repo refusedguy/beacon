@@ -1,13 +1,14 @@
 ---
 id: T-d2aa9d37
 title: Add worktree reclaim helper for initializing locks
-status: available
+status: done
 scope:
     - internal/infra/workspace/git_worktree.go
     - internal/infra/workspace/git_worktree_test.go
 priority: 1
 kind: task
 require_review: llm
+status_reason: "Already delivered in commit 76b4d9e0 (PR #2902): unlockInitializing/reclaim and both tests exist on base."
 ---
 
 Goal: a killed git worktree add must not block every future dispatch for that task.
