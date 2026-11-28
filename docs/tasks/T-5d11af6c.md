@@ -1,7 +1,7 @@
 ---
 id: T-5d11af6c
 title: '[perf] Planner allocation cut after dispatch merge'
-status: available
+status: done
 scope:
     - internal/app/planner.go
     - internal/app/planner_test.go
@@ -19,5 +19,7 @@ Evidence: planner.go:209 matching allocates a map per candidate and builds out w
 Variants: V1 rewrite leadingWildcard with strings.IndexByte and ContainsAny, and apply the same treatment to any remaining claimDirKeys split. V2 replace the per-candidate map with a reusable epoch buffer and preallocated out slice using slices.Sort. V3 preallocate newActiveRunIndex and newActiveScopeIndex without changing index order.
 
 CI commands: BenchmarkPlannerSelectInjectedChecker, BenchmarkPlannerSelectLargeDispatch. Limiter: map and slice allocations and core.ScopeDir checks.
+
+Close evidence: the work landed in PR #2741, commit 96b0901da4979279a09485c0e1505b1df2e0a152, which names this card. `git merge-base --is-ancestor 96b0901d origin/main` exits 0. All three variants are already in internal/app/planner.go: leadingWildcard and claimDirKeys use strings.IndexByte with strings.ContainsAny and no strings.Split; matching uses an epoch buffer with a preallocated out slice and slices.Sort; newActiveRunIndex and newActiveScopeIndex preallocate their maps and slices. Later commits #2811 and #2822 extended the same work. No duplicate code PR was opened.
 
 Protocol: Work in your own worktree and branch off current main. Never push to main. Never run go test, go build, go vet, linters, node tests or benchmarks locally. Open a PR, call beacon_watch_pr with your run ID, add the `perf` label, and do not add `ready-to-merge` until every variant is tried. One variant is one commit and one push. After each push wait for the `<!-- beacon-pr-perf -->` comment and check that work counts match, errors are zero, a limiter is named, ranges do not overlap and the head median is strictly better. Keep a winning variant and move to the next. Revert a losing or inconclusive variant with `git reset --hard HEAD~1` and `git push --force-with-lease`. Put a final table in the PR body with base median, head median, ranges, work, errors and limiter, then add `ready-to-merge`.
