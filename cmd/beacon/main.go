@@ -71,13 +71,14 @@ type refreshHarness interface {
 
 // wiredInfra holds the adapters shared by every application service.
 type wiredInfra struct {
-	store     *sqlite.Store
-	source    core.TaskSource
-	harness   core.AgentHarness
-	workspace *workspace.GitWorktree
-	scm       core.ScmGateway
-	changes   chan int
-	decisions app.DecisionLogger
+	store       *sqlite.Store
+	source      core.TaskSource
+	harness     core.AgentHarness
+	workspace   *workspace.GitWorktree
+	scm         core.ScmGateway
+	changes     chan int
+	decisions   app.DecisionLogger
+	capProvider func() int
 }
 
 // The store adapter must satisfy each consumer-side port before any service is
@@ -158,6 +159,10 @@ func wire(path, parentSession string) (*wiring, error) {
 	}
 	cw := newConfigWatcher(resolvedConfigPath(path, root), root, parentSession,
 		newLiveState(cfg, infra.harness), configWatchInterval)
+	// The one cap source is the watcher's live config. The provider closes over
+	// the pointer so a reload changes the cap the reconciler enforces without
+	// rebuilding the reconciler or restarting the daemon.
+	infra.capProvider = func() int { return cw.live.Load().cfg.Merge.MaxAutoRebases }
 	seedParentModel(cw, parentSession, startupModel(infra.harness, cfg, parentSession))
 	h := &reloadableHarness{live: &cw.live, events: infra.harness.Events()}
 	p := &reloadablePolicy{live: &cw.live}
@@ -346,6 +351,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		OrphanTimeout:      cfg.OrphanTimeoutDuration(),
 		AutoRebase:         cfg.Merge.AutoRebase,
 		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
+		RebaseCap:          infra.capProvider,
 	}, runStore, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
 	explain := app.ExplainService{Store: infra.store, SCM: infra.scm}
@@ -415,6 +421,7 @@ func newReconciler(
 		OrphanTimeout:      cfg.OrphanTimeout,
 		AutoRebase:         cfg.AutoRebase,
 		MaxAutoRebases:     cfg.MaxAutoRebases,
+		RebaseCap:          cfg.RebaseCap,
 	}
 }
 

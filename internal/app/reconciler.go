@@ -98,6 +98,7 @@ type ReconcilerConfig struct {
 	OrphanTimeout      time.Duration
 	AutoRebase         bool
 	MaxAutoRebases     int
+	RebaseCap          func() int
 }
 
 // Reconciler observes pull requests, applies merge policy to their runs and
@@ -125,6 +126,7 @@ type Reconciler struct {
 	Events             <-chan core.HarnessEvent
 	AutoRebase         bool
 	MaxAutoRebases     int
+	RebaseCap          func() int
 	Decisions          DecisionLogger
 }
 

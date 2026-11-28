@@ -202,10 +202,7 @@ func (cw *configWatcher) reload() bool {
 		// The running services were wired with the previous values for these
 		// fields. Storing the new config would make the snapshot disagree with
 		// what the services use, so keep the whole previous config instead.
-		for _, field := range restart {
-			slog.Warn("config watch: change needs restart, kept previous config", "field", field,
-				"action", "restart beacon mcp and reconnect OpenCode")
-		}
+		warnRestart(restart)
 		return false
 	}
 	if modelOnly {
@@ -214,14 +211,7 @@ func (cw *configWatcher) reload() bool {
 		// config with the existing services and advance the generation to
 		// invalidate the resolver cache. No new harness, no policy rebuild and
 		// no reload broadcast: the watchers keep watching the same harness.
-		state := &liveState{
-			cfg:        cfg,
-			harness:    previous.harness,
-			policy:     previous.policy,
-			relay:      previous.relay,
-			generation: cw.generations + 1,
-		}
-		cw.live.Store(state)
+		cw.live.Store(cw.keepServicesState(cfg, previous, previous.policy))
 		cw.generations++
 		return true
 	}
@@ -231,27 +221,37 @@ func (cw *configWatcher) reload() bool {
 		// reloadablePolicy wrapper reads the policy from live state on every
 		// evaluation. Keep the harness and the event relay, rebuild just the
 		// policy, and do not broadcast a reload: no service is replaced.
-		state := &liveState{
-			cfg:        cfg,
-			harness:    previous.harness,
-			policy:     mergePolicy(cfg),
-			relay:      previous.relay,
-			generation: cw.generations + 1,
-		}
-		cw.live.Store(state)
+		cw.live.Store(cw.keepServicesState(cfg, previous, mergePolicy(cfg)))
 		cw.generations++
 		return true
 	}
-	state := cw.build(cfg, root)
+	if capOnlyChange(previous.cfg, cfg) {
+		// The reconciler reads the cap from live state on every tick, so a
+		// cap-only edit keeps the current services and needs no broadcast.
+		cw.live.Store(cw.keepServicesState(cfg, previous, previous.policy))
+		cw.generations++
+		return true
+	}
+	state := cw.rebuildLiveState(cfg, root, previous)
 	if state == nil {
 		return false
 	}
-	state.relay = previous.relay
-	state.generation = cw.generations + 1
 	cw.live.Store(state)
 	state.relay.signalReload()
 	cw.generations++
 	return true
+}
+
+// rebuildLiveState builds a fresh harness and policy for cfg and keeps the
+// relay from the previous state so watchers do not retarget on a reload.
+func (cw *configWatcher) rebuildLiveState(cfg config.Config, root string, previous *liveState) *liveState {
+	state := cw.build(cfg, root)
+	if state == nil {
+		return nil
+	}
+	state.relay = previous.relay
+	state.generation = cw.generations + 1
+	return state
 }
 
 // build constructs a new live state for cfg, or nil when the harness needs a restart.
@@ -339,14 +339,39 @@ var restartFieldChecks = []restartField{
 	{"webhook", func(a, b config.Config) bool { return reflect.DeepEqual(a.Webhook, b.Webhook) }},
 }
 
-// maxAutoRebasesCheck classifies the automatic rebase cap. The reconciler
-// reads that cap when it is built and keeps it for the life of the daemon, so
-// an edit cannot reach a running reconciler. The check stays outside
-// restartFieldChecks because that table's length is pinned by the reload
-// benchmark's work constant.
-var maxAutoRebasesCheck = restartField{
-	name:  "merge.max_auto_rebases",
-	equal: func(a, b config.Config) bool { return a.Merge.MaxAutoRebases == b.Merge.MaxAutoRebases },
+// capOnlyChange reports whether the automatic rebase cap is the sole
+// difference between two configs. The reconciler reads the cap from the live
+// config through a provider, so a cap-only edit can be stored without
+// rebuilding the harness or the policy.
+func capOnlyChange(old, next config.Config) bool {
+	if old.Merge.MaxAutoRebases == next.Merge.MaxAutoRebases {
+		return false
+	}
+	probe := old
+	probe.Merge.MaxAutoRebases = next.Merge.MaxAutoRebases
+	return reflect.DeepEqual(probe, next)
+}
+
+// warnRestart names every field that needs a restart and tells the operator
+// what to do. Values are never logged.
+func warnRestart(restart []string) {
+	for _, field := range restart {
+		slog.Warn("config watch: change needs restart, kept previous config", "field", field,
+			"action", "restart beacon mcp and reconnect OpenCode")
+	}
+}
+
+// keepServicesState builds a snapshot that applies cfg without replacing the
+// harness or the relay. A caller that needs new merge settings passes a new
+// policy; the others pass the previous one.
+func (cw *configWatcher) keepServicesState(cfg config.Config, previous *liveState, policy core.MergePolicy) *liveState {
+	return &liveState{
+		cfg:        cfg,
+		harness:    previous.harness,
+		policy:     policy,
+		relay:      previous.relay,
+		generation: cw.generations + 1,
+	}
 }
 
 // restartFields names changed fields that cannot be applied without replacing
@@ -364,17 +389,15 @@ func restartFields(old, next config.Config) []string {
 // configChange classifies a config edit before any service is rebuilt. It
 // returns the restart fields that changed, whether the edit is confined to the
 // model, and whether it is confined to workflow-resolved required checks.
-// Restart changes cannot be applied to running services, including the
-// automatic rebase cap the reconciler captures at construction. A model-only
-// change needs no new harness or policy, because dispatch resolves the model
-// from the live config. A checks-only change in workflow mode comes from a workflow job
-// rename and needs a new policy but no new harness or reload broadcast. Any
-// other change rebuilds the harness and policy from the new config.
+// Restart changes cannot be applied to running services. A model-only change
+// needs no new harness or policy, because dispatch resolves the model from the
+// live config. A checks-only change in workflow mode comes from a workflow job
+// rename and needs a new policy but no new harness or reload broadcast. The
+// automatic rebase cap is not a restart field: the reconciler reads it from
+// the live config on every tick. Any other change rebuilds the harness and
+// policy from the new config.
 func configChange(old, next config.Config) (restart []string, modelOnly, checksOnly bool) {
 	restart = restartFields(old, next)
-	if !maxAutoRebasesCheck.equal(old, next) {
-		restart = append(restart, maxAutoRebasesCheck.name)
-	}
 	if len(restart) > 0 {
 		return restart, false, false
 	}
