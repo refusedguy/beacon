@@ -496,6 +496,7 @@ jobs:
       # the Node harnesses and the workspace latency test. Production code
       # stays at each tree's own revision, so it is deliberately not hashed.
       - name: Hash measurement files
+        id: hashes
         if: steps.trees.outputs.ci_changed != 'true'
         continue-on-error: true
         run: |
@@ -527,7 +528,10 @@ jobs:
           }
           base_hash="$(hash_tree "$RUNNER_TEMP/perf-base")"
           head_hash="$(hash_tree "$RUNNER_TEMP/perf-head")"
-          printf 'base %s\nhead %s\n' "$base_hash" "$head_hash" > "$RUNNER_TEMP/perf-hash"
+          printf 'base %s\nhead %s\n' "$base_hash" "$head_hash" | tee "$RUNNER_TEMP/perf-hash"
+          echo "base=$base_hash" >> "$GITHUB_OUTPUT"
+          echo "head=$head_hash" >> "$GITHUB_OUTPUT"
+          echo "artifact=${head_hash:0:12}" >> "$GITHUB_OUTPUT"
           if [[ "$base_hash" != "$head_hash" ]]; then
             echo "measurement trees differ" >> "$RUNNER_TEMP/perf-status"
           fi
@@ -535,7 +539,24 @@ jobs:
       - name: Run five low-noise passes per side
         if: steps.trees.outputs.ci_changed != 'true'
         continue-on-error: true
-        run: bash scripts/perf-harness.sh "$RUNNER_TEMP" perf
+        run: |
+          set -euo pipefail
+          allowed="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+          cpu="${allowed%%,*}"; cpu="${cpu%%-*}"; [[ -n "$cpu" ]] || cpu=0
+          model="$(awk -F: '/^model name[[:space:]]*:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+          {
+            printf 'go_version=%s\n' "$(go version)"
+            printf 'GOFLAGS=%s\n' "${GOFLAGS-}"
+            printf 'CGO_ENABLED=%s\n' "${CGO_ENABLED-}"
+            printf 'GOAMD64=%s\n' "${GOAMD64-}"
+            printf 'GOGC=%s\n' "${GOGC-}"
+            printf 'GOTOOLCHAIN=%s\n' "${GOTOOLCHAIN-}"
+            printf 'GOMAXPROCS=%s\n' "${GOMAXPROCS-}"
+            printf 'cpu_model=%s\n' "$model"
+            printf 'pinned_cpu=%s\n' "$cpu"
+            printf 'test_args=%s\n' 'bash scripts/perf-harness.sh "$RUNNER_TEMP" perf'
+          } | tee "$RUNNER_TEMP/perf-env.txt"
+          bash scripts/perf-harness.sh "$RUNNER_TEMP" perf
 
       # The benchmarks now write their reports to stderr, so the result lines
       # benchstat reads are clean and no post-processing is needed. The
@@ -654,6 +675,8 @@ jobs:
              .sort((a, b) => b.id - a.id)
             const last = runs[0]
             core.setOutput('run_id', last ? String(last.id) : '')
+            core.setOutput('created_at', last ? String(last.created_at || '') : '')
+            core.info(`noise floor run ${last ? last.id : 'none'} created_at=${last ? last.created_at : '-'}`)
 
       - name: Download calibrated noise floor
         if: steps.trees.outputs.ci_changed != 'true' && steps.base_scripts.outputs.unsafe != 'true' && steps.floor.outputs.run_id != ''
@@ -664,6 +687,13 @@ jobs:
           path: ${{ runner.temp }}/bench-noise-floor
           run-id: ${{ steps.floor.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report downloaded noise floor
+        if: steps.trees.outputs.ci_changed != 'true' && steps.base_scripts.outputs.unsafe != 'true' && steps.floor.outputs.run_id != ''
+        continue-on-error: true
+        run: |
+          echo "noise floor run id: ${{ steps.floor.outputs.run_id }}"
+          echo "noise floor created_at: ${{ steps.floor.outputs.created_at }}"
 
       - name: Mark advisory inconclusive for untrusted workflow
         if: steps.trees.outputs.ci_changed == 'true' || steps.base_scripts.outputs.unsafe == 'true'
@@ -682,6 +712,9 @@ jobs:
       - name: Build comparison comment
         if: steps.trees.outputs.ci_changed != 'true' && steps.base_scripts.outputs.unsafe != 'true'
         continue-on-error: true
+        env:
+          FLOOR_RUN_ID: ${{ steps.floor.outputs.run_id }}
+          FLOOR_CREATED_AT: ${{ steps.floor.outputs.created_at }}
         run: |
           # The inline source below is extracted from BASE_REF and run as that
           # copy, so a PR cannot rewrite its own verdict rules.
@@ -700,6 +733,14 @@ jobs:
           const readLines = path => {
             try { return fs.readFileSync(path, 'utf8').split(/\r?\n/); }
             catch (e) { notes.push(`cannot read ${path}: ${e.message}`); return []; }
+          };
+          const readKV = path => {
+            const out = new Map();
+            for (const line of readLines(path)) {
+              const at = line.indexOf('=');
+              if (at > 0) out.set(line.slice(0, at), line.slice(at + 1));
+            }
+            return out;
           };
 
           // benchstat writes one CSV table per config, not one merged
@@ -846,14 +887,18 @@ jobs:
           const minSamples = Number.isFinite(noise.minSamples) && noise.minSamples > 0
             ? noise.minSamples : 5;
           const quantile = Number.isFinite(noise.quantile) ? noise.quantile : 0.95;
+          const maxAgeHours = Number.isFinite(noise.maxAgeHours) && noise.maxAgeHours > 0
+            ? noise.maxAgeHours : 168;
 
           // The nightly no-change control publishes the observed floor. Use it
           // when available and say so when the comparison is uncalibrated.
           let floorPct = defaultFloor;
           let calibrated = false;
           let floors = null, rawFloors = null;
+          let floorDoc = null, floorEnv = null, floorCreatedAt = '';
           try {
-            const doc = JSON.parse(fs.readFileSync(`${temp}/bench-noise-floor/noise-floor.json`, 'utf8'));
+            floorDoc = JSON.parse(fs.readFileSync(`${temp}/bench-noise-floor/noise-floor.json`, 'utf8'));
+            const doc = floorDoc;
             if (Number.isFinite(doc.floorPct) && doc.floorPct > 0) {
               floorPct = Math.max(defaultFloor, doc.floorPct);
               calibrated = true;
@@ -871,8 +916,27 @@ jobs:
             if (doc.rawFloors && typeof doc.rawFloors === 'object' && !Array.isArray(doc.rawFloors)) {
               rawFloors = doc.rawFloors;
             }
+            if (typeof doc.created_at === 'string' && doc.created_at) floorCreatedAt = doc.created_at;
+            if (doc.env && typeof doc.env === 'object' && !Array.isArray(doc.env)) floorEnv = doc.env;
           } catch (e) {
             notes.push(`noise floor uncalibrated; using registry default ${defaultFloor}%`);
+          }
+          const floorRunId = process.env.FLOOR_RUN_ID || (floorDoc && String(floorDoc.run_id || '')) || '';
+          if (process.env.FLOOR_CREATED_AT) floorCreatedAt = process.env.FLOOR_CREATED_AT;
+          let floorAgeHours = NaN, staleFloor = false;
+          if (floorCreatedAt) {
+            const created = Date.parse(floorCreatedAt);
+            if (Number.isFinite(created)) {
+              floorAgeHours = (Date.now() - created) / 3600000;
+              staleFloor = floorAgeHours > maxAgeHours;
+            }
+          }
+          if (staleFloor) {
+            notes.push(`noise floor run ${floorRunId || '-'} created ${floorCreatedAt} is ${floorAgeHours.toFixed(1)}h old, beyond maxAgeHours ${maxAgeHours}; discarding calibration`);
+            floorPct = defaultFloor;
+            calibrated = false;
+            floors = null;
+            rawFloors = null;
           }
 
           // One canonical row per named plan per pass. Every failure is reported
@@ -925,6 +989,43 @@ jobs:
           const hashes = readLines(`${temp}/perf-hash`);
           const sameHarness = hashes.length >= 2 &&
             hashes[0].split(/\s+/)[1] === hashes[1].split(/\s+/)[1];
+
+          // Environment and fixture pins come from the pass logs and artifacts,
+          // not from the running process, so base, head and floor can be
+          // compared even when they ran on different machines.
+          const currentEnv = readKV(`${temp}/perf-env.txt`);
+          const runnerFields = ['ImageOS', 'ImageVersion', 'RUNNER_ENVIRONMENT', 'RUNNER_OS', 'RUNNER_ARCH', 'RUNNER_NAME'];
+          const envFields = ['go_version', 'GOFLAGS', 'CGO_ENABLED', 'GOAMD64', 'GOGC', 'GOTOOLCHAIN', 'GOMAXPROCS', 'cpu_model', 'pinned_cpu', 'test_args'];
+          const currentRunner = Object.fromEntries(runnerFields.map(k => [k, process.env[k] || '-']));
+          const floorRunner = Object.fromEntries(runnerFields.map(k => [k, (floorDoc && floorDoc[k]) || '-']));
+          const fixtureHashes = path => [...new Set(readLines(path)
+            .map(line => line.match(/^fixture hash:\s*(\S+)/))
+            .filter(Boolean).map(m => m[1]))];
+          const baseFixtures = fixtureHashes(`${temp}/perf-base.txt`);
+          const headFixtures = fixtureHashes(`${temp}/perf-head.txt`);
+          const floorFixtures = [...new Set([
+            ...fixtureHashes(`${temp}/bench-noise-floor/floor-base.txt`),
+            ...fixtureHashes(`${temp}/bench-noise-floor/floor-head.txt`),
+          ])];
+          const baseHarnessHash = hashes[0] ? hashes[0].split(/\s+/)[1] : '-';
+          const headHarnessHash = hashes[1] ? hashes[1].split(/\s+/)[1] : '-';
+          if (!sameHarness) notes.push(`harness hashes differ: base ${baseHarnessHash}, head ${headHarnessHash}`);
+          if (baseFixtures.join(',') !== headFixtures.join(',')) {
+            notes.push(`base and head fixture hashes differ: ${baseFixtures.join(',')} vs ${headFixtures.join(',')}`);
+          }
+          if (floorFixtures.length && floorFixtures.join(',') !== headFixtures.join(',')) {
+            notes.push(`floor fixture hashes differ: ${floorFixtures.join(',')} vs ${headFixtures.join(',')}`);
+          }
+          for (const key of envFields) {
+            if (floorEnv && key in floorEnv && (currentEnv.get(key) || '') !== (floorEnv[key] || '')) {
+              notes.push(`floor ${key} differs from base/head: ${floorEnv[key]} vs ${currentEnv.get(key) || '-'}`);
+            }
+          }
+          for (const key of runnerFields) {
+            if (floorRunner[key] !== '-' && floorRunner[key] !== currentRunner[key]) {
+              notes.push(`floor ${key} differs from base/head: ${floorRunner[key]} vs ${currentRunner[key]}`);
+            }
+          }
 
           if (!basePasses.length || !headPasses.length) notes.push('missing pass markers');
 
@@ -1115,6 +1216,26 @@ jobs:
             rows.push(`| ${key} | ${am.toFixed(3)} | ${bm.toFixed(3)} | ${fmtPct(delta)} | ${amin.toFixed(3)}-${amax.toFixed(3)} | ${bmin.toFixed(3)}-${bmax.toFixed(3)} | ${relation} | ${fmt(ra)} | ${fmt(rb)} | ${fmt(ratioDelta, 2)}% | ${fmtCount(allocEntry && allocEntry.old)} | ${fmtCount(allocEntry && allocEntry.next)} | ${fmtPct(allocDelta)} | ${fmtCount(bytesEntry && bytesEntry.old)} | ${fmtCount(bytesEntry && bytesEntry.next)} | ${fmtPct(bytesDelta)} | ${limiter} | ${cache} | ${verdict} |`);
           }
 
+          // Render the pins as short lists so a reader can see whether base,
+          // head and floor used the same machine, toolchain, flags, fixtures
+          // and harness before trusting any verdict.
+          const kvLines = (label, pairs) => [
+            `${label}:`,
+            ...pairs.map(([k, v]) => `- ${k}: ${v || '-'}`),
+          ];
+          const pinLines = [
+            `Harness hashes: base ${baseHarnessHash}, head ${headHarnessHash} (${sameHarness ? 'same' : 'DIFFER'}).`,
+            `Fixture hashes from pass logs: base ${baseFixtures.join(', ') || '-'}, head ${headFixtures.join(', ') || '-'}, floor ${floorFixtures.join(', ') || '-'}.`,
+            `Noise floor run: ${floorRunId || '-'}, created_at: ${floorCreatedAt || '-'}, age: ${Number.isFinite(floorAgeHours) ? `${floorAgeHours.toFixed(1)}h` : '-'}, maxAgeHours: ${maxAgeHours}${staleFloor ? ' (STALE, calibration discarded)' : ''}.`,
+            ...kvLines('Base and head environment', [
+              ...envFields.map(k => [k, currentEnv.get(k) || '-']),
+              ...runnerFields.map(k => [k, currentRunner[k]]),
+            ]),
+            ...kvLines('Noise floor environment', [
+              ...envFields.map(k => [k, floorEnv ? (floorEnv[k] || '-') : '-']),
+              ...runnerFields.map(k => [k, floorRunner[k]]),
+            ]),
+          ];
           const marker = '<!-- beacon-pr-perf -->';
           const body = [
             marker,
@@ -1123,7 +1244,8 @@ jobs:
             'Five alternating passes per side (B A A B B A A B B A) on two detached worktrees at the merge base and the real head SHA.',
             'One uncounted compile-only warmup per tree compiles the bench and workspace packages before the passes; measurement runs on one CPU from Cpus_allowed_list via taskset.',
             'Canonical rows come from the harness output; names, limiter text and the noise floor come from the registry on the base ref.',
-            `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}. Verdict floors use the raw observed floor, including any value above 25%.`,
+            ...pinLines,
+            `Noise floor ${floorPct}% (${calibrated ? 'calibrated by the no-change control' : 'uncalibrated, registry default'}); policy: ${minSamples} samples at quantile ${quantile}. Verdict floors use the raw observed floor, including any value above 25%. A floor older than maxAgeHours is discarded.`,
             'Times are in ms. Work and errs are counts. Ratios divide each plan by the pure json-control row in the same pass.',
             'Allocation and counter columns come from perf-results/compare.csv. Go benchmarks report them at benchmark granularity, so the ten HotPaths plans share the HotPaths row.',
             'Advisory data only: it adds no required check and does not gate merge.',
@@ -1150,11 +1272,12 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: perf-compare-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          name: perf-compare-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}-${{ steps.hashes.outputs.artifact }}
           path: |
             perf-results/
             ${{ runner.temp }}/perf-base.txt
             ${{ runner.temp }}/perf-head.txt
+            ${{ runner.temp }}/perf-env.txt
           retention-days: 7
           if-no-files-found: ignore
 
@@ -1221,7 +1344,24 @@ jobs:
 
       - name: Run five no-change passes per side
         continue-on-error: true
-        run: bash scripts/perf-harness.sh "$RUNNER_TEMP" floor
+        run: |
+          set -euo pipefail
+          allowed="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+          cpu="${allowed%%,*}"; cpu="${cpu%%-*}"; [[ -n "$cpu" ]] || cpu=0
+          model="$(awk -F: '/^model name[[:space:]]*:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+          {
+            printf 'go_version=%s\n' "$(go version)"
+            printf 'GOFLAGS=%s\n' "${GOFLAGS-}"
+            printf 'CGO_ENABLED=%s\n' "${CGO_ENABLED-}"
+            printf 'GOAMD64=%s\n' "${GOAMD64-}"
+            printf 'GOGC=%s\n' "${GOGC-}"
+            printf 'GOTOOLCHAIN=%s\n' "${GOTOOLCHAIN-}"
+            printf 'GOMAXPROCS=%s\n' "${GOMAXPROCS-}"
+            printf 'cpu_model=%s\n' "$model"
+            printf 'pinned_cpu=%s\n' "$cpu"
+            printf 'test_args=%s\n' 'bash scripts/perf-harness.sh "$RUNNER_TEMP" floor'
+          } | tee "$RUNNER_TEMP/perf-env.txt"
+          bash scripts/perf-harness.sh "$RUNNER_TEMP" floor
 
       - name: Calibrate the noise floor
         continue-on-error: true
@@ -1231,6 +1371,19 @@ jobs:
           const temp = process.env.RUNNER_TEMP;
           const prefix = 'beacon-perf: ';
           const fields = ['key', 'median_ms', 'min_ms', 'max_ms', 'work', 'errs', 'limiter', 'cache'];
+          // Pin the machine, toolchain and flags beside the floor so a PR can
+          // tell whether its runner matches the one that calibrated it.
+          const readKV = path => {
+            const out = {};
+            try {
+              for (const line of fs.readFileSync(path, 'utf8').split(/\r?\n/)) {
+                const at = line.indexOf('=');
+                if (at > 0) out[line.slice(0, at)] = line.slice(at + 1);
+              }
+            } catch (e) { /* the comment builder reports a missing env file */ }
+            return out;
+          };
+          const env = readKV(`${temp}/perf-env.txt`);
           // Every published floor is at least the registry default.
           let defaultFloor = 2;
           try {
@@ -1337,6 +1490,15 @@ jobs:
             quantile: 0.95,
             sha: process.env.GITHUB_SHA,
             source: 'no-change-control',
+            run_id: process.env.GITHUB_RUN_ID || '',
+            created_at: new Date().toISOString(),
+            ImageOS: process.env.ImageOS || '',
+            ImageVersion: process.env.ImageVersion || '',
+            RUNNER_ENVIRONMENT: process.env.RUNNER_ENVIRONMENT || '',
+            RUNNER_OS: process.env.RUNNER_OS || '',
+            RUNNER_ARCH: process.env.RUNNER_ARCH || '',
+            RUNNER_NAME: process.env.RUNNER_NAME || '',
+            env,
           };
           fs.writeFileSync(`${temp}/noise-floor.json`, JSON.stringify(doc, null, 2) + '\n');
           console.log(`calibrated noise floor ${floorPct}% (raw ${rawFloorPct}%) from ${deltas.length} plans`);
@@ -1348,7 +1510,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-noise-floor
-          path: ${{ runner.temp }}/noise-floor.json
+          path: |
+            ${{ runner.temp }}/noise-floor.json
+            ${{ runner.temp }}/floor-base.txt
+            ${{ runner.temp }}/floor-head.txt
+            ${{ runner.temp }}/perf-env.txt
           retention-days: 30
           overwrite: true
           if-no-files-found: ignore
@@ -1419,7 +1585,23 @@ jobs:
 
       - name: Measure current HEAD
         run: |
+          set -euo pipefail
           mkdir -p bench-results
+          allowed="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+          cpu="${allowed%%,*}"; cpu="${cpu%%-*}"; [[ -n "$cpu" ]] || cpu=0
+          model="$(awk -F: '/^model name[[:space:]]*:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+          {
+            printf 'go_version=%s\n' "$(go version)"
+            printf 'GOFLAGS=%s\n' "${GOFLAGS-}"
+            printf 'CGO_ENABLED=%s\n' "${CGO_ENABLED-}"
+            printf 'GOAMD64=%s\n' "${GOAMD64-}"
+            printf 'GOGC=%s\n' "${GOGC-}"
+            printf 'GOTOOLCHAIN=%s\n' "${GOTOOLCHAIN-}"
+            printf 'GOMAXPROCS=%s\n' "${GOMAXPROCS-}"
+            printf 'cpu_model=%s\n' "$model"
+            printf 'pinned_cpu=%s\n' "$cpu"
+            printf 'test_args=%s\n' "go test -run '^\$' -bench 'BenchmarkHotPaths|BenchmarkE2EOperatorPaths' -benchtime=1x -count=10 ./internal/bench/"
+          } | tee bench-results/perf-env.txt
           go test -run '^$' -bench 'BenchmarkHotPaths|BenchmarkE2EOperatorPaths' \
             -benchtime=1x -count=10 ./internal/bench/ | tee bench-results/current.txt
 

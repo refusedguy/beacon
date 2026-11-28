@@ -1,6 +1,8 @@
 package bench
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +10,34 @@ import (
 	"sort"
 	"time"
 )
+
+// expectedGoFixtureHash pins the Go fixture shape. A reader compares it with
+// the same line from ui_bench.js, run_watcher_bench.js and the other side of a
+// perf comparison before trusting a timing verdict.
+const expectedGoFixtureHash = "7e24f65f97a37700"
+
+// fixtureHash hashes the fixed fixture dimensions and clock, not the generated
+// rows. Keeping the hash here in report.go means the report itself carries the
+// pin without a second copy of the fixture builders.
+func fixtureHash() string {
+	dimensions := fmt.Sprintf("seed=%d runs=%d tasks=%d decisions=%d cards=%d wire=%d now=%s",
+		fixtureSeed, fixtureRuns, fixtureTasks, fixtureDecisions, fixtureCards,
+		fixtureWireRuns, fixtureNow.UTC().Format(time.RFC3339))
+	sum := sha256.Sum256([]byte(dimensions))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// printFixtureHash writes one canonical hash line. A mismatch with the pinned
+// value is visible in the report, so a reader can reject a comparison whose
+// two sides measured different fixture shapes.
+func printFixtureHash(w io.Writer) {
+	hash := fixtureHash()
+	if hash != expectedGoFixtureHash {
+		fmt.Fprintf(w, "fixture hash: %s (expected %s; FIXTURE DRIFT)\n", hash, expectedGoFixtureHash)
+		return
+	}
+	fmt.Fprintf(w, "fixture hash: %s\n", hash)
+}
 
 // perfPrefix marks one canonical row in a benchmark log. The payload is JSON
 // so limiter strings may contain spaces.
@@ -175,6 +205,7 @@ func endToEnd(sums []summary) time.Duration {
 func printReport(w io.Writer, sums []summary, total time.Duration, iterations int) {
 	fmt.Fprintf(w, "hot paths: seed=%d runs=%d tasks=%d decisions=%d cards=%d wire=%d iterations=%d\n",
 		fixtureSeed, fixtureRuns, fixtureTasks, fixtureDecisions, fixtureCards, fixtureWireRuns, iterations)
+	printFixtureHash(w)
 	fmt.Fprintln(w, "hot path             median      range       work    errs  share  limiter")
 	for _, s := range sums {
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %5.1f%%  %s\n",
@@ -289,6 +320,7 @@ func snapshotShares(phases []snapshotPhase) []snapshotPhase {
 // `go test -bench=BenchmarkFullSnapshot -benchmem -count=5` emits it without -v.
 func printSnapshotReport(w io.Writer, phases []snapshotPhase, fixture string, passes int) {
 	fmt.Fprintf(w, "full snapshot: %s passes=%d\n", fixture, passes)
+	printFixtureHash(w)
 	fmt.Fprintln(w, "phase                median      range       work    errs   bytes  allocs  share  limiter")
 	for _, p := range phases {
 		fmt.Fprintf(w, "%-20s %-11s %-11s %8d %6d %7d %7.1f %5.1f%%  %s\n",

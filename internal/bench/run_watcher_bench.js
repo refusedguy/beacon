@@ -2,6 +2,7 @@
 // 20 active runs, each carrying 40 timeline events, 40 decisions and 8 checks,
 // plus 30 queue rows. The arms differ only in how they fingerprint that payload.
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { performance } from "node:perf_hooks"
 import { createRunChangeWatcher, snapshotFingerprint } from "../../.opencode/plugins/beacon-project/run_watcher.js"
 import { joinKey, normalizeSnapshot } from "../../.opencode/plugins/beacon-project/ui/ui_model.js"
@@ -12,6 +13,17 @@ const TICKS = +(process.env.BENCH_TICKS ?? 1001), ROUNDS = +(process.env.BENCH_R
 // comparison inconclusive instead of just the stable deciding row.
 const MOVING = process.env.BENCH_MOVING_ARM === "1", MOVING_KEY = "run-watcher-fp-moving"
 const ACTIVE = 20, TIMELINE = 40, DECISIONS = 40, CHECKS = 8, QUEUE = 30
+// The hash pins the fixture shape so a perf comparison never mixes two
+// versions of this harness. Env overrides change timing, not the fixture, so
+// they are deliberately excluded. Any edit to these constants fails the run
+// before a number is printed.
+const EXPECTED_FIXTURE_HASH = "fda66d0f258058b4"
+const fixtureHashValue = createHash("sha256").update(JSON.stringify({
+  active: ACTIVE, timeline: TIMELINE, decisions: DECISIONS, checks: CHECKS, queue: QUEUE,
+})).digest("hex").slice(0, 16)
+if (fixtureHashValue !== EXPECTED_FIXTURE_HASH) {
+  throw new Error(`fixture hash drift: expected ${EXPECTED_FIXTURE_HASH}, got ${fixtureHashValue}`)
+}
 // CACHE names the policy the measurement ran under; an unset variable is
 // reported as "unset" so every canonical row carries the field.
 const CACHE = process.env.BEACON_BENCH_CACHE || "unset"
@@ -94,6 +106,7 @@ console.log(`run-watcher-fp: median ${p.ms.toFixed(2)} ms, range ${p.min.toFixed
 console.log(`run-watcher-fp-chars: ${p.chars} characters, range ${p.cmin} to ${p.cmax}`)
 console.log(`run-watcher-fp-work: snapshots=${p.snapshots} normalizations=${p.norm} emissions=${p.emissions}`)
 console.log(`run-watcher-fp-errs: ${p.errs} errors`)
+console.log(`fixture hash: ${fixtureHashValue}`)
 if (MOVING) {
   const moving = { before: [], after: [], production: [] }
   for (let round = 0; round < ROUNDS; round += 1) {
