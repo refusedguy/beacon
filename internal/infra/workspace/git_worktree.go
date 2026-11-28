@@ -347,16 +347,68 @@ func (g *GitWorktree) addWorktree(ctx context.Context, t createTarget) error {
 	return nil
 }
 
-// worktreeBase resolves the merge base and removes the worktree if that fails.
-// The cleanup keeps a failed create from leaving a worktree behind.
-func (g *GitWorktree) worktreeBase(ctx context.Context, t createTarget) (string, error) {
-	mergeBase, err := g.run(ctx, "merge-base", "origin/"+t.base, t.branch)
-	if err != nil {
-		_, cleanupErr := g.run(ctx, "worktree", "remove", t.path)
-		g.refresh(ctx)
-		return "", core.JoinWith(err, "remove worktree after failed merge-base", cleanupErr)
+// isObjectID reports whether s is a hexadecimal git object id. Both SHA-1 and
+// SHA-256 lengths are accepted so a ref read works in either repository format.
+func isObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
 	}
-	return strings.TrimSpace(mergeBase), nil
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// refSHA resolves ref to an object id without spawning git. A fetched remote
+// tracking ref is usually loose; an older or pruned one lives in packed-refs.
+func (g *GitWorktree) refSHA(ref string) (string, error) {
+	loose := filepath.Join(g.Root, ".git", filepath.FromSlash(ref))
+	if data, err := os.ReadFile(loose); err == nil {
+		if sha := strings.TrimSpace(string(data)); isObjectID(sha) {
+			return sha, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	packed, err := os.ReadFile(filepath.Join(g.Root, ".git", "packed-refs"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("ref %s not found", ref)
+		}
+		return "", err
+	}
+	for _, line := range strings.Split(string(packed), "\n") {
+		if line == "" || line[0] == '#' || line[0] == '^' {
+			continue
+		}
+		sha, name, ok := strings.Cut(line, " ")
+		if ok && name == ref && isObjectID(sha) {
+			return sha, nil
+		}
+	}
+	return "", fmt.Errorf("ref %s not found", ref)
+}
+
+// worktreeBase resolves the base commit of a fresh worktree. add -B pins the
+// branch tip to origin/base, so the merge base of the two is that tip. Reading
+// the remote tracking ref gives the same commit without a git subprocess. A
+// ref the disk reader cannot resolve falls back to merge-base, and either
+// failure removes the worktree so a failed create leaves no stale path.
+func (g *GitWorktree) worktreeBase(ctx context.Context, t createTarget) (string, error) {
+	base, err := g.refSHA("refs/remotes/origin/" + t.base)
+	if err == nil {
+		return base, nil
+	}
+	mergeBase, mergeErr := g.run(ctx, "merge-base", "origin/"+t.base, t.branch)
+	if mergeErr == nil {
+		return strings.TrimSpace(mergeBase), nil
+	}
+	_, cleanupErr := g.run(ctx, "worktree", "remove", t.path)
+	g.refresh(ctx)
+	return "", core.JoinWith(mergeErr, "remove worktree after failed base resolution", cleanupErr)
 }
 
 // Create checks out a fresh worktree for task.

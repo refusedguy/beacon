@@ -460,10 +460,13 @@ func TestGitWorktreeCreateCleanPathLimitsGitCalls(t *testing.T) {
 	if _, err := wt.Create(ctx, core.Task{ID: "T-COUNT"}); err != nil {
 		t.Fatalf("Create(): %v", err)
 	}
-	if len(calls) > 4 {
-		t.Fatalf("Create() ran %d git commands, want at most 4: %v", len(calls), calls)
+	if len(calls) != 2 {
+		t.Fatalf("Create() ran %d git commands, want fetch and worktree add only: %v", len(calls), calls)
 	}
 	for _, call := range calls {
+		if len(call) > 0 && call[0] == "merge-base" {
+			t.Fatalf("Create() spawned merge-base on a clean path: %v", calls)
+		}
 		if len(call) > 1 && call[0] == "worktree" && call[1] == "prune" {
 			t.Fatalf("Create() pruned on a clean path: %v", calls)
 		}
@@ -995,6 +998,9 @@ func rebaseInProgress(t *testing.T, path string) bool {
 func TestGitWorktreeCreateReportsMergeBaseCleanupFailure(t *testing.T) {
 	wt, _ := newTestGitWorktree(t)
 	ctx := context.Background()
+	// Point the ref reader at a directory with no git metadata so base
+	// resolution falls back to the merge-base subprocess.
+	wt.Root = t.TempDir()
 	mergeErr := errors.New("injected merge-base failure")
 	cleanupErr := errors.New("injected worktree remove failure")
 	wt.commandHook = func(dir string, args []string) error {
@@ -1014,7 +1020,7 @@ func TestGitWorktreeCreateReportsMergeBaseCleanupFailure(t *testing.T) {
 
 	_, err := wt.Create(ctx, core.Task{ID: "T-MB-CLEANUP"})
 	if !errors.Is(err, mergeErr) {
-		t.Fatalf("Create() error = %v, want the merge-base failure", err)
+		t.Fatalf("Create() error = %v, want the merge-base fallback failure", err)
 	}
 	if !errors.Is(err, cleanupErr) {
 		t.Fatalf("Create() error = %v, want the worktree cleanup failure", err)
