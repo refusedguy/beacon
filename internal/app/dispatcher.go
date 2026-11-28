@@ -227,6 +227,205 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	return out, nil
 }
 
+// StartOneOutcome is the caller-facing result of one targeted start. A refusal
+// carries a code and a reason with no run. Blockers names the dependencies
+// that still hold the task, and Active reports the in-flight count when a
+// global budget is full.
+type StartOneOutcome struct {
+	TaskID   core.TaskID      `json:"task_id"`
+	RunID    core.RunID       `json:"run_id,omitempty"`
+	State    core.RunState    `json:"state,omitempty"`
+	Scope    []core.ScopePath `json:"scope,omitempty"`
+	Code     string           `json:"code,omitempty"`
+	Reason   string           `json:"reason,omitempty"`
+	Blockers []StartBlocker   `json:"blockers,omitempty"`
+	Active   int              `json:"active,omitempty"`
+}
+
+// StartBlocker names one unresolved dependency and the status observed for it.
+// A blocker is read only. A targeted start never changes another card.
+type StartBlocker struct {
+	TaskID core.TaskID `json:"task_id"`
+	Status string      `json:"status"`
+}
+
+// StartOneCode is a stable refusal reason that the planner codes do not cover.
+type StartOneCode string
+
+const (
+	StartUnknownTask    StartOneCode = "unknown_task"
+	StartUnresolvedDeps StartOneCode = "unresolved_dependencies"
+	StartNoSlot         StartOneCode = "no_slot"
+	StartFailed         StartOneCode = "start_failed"
+)
+
+// StartOne starts exactly one named task. Every refusal is decided before the
+// task sync or any run write, so a blocked call leaves every other card and run
+// untouched. Unlike Dispatch, it never evicts or reprioritates another task.
+func (d *Dispatcher) StartOne(ctx context.Context, taskID core.TaskID) (StartOneOutcome, error) {
+	defer d.Decisions.flushDeferred()
+
+	out := StartOneOutcome{TaskID: taskID}
+	d.slotsMu.Lock()
+	available, err := d.Source.ListAvailable(ctx)
+	if err != nil {
+		d.slotsMu.Unlock()
+		return out, err
+	}
+	active, err := d.Store.ListActive(ctx)
+	if err != nil {
+		d.slotsMu.Unlock()
+		return out, err
+	}
+	view := d.withReserved(active)
+
+	// A run owns the task even when the card no longer reads as available, so
+	// this guard runs before the lookup in the task source.
+	for _, run := range view {
+		if run != nil && run.TaskID == taskID {
+			d.slotsMu.Unlock()
+			out.Code = string(SkipActiveRun)
+			out.Reason = "task already has an active run"
+			out.Blockers = []StartBlocker{{TaskID: taskID, Status: string(run.State)}}
+			d.Decisions.logDispatchSkip(ctx, SkippedTask{
+				TaskID: taskID, Code: SkipActiveRun, BlockedBy: taskID,
+				BlockedByRun: run.ID, Reason: out.Reason,
+			})
+			return out, nil
+		}
+	}
+
+	var task core.Task
+	found := false
+	for _, item := range available {
+		if item.ID == taskID {
+			task, found = item, true
+			break
+		}
+	}
+	if !found {
+		d.slotsMu.Unlock()
+		out.Code = string(StartUnknownTask)
+		out.Reason = "task is unknown or not available"
+		d.Decisions.logDispatchSkip(ctx, SkippedTask{
+			TaskID: taskID, Code: SkipCode(StartUnknownTask), Reason: out.Reason,
+		})
+		return out, nil
+	}
+	if task.Status != "" && task.Status != core.TaskAvailable {
+		d.slotsMu.Unlock()
+		out.Code = string(SkipBadStatus)
+		out.Reason = "task status is " + string(task.Status)
+		d.Decisions.logDispatchSkip(ctx, SkippedTask{
+			TaskID: taskID, Code: SkipBadStatus, Reason: out.Reason,
+		})
+		return out, nil
+	}
+
+	if blockers := unresolvedStartDeps(task, available, view); len(blockers) > 0 {
+		d.slotsMu.Unlock()
+		out.Code = string(StartUnresolvedDeps)
+		out.Reason = "unresolved dependencies: " + formatStartBlockers(blockers)
+		out.Blockers = blockers
+		d.Decisions.logDispatchSkip(ctx, SkippedTask{
+			TaskID: taskID, Code: SkipCode(StartUnresolvedDeps),
+			BlockedBy: blockers[0].TaskID, Reason: out.Reason,
+		})
+		return out, nil
+	}
+
+	limit := d.inFlightLimit()
+	out.Active = len(view)
+	if len(view) >= limit {
+		d.slotsMu.Unlock()
+		out.Code = string(StartNoSlot)
+		out.Reason = fmt.Sprintf("in-flight limit %d reached with %d active runs", limit, len(view))
+		d.Decisions.logDispatchSkip(ctx, SkippedTask{
+			TaskID: taskID, Code: SkipCode(StartNoSlot), Reason: out.Reason,
+		})
+		return out, nil
+	}
+	if d.availableFrom(view) <= 0 {
+		d.slotsMu.Unlock()
+		out.Code = string(StartNoSlot)
+		out.Reason = fmt.Sprintf("no agent slot free with %d active runs", len(view))
+		d.Decisions.logDispatchSkip(ctx, SkippedTask{
+			TaskID: taskID, Code: SkipCode(StartNoSlot), Reason: out.Reason,
+		})
+		return out, nil
+	}
+
+	// Every refusal is decided before this write, so a blocked call changes no
+	// card, run or status. Dispatch uses the same sync before it starts a run.
+	if err := d.Store.SyncTasks(ctx, available); err != nil {
+		d.slotsMu.Unlock()
+		return out, err
+	}
+	run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
+	if d.MaxAttempts > 0 {
+		run.MaxAttempts = d.MaxAttempts
+	}
+	run.Scope = task.Scope
+	run.ParentSessionID = core.FirstNonEmpty(parentSession(ctx), d.ParentSessionID)
+	if d.reserved == nil {
+		d.reserved = make(map[core.RunID]*slotReservation)
+	}
+	d.reserved[run.ID] = &slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: true}
+	d.slotsMu.Unlock()
+
+	defer d.dropReservation(run.ID)
+	if err := d.startOne(ctx, &dispatchBatch{}, run, task); err != nil {
+		d.handleStartFailure(ctx, run, err)
+		out.Code = string(StartFailed)
+		out.Reason = err.Error()
+		return out, nil
+	}
+	out.RunID = run.ID
+	out.State = run.State
+	out.Scope = run.Scope
+	return out, nil
+}
+
+// unresolvedStartDeps reports only this task's dependencies that are still
+// open. An active run marks a dependency in progress, an available card marks
+// it ready. An absent card is done, dropped or a pruned dangling edge, all of
+// which resolve the same way in the store's dependency predicate.
+func unresolvedStartDeps(task core.Task, available []core.Task, active []*core.Run) []StartBlocker {
+	byID := make(map[core.TaskID]core.Task, len(available))
+	for _, item := range available {
+		byID[item.ID] = item
+	}
+	busy := activeRunsByTask(active)
+	seen := make(map[core.TaskID]bool, len(task.DependsOn))
+	var out []StartBlocker
+	for _, dep := range task.DependsOn {
+		if seen[dep] {
+			continue
+		}
+		seen[dep] = true
+		if run, ok := busy[dep]; ok && !run.State.Terminal() {
+			out = append(out, StartBlocker{TaskID: dep, Status: string(core.TaskClaimed)})
+			continue
+		}
+		if item, ok := byID[dep]; ok {
+			status := string(item.Status)
+			if status == "" {
+				status = string(core.TaskAvailable)
+			}
+			out = append(out, StartBlocker{TaskID: dep, Status: status})
+		}
+	}
+	return out
+}
+
+func formatStartBlockers(blockers []StartBlocker) string {
+	parts := make([]string, 0, len(blockers))
+	for _, b := range blockers {
+		parts = append(parts, string(b.TaskID)+" ("+b.Status+")")
+	}
+	return strings.Join(parts, ", ")
+}
+
 // planDispatch selects and reserves one batch under slotsMu. The reservation
 // is visible to other batches before the lock is released, so none of them
 // can select a reserved task or spend a reserved slot while this batch runs

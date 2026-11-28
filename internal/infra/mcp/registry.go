@@ -70,6 +70,7 @@ func init() {
 		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskDelete},
 		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskUpdate},
 		{Name: "beacon_task_close", Description: "Close task cards with a status and reason in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskClose},
+		{Name: "beacon_task_start", Description: "Start one specific task by ID. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskStart},
 		{Name: "beacon_reconcile", Description: "Force one reconciler tick for a PR and report its decision. Orchestrator only.", OrchestratorOnly: true, Register: registerReconcile},
 	}
 	toolRegistrations = make([]func(*msdk.Server, Services), 0, len(toolSpecs))
