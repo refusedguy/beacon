@@ -23,6 +23,8 @@ const (
 	CodeExhausted ErrorCode = "exhausted"
 	// CodeBaseRed means the base branch has failing checks.
 	CodeBaseRed ErrorCode = "base_red"
+	// CodePermissionDenied means the caller's role cannot use the requested tool.
+	CodePermissionDenied ErrorCode = "permission_denied"
 )
 
 // AppError is an error that carries a stable code.
