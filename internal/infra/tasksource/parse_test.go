@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -193,6 +195,41 @@ func TestParseTaskFieldsAcceptsCardAliases(t *testing.T) {
 	want := []core.ScopePath{"f:a.go", "f:b.go"}
 	if resolved := got.Scopes(""); !reflect.DeepEqual(resolved, want) {
 		t.Fatalf("resolved scope = %v, want %v", resolved, want)
+	}
+}
+
+func TestParseTaskFieldsPerfGateKinds(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		want GateKind
+	}{
+		{"timing", GateKindTiming},
+		{"alloc", GateKindAlloc},
+		{"counter", GateKindCounter},
+		{"structural", GateKindStructural},
+	} {
+		body := "```yaml\nid: T-GATE\ngate:\n  kind: " + tc.kind + "\n  key: deciding-key\n```\n"
+		got := ParseTaskFields(body, "", "").Gate
+		want := PerfGate{Kind: tc.want, Key: "deciding-key"}
+		if got != want {
+			t.Errorf("gate kind %q = %+v, want %+v", tc.kind, got, want)
+		}
+	}
+}
+
+func TestParseCardFrontmatterPerfGate(t *testing.T) {
+	const frontmatter = "id: T-GATE\ngate:\n  kind: STRUCTURAL\n  key: ci-advisory\n"
+	var fm cardSchema
+	if err := yaml.Unmarshal([]byte(frontmatter), &fm); err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSchema(fm, "").Gate
+	want := PerfGate{Kind: GateKindStructural, Key: "ci-advisory"}
+	if got != want {
+		t.Fatalf("frontmatter gate = %+v, want %+v", got, want)
+	}
+	if unknown := normalizeGateKind("advisory"); unknown != "" {
+		t.Fatalf("unknown gate kind = %q, want empty", unknown)
 	}
 }
 
