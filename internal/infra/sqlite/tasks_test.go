@@ -42,6 +42,55 @@ func TestSyncTasksPersistsParent(t *testing.T) {
 	}
 }
 
+func TestSyncTasksKeepsDoneCardThroughPruneAndStaleSource(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if err := store.SyncTasks(ctx, []core.Task{
+		{ID: "T-DONE", Status: core.TaskAvailable},
+		{ID: "T-OPEN", Status: core.TaskAvailable},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTaskStatus(ctx, "T-DONE", string(core.TaskDone)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The source lists only available cards, so T-DONE is absent. The prune
+	// must keep its done row instead of deleting it.
+	if err := store.SyncTasks(ctx, []core.Task{{ID: "T-OPEN", Status: core.TaskAvailable}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusOf(t, store, "T-DONE"); got != string(core.TaskDone) {
+		t.Fatalf("status after prune sync = %q, want %q", got, core.TaskDone)
+	}
+
+	// A later sync where a stale frontmatter lists T-DONE as available must
+	// not revive it into the ready set, however often that sync runs.
+	for i := 0; i < 2; i++ {
+		if err := store.SyncTasks(ctx, []core.Task{
+			{ID: "T-DONE", Status: core.TaskAvailable},
+			{ID: "T-OPEN", Status: core.TaskAvailable},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := statusOf(t, store, "T-DONE"); got != string(core.TaskDone) {
+		t.Fatalf("status after stale sync = %q, want %q", got, core.TaskDone)
+	}
+	ready, err := store.ListReadyTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != 1 || ready[0].ID != "T-OPEN" {
+		t.Fatalf("ready tasks = %+v, want only T-OPEN", ready)
+	}
+}
+
 func TestSyncTasksRejectsBadGraphBeforeWriting(t *testing.T) {
 	cases := []struct {
 		name  string
