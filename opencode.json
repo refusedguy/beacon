@@ -30,6 +30,11 @@
           "resource": "*"
         },
         {
+          "action": "beacon_beacon_task_start",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
           "action": "beacon_beacon_task_update",
           "effect": "allow",
           "resource": "*"
@@ -62,6 +67,11 @@
         },
         {
           "action": "beacon_beacon_task_delete",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_task_start",
           "effect": "allow",
           "resource": "*"
         },
@@ -102,6 +112,11 @@
           "resource": "*"
         },
         {
+          "action": "beacon_beacon_task_start",
+          "effect": "deny",
+          "resource": "*"
+        },
+        {
           "action": "beacon_beacon_task_update",
           "effect": "deny",
           "resource": "*"
@@ -127,6 +142,11 @@
     },
     {
       "action": "beacon_beacon_task_delete",
+      "effect": "deny",
+      "resource": "*"
+    },
+    {
+      "action": "beacon_beacon_task_start",
       "effect": "deny",
       "resource": "*"
     },

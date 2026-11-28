@@ -138,6 +138,9 @@ type WaitService struct {
 
 // WaitFor blocks until the run is terminal or the context deadline expires.
 func (w WaitService) WaitFor(ctx context.Context, id core.RunID) (*core.Run, error) {
+	if w.Store == nil {
+		return nil, core.Errorf(core.CodeUnavailable, "wait store is not configured")
+	}
 	interval := w.Interval
 	if interval <= 0 {
 		interval = time.Second
