@@ -476,6 +476,55 @@ func TestGitWorktreeCreateCleanPathLimitsGitCalls(t *testing.T) {
 	}
 }
 
+func TestGitWorktreeCardOnlyDirtUsesOneStatusCall(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-CARD-DIRT-COUNT"})
+	if err != nil {
+		t.Fatalf("Create(): %v", err)
+	}
+	cards := filepath.Join(ws.Path, "docs", "tasks")
+	if err := os.MkdirAll(cards, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(cards): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cards, "stale.md"), []byte("stale\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(stale.md): %v", err)
+	}
+
+	var statusCalls int
+	wt.commandHook = func(_ string, args []string) error {
+		if len(args) > 0 && args[0] == "status" {
+			statusCalls++
+		}
+		return nil
+	}
+	dirty, onlyCards, err := wt.cardOnlyDirt(ctx, ws.Path)
+	if err != nil {
+		t.Fatalf("cardOnlyDirt(): %v", err)
+	}
+	if !dirty || !onlyCards {
+		t.Fatalf("cardOnlyDirt() = (%v, %v), want (true, true)", dirty, onlyCards)
+	}
+	if statusCalls != 1 {
+		t.Fatalf("cardOnlyDirt() ran %d status calls, want 1", statusCalls)
+	}
+
+	if err := os.WriteFile(filepath.Join(ws.Path, "agent.go"), []byte("agent\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(agent.go): %v", err)
+	}
+	statusCalls = 0
+	dirty, onlyCards, err = wt.cardOnlyDirt(ctx, ws.Path)
+	if err != nil {
+		t.Fatalf("cardOnlyDirt() with agent code: %v", err)
+	}
+	if !dirty || onlyCards {
+		t.Fatalf("cardOnlyDirt() with agent code = (%v, %v), want (true, false)", dirty, onlyCards)
+	}
+	if statusCalls != 1 {
+		t.Fatalf("cardOnlyDirt() ran %d status calls with agent code, want 1", statusCalls)
+	}
+}
+
 func TestGitWorktreeCommitPathOnlyStagesPathspec(t *testing.T) {
 	wt, _ := newTestGitWorktree(t)
 	ctx := context.Background()

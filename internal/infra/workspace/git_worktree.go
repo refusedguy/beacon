@@ -109,40 +109,59 @@ func (g *GitWorktree) status(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(out) == "", nil
 }
 
-// statusCount counts dirty paths, optionally restricted to one pathspec.
-func (g *GitWorktree) statusCount(ctx context.Context, path string, pathspec ...string) (int, error) {
-	args := []string{"status", "--porcelain", "--untracked-files=all"}
-	if len(pathspec) > 0 {
-		args = append(args, "--")
-		args = append(args, pathspec...)
+// porcelainPaths returns every path named by a porcelain v1 status line. A
+// rename names both source and destination, and either one outside docs/tasks
+// means the workspace holds more than a card marker.
+func porcelainPaths(line string) []string {
+	if len(line) < 4 {
+		return nil
 	}
-	out, err := g.runInDir(ctx, path, args...)
-	if err != nil {
-		return 0, err
+	rest := line[3:]
+	if i := strings.Index(rest, " -> "); i >= 0 {
+		return []string{
+			strings.Trim(strings.TrimSpace(rest[:i]), "\""),
+			strings.Trim(strings.TrimSpace(rest[i+4:]), "\""),
+		}
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		return 0, nil
-	}
-	return len(strings.Split(out, "\n")), nil
+	return []string{strings.Trim(strings.TrimSpace(rest), "\"")}
+}
+
+// underCards reports whether p is the docs/tasks directory or a path below it.
+func underCards(p string) bool {
+	return p == "docs/tasks" || strings.HasPrefix(p, "docs/tasks/")
 }
 
 // cardOnlyDirt reports whether a workspace is dirty and whether every dirty
 // path sits under docs/tasks. A Beacon status marker is safe to discard. Agent
-// code outside docs/tasks is not.
+// code outside docs/tasks is not. One status call returns the paths and Go
+// classifies them, instead of asking git to count them twice.
 func (g *GitWorktree) cardOnlyDirt(ctx context.Context, path string) (dirty, onlyCards bool, err error) {
-	all, err := g.statusCount(ctx, path)
+	out, err := g.runInDir(ctx, path, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return false, false, err
 	}
-	if all == 0 {
+	// Trim only the trailing newline. TrimSpace would eat the status field's
+	// leading blank and shift every path by one character.
+	out = strings.TrimRight(out, "\r\n")
+	if out == "" {
 		return false, true, nil
 	}
-	inside, err := g.statusCount(ctx, path, "docs/tasks")
-	if err != nil {
-		return false, false, err
+	onlyCards = true
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		for _, p := range porcelainPaths(line) {
+			if !underCards(p) {
+				onlyCards = false
+				break
+			}
+		}
+		if !onlyCards {
+			break
+		}
 	}
-	return true, all == inside, nil
+	return true, onlyCards, nil
 }
 
 // createTarget names the branch, worktree path and base ref for a task.
