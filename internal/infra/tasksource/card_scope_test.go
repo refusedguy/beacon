@@ -23,9 +23,7 @@ const (
 // singleton rule in AGENTS.md.
 var hotFiles = []string{
 	".github/workflows/ci.yml",
-	"cmd/beacon/commands.go",
 	"cmd/beacon/main.go",
-	"cmd/beacon/mcp.go",
 	"cmd/beacon/serve.go",
 	"internal/app/dispatcher.go",
 	"internal/app/reconcile_observation.go",

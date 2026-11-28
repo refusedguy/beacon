@@ -11,6 +11,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/internal/infra/sqlite"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
 func TestValidateControl(t *testing.T) {
@@ -338,5 +342,144 @@ func TestControlFallbackWiresWithEnvironmentParent(t *testing.T) {
 				t.Fatalf("wire parent = %q, want %q", *got, tc.want)
 			}
 		})
+	}
+}
+
+func TestControlRefusalPrintsReasonJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(core.NewWireControlRefusal(core.ControlApprove, core.RunID("r1"), "run is running"))
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, ".beacon")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(dir, 0o755): %v", err)
+	}
+	info := connectionInfo{Addr: srv.URL, Token: "tok", PID: os.Getpid()}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("json.Marshal(info): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "connection.json"), data, 0o600); err != nil {
+		t.Fatalf("os.WriteFile(connection.json): %v", err)
+	}
+	t.Setenv("BEACON_PROJECT_ROOT", root)
+
+	configPath := ""
+	cmd := newControlCommand(&configPath, wire)
+	cmd.SetArgs([]string{"--action", "approve", "--run-id", "r1", "--sha", "abc"})
+	var execErr error
+	out := captureStdout(t, func() { execErr = cmd.Execute() })
+	if execErr != nil {
+		t.Fatalf("cmd.Execute(): %v", execErr)
+	}
+	var result controlResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("output %q: %v", out, err)
+	}
+	if result.OK || result.Action != "approve" || result.RunID != "r1" || result.Reason != "run is running" {
+		t.Fatalf("result = %+v", result)
+	}
+	if !strings.Contains(out, `"ok": false`) {
+		t.Fatalf("output = %q, want ok false", out)
+	}
+}
+
+type failingWorktreeRemover struct{ err error }
+
+func (f failingWorktreeRemover) ForceRemove(context.Context, core.Workspace) error { return f.err }
+
+type recordingWorktreeRemover struct{ paths []string }
+
+func (r *recordingWorktreeRemover) ForceRemove(_ context.Context, ws core.Workspace) error {
+	r.paths = append(r.paths, ws.Path)
+	return nil
+}
+
+func gcFixture(t *testing.T) (*sqlite.Store, config.Config) {
+	t.Helper()
+	root := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	workspaceDir := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(filepath.Join(workspaceDir, "unused"), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(workspaceDir/unused): %v", err)
+	}
+	return store, config.Config{WorkspaceDir: workspaceDir}
+}
+
+func TestGCReportsRemovalFailure(t *testing.T) {
+	store, cfg := gcFixture(t)
+	err := gcWorktrees(context.Background(), cfg, store, failingWorktreeRemover{err: errors.New("permission denied")})
+	if err == nil {
+		t.Fatal("gc returned nil after a failed removal")
+	}
+	for _, want := range []string{"removed 0", "failed 1", "permission denied"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestGCRemovesUnusedWorktreesSilently(t *testing.T) {
+	store, cfg := gcFixture(t)
+	remover := &recordingWorktreeRemover{}
+	if err := gcWorktrees(context.Background(), cfg, store, remover); err != nil {
+		t.Fatalf("gcWorktrees: %v", err)
+	}
+	if len(remover.paths) != 1 {
+		t.Fatalf("removed paths = %v, want one directory", remover.paths)
+	}
+}
+
+func TestWithWriteLockRefusesWhileHeld(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := acquireLock(dir)
+	if err != nil {
+		t.Fatalf("acquireLock: %v", err)
+	}
+	defer lock.Close()
+	called := false
+	err = withWriteLock(dir, func() error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("withWriteLock ran while the lock was held")
+	}
+	if called {
+		t.Fatal("write ran without the lock")
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("error = %q, want lock contention", err)
+	}
+}
+
+func TestDispatchRequiresWriteLock(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := acquireLock(dir)
+	if err != nil {
+		t.Fatalf("acquireLock: %v", err)
+	}
+	defer lock.Close()
+	store, err := sqlite.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	fn := func(_, _ string) (*wiring, error) {
+		return &wiring{cfg: config.Config{StateDB: filepath.Join(dir, "state.db")}, store: store}, nil
+	}
+	configPath := ""
+	cmd := newDispatchCommand(&configPath, fn)
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	cmd.SetArgs([]string{"1"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("dispatch ran while the daemon lock was held")
 	}
 }
