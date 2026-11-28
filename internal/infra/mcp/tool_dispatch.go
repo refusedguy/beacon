@@ -17,15 +17,22 @@ type DispatchArgs struct {
 }
 
 // dispatchOutcome is one caller-facing line of a dispatch. Every candidate
-// gets one, whether it started, was skipped or failed to start.
+// gets one, whether it started, was skipped or failed to start. Reason is the
+// reason the run or skip actually gave; an empty reason stays empty. Next tells
+// the caller how to clear a skip or a failed start.
 type dispatchOutcome struct {
 	ID       string `json:"id"`
 	TaskID   string `json:"task_id"`
 	State    string `json:"state"`
 	Reason   string `json:"reason"`
+	Next     string `json:"next"`
 	Launch   string `json:"launch_source,omitempty"`
 	Identity string `json:"agent_identity,omitempty"`
 }
+
+// dispatchFailureNext is the step that clears a worker that failed to start.
+// The outcome's Reason carries the underlying error.
+const dispatchFailureNext = "inspect the failure reason, resolve it, then dispatch again"
 
 func registerDispatch(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, catalogTool("beacon_dispatch"), func(ctx context.Context, req *msdk.CallToolRequest, a DispatchArgs) (*msdk.CallToolResult, any, error) {
@@ -53,13 +60,14 @@ func registerDispatch(s *msdk.Server, sv Services) {
 		for _, failure := range res.Failures {
 			summary = append(summary, dispatchOutcome{
 				ID: string(failure.TaskID), TaskID: string(failure.TaskID),
-				State: "failed", Reason: failure.Err, Launch: string(source), Identity: agent,
+				State: "failed", Reason: failure.Err, Next: dispatchFailureNext,
+				Launch: string(source), Identity: agent,
 			})
 		}
 		for _, skip := range res.Skipped {
 			summary = append(summary, dispatchOutcome{
 				ID: string(skip.TaskID), TaskID: string(skip.TaskID),
-				State: "skipped", Reason: skip.Reason,
+				State: "skipped", Reason: skip.Reason, Next: dispatchSkipNext(skip),
 			})
 		}
 		return jsonResult(map[string]any{
@@ -72,14 +80,20 @@ func registerDispatch(s *msdk.Server, sv Services) {
 }
 
 func outcomeForRun(run *core.Run) dispatchOutcome {
-	reason := run.Reason
-	if reason == "" {
-		reason = string(run.State)
-	}
 	return dispatchOutcome{
 		ID: string(run.ID), TaskID: string(run.TaskID), State: string(run.State),
-		Reason: reason, Launch: string(run.LaunchSource), Identity: run.AgentIdentity,
+		Reason: run.Reason, Launch: string(run.LaunchSource), Identity: run.AgentIdentity,
 	}
+}
+
+// dispatchSkipNext returns the action a skip tells the caller to take. A skip
+// built without a Next still gets its action filled when the raw skipped array
+// is encoded, so the summary mirrors that default instead of going empty.
+func dispatchSkipNext(skip app.SkippedTask) string {
+	if skip.Next != "" {
+		return skip.Next
+	}
+	return "review the skip reason, then dispatch again"
 }
 
 // normalizeLaunchSource maps caller metadata onto the neutral tokens core

@@ -43,6 +43,167 @@ type ReconcilerStore interface {
 	UpdateIncident(ctx context.Context, in *core.BaseIncident) error
 }
 
+// runRevision identifies the stored version of a run. Both fields come from
+// the same read, matching the version check in the store's SaveCAS primitive.
+type runRevision struct {
+	updatedAt int64
+	headSHA   string
+}
+
+func revisionOf(run *core.Run) runRevision {
+	if run == nil {
+		return runRevision{}
+	}
+	return runRevision{updatedAt: run.UpdatedAt.UnixNano(), headSHA: run.HeadSHA}
+}
+
+// reconcileCASStore scopes compare-and-swap writes to one reconcile pass. It
+// remembers the version of every run the pass reads and makes each later save
+// compare against the most recent read or write. A transition saved by another
+// caller between those points fails with CodeConflict instead of being
+// overwritten. A store without SaveCAS keeps its plain save.
+type reconcileCASStore struct {
+	ReconcilerStore
+	mu        sync.Mutex
+	revisions map[core.RunID]runRevision
+}
+
+func newReconcileCASStore(inner ReconcilerStore, read ...*core.Run) *reconcileCASStore {
+	s := &reconcileCASStore{ReconcilerStore: inner, revisions: make(map[core.RunID]runRevision)}
+	s.remember(read...)
+	return s
+}
+
+func (s *reconcileCASStore) remember(runs ...*core.Run) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, run := range runs {
+		if run == nil {
+			continue
+		}
+		s.revisions[run.ID] = revisionOf(run)
+	}
+}
+
+// FindByPR and Get return runs that this pass may later save. Remembering the
+// version here makes each save compare against what the pass actually saw.
+func (s *reconcileCASStore) FindByPR(ctx context.Context, pr int) (*core.Run, error) {
+	run, err := s.ReconcilerStore.FindByPR(ctx, pr)
+	if err == nil {
+		s.remember(run)
+	}
+	return run, err
+}
+
+func (s *reconcileCASStore) Get(ctx context.Context, id core.RunID) (*core.Run, error) {
+	run, err := s.ReconcilerStore.Get(ctx, id)
+	if err == nil {
+		s.remember(run)
+	}
+	return run, err
+}
+
+func (s *reconcileCASStore) ListActive(ctx context.Context) ([]*core.Run, error) {
+	runs, err := s.ReconcilerStore.ListActive(ctx)
+	if err == nil {
+		s.remember(runs...)
+	}
+	return runs, err
+}
+
+func (s *reconcileCASStore) FindActiveByTask(ctx context.Context, id core.TaskID) (*core.Run, error) {
+	run, err := s.ReconcilerStore.FindActiveByTask(ctx, id)
+	if err == nil {
+		s.remember(run)
+	}
+	return run, err
+}
+
+func (s *reconcileCASStore) ListByIncident(ctx context.Context, id string) ([]*core.Run, error) {
+	runs, err := s.ReconcilerStore.ListByIncident(ctx, id)
+	if err == nil {
+		s.remember(runs...)
+	}
+	return runs, err
+}
+
+// ActiveRunsByPR keeps the duplicate-owner warning working through the wrapper.
+func (s *reconcileCASStore) ActiveRunsByPR(ctx context.Context, pr int) ([]*core.Run, error) {
+	finder, ok := s.ReconcilerStore.(prOwnerFinder)
+	if !ok {
+		return nil, nil
+	}
+	runs, err := finder.ActiveRunsByPR(ctx, pr)
+	if err == nil {
+		s.remember(runs...)
+	}
+	return runs, err
+}
+
+// Save compares against the version this pass last read or wrote. A run the
+// pass never read has no version to compare, so it keeps the plain save.
+func (s *reconcileCASStore) Save(ctx context.Context, run *core.Run) error {
+	cas, ok := s.ReconcilerStore.(casStore)
+	if !ok {
+		return s.ReconcilerStore.Save(ctx, run)
+	}
+	s.mu.Lock()
+	expected, tracked := s.revisions[run.ID]
+	s.mu.Unlock()
+	if !tracked {
+		return s.ReconcilerStore.Save(ctx, run)
+	}
+	if err := cas.SaveCAS(ctx, run, expected.updatedAt, expected.headSHA); err != nil {
+		return err
+	}
+	s.remember(run)
+	return nil
+}
+
+// withStore returns a view of the reconciler that writes through store for one
+// pass. Watchdog state stays with the original reconciler, which owns it.
+func (r *Reconciler) withStore(store ReconcilerStore) *Reconciler {
+	return &Reconciler{
+		Store: store, SCM: r.SCM, Policy: r.Policy, Harness: r.Harness,
+		Source: r.Source, Workspace: r.Workspace, Notifier: r.Notifier,
+		Promoter: r.Promoter, AgentSlots: r.AgentSlots, Changes: r.Changes,
+		Repo: r.Repo, BaseBranch: r.BaseBranch, ParentSessionID: r.ParentSessionID,
+		BaseRedMode: r.BaseRedMode, WorkerInstructions: r.WorkerInstructions,
+		MaxFixTries: r.MaxFixTries, MaxAttempts: r.MaxAttempts,
+		Interval: r.Interval, OrphanTimeout: r.OrphanTimeout, Events: r.Events,
+		AutoRebase: r.AutoRebase, MaxAutoRebases: r.MaxAutoRebases,
+		RebaseCap: r.RebaseCap, Decisions: r.Decisions,
+		Dispatch: r.Dispatch, AutoDispatchEnabled: r.AutoDispatchEnabled,
+		AutoDispatchBatchSize: r.AutoDispatchBatchSize, DispatchOpen: r.DispatchOpen,
+		WatchdogEnabled: r.WatchdogEnabled, WatchdogAges: r.WatchdogAges,
+	}
+}
+
+// recentRunLister is the optional store capability for finding a finished run
+// bound to a PR. Stores without it treat every active-lookup miss as unbound.
+type recentRunLister interface {
+	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
+}
+
+// hasFinishedRun reports whether a terminal run still holds pr. It keeps the
+// tick after a merge or close a noop instead of an unbound-PR error.
+func (r *Reconciler) hasFinishedRun(ctx context.Context, pr int) bool {
+	recent, ok := r.Store.(recentRunLister)
+	if !ok {
+		return false
+	}
+	runs, err := recent.ListRecent(ctx, 0)
+	if err != nil {
+		return false
+	}
+	for _, run := range runs {
+		if run != nil && run.PRNumber == pr {
+			return true
+		}
+	}
+	return false
+}
+
 // stalePruner is the optional store capability for reclaiming old delivery and
 // approval rows. The reconciler type-asserts its store so adapters without
 // retention support keep working, and keeps the store ports free of a method
@@ -182,9 +343,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	if err != nil {
 		return core.MergeDecision{}, err
 	}
-	if run == nil || run.State.Terminal() {
+	if run == nil {
+		// FindByPR returns only active runs. A PR whose run just finished is
+		// still bound, so a completed tick must stay a noop. A PR with no run
+		// at all is an input error the operator needs to see.
+		if r.hasFinishedRun(ctx, pr) {
+			return core.MergeDecision{Verdict: core.VerdictNoop}, nil
+		}
+		return core.MergeDecision{}, core.Errorf(core.CodeNotFound, "no run bound to PR %d", pr)
+	}
+	if run.State.Terminal() {
 		return core.MergeDecision{Verdict: core.VerdictNoop}, nil
 	}
+	// The deferred decision logger owns the cache shared across reconciles, so
+	// register it on the original reconciler before switching to the CAS view.
+	decisions := &r.Decisions
+	r = r.withStore(newReconcileCASStore(r.Store, run))
 	if finder, ok := r.Store.(prOwnerFinder); ok {
 		owners, err := finder.ActiveRunsByPR(ctx, pr)
 		if err != nil {
@@ -202,7 +376,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	if run.PRNumber == 0 {
 		run.PRNumber = pr
 	}
-	defer r.Decisions.logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
+	defer decisions.logReconcileDecisionDeferred(ctx, pr, run, obs, &decision)
 	// Classify a final PR state before any approval lookup or policy decision.
 	// A merged or closed PR is final even when a provider call fails, so the
 	// run can close without waiting on unrelated signals.
