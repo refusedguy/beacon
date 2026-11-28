@@ -23,7 +23,10 @@ type ToolSpec struct {
 	// trusted boundary and the client permission is the role gate. A caller
 	// that does declare the worker role is still refused server-side.
 	OrchestratorOnly bool
-	Register         func(*msdk.Server, Services)
+	// AllowAll grants a worker tool to every agent, so a normal call never
+	// falls back to an interactive permission prompt.
+	AllowAll bool
+	Register func(*msdk.Server, Services)
 }
 
 // requireOrchestrator refuses a tool call whose metadata names a worker agent.
@@ -62,7 +65,7 @@ func init() {
 		{Name: "beacon_status", Description: "List active runs, PRs and blockers.", Register: registerStatus},
 		{Name: "beacon_recent", Description: "List the most recently finished runs.", Register: registerRecent},
 		{Name: "beacon_wait", Description: "Wait for a run to reach an active verdict or a terminal state.", Register: registerWait},
-		{Name: "beacon_control", Description: controlDescription(), Register: registerControl},
+		{Name: "beacon_control", Description: controlDescription(), AllowAll: true, Register: registerControl},
 		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskCreate},
 		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskDelete},
 		{Name: "beacon_task_update", Description: "Update task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true, Register: registerTaskUpdate},
@@ -104,27 +107,39 @@ type Permission struct {
 
 // PermissionSet groups the catalog-derived entries by scope. Global denies an
 // orchestrator-only tool everywhere, Allow restores it for orchestrators and
-// the build agent, and Deny keeps it away from workers.
+// the build agent, and Deny keeps it away from workers. Worker tools marked
+// AllowAll appear in Allow and Deny with the allow effect.
 type PermissionSet struct {
 	Global []Permission
 	Allow  []Permission
 	Deny   []Permission
 }
 
+// mcpAction is the action string OpenCode checks for an MCP tool. The CLI
+// joins the server name and the tool name with an underscore, so the beacon
+// server and a beacon_* tool produce a beacon_beacon_* action.
+func mcpAction(name string) string {
+	return "beacon_" + name
+}
+
 // GeneratedPermissions derives the permission entries beacon-gen owns from the
-// tool catalog. Catalog names already carry their prefix, so each
-// orchestrator-only tool contributes exactly one real action name.
+// tool catalog. OpenCode prefixes every tool name with the server name, so a
+// catalog name such as beacon_task_create becomes beacon_beacon_task_create.
 func GeneratedPermissions(specs []ToolSpec) PermissionSet {
 	set := PermissionSet{}
 	sorted := append([]ToolSpec(nil), specs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 	for _, spec := range sorted {
-		if !spec.OrchestratorOnly {
-			continue
+		action := mcpAction(spec.Name)
+		switch {
+		case spec.OrchestratorOnly:
+			set.Global = append(set.Global, permission(action, "deny"))
+			set.Allow = append(set.Allow, permission(action, "allow"))
+			set.Deny = append(set.Deny, permission(action, "deny"))
+		case spec.AllowAll:
+			set.Allow = append(set.Allow, permission(action, "allow"))
+			set.Deny = append(set.Deny, permission(action, "allow"))
 		}
-		set.Global = append(set.Global, permission(spec.Name, "deny"))
-		set.Allow = append(set.Allow, permission(spec.Name, "allow"))
-		set.Deny = append(set.Deny, permission(spec.Name, "deny"))
 	}
 	return set
 }
@@ -134,14 +149,14 @@ func permission(action, effect string) Permission {
 }
 
 // OwnedActions returns the action names owned by the generated permission
-// writer. It includes the doubled prefix older generators emitted, so both the
-// library merge and cmd/beacon-gen drop the same stale entries. Keeping the
-// rule here gives the two writers one owner.
+// writer. It keeps the namespaced action this generator writes and also drops
+// the unprefixed catalog name older generators emitted. Keeping the rule here
+// gives the library merge and cmd/beacon-gen one owner.
 func OwnedActions(want []Permission) map[string]bool {
 	owned := make(map[string]bool, len(want)*2)
 	for _, p := range want {
 		owned[p.Action] = true
-		owned["beacon_"+p.Action] = true
+		owned[strings.TrimPrefix(p.Action, "beacon_")] = true
 	}
 	return owned
 }
