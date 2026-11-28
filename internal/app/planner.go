@@ -111,13 +111,8 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 			}
 			t.Scope = []core.ScopePath{core.ScopeAll()}
 		}
-		if budget := declaredScopeBudget(t.Scope); !scopeWithinCap(budget) {
-			skipped = append(skipped, SkippedTask{
-				TaskID: t.ID,
-				Code:   SkipOversizedScope,
-				Reason: fmt.Sprintf("scope breaks the 3-2-1200 cap: %d paths, %d production files",
-					budget.paths, budget.files),
-			})
+		if skip, ok := oversizedSkip(t); ok {
+			skipped = append(skipped, skip)
 			continue
 		}
 		if blocker, paths := p.activeConflict(t, index); blocker != nil {
@@ -152,6 +147,22 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 		selected = append(selected, t)
 	}
 	return selected, skipped, nil
+}
+
+// oversizedSkip reports the dispatch-time backstop for a card that breaks the
+// 3-2-1200 cap. Creation measures lines against the checkout; the planner only
+// sees the parsed card, so it checks paths and production file paths.
+func oversizedSkip(t core.Task) (SkippedTask, bool) {
+	budget := declaredScopeBudget(t.Scope)
+	if scopeWithinCap(budget) {
+		return SkippedTask{}, false
+	}
+	return SkippedTask{
+		TaskID: t.ID,
+		Code:   SkipOversizedScope,
+		Reason: fmt.Sprintf("scope breaks the 3-2-1200 cap: %d paths, %d production files",
+			budget.paths, budget.files),
+	}, true
 }
 
 // newActiveRunIndex builds the per-cycle view of active runs: busy task IDs and
