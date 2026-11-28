@@ -4,8 +4,12 @@
 import { locationInfo } from "../state/location.js"
 import {
   RESUBSCRIBE_MAX_MS, RESUBSCRIBE_MIN_MS, RUN_CHANGED_EVENT,
-  eventKey, eventMatchesLocation,
+  eventKey, eventMatchesLocation, str,
 } from "./ui_model.js"
+
+// Notifications carry no run identity. Each one must reach the panel, so the
+// dedupe window does not record them.
+const NOTIFICATION_TYPES = new Set(["ping", "resync", "gap", "reconnected"])
 
 export function createRunChangeBridge(rpc, ownLocation, onEvent, deps = {}) {
   const now = deps.now ?? (() => Date.now())
@@ -34,12 +38,18 @@ export function createRunChangeBridge(rpc, ownLocation, onEvent, deps = {}) {
       const unsubscribe = rpc.events.on(RUN_CHANGED_EVENT, (event) => {
         if (stopped) return
         try {
-          if (!eventMatchesLocation(event?.location, ownLocation)) return
-          const key = eventKey(event?.data)
+          // The watcher emits a flat payload. Older peers wrap it in data.
+          const payload = event?.data ?? event
+          // A live event without a location is not evidence that it belongs to
+          // another project. Only filter when the sender states a location.
+          if (event?.location != null && !eventMatchesLocation(event.location, ownLocation)) return
+          const key = NOTIFICATION_TYPES.has(str(event?.type)) ? "" : eventKey(payload)
           if (key && keys.has(key)) return
-          if (key) { keys.add(key); if (keys.size > 128) keys = new Set([...keys].slice(-64)) }
           lastEventAt = now()
+          // Acknowledge only after the callback accepts the event. A callback
+          // that throws retries the subscription and must see the event again.
           onEvent(event)
+          if (key) { keys.add(key); if (keys.size > 128) keys = new Set([...keys].slice(-64)) }
         } catch {
           teardown()
           scheduleRetry()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
@@ -154,7 +155,7 @@ func runWireEncode(e *env) (int64, int64) {
 		errs++
 	}
 	work += int64(len(b))
-	event := core.NewWireEvent(core.HarnessEvent{Kind: string(core.EvPRRegistered), RunID: e.wire[0].ID})
+	event := core.NewWireEvent(core.HarnessEvent{Kind: string(core.EvPRRegistered), RunID: e.wire[0].ID}, 1, time.Unix(0, 0).UTC())
 	b, err = json.Marshal(event)
 	if err != nil {
 		errs++
