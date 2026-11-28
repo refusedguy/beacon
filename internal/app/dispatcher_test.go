@@ -1125,6 +1125,64 @@ func TestConcurrentDispatchRespectsInFlightCap(t *testing.T) {
 	}
 }
 
+// TestDispatchParallelLaunchSharesRaceSafeFakes drives one wave of starts with
+// the unguarded fakes. Every run goes through Create, MarkInWorkspace, Spawn,
+// Save and SetTaskStatus at the same time, so the race job catches any shared
+// fake field that is still written without a lock.
+func TestDispatchParallelLaunchSharesRaceSafeFakes(t *testing.T) {
+	const count = 6
+	tasks := make([]core.Task, count)
+	for i := range tasks {
+		tasks[i] = core.Task{
+			ID:     core.TaskID(fmt.Sprintf("T-PAR-%02d", i)),
+			Status: core.TaskAvailable,
+			Scope:  []core.ScopePath{core.ScopeFile(fmt.Sprintf("par%d.go", i))},
+		}
+	}
+	src := &fakeSource{tasks: tasks, log: &callLog{}}
+	ws := &fakeWorkspace{}
+	h := &fakeHarness{}
+	store := newFakeStore()
+	d := &Dispatcher{
+		Source: src, Planner: NewPlanner(nil), Workspace: ws, Harness: h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: count, MaxActiveAgents: count},
+	}
+	res, err := d.Dispatch(context.Background(), count)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if len(res.Runs) != count {
+		t.Fatalf("runs = %d, want %d", len(res.Runs), count)
+	}
+	if ws.creates != count {
+		t.Fatalf("creates = %d, want %d", ws.creates, count)
+	}
+	if len(src.marked) != count || len(h.sessions) != count {
+		t.Fatalf("marks = %d, sessions = %d, want %d each", len(src.marked), len(h.sessions), count)
+	}
+	marked := map[core.TaskID]int{}
+	for _, call := range src.marked {
+		marked[call.id]++
+	}
+	if len(marked) != count {
+		t.Fatalf("marked tasks = %v, want %d distinct ids", marked, count)
+	}
+	for _, task := range tasks {
+		if marked[task.ID] != 1 {
+			t.Fatalf("task %s marked %d times, want 1", task.ID, marked[task.ID])
+		}
+	}
+	entries := src.log.entries()
+	if len(entries) != count {
+		t.Fatalf("source log = %v, want %d entries", entries, count)
+	}
+	for _, entry := range entries {
+		if entry != "mark:in_progress" {
+			t.Fatalf("source log entry = %q, want mark:in_progress", entry)
+		}
+	}
+}
+
 // TestFailedSpawnFreesReservation checks that a held agent slot is released
 // when its worker fails, so the next dispatch can use it.
 func TestFailedSpawnFreesReservation(t *testing.T) {

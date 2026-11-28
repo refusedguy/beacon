@@ -4,17 +4,33 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-type callLog struct{ items []string }
+type callLog struct {
+	mu    sync.Mutex
+	items []string
+}
 
 func (l *callLog) add(entry string) {
-	if l != nil {
-		l.items = append(l.items, entry)
+	if l == nil {
+		return
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.items = append(l.items, entry)
+}
+
+func (l *callLog) entries() []string {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.items...)
 }
 
 type markCall struct {
@@ -29,6 +45,7 @@ type commitCall struct {
 }
 
 type fakeSource struct {
+	mu          sync.Mutex
 	tasks       []core.Task
 	claimed     []core.TaskID
 	complete    []core.TaskID
@@ -38,12 +55,20 @@ type fakeSource struct {
 	log         *callLog
 }
 
-func (f *fakeSource) ListAvailable(context.Context) ([]core.Task, error) { return f.tasks, nil }
+func (f *fakeSource) ListAvailable(context.Context) ([]core.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tasks, nil
+}
 func (f *fakeSource) Claim(_ context.Context, id core.TaskID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.claimed = append(f.claimed, id)
 	return nil
 }
 func (f *fakeSource) Complete(_ context.Context, id core.TaskID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.completeErr != nil {
 		return f.completeErr
 	}
@@ -51,17 +76,22 @@ func (f *fakeSource) Complete(_ context.Context, id core.TaskID) error {
 	return nil
 }
 func (f *fakeSource) MarkInWorkspace(_ context.Context, id core.TaskID, path, status string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.marked = append(f.marked, markCall{id: id, path: path, status: status})
 	f.log.add("mark:" + status)
 	return nil
 }
 func (f *fakeSource) Remove(_ context.Context, id core.TaskID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.removed = append(f.removed, id)
 	f.log.add("remove:" + string(id))
 	return nil
 }
 
 type fakeStore struct {
+	mu            sync.Mutex
 	runs          map[core.RunID]*core.Run
 	deliveries    map[string]bool
 	approvals     map[string]bool
@@ -81,11 +111,15 @@ func newFakeStore() *fakeStore {
 }
 
 func (f *fakeStore) Save(_ context.Context, r *core.Run) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	copy := *r
 	f.runs[r.ID] = &copy
 	return nil
 }
 func (f *fakeStore) Get(_ context.Context, id core.RunID) (*core.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	r, ok := f.runs[id]
 	if !ok {
 		return nil, nil
@@ -93,6 +127,8 @@ func (f *fakeStore) Get(_ context.Context, id core.RunID) (*core.Run, error) {
 	return r, nil
 }
 func (f *fakeStore) FindByPR(_ context.Context, pr int) (*core.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, r := range f.runs {
 		if r.PRNumber == pr && !r.State.Terminal() {
 			return r, nil
@@ -101,6 +137,8 @@ func (f *fakeStore) FindByPR(_ context.Context, pr int) (*core.Run, error) {
 	return nil, nil
 }
 func (f *fakeStore) FindActiveByTask(_ context.Context, id core.TaskID) (*core.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, r := range f.runs {
 		if r.TaskID == id && !r.State.Terminal() {
 			return r, nil
@@ -109,6 +147,8 @@ func (f *fakeStore) FindActiveByTask(_ context.Context, id core.TaskID) (*core.R
 	return nil, nil
 }
 func (f *fakeStore) ActiveTaskIDs(_ context.Context, ids []string) (map[string]core.RunState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := make(map[string]core.RunState)
 	for _, id := range ids {
 		for _, r := range f.runs {
@@ -121,6 +161,8 @@ func (f *fakeStore) ActiveTaskIDs(_ context.Context, ids []string) (map[string]c
 	return out, nil
 }
 func (f *fakeStore) ListActive(context.Context) ([]*core.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []*core.Run
 	for _, r := range f.runs {
 		if !r.State.Terminal() {
@@ -130,6 +172,8 @@ func (f *fakeStore) ListActive(context.Context) ([]*core.Run, error) {
 	return out, nil
 }
 func (f *fakeStore) ListRecent(_ context.Context, limit int) ([]*core.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []*core.Run
 	for _, r := range f.runs {
 		if r.State == core.RunMerged || r.State == core.RunClosed || r.State == core.RunState("dropped") {
@@ -143,6 +187,8 @@ func (f *fakeStore) ListRecent(_ context.Context, limit int) ([]*core.Run, error
 	return out, nil
 }
 func (f *fakeStore) ListByIncident(_ context.Context, id string) ([]*core.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []*core.Run
 	for _, r := range f.runs {
 		if r.BlockedIncidentID == id {
@@ -152,6 +198,8 @@ func (f *fakeStore) ListByIncident(_ context.Context, id string) ([]*core.Run, e
 	return out, nil
 }
 func (f *fakeStore) ClaimDelivery(_ context.Context, key string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.deliveries[key] {
 		return false, nil
 	}
@@ -159,27 +207,39 @@ func (f *fakeStore) ClaimDelivery(_ context.Context, key string) (bool, error) {
 	return true, nil
 }
 func (f *fakeStore) ReleaseDelivery(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	delete(f.deliveries, key)
 	return nil
 }
 func (f *fakeStore) SetApproval(_ context.Context, id core.RunID, sha string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.approvals[string(id)+":"+sha] = true
 	return nil
 }
 func (f *fakeStore) Approved(_ context.Context, id core.RunID, sha string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.approvals[string(id)+":"+sha], nil
 }
 func (f *fakeStore) SyncTasks(_ context.Context, tasks []core.Task) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.tasks = tasks
 	return nil
 }
 func (f *fakeStore) ListReadyTasks(context.Context) ([]core.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.ready != nil {
 		return f.ready, nil
 	}
 	return f.tasks, nil
 }
 func (f *fakeStore) SetTaskStatus(_ context.Context, taskID core.TaskID, status string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.taskStatusErr != nil {
 		return f.taskStatusErr
 	}
@@ -187,6 +247,8 @@ func (f *fakeStore) SetTaskStatus(_ context.Context, taskID core.TaskID, status 
 	return nil
 }
 func (f *fakeStore) CreateIncident(_ context.Context, in *core.BaseIncident) (*core.BaseIncident, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if existing := f.incidents[in.Signature]; existing != nil {
 		return existing, nil
 	}
@@ -199,6 +261,8 @@ func (f *fakeStore) CreateIncident(_ context.Context, in *core.BaseIncident) (*c
 	return &copy, nil
 }
 func (f *fakeStore) GetIncident(_ context.Context, id string) (*core.BaseIncident, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, in := range f.incidents {
 		if in.ID == id {
 			return in, nil
@@ -207,9 +271,13 @@ func (f *fakeStore) GetIncident(_ context.Context, id string) (*core.BaseInciden
 	return nil, nil
 }
 func (f *fakeStore) FindOpenIncident(_ context.Context, _, _, signature string) (*core.BaseIncident, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.incidents[signature], nil
 }
 func (f *fakeStore) ListOpenIncidents(context.Context) ([]*core.BaseIncident, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []*core.BaseIncident
 	for _, in := range f.incidents {
 		if in.Status == "open" {
@@ -219,6 +287,8 @@ func (f *fakeStore) ListOpenIncidents(context.Context) ([]*core.BaseIncident, er
 	return out, nil
 }
 func (f *fakeStore) UpdateIncident(_ context.Context, in *core.BaseIncident) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.incidents[in.Signature] = in
 	return nil
 }
@@ -234,6 +304,7 @@ var (
 )
 
 type fakeWorkspace struct {
+	mu            sync.Mutex
 	removed       int
 	forcedRemoves int
 	dirty         bool
@@ -248,18 +319,28 @@ type fakeWorkspace struct {
 }
 
 func (f *fakeWorkspace) Create(_ context.Context, t core.Task) (core.Workspace, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.creates++
 	if f.creates == 1 && f.createErrOnce != nil {
 		return core.Workspace{}, f.createErrOnce
 	}
 	return core.Workspace{Path: "/ws/" + string(t.ID), Branch: "beacon/" + string(t.ID)}, nil
 }
-func (f *fakeWorkspace) Clean(context.Context, core.Workspace) (bool, error) { return !f.dirty, nil }
+func (f *fakeWorkspace) Clean(context.Context, core.Workspace) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.dirty, nil
+}
 func (f *fakeWorkspace) Remove(_ context.Context, _ core.Workspace) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.removed++
 	return nil
 }
 func (f *fakeWorkspace) ForceRemove(_ context.Context, _ core.Workspace) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.forcedRemoves++
 	return nil
 }
@@ -269,6 +350,8 @@ func (f *fakeWorkspace) HasChanges(context.Context, core.Workspace, string) (boo
 func (f *fakeWorkspace) EnsureBranch(context.Context, string, string) error { return nil }
 
 func (f *fakeWorkspace) CommitPath(_ context.Context, _ core.Workspace, pathspec, message string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.commits = append(f.commits, commitCall{pathspec: pathspec, message: message})
 	f.log.add("commit:" + pathspec)
 	f.pushes++
@@ -279,6 +362,8 @@ func (f *fakeWorkspace) CommitPath(_ context.Context, _ core.Workspace, pathspec
 }
 
 func (f *fakeWorkspace) RebaseBase(_ context.Context, _ core.Workspace, base string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.rebaseBaseErr != nil {
 		return f.rebaseBaseErr
 	}
@@ -293,6 +378,7 @@ type parentNotification struct {
 }
 
 type fakeHarness struct {
+	mu            sync.Mutex
 	sessions      []string
 	prompts       []string
 	wakes         []core.WakeContext
@@ -303,24 +389,37 @@ type fakeHarness struct {
 }
 
 func (f *fakeHarness) Spawn(_ context.Context, req core.SpawnRequest) (core.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.sessions = append(f.sessions, string(req.RunID))
 	f.prompts = append(f.prompts, req.Prompt)
 	return core.Session{ID: "sess-" + string(req.RunID)}, nil
 }
 func (f *fakeHarness) Wake(_ context.Context, _ string, w core.WakeContext) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.wakes = append(f.wakes, w)
 	return nil
 }
-func (f *fakeHarness) Stop(context.Context, string) error { f.stops++; return nil }
+func (f *fakeHarness) Stop(context.Context, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stops++
+	return nil
+}
 func (f *fakeHarness) IsAlive(context.Context, string) (bool, error) {
 	return true, nil
 }
 func (f *fakeHarness) NotifyParent(_ context.Context, sessionID, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.notifications = append(f.notifications, parentNotification{sessionID: sessionID, text: text})
 	f.log.add("notify_parent")
 	return nil
 }
 func (f *fakeHarness) Events() <-chan core.HarnessEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.events == nil {
 		f.events = make(chan core.HarnessEvent, 16)
 	}

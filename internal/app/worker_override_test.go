@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -10,11 +11,14 @@ import (
 
 type requestCapturingHarness struct {
 	*fakeHarness
+	mu       sync.Mutex
 	requests []core.SpawnRequest
 }
 
 func (h *requestCapturingHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.mu.Lock()
 	h.requests = append(h.requests, req)
+	h.mu.Unlock()
 	return h.fakeHarness.Spawn(ctx, req)
 }
 
