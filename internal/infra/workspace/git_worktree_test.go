@@ -389,15 +389,16 @@ func TestGitWorktreeCreateCleanPathLimitsGitCalls(t *testing.T) {
 	if _, err := wt.Create(ctx, core.Task{ID: "T-COUNT"}); err != nil {
 		t.Fatalf("Create(): %v", err)
 	}
-	if len(calls) > 4 {
-		t.Fatalf("Create() ran %d git commands, want at most 4: %v", len(calls), calls)
+	if len(calls) != 2 {
+		t.Fatalf("Create() ran %d git commands on a clean path, want 2: %v", len(calls), calls)
+	}
+	if calls[0][0] != "fetch" || calls[1][0] != "worktree" {
+		t.Fatalf("Create() call order = %v, want fetch then worktree add", calls)
 	}
 	for _, call := range calls {
-		if len(call) > 1 && call[0] == "worktree" && call[1] == "prune" {
-			t.Fatalf("Create() pruned on a clean path: %v", calls)
-		}
-		if len(call) > 1 && call[0] == "show-ref" {
-			t.Fatalf("Create() probed show-ref on a clean path: %v", calls)
+		if len(call) > 0 && (call[0] == "merge-base" || call[0] == "show-ref" ||
+			(len(call) > 1 && call[0] == "worktree" && call[1] == "prune")) {
+			t.Fatalf("Create() probed git on a clean path: %v", calls)
 		}
 	}
 }
@@ -921,32 +922,29 @@ func rebaseInProgress(t *testing.T, path string) bool {
 	return false
 }
 
-func TestGitWorktreeCreateReportsMergeBaseCleanupFailure(t *testing.T) {
+func TestGitWorktreeCreateReportsBaseRefCleanupFailure(t *testing.T) {
 	wt, _ := newTestGitWorktree(t)
 	ctx := context.Background()
-	mergeErr := errors.New("injected merge-base failure")
+	ws, err := wt.Create(ctx, core.Task{ID: "T-MB-CLEANUP"})
+	if err != nil {
+		t.Fatalf("Create(): %v", err)
+	}
 	cleanupErr := errors.New("injected worktree remove failure")
-	wt.commandHook = func(dir string, args []string) error {
-		if len(args) == 0 {
-			return nil
-		}
-		switch args[0] {
-		case "merge-base":
-			return mergeErr
-		case "worktree":
-			if len(args) > 1 && args[1] == "remove" {
-				return cleanupErr
-			}
+	wt.commandHook = func(_ string, args []string) error {
+		if len(args) > 1 && args[0] == "worktree" && args[1] == "remove" {
+			return cleanupErr
 		}
 		return nil
 	}
 
-	_, err := wt.Create(ctx, core.Task{ID: "T-MB-CLEANUP"})
-	if !errors.Is(err, mergeErr) {
-		t.Fatalf("Create() error = %v, want the merge-base failure", err)
-	}
+	// A base ref that was never fetched cannot be resolved from disk. The
+	// cleanup must run even though the failure is a file read, not a git call.
+	_, err = wt.worktreeBase(ctx, createTarget{branch: ws.Branch, path: ws.Path, base: "never-fetched"})
 	if !errors.Is(err, cleanupErr) {
-		t.Fatalf("Create() error = %v, want the worktree cleanup failure", err)
+		t.Fatalf("worktreeBase() error = %v, want the worktree cleanup failure", err)
+	}
+	if !strings.Contains(err.Error(), "base ref") {
+		t.Fatalf("worktreeBase() error = %v, want the base ref read failure", err)
 	}
 }
 
@@ -1083,7 +1081,7 @@ func TestGitWorktreeRemoveCleanPathLimitsGitCalls(t *testing.T) {
 	}
 }
 
-func TestGitWorktreeRemoveDirtyPathClassifiesWithOneProbe(t *testing.T) {
+func TestGitWorktreeRemoveDirtyPathClassifiesWithoutStatus(t *testing.T) {
 	wt, _ := newTestGitWorktree(t)
 	ctx := context.Background()
 	ws, err := wt.Create(ctx, core.Task{ID: "T-RM-DIRTY"})
@@ -1103,11 +1101,11 @@ func TestGitWorktreeRemoveDirtyPathClassifiesWithOneProbe(t *testing.T) {
 	if core.CodeOf(err) != core.CodeConflict {
 		t.Fatalf("Remove() error = %v, want CodeConflict for a dirty worktree", err)
 	}
-	if len(calls) != 2 {
-		t.Fatalf("Remove() ran %d git commands on a dirty path, want 2: %v", len(calls), calls)
+	if len(calls) != 1 {
+		t.Fatalf("Remove() ran %d git commands on a dirty path, want 1: %v", len(calls), calls)
 	}
-	if calls[0][0] != "worktree" || calls[1][0] != "status" {
-		t.Fatalf("Remove() probe order = %v, want worktree remove then status", calls)
+	if calls[0][0] != "worktree" || calls[0][1] != "remove" {
+		t.Fatalf("Remove() call = %v, want worktree remove only", calls[0])
 	}
 	if _, err := os.Stat(dirty); err != nil {
 		t.Fatalf("agent file removed by a rejected Remove(): %v", err)

@@ -109,40 +109,43 @@ func (g *GitWorktree) status(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(out) == "", nil
 }
 
-// statusCount counts dirty paths, optionally restricted to one pathspec.
-func (g *GitWorktree) statusCount(ctx context.Context, path string, pathspec ...string) (int, error) {
-	args := []string{"status", "--porcelain", "--untracked-files=all"}
-	if len(pathspec) > 0 {
-		args = append(args, "--")
-		args = append(args, pathspec...)
+// porcelainPath extracts the path from one porcelain status line. The first
+// two bytes hold the index and worktree codes, and a rename renders as
+// "old -> new", so the destination is the path that matters for classification.
+func porcelainPath(line string) string {
+	if len(line) < 3 {
+		return ""
 	}
-	out, err := g.runInDir(ctx, path, args...)
-	if err != nil {
-		return 0, err
+	path := line[3:]
+	if arrow := strings.Index(path, " -> "); arrow >= 0 {
+		path = path[arrow+4:]
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		return 0, nil
-	}
-	return len(strings.Split(out, "\n")), nil
+	return strings.Trim(path, `"`)
 }
 
 // cardOnlyDirt reports whether a workspace is dirty and whether every dirty
-// path sits under docs/tasks. A Beacon status marker is safe to discard. Agent
-// code outside docs/tasks is not.
+// path sits under docs/tasks. One status call returns the paths and Go decides
+// which side of that boundary they fall on. A Beacon status marker is safe to
+// discard. Agent code outside docs/tasks is not.
 func (g *GitWorktree) cardOnlyDirt(ctx context.Context, path string) (dirty, onlyCards bool, err error) {
-	all, err := g.statusCount(ctx, path)
+	out, err := g.runInDir(ctx, path, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return false, false, err
 	}
-	if all == 0 {
-		return false, true, nil
+	onlyCards = true
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			continue
+		}
+		dirty = true
+		p := porcelainPath(line)
+		if p != "docs/tasks" && !strings.HasPrefix(p, "docs/tasks/") {
+			onlyCards = false
+			break
+		}
 	}
-	inside, err := g.statusCount(ctx, path, "docs/tasks")
-	if err != nil {
-		return false, false, err
-	}
-	return true, all == inside, nil
+	return dirty, onlyCards, nil
 }
 
 // createTarget names the branch, worktree path and base ref for a task.
@@ -250,16 +253,66 @@ func (g *GitWorktree) addWorktree(ctx context.Context, t createTarget) error {
 	return nil
 }
 
-// worktreeBase resolves the merge base and removes the worktree if that fails.
+// isObjectID reports whether s looks like a full git object id. Both SHA-1 and
+// SHA-256 repositories are accepted so a ref read cannot return a short id or
+// a symbolic line by mistake.
+func isObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// remoteRefSHA reads refs/remotes/origin/<base> from the repository without
+// spawning git. Create's `worktree add -B <branch> <path> origin/<base>` resets
+// the branch tip to that ref, so the ref is also the merge base of the two. A
+// loose ref wins over packed-refs, matching git's own lookup order.
+func (g *GitWorktree) remoteRefSHA(base string) (string, error) {
+	gitDir := filepath.Join(g.Root, ".git")
+	parts := append([]string{gitDir, "refs", "remotes", "origin"}, strings.Split(base, "/")...)
+	if data, err := os.ReadFile(filepath.Join(parts...)); err == nil {
+		if sha := strings.TrimSpace(string(data)); isObjectID(sha) {
+			return sha, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	want := "refs/remotes/origin/" + base
+	data, err := os.ReadFile(filepath.Join(gitDir, "packed-refs"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("remote ref %s not found", want)
+		}
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "^") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == want && isObjectID(fields[0]) {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("remote ref %s not found", want)
+}
+
+// worktreeBase resolves the base ref and removes the worktree if that fails.
 // The cleanup keeps a failed create from leaving a worktree behind.
 func (g *GitWorktree) worktreeBase(ctx context.Context, t createTarget) (string, error) {
-	mergeBase, err := g.run(ctx, "merge-base", "origin/"+t.base, t.branch)
+	base, err := g.remoteRefSHA(t.base)
 	if err != nil {
 		_, cleanupErr := g.run(ctx, "worktree", "remove", t.path)
 		g.refresh(ctx)
-		return "", core.JoinWith(err, "remove worktree after failed merge-base", cleanupErr)
+		return "", core.JoinWith(err, "remove worktree after failed base ref read", cleanupErr)
 	}
-	return strings.TrimSpace(mergeBase), nil
+	return base, nil
 }
 
 // Create checks out a fresh worktree for task.
@@ -505,17 +558,20 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	} else if err != nil {
 		return err
 	}
-	// A failed removal may mean dirt or a broken git registration. Ask git once
-	// to tell the cases apart so a dirty worktree keeps its old conflict error
-	// and every other failure keeps the original git error.
-	clean, cleanErr := g.Clean(ctx, ws)
-	if cleanErr != nil {
-		return core.JoinWith(removeErr, "check worktree before removal", cleanErr)
-	}
-	if !clean {
+	// Git reports dirt in the remove failure itself. Classifying that text
+	// keeps the conflict error without a second status subprocess. Every other
+	// failure, such as a broken registration, keeps the original git error.
+	if isDirtyWorktreeError(removeErr) {
 		return core.WorkspaceConflict(ws.Path)
 	}
 	return removeErr
+}
+
+// isDirtyWorktreeError recognizes git's stable marker for a worktree it refused
+// to remove because of modified or untracked files. It deliberately matches no
+// other failure so a broken registration is not mislabeled as a conflict.
+func isDirtyWorktreeError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "contains modified or untracked files")
 }
 
 // deleteBranch deletes the local branch with -d for a safe delete or -D for a
