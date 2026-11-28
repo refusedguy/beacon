@@ -3,9 +3,11 @@ package scm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -184,11 +186,69 @@ const (
 	maxGitLabPages = 100
 )
 
-// getJSONPages walks GitLab's page-number API until a short page or the
-// explicit cap. It reports capped reads so callers can mark an observation
-// incomplete instead of deciding from a partial list. When id is non-nil,
-// repeated provider IDs from pages that shifted under concurrent writes are
-// collapsed.
+// glPage carries one GitLab page through the breaker, which stores any. The
+// raw X-Next-Page values travel with the body so the walk can tell an explicit
+// end of pagination from a header the provider did not send.
+type glPage struct {
+	body     []byte
+	nextPage []string
+}
+
+// getJSONPage fetches one GitLab page into out and returns the X-Next-Page
+// header values. It mirrors getJSON's request rules and keeps the breaker in
+// the path, so a paginated read cannot bypass it.
+func (g *GitLab) getJSONPage(ctx context.Context, path string, query url.Values, out any) ([]string, error) {
+	u := g.baseURL + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if g.token != "" {
+		req.Header.Set("Authorization", "Bearer "+g.token)
+	}
+	page, err := guarded(g.br, func() (glPage, error) {
+		resp, err := g.client.Do(req)
+		if err != nil {
+			return glPage{}, err
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if err != nil {
+			return glPage{}, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return glPage{}, core.Errorf(gitlabErrorCode(resp.StatusCode), "gitlab GET %s: %s: %s", path, resp.Status, strings.TrimSpace(string(data)))
+		}
+		return glPage{body: data, nextPage: append([]string(nil), resp.Header.Values("X-Next-Page")...)}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out != nil && len(page.body) > 0 && string(page.body) != "null" {
+		if err := json.Unmarshal(page.body, out); err != nil {
+			return nil, err
+		}
+	}
+	return page.nextPage, nil
+}
+
+// noNextPage reports an explicit end of pagination. GitLab sends X-Next-Page
+// as an empty value on the last page, including one that is exactly full. An
+// absent header leaves the short-page rule in charge for providers that do not
+// send pagination headers.
+func noNextPage(values []string) bool {
+	return len(values) > 0 && strings.TrimSpace(values[0]) == ""
+}
+
+// getJSONPages walks GitLab's page-number API until a short page, an explicit
+// no-next-page header, or the cap. It reports capped reads so callers can mark
+// an observation incomplete instead of deciding from a partial list. When id
+// is non-nil, repeated provider IDs from pages that shifted under concurrent
+// writes are collapsed.
 func getJSONPages[T any](g *GitLab, ctx context.Context, path string, query url.Values, id func(T) int64) ([]T, bool, error) {
 	q := url.Values{}
 	for key, values := range query {
@@ -200,7 +260,8 @@ func getJSONPages[T any](g *GitLab, ctx context.Context, path string, query url.
 	for page := 1; page <= maxGitLabPages; page++ {
 		q.Set("page", strconv.Itoa(page))
 		var items []T
-		if err := g.getJSON(ctx, path, q, &items); err != nil {
+		nextPage, err := g.getJSONPage(ctx, path, q, &items)
+		if err != nil {
 			return nil, false, err
 		}
 		for _, item := range items {
@@ -215,7 +276,7 @@ func getJSONPages[T any](g *GitLab, ctx context.Context, path string, query url.
 			}
 			all = append(all, item)
 		}
-		if len(items) < gitlabPageSize {
+		if noNextPage(nextPage) || len(items) < gitlabPageSize {
 			return all, false, nil
 		}
 	}
