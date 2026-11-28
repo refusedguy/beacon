@@ -272,6 +272,7 @@ func TestDispatchToolReportsStartedAndFailedRunsInSummary(t *testing.T) {
 			TaskID   string `json:"task_id"`
 			State    string `json:"state"`
 			Reason   string `json:"reason"`
+			Next     string `json:"next"`
 			Launch   string `json:"launch_source"`
 			Identity string `json:"agent_identity"`
 		} `json:"summary"`
@@ -288,21 +289,28 @@ func TestDispatchToolReportsStartedAndFailedRunsInSummary(t *testing.T) {
 	if len(payload.Summary) != 2 {
 		t.Fatalf("summary = %+v, want two outcomes", payload.Summary)
 	}
-	byTask := map[string]struct{ id, state, reason string }{}
-	for _, outcome := range payload.Summary {
-		if outcome.ID == "" || outcome.State == "" || outcome.Reason == "" {
-			t.Fatalf("incomplete outcome = %+v", outcome)
+	type outcome struct{ id, state, reason, next string }
+	byTask := map[string]outcome{}
+	for _, item := range payload.Summary {
+		if item.ID == "" || item.State == "" {
+			t.Fatalf("incomplete outcome = %+v", item)
 		}
-		if outcome.Launch != "cli" || outcome.Identity != "operator" {
-			t.Fatalf("outcome launch = %q, agent = %q", outcome.Launch, outcome.Identity)
+		if item.Launch != "cli" || item.Identity != "operator" {
+			t.Fatalf("outcome launch = %q, agent = %q", item.Launch, item.Identity)
 		}
-		byTask[outcome.TaskID] = struct{ id, state, reason string }{outcome.ID, outcome.State, outcome.Reason}
+		byTask[item.TaskID] = outcome{item.ID, item.State, item.Reason, item.Next}
 	}
 	if byTask["T-OK"].state != "running" || byTask["T-BAD"].state != "failed" {
 		t.Fatalf("outcomes = %+v, want running and failed", byTask)
 	}
+	if byTask["T-OK"].reason != "" {
+		t.Fatalf("started run reason = %q, want empty", byTask["T-OK"].reason)
+	}
 	if !strings.Contains(byTask["T-BAD"].reason, "dirty worktree") {
 		t.Fatalf("failure reason = %q", byTask["T-BAD"].reason)
+	}
+	if byTask["T-BAD"].next == "" {
+		t.Fatalf("failure outcome has no next action: %+v", byTask["T-BAD"])
 	}
 	if byTask["T-BAD"].id != "T-BAD" || !strings.HasPrefix(byTask["T-OK"].id, "run-") {
 		t.Fatalf("outcome ids = %q and %q", byTask["T-OK"].id, byTask["T-BAD"].id)
@@ -498,5 +506,143 @@ func TestParentSessionUsesEnvWithoutMeta(t *testing.T) {
 	t.Setenv("BEACON_PARENT_SESSION", "")
 	if got := parentSession(nil); got != "" {
 		t.Fatalf("parentSession(nil) = %q, want empty", got)
+	}
+}
+
+// dispatchSummaryOutcome is the caller-facing shape of one dispatch outcome.
+type dispatchSummaryOutcome struct {
+	ID       string `json:"id"`
+	TaskID   string `json:"task_id"`
+	State    string `json:"state"`
+	Reason   string `json:"reason"`
+	Next     string `json:"next"`
+	Launch   string `json:"launch_source"`
+	Identity string `json:"agent_identity"`
+}
+
+// callDispatchSummary invokes beacon_dispatch over an in-memory transport and
+// returns the summary from the tool result.
+func callDispatchSummary(t *testing.T, d *app.Dispatcher, n int) []dispatchSummaryOutcome {
+	t.Helper()
+	server := NewServer(Services{Dispatcher: d})
+	clientTransport, serverTransport := msdk.NewInMemoryTransports()
+	ss, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	client := msdk.NewClient(&msdk.Implementation{Name: "test-client"}, nil)
+	cs, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name: "beacon_dispatch", Arguments: DispatchArgs{N: n},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Content) == 0 {
+		t.Fatal("empty dispatch result")
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatal("unexpected tool content")
+	}
+	var payload struct {
+		Summary []dispatchSummaryOutcome `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(text.Text), &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload.Summary
+}
+
+func newSummaryDispatcher(t *testing.T, tasks []core.Task, workspace core.WorkspaceManager, limit int) *app.Dispatcher {
+	t.Helper()
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	return &app.Dispatcher{
+		Source:      &dispatchSource{tasks: tasks},
+		Planner:     planner.New(planner.Options{}),
+		Workspace:   workspace,
+		Harness:     stubDispatchHarness{},
+		Store:       store,
+		Concurrency: core.Concurrency{MaxInFlight: limit, MaxActiveAgents: limit},
+	}
+}
+
+func TestDispatchSummarySkipCarriesReasonAndNext(t *testing.T) {
+	tasks := []core.Task{
+		{ID: "T-A", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("a.go")}},
+		{ID: "T-B", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("b.go")}},
+	}
+	d := newSummaryDispatcher(t, tasks, dispatchWorkspace{}, 1)
+
+	summary := callDispatchSummary(t, d, 1)
+	if len(summary) != 2 {
+		t.Fatalf("summary = %+v, want one run and one skip", summary)
+	}
+	var skip *dispatchSummaryOutcome
+	for i := range summary {
+		if summary[i].State == "skipped" {
+			skip = &summary[i]
+		}
+	}
+	if skip == nil {
+		t.Fatalf("summary = %+v, want a skipped outcome", summary)
+	}
+	if skip.Reason == "" {
+		t.Fatalf("skip reason = %q, want requested and active counts", skip.Reason)
+	}
+	if !strings.Contains(skip.Reason, "requested 1") || !strings.Contains(skip.Reason, "active runs") {
+		t.Fatalf("skip reason = %q, want requested n and active count", skip.Reason)
+	}
+	if skip.Next == "" {
+		t.Fatalf("skip outcome has no next action: %+v", skip)
+	}
+}
+
+func TestDispatchSummaryFailureCarriesReasonAndNext(t *testing.T) {
+	task := core.Task{ID: "T-BAD", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("bad.go")}}
+	d := newSummaryDispatcher(t, []core.Task{task}, failingDispatchWorkspace{}, 1)
+
+	summary := callDispatchSummary(t, d, 1)
+	if len(summary) != 1 {
+		t.Fatalf("summary = %+v, want one failed outcome", summary)
+	}
+	got := summary[0]
+	if got.State != "failed" {
+		t.Fatalf("state = %q, want failed", got.State)
+	}
+	if !strings.Contains(got.Reason, "dirty worktree") {
+		t.Fatalf("reason = %q, want the worker start error", got.Reason)
+	}
+	if got.Next == "" {
+		t.Fatalf("failed outcome has no next action: %+v", got)
+	}
+	if !strings.Contains(got.Next, "dispatch again") {
+		t.Fatalf("next = %q, want a dispatch instruction", got.Next)
+	}
+}
+
+func TestDispatchSummaryLeavesReasonEmptyForReasonlessRun(t *testing.T) {
+	task := core.Task{ID: "T-RUN", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("run.go")}}
+	d := newSummaryDispatcher(t, []core.Task{task}, dispatchWorkspace{}, 1)
+
+	summary := callDispatchSummary(t, d, 1)
+	if len(summary) != 1 {
+		t.Fatalf("summary = %+v, want one started run", summary)
+	}
+	got := summary[0]
+	if got.State != "running" {
+		t.Fatalf("state = %q, want running", got.State)
+	}
+	if got.Reason != "" {
+		t.Fatalf("reason = %q, want empty for a run with no reason", got.Reason)
 	}
 }
