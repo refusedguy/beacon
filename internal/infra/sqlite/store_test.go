@@ -1466,3 +1466,98 @@ func TestDecisionCountQueryBindsEveryPlaceholder(t *testing.T) {
 		}
 	}
 }
+
+// The seam files own disjoint groups of Store methods. These assertions keep
+// every group bound to its interface after a move, including the explain read
+// that production does not assert.
+var (
+	_ core.RunStore        = (*Store)(nil)
+	_ app.ActiveTaskFinder = (*Store)(nil)
+	_ app.DecisionSink     = (*Store)(nil)
+	_ app.DecisionLookup   = (*Store)(nil)
+	_ app.SnapshotStore    = (*Store)(nil)
+	_ app.QueueStore       = (*Store)(nil)
+	_ app.IncidentStore    = (*Store)(nil)
+	_ app.ReportStore      = (*Store)(nil)
+	_ app.RunExplainStore  = (*Store)(nil)
+)
+
+func TestStoreSeamFilesReachable(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("runs", func(t *testing.T) {
+		store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer store.Close()
+		run := core.NewRun("r-seam-runs", "T-seam-runs", time.Now().UTC())
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+		got, err := store.Get(ctx, run.ID)
+		if err != nil || got == nil || got.ID != run.ID {
+			t.Fatalf("Get = %+v, %v, want run %s", got, err, run.ID)
+		}
+		active, err := store.ListActive(ctx)
+		if err != nil || len(active) != 1 || active[0].ID != run.ID {
+			t.Fatalf("ListActive = %+v, %v, want one run %s", active, err, run.ID)
+		}
+	})
+
+	t.Run("decisions", func(t *testing.T) {
+		store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer store.Close()
+		run := core.NewRun("r-seam-decisions", "T-seam-decisions", time.Now().UTC().Add(-time.Hour))
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+		if err := store.RecordDecision(ctx, app.Decision{
+			At:      time.Now().UTC().Add(-time.Minute),
+			RunID:   string(run.ID),
+			Verdict: string(core.VerdictWait),
+			Reason:  "seam",
+		}); err != nil {
+			t.Fatalf("RecordDecision: %v", err)
+		}
+		data, err := store.RunExplain(ctx, run.ID)
+		if err != nil || data == nil || data.Decision == nil || data.Decision.Reason != "seam" {
+			t.Fatalf("RunExplain = %+v, %v, want the seam decision", data, err)
+		}
+		decisions, err := store.ListDecisions(ctx, []string{string(run.ID)}, 10, 10)
+		if err != nil || len(decisions) != 1 || decisions[0].Reason != "seam" {
+			t.Fatalf("ListDecisions = %+v, %v, want one seam decision", decisions, err)
+		}
+	})
+
+	t.Run("queue", func(t *testing.T) {
+		store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer store.Close()
+		if err := store.SyncTasks(ctx, []core.Task{{ID: "T-seam-queue", Status: core.TaskAvailable}}); err != nil {
+			t.Fatalf("SyncTasks: %v", err)
+		}
+		queue, err := store.ListQueueTasks(ctx)
+		if err != nil {
+			t.Fatalf("ListQueueTasks: %v", err)
+		}
+		found := false
+		for _, task := range queue {
+			if task.ID == "T-seam-queue" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("queue = %+v, want T-seam-queue", queue)
+		}
+		incident, err := store.CurrentIncident(ctx)
+		if err != nil || incident != nil {
+			t.Fatalf("CurrentIncident = %+v, %v, want nil, nil", incident, err)
+		}
+	})
+}
