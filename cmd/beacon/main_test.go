@@ -499,7 +499,7 @@ func wireParentModelConfig(t *testing.T, endpoint, parent string) string {
 	return path
 }
 
-func TestWireDoesNotResolveParentModelOnFirstDispatch(t *testing.T) {
+func TestWireDefersParentModelToFirstDispatch(t *testing.T) {
 	t.Setenv("BEACON_MODEL", "")
 	var gets atomic.Int32
 	srv := parentModelServer(&gets)
@@ -512,9 +512,8 @@ func TestWireDoesNotResolveParentModelOnFirstDispatch(t *testing.T) {
 	}
 	defer w.close()
 
-	startup := gets.Load()
-	if startup != 1 {
-		t.Fatalf("parent session GETs at startup = %d, want 1", startup)
+	if startup := gets.Load(); startup != 0 {
+		t.Fatalf("parent session GETs at startup = %d, want 0", startup)
 	}
 
 	want := core.ModelRef{ProviderID: "opencode", ID: "parent-model", Variant: "default"}
@@ -522,9 +521,9 @@ func TestWireDoesNotResolveParentModelOnFirstDispatch(t *testing.T) {
 		if got := w.dispatcher.ResolveModel("ses_parent"); got != want {
 			t.Fatalf("dispatch %d model = %+v, want %+v", i, got, want)
 		}
-	}
-	if got := gets.Load(); got != startup {
-		t.Fatalf("parent session GETs after five dispatches = %d, want %d", got, startup)
+		if got := gets.Load(); got != 1 {
+			t.Fatalf("parent session GETs after dispatch %d = %d, want 1", i+1, got)
+		}
 	}
 }
 
@@ -541,12 +540,16 @@ func TestWireStillResolvesPerDispatchParentOverride(t *testing.T) {
 	}
 	defer w.close()
 
+	if startup := gets.Load(); startup != 0 {
+		t.Fatalf("parent session GETs at startup = %d, want 0", startup)
+	}
+
 	want := core.ModelRef{ProviderID: "opencode", ID: "parent-model", Variant: "default"}
 	if got := w.dispatcher.ResolveModel("ses_override"); got != want {
 		t.Fatalf("override model = %+v, want %+v", got, want)
 	}
-	if got := gets.Load(); got != 2 {
-		t.Fatalf("parent session GETs = %d, want 2 (startup plus override)", got)
+	if got := gets.Load(); got != 1 {
+		t.Fatalf("parent session GETs = %d, want 1 (deferred override only)", got)
 	}
 }
 
