@@ -1,7 +1,11 @@
 ---
 id: T-4de758ed
 title: Give daemon goroutines a stop path
-status: available
+<<<<<<< Updated upstream
+status: in_progress
+=======
+status: done
+>>>>>>> Stashed changes
 scope:
     - cmd/beacon/config_watch.go
     - cmd/beacon/serve.go

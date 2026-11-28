@@ -215,13 +215,11 @@ func (f *eventFrames) run(ctx context.Context) {
 type pingBroadcaster struct {
 	mu   sync.Mutex
 	subs map[chan []byte]struct{}
-	tick *time.Ticker
 }
 
 func newPingBroadcaster() *pingBroadcaster {
 	return &pingBroadcaster{
 		subs: make(map[chan []byte]struct{}),
-		tick: time.NewTicker(10 * time.Second),
 	}
 }
 
@@ -256,12 +254,13 @@ func pingFrame(now time.Time) []byte {
 // run broadcasts one ping per tick. A full subscriber channel is skipped so a
 // slow monitor cannot stall the other connections.
 func (p *pingBroadcaster) run(ctx context.Context) {
-	defer p.tick.Stop()
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-p.tick.C:
+		case now := <-tick.C:
 			frame := pingFrame(now)
 			p.mu.Lock()
 			for ch := range p.subs {
@@ -299,6 +298,9 @@ type apiServices struct {
 
 type apiServer struct {
 	services apiServices
+	// daemonCtx ends when the daemon stops. The SSE handler watches it in
+	// addition to the request context, which srv.Shutdown does not cancel.
+	daemonCtx context.Context
 	// token holds the token bytes, converted once at construction so the auth
 	// check does not allocate a byte slice on every request.
 	token   []byte
@@ -341,7 +343,7 @@ func startAPIServer(ctx context.Context, services apiServices, token string, eve
 	go frames.run(ctx)
 	pings := newPingBroadcaster()
 	go pings.run(ctx)
-	api := &apiServer{services: services, token: []byte(token), frames: frames, changes: changes, pings: pings}
+	api := &apiServer{services: services, daemonCtx: ctx, token: []byte(token), frames: frames, changes: changes, pings: pings}
 	runHTTP(ctx, errCh, addr, api.handler())
 }
 
@@ -442,6 +444,13 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	// Shutdown does not cancel active requests, so watch the daemon context as
+	// well. A nil context leaves the channel nil and blocks that case, which is
+	// the behaviour of handlers built directly in tests.
+	var daemonDone <-chan struct{}
+	if a.daemonCtx != nil {
+		daemonDone = a.daemonCtx.Done()
+	}
 	frames, unsubscribeFrames := a.frames.subscribe()
 	defer unsubscribeFrames()
 	changes, unsubscribeChanges := a.changes.subscribe()
@@ -483,6 +492,8 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-daemonDone:
 			return
 		case frame := <-frames:
 			writeID()
