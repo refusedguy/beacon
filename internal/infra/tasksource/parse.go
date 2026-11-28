@@ -123,13 +123,14 @@ func (l *stringList) UnmarshalYAML(node *yaml.Node) error {
 // YAML block in issue bodies. Both decoders accept every alias, so task_id and
 // owner_files read the same in either format.
 //
-// Schema note. Five groups carry the load: identity (id, task_id); display
+// Schema note. Six groups carry the load: identity (id, task_id); display
 // and lifecycle (title, status, priority, kind, base_branch, require_review);
-// ownership (scope, owner_files); dependencies (depends, depends_on); and epic
+// ownership (scope, owner_files); dependencies (depends, depends_on); epic
 // planning (plan, whose children carry title, body, scope, depends and
-// priority). The aliases are task_id for id, owner_files for scope and
-// depends_on for depends. The flat-line reader also accepts the legacy keys
-// Владелец файлов, Зависимости, Статус, Фаза, Ссылка and ParentTask.
+// priority); and perf closure (gate, with kind and key). The aliases are
+// task_id for id, owner_files for scope and depends_on for depends. The
+// flat-line reader also accepts the legacy keys Владелец файлов,
+// Зависимости, Статус, Фаза, Ссылка and ParentTask.
 //
 // Keys outside these groups, including perf: true on existing cards, are
 // ignored rather than rejected. Strict decoding with KnownFields stays off in
@@ -155,6 +156,49 @@ type cardSchema struct {
 	WorkerAgent   string     `yaml:"worker_agent"`
 	WorkerPrompt  string     `yaml:"worker_prompt"`
 	Plan          []planSpec `yaml:"plan"`
+	Gate          gateSpec   `yaml:"gate"`
+}
+
+// gateSpec is the wire shape of the perf gate block. Key names the registry
+// key whose verdict.json entry decides the card.
+type gateSpec struct {
+	Kind string `yaml:"kind"`
+	Key  string `yaml:"key"`
+}
+
+// GateKind names the advisory measurement that closes a perf card. A timing
+// gate reads a timing verdict, alloc and counter gates read their gain kinds,
+// and a structural gate closes without waiting for a measured gain.
+type GateKind string
+
+const (
+	GateKindTiming     GateKind = "timing"
+	GateKindAlloc      GateKind = "alloc"
+	GateKindCounter    GateKind = "counter"
+	GateKindStructural GateKind = "structural"
+)
+
+// PerfGate is the normalized gate block. Kind is empty when the source has no
+// gate or carries an unknown kind, so tooling can treat both as ungated.
+type PerfGate struct {
+	Kind GateKind
+	Key  string
+}
+
+// normalizeGateKind maps s to a known gate kind.
+func normalizeGateKind(s string) GateKind {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "timing":
+		return GateKindTiming
+	case "alloc":
+		return GateKindAlloc
+	case "counter":
+		return GateKindCounter
+	case "structural":
+		return GateKindStructural
+	default:
+		return ""
+	}
 }
 
 // combinedScope returns the scope field followed by its owner_files alias.
@@ -212,6 +256,7 @@ type taskFields struct {
 	WorkerAgent   string
 	WorkerPrompt  string
 	Plan          []core.ChildSpec
+	Gate          PerfGate
 }
 
 // childSpecs converts plan specs into core child specs.
@@ -375,6 +420,10 @@ func decodeSchema(yf cardSchema, dir string) taskFields {
 	out.WorkerAgent = strings.TrimSpace(yf.WorkerAgent)
 	out.WorkerPrompt = strings.TrimSpace(yf.WorkerPrompt)
 	out.Plan = childSpecs(yf.Plan, dir)
+	out.Gate = PerfGate{
+		Kind: normalizeGateKind(yf.Gate.Kind),
+		Key:  strings.TrimSpace(yf.Gate.Key),
+	}
 	return out
 }
 

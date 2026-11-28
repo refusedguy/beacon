@@ -706,6 +706,8 @@ jobs:
               '' \
               'Advisory inconclusive: this PR edits .github/workflows/ci.yml, which owns the verdict rules. Inline rules from the PR head are not trusted.'
           } > perf-results/comment.md
+          # No trusted registry input exists here, so publish an empty key map.
+          printf '{}\n' > perf-results/verdict.json
 
       # One comment per PR. A spread rule decides a verdict; the range relation
       # is supporting text only.
@@ -1122,6 +1124,10 @@ jobs:
           }).filter(Number.isFinite);
 
           const rows = [];
+          // Structured output for card gates. Null-prototype so a registry key
+          // can never collide with an inherited object property.
+          const verdicts = Object.create(null);
+          const finiteOrNull = x => Number.isFinite(x) ? x : null;
           const cacheStates = [...new Set([...basePasses, ...headPasses]
             .flatMap(p => p.rows.map(r => r.cache)))];
           for (const key of [...expected]) {
@@ -1133,6 +1139,10 @@ jobs:
             const a = values(basePasses, key, 'median_ms');
             const b = values(headPasses, key, 'median_ms');
             if (!a.length || !b.length) {
+              verdicts[key] = {
+                verdict: 'inconclusive', delta: null, floor: null,
+                work: null, errs: null, limiter, cache,
+              };
               rows.push(`| ${key} | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | ${limiter} | ${cache} | inconclusive |`);
               continue;
             }
@@ -1209,6 +1219,15 @@ jobs:
             } else {
               verdict = 'flat';
             }
+            verdicts[key] = {
+              verdict,
+              delta: finiteOrNull(delta),
+              floor: finiteOrNull(rowFloor),
+              work: { base: finiteOrNull(median(wa)), head: finiteOrNull(median(wb)) },
+              errs: { base: finiteOrNull(median(ea)), head: finiteOrNull(median(eb)) },
+              limiter,
+              cache,
+            };
             const ra = ratiosUsable ? median(ratios(baseRatio, key)) : NaN;
             const rb = ratiosUsable ? median(ratios(headRatio, key)) : NaN;
             const ratioDelta = Number.isFinite(ra) && ra !== 0 && Number.isFinite(rb)
@@ -1264,6 +1283,7 @@ jobs:
           ].join('\n');
           fs.mkdirSync('perf-results', { recursive: true });
           fs.writeFileSync('perf-results/comment.md', body + '\n');
+          fs.writeFileSync('perf-results/verdict.json', JSON.stringify(verdicts, null, 2) + '\n');
           // advisory-script:comment-builder:end
           NODE
 
