@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -53,6 +54,74 @@ func ghObserveHandler(t *testing.T, files http.HandlerFunc) http.Handler {
 			http.NotFound(w, r)
 		}
 	})
+}
+
+const githubLeakToken = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+
+// githubFailingChecksBody serves one failed check whose output carries two
+// token shapes. Both the observation excerpt and the stored check output must
+// lose them before the adapter returns.
+func githubFailingChecksBody() string {
+	return `{"total_count":1,"check_runs":[{"name":"ci","status":"completed",` +
+		`"conclusion":"failure","output":{"title":"leak",` +
+		`"text":"token ` + githubLeakToken + ` opencode:deadbeef0123456789"}}]}`
+}
+
+func assertNoGitHubSecret(t *testing.T, text string) {
+	t.Helper()
+	if strings.Contains(text, githubLeakToken) || strings.Contains(text, "opencode:deadbeef0123456789") {
+		t.Fatalf("secret leaked into %q", text)
+	}
+	if !strings.Contains(text, "[REDACTED]") {
+		t.Fatalf("no redaction marker in %q", text)
+	}
+}
+
+func TestGitHubObserveRedactsFailedCheckOutput(t *testing.T) {
+	base := ghObserveHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("changed files fetched even though a check failed")
+	})
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/check-runs") {
+			_, _ = io.WriteString(w, githubFailingChecksBody())
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+
+	obs, err := g.Observe(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("g.Observe(context.Background(), 42): %v", err)
+	}
+	assertNoGitHubSecret(t, obs.FailureExcerpt)
+	for _, check := range obs.Checks {
+		assertNoGitHubSecret(t, check.Output)
+	}
+}
+
+func TestGitHubBaseBranchStatusRedactsFailedCheckOutput(t *testing.T) {
+	g := ghObserveGitHub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/branches/main"):
+			_, _ = io.WriteString(w, `{"name":"main","commit":{"sha":"abc"}}`)
+		case strings.Contains(r.URL.Path, "/check-runs"):
+			_, _ = io.WriteString(w, githubFailingChecksBody())
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+
+	status, err := g.BaseBranchStatus(context.Background(), "main")
+	if err != nil {
+		t.Fatalf("g.BaseBranchStatus(context.Background(), \"main\"): %v", err)
+	}
+	assertNoGitHubSecret(t, status.FailureExcerpt)
+	for _, check := range status.FailedChecks {
+		assertNoGitHubSecret(t, check.Output)
+	}
 }
 
 func TestIgnoredPathsOnly(t *testing.T) {

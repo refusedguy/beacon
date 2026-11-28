@@ -231,7 +231,7 @@ func TestMergeOpenCodeConfigPreservesUserKeys(t *testing.T) {
 		switch obj["action"] {
 		case "custom":
 			foundCustom = obj["effect"] == "allow"
-		case "beacon_task_create":
+		case "beacon_beacon_task_create":
 			foundDeny = obj["effect"] == "deny"
 		}
 	}

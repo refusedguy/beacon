@@ -900,3 +900,70 @@ func TestGroupHistoryBucketsRowsByRun(t *testing.T) {
 		t.Fatal("histories has an entry for a run with no decisions")
 	}
 }
+
+// TestStatusReadsRedactRunReasons covers the loopback read paths. A reason
+// that still carries a token must not leave the service or the snapshot, and
+// the store's own copy must stay untouched.
+func TestStatusReadsRedactRunReasons(t *testing.T) {
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+	ctx := context.Background()
+	active := core.NewRun("run-active", "T-1", time.Now().UTC())
+	active.State = core.RunWaitingCI
+	active.Reason = "ci failed with token " + secret
+	recent := core.NewRun("run-recent", "T-2", time.Now().UTC())
+	recent.State = core.RunMerged
+	recent.Reason = "ci failed with token " + secret
+
+	store := newFakeStore()
+	if err := store.Save(ctx, active); err != nil {
+		t.Fatalf("store.Save(active): %v", err)
+	}
+	if err := store.Save(ctx, recent); err != nil {
+		t.Fatalf("store.Save(recent): %v", err)
+	}
+	svc := StatusService{Store: store}
+
+	for name, runs := range map[string][]*core.Run{
+		"active": mustActive(t, svc, ctx),
+		"recent": mustRecent(t, svc, ctx),
+	} {
+		for _, run := range runs {
+			if strings.Contains(run.Reason, secret) {
+				t.Fatalf("%s reason leaked: %q", name, run.Reason)
+			}
+			if !strings.Contains(run.Reason, "[REDACTED]") {
+				t.Fatalf("%s reason = %q, want a redaction marker", name, run.Reason)
+			}
+		}
+	}
+	if !strings.Contains(store.runs[active.ID].Reason, secret) {
+		t.Fatal("redaction mutated the store's run")
+	}
+
+	snapStore := &snapshotStubStore{active: []*core.Run{active}}
+	snap, err := (SnapshotService{Store: snapStore}).Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if strings.Contains(snap.Active[0].Reason, secret) {
+		t.Fatalf("snapshot reason leaked: %q", snap.Active[0].Reason)
+	}
+}
+
+func mustActive(t *testing.T, svc StatusService, ctx context.Context) []*core.Run {
+	t.Helper()
+	runs, err := svc.Active(ctx)
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+	}
+	return runs
+}
+
+func mustRecent(t *testing.T, svc StatusService, ctx context.Context) []*core.Run {
+	t.Helper()
+	runs, err := svc.Recent(ctx, 0)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	return runs
+}

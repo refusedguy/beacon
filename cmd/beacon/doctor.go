@@ -24,6 +24,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/config"
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/shared"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 // checkLevel ranks a doctor check as OK, warning or failure.
@@ -68,7 +69,7 @@ func doctorExitCode(checks []doctorCheck) int {
 // printDoctorChecks writes each check's level, name and detail to out.
 func printDoctorChecks(out io.Writer, checks []doctorCheck) {
 	for _, c := range checks {
-		_, _ = fmt.Fprintf(out, "%s %s: %s\n", c.level.label(), c.name, c.detail)
+		_, _ = fmt.Fprintf(out, "%s %s: %s\n", c.level.label(), c.name, redact.Redact(c.detail))
 	}
 }
 

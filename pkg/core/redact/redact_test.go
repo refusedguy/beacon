@@ -88,6 +88,27 @@ func TestRedactMatchesLegacy(t *testing.T) {
 	}
 }
 
+// TestRedactOpenCodeToken covers the opencode:HEX credential shape used by
+// the harness. It is separate from redactCases because the legacy chain in
+// that table predates this rule.
+func TestRedactOpenCodeToken(t *testing.T) {
+	const token = "opencode:deadbeef0123456789"
+	in := "harness auth failed for " + token + " on session"
+	got := Redact(in)
+	if strings.Contains(got, token) {
+		t.Fatalf("secret leaked: %q", got)
+	}
+	if !strings.Contains(got, Marker) {
+		t.Fatalf("no marker in %q", got)
+	}
+	if !strings.HasPrefix(got, "harness auth failed for ") || !strings.HasSuffix(got, " on session") {
+		t.Fatalf("surrounding text lost: %q", got)
+	}
+	if !HasCandidate(token) {
+		t.Fatal("HasCandidate(opencode token) = false")
+	}
+}
+
 func TestHasCandidate(t *testing.T) {
 	for _, tc := range redactCases {
 		if tc.redacted && !HasCandidate(tc.in) {

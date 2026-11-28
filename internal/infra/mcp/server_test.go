@@ -770,6 +770,44 @@ func TestReconcileReturnsErrorAsStructuredJSON(t *testing.T) {
 	}
 }
 
+func TestReconcileRedactsDecisionReasonAndError(t *testing.T) {
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+	ticker := &stubTickReconciler{
+		decision: core.MergeDecision{
+			Verdict:   core.VerdictBlocked,
+			Reason:    "ci failed with token " + secret,
+			Criterion: "checks",
+		},
+		err: errors.New("scm unavailable for opencode:deadbeef0123456789"),
+	}
+	cs := deleteClient(t, Services{Reconcile: &app.ReconcileService{Reconciler: ticker}})
+
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name:      "beacon_reconcile",
+		Arguments: map[string]any{"pr": 42},
+	})
+	if err != nil {
+		t.Fatalf("cs.CallTool(Name: \"beacon_reconcile\"): %v", err)
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatalf("unexpected result: %+v", res.Content)
+	}
+	if strings.Contains(text.Text, secret) || strings.Contains(text.Text, "opencode:deadbeef0123456789") {
+		t.Fatalf("secret leaked into tool result: %q", text.Text)
+	}
+	var got app.ReconcileResult
+	if err := json.Unmarshal([]byte(text.Text), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if !strings.Contains(got.Decision.Reason, "[REDACTED]") {
+		t.Fatalf("decision reason = %q, want a redaction marker", got.Decision.Reason)
+	}
+	if !strings.Contains(got.Error, "[REDACTED]") {
+		t.Fatalf("error = %q, want a redaction marker", got.Error)
+	}
+}
+
 func createBatchArgs() map[string]any {
 	return map[string]any{
 		"tasks": []any{

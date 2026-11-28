@@ -542,6 +542,15 @@ type reconcileArgs struct {
 	PR int `json:"pr"`
 }
 
+// redactReconcileResult cleans the decision reason and the error before either
+// reaches a tool result. A reconcile tick can surface a raw provider reason, so
+// this is the last boundary before the orchestrator reads the JSON.
+func redactReconcileResult(in app.ReconcileResult) app.ReconcileResult {
+	in.Decision.Reason = redact.Redact(in.Decision.Reason)
+	in.Error = redact.Redact(in.Error)
+	return in
+}
+
 func registerReconcile(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, catalogTool("beacon_reconcile"), func(ctx context.Context, req *msdk.CallToolRequest, a reconcileArgs) (*msdk.CallToolResult, any, error) {
 		if err := requireOrchestrator(req); err != nil {
@@ -550,10 +559,10 @@ func registerReconcile(s *msdk.Server, sv Services) {
 		if err := requireService("reconcile service", sv.Reconcile); err != nil {
 			return nil, nil, err
 		}
-		result := sv.Reconcile.Tick(ctx, a.PR)
+		result := redactReconcileResult(sv.Reconcile.Tick(ctx, a.PR))
 		out := jsonResult(result)
 		if result.Error != "" {
-			slog.WarnContext(ctx, "beacon_reconcile", "pr", a.PR, "error", redact.Redact(result.Error))
+			slog.WarnContext(ctx, "beacon_reconcile", "pr", a.PR, "error", result.Error)
 			out.IsError = true
 		}
 		return out, nil, nil
