@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -40,6 +41,122 @@ type DispatchStore interface {
 	ListRecent(ctx context.Context, limit int) ([]*core.Run, error)
 	Save(ctx context.Context, run *core.Run) error
 	SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error
+}
+
+// skipCapFullCode is the reason a ready card lost to the capacity limit. It
+// stays in the dispatcher because the planner only judges scope conflicts.
+const skipCapFullCode SkipCode = "cap_full"
+
+// runClaimStore is the store capability that serializes a task claim across
+// processes. sqlite.Store satisfies it with its deliveries table. A store
+// without the capability keeps the dispatcher's in-process reservations only.
+type runClaimStore interface {
+	ClaimDelivery(ctx context.Context, key string) (bool, error)
+	ReleaseDelivery(ctx context.Context, key string) error
+}
+
+// runClaimKey namespaces dispatch claims away from the idempotency keys that
+// share the store's deliveries table.
+func runClaimKey(taskID core.TaskID) string {
+	return "dispatch:claim:" + string(taskID)
+}
+
+// claimRun records a store-backed claim before any workspace work. release
+// runs once the run is visible in the store or the failed start is cleaned up.
+// ok is false when another dispatcher already owns the task.
+func (d *Dispatcher) claimRun(ctx context.Context, taskID core.TaskID) (release func(), ok bool, err error) {
+	store, capable := d.Store.(runClaimStore)
+	if !capable {
+		return func() {}, true, nil
+	}
+	key := runClaimKey(taskID)
+	claimed, err := store.ClaimDelivery(ctx, key)
+	if err != nil {
+		return nil, false, err
+	}
+	if !claimed {
+		return nil, false, nil
+	}
+	return func() {
+		if err := store.ReleaseDelivery(context.WithoutCancel(ctx), key); err != nil {
+			slog.WarnContext(ctx, "release run claim", "task", taskID, "error", err)
+		}
+	}, true, nil
+}
+
+// errTaskClaimed is the internal signal for a targeted start that lost the
+// store claim. The caller turns it into a refusal with no error.
+var errTaskClaimed = errors.New("task is claimed by another dispatcher")
+
+// syncAndClaimStart syncs cards and takes the cross-process claim before any
+// run or slot is reserved. A lost claim is reported on out and returns
+// errTaskClaimed, so the caller gives the same answer as an active run.
+func (d *Dispatcher) syncAndClaimStart(ctx context.Context, out *StartOneOutcome, available []core.Task, taskID core.TaskID) (func(), error) {
+	if err := d.Store.SyncTasks(ctx, available); err != nil {
+		return nil, err
+	}
+	release, claimed, err := d.claimRun(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		out.Code = string(SkipActiveRun)
+		out.Reason = errTaskClaimed.Error()
+		d.Decisions.logDispatchSkip(ctx, SkippedTask{
+			TaskID: taskID, Code: SkipActiveRun, Reason: out.Reason,
+		})
+		return nil, errTaskClaimed
+	}
+	return release, nil
+}
+
+// reserve adds one in-process slot reservation. A nil map is created here so
+// callers do not each carry a branch for the first start.
+func (d *Dispatcher) reserve(res *slotReservation) {
+	if d.reserved == nil {
+		d.reserved = make(map[core.RunID]*slotReservation)
+	}
+	d.reserved[res.runID] = res
+}
+
+// releaseRunClaims frees every store claim taken for this batch. It is called
+// after launch, so each run is visible in the store or cleaned up before
+// another process can claim its task.
+func releaseRunClaims(batch *dispatchBatch) {
+	for i := len(batch.claims) - 1; i >= 0; i-- {
+		batch.claims[i]()
+	}
+	batch.claims = nil
+}
+
+// capFullSkip gives one capacity-losing card an outcome. The reason carries
+// the requested count and the active count so a caller can report both.
+func capFullSkip(taskID core.TaskID, requested, active int) SkippedTask {
+	return SkippedTask{
+		TaskID: taskID,
+		Code:   skipCapFullCode,
+		Reason: fmt.Sprintf("requested %d runs with %d active runs: no free slot", requested, active),
+		Next:   nextActionFor(SkipActiveRun),
+	}
+}
+
+// addCapacitySkips accounts for every ready card the planner neither chose nor
+// skipped. Those cards lost on capacity, so each gets exactly one cap_full
+// skip and no card gets two outcomes.
+func addCapacitySkips(batch *dispatchBatch, ready []core.Task, requested, active int) {
+	accounted := make(map[core.TaskID]bool, len(batch.planned)+len(batch.skipped))
+	for _, p := range batch.planned {
+		accounted[p.task.ID] = true
+	}
+	for _, s := range batch.skipped {
+		accounted[s.TaskID] = true
+	}
+	for _, task := range ready {
+		if accounted[task.ID] {
+			continue
+		}
+		batch.skipped = append(batch.skipped, capFullSkip(task.ID, requested, active))
+	}
 }
 
 // Dispatcher selects ready cards and starts a worker for each within the
@@ -101,6 +218,7 @@ type dispatchBatch struct {
 	reserved  []core.RunID
 	skipped   []SkippedTask
 	active    map[core.TaskID]*core.Run
+	claims    []func()
 	limit     int
 	budget    int
 }
@@ -193,6 +311,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	if err != nil {
 		return out, err
 	}
+	defer releaseRunClaims(batch)
 	defer d.releaseReservations(batch)
 	out.Skipped = batch.skipped
 	for _, s := range batch.skipped {
@@ -397,10 +516,15 @@ func (d *Dispatcher) StartOne(ctx context.Context, taskID core.TaskID) (StartOne
 		return out, nil
 	}
 
-	// Every refusal is decided before this write, so a blocked call changes no
-	// card, run or status. Dispatch uses the same sync before it starts a run.
-	if err := d.Store.SyncTasks(ctx, available); err != nil {
+	// Every refusal is decided before any run write. The claim is the
+	// cross-process authority, so a CLI start cannot race a daemon start into
+	// two runs for one task.
+	release, err := d.syncAndClaimStart(ctx, &out, available, task.ID)
+	if err != nil {
 		d.slotsMu.Unlock()
+		if errors.Is(err, errTaskClaimed) {
+			return out, nil
+		}
 		return out, err
 	}
 	run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
@@ -409,12 +533,10 @@ func (d *Dispatcher) StartOne(ctx context.Context, taskID core.TaskID) (StartOne
 	}
 	run.Scope = task.Scope
 	run.ParentSessionID = core.FirstNonEmpty(parentSession(ctx), d.ParentSessionID)
-	if d.reserved == nil {
-		d.reserved = make(map[core.RunID]*slotReservation)
-	}
-	d.reserved[run.ID] = &slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: true}
+	d.reserve(&slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: true})
 	d.slotsMu.Unlock()
 
+	defer release()
 	defer d.dropReservation(run.ID)
 	if err := d.startOne(ctx, &dispatchBatch{}, run, task); err != nil {
 		d.handleStartFailure(ctx, run, err)
@@ -582,15 +704,22 @@ func (d *Dispatcher) planDispatch(ctx context.Context, n int) (*dispatchBatch, e
 	batch.skipped = sel.Skipped
 	batch.budget = d.availableFrom(view)
 	d.Decisions.logDispatchCandidates(ctx, len(ready), len(stored), sel.Limit, batch.budget)
-	if sel.Limit <= 0 {
-		return batch, nil
-	}
 	batch.active = activeRunsByTask(view)
-	if d.reserved == nil {
-		d.reserved = make(map[core.RunID]*slotReservation)
-	}
 	agentLeft := batch.budget
 	for _, task := range sel.Chosen {
+		release, claimed, err := d.claimRun(ctx, task.ID)
+		if err != nil {
+			releaseRunClaims(batch)
+			return nil, err
+		}
+		if !claimed {
+			batch.skipped = append(batch.skipped, SkippedTask{
+				TaskID: task.ID, Code: SkipActiveRun,
+				Reason: "task is claimed by another dispatcher",
+			})
+			continue
+		}
+		batch.claims = append(batch.claims, release)
 		run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
 		if d.MaxAttempts > 0 {
 			run.MaxAttempts = d.MaxAttempts
@@ -602,9 +731,12 @@ func (d *Dispatcher) planDispatch(ctx context.Context, n int) (*dispatchBatch, e
 			agent = true
 			agentLeft--
 		}
-		d.reserved[run.ID] = &slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: agent}
+		d.reserve(&slotReservation{runID: run.ID, taskID: task.ID, scope: task.Scope, agent: agent})
 		batch.reserved = append(batch.reserved, run.ID)
 		batch.planned = append(batch.planned, plannedRun{run: run, task: task})
+	}
+	if n > 0 {
+		addCapacitySkips(batch, ready, n, len(view))
 	}
 	return batch, nil
 }
