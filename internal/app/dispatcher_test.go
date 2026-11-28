@@ -516,7 +516,7 @@ func TestSpawnPromptHeaderFormat(t *testing.T) {
 	}
 }
 
-func TestSpawnPromptRequiresPrePRFormatAndTestCheck(t *testing.T) {
+func TestSpawnPromptKeepsStackChecksInConfig(t *testing.T) {
 	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
 	d := newInstructionDispatcher(h, "")
 	if _, err := d.Dispatch(context.Background(), 1); err != nil {
@@ -526,16 +526,24 @@ func TestSpawnPromptRequiresPrePRFormatAndTestCheck(t *testing.T) {
 		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
 	}
 	prompt := h.requests[0].Prompt
-	for _, want := range []string{
-		"gofmt -l",
-		"go test",
-		"Do not open a pull request",
-		"Report the exact command you ran and its full output",
-		"advisory",
-	} {
+	for _, unwanted := range []string{"gofmt -l", "go test <changed Go packages>"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Errorf("stock spawn prompt hard-codes %q: %s", unwanted, prompt)
+		}
+	}
+	for _, want := range []string{"local format and targeted test checks for this stack", "advisory"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("spawn prompt missing %q: %s", want, prompt)
 		}
+	}
+
+	const configured = "For Go, run gofmt -l on changed files and go test for changed packages."
+	other := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	if _, err := newInstructionDispatcher(other, configured).Dispatch(context.Background(), 1); err != nil {
+		t.Fatalf(`Dispatch(context.Background(), 1): %v`, err)
+	}
+	if !strings.Contains(other.requests[0].Prompt, "gofmt -l") {
+		t.Fatalf("configured instructions were not prepended: %s", other.requests[0].Prompt)
 	}
 }
 
@@ -578,15 +586,24 @@ func TestPRWatchInstructionIsSharedAcrossPrompts(t *testing.T) {
 		t.Fatalf("idle wakes = %d, want 1", len(idleHarness.wakes))
 	}
 
-	w := core.WakeContext{RunID: "run-1", PRNumber: 17}
+	w := core.WakeContext{RunID: "run-1", PRNumber: 17, Action: core.WakeFix}
 	for name, text := range map[string]string{
-		"spawn":        h.requests[0].Prompt,
-		"wake":         core.WakeText(w),
-		"limited wake": core.WakeTextLimited(w, 0),
-		"idle nudge":   idleHarness.wakes[0].Excerpt,
+		"spawn":      h.requests[0].Prompt,
+		"idle nudge": idleHarness.wakes[0].Excerpt,
 	} {
 		if !strings.Contains(text, core.OpenPRAndWatchInstruction) {
 			t.Errorf("%s prompt missing shared PR/watch instruction: %q", name, text)
+		}
+	}
+	for name, text := range map[string]string{
+		"wake":         core.WakeText(w),
+		"limited wake": core.WakeTextLimited(w, 0),
+	} {
+		if !strings.Contains(text, core.ExistingPRInstruction) {
+			t.Errorf("%s prompt missing existing-PR instruction: %q", name, text)
+		}
+		if strings.Contains(text, core.OpenPRAndWatchInstruction) {
+			t.Errorf("%s prompt asked for a second PR: %q", name, text)
 		}
 	}
 }
@@ -667,12 +684,17 @@ func TestDispatchWithoutResolverLeavesHarnessDefault(t *testing.T) {
 func TestFixerPromptPrependsWorkerInstructions(t *testing.T) {
 	const custom = "Custom worker instructions from config."
 	in := &core.BaseIncident{FailedChecksJSON: "[\"ci\"]"}
-	prompt := fixerPrompt(redBase(), in, core.Task{ID: "FIX-1"}, custom)
+	prompt := fixerPrompt(redBase(), in, core.Task{ID: "FIX-1"}, custom, "fix-run-1", "base-sha")
 	if !strings.HasPrefix(prompt, custom+"\n\n") {
 		t.Fatalf("fixer prompt does not start with configured instructions: %q", prompt)
 	}
-	if !strings.Contains(prompt, "Base branch main is red") {
+	if !strings.Contains(prompt, "Base branch main at SHA base-sha is red") {
 		t.Fatalf("fixer prompt content lost: %q", prompt)
+	}
+	for _, want := range []string{"fix-run-1", "base-sha", core.OpenPRAndWatchInstruction} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("fixer prompt missing %q: %s", want, prompt)
+		}
 	}
 }
 
@@ -1986,7 +2008,7 @@ func TestDispatchSeamFilesReachable(t *testing.T) {
 		if direct := spawnPrompt(task, "run-p", "/ws/p", "operator note"); built != direct {
 			t.Fatal("BuildSpawnPrompt and spawnPrompt disagree")
 		}
-		for _, want := range []string{"run-p", "T-P", "/ws/p", "operator note", "custom", "gofmt -l"} {
+		for _, want := range []string{"run-p", "T-P", "/ws/p", "operator note", "custom", "local format and targeted test checks for this stack"} {
 			if !strings.Contains(built, want) {
 				t.Errorf("prompt missing %q", want)
 			}

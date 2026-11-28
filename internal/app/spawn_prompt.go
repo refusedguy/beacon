@@ -6,31 +6,19 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// prePRCheck is appended to the stock worker prompt before the task card's
-// override. It makes a known formatting or test failure stop the worker before
-// it opens a PR, so CI does not spend a fix round on it. The Go check commands
-// are concrete; the verification rule they serve comes from pkg/core so the
-// spawn prompt cannot contradict the config default or the init instructions.
-const prePRCheck = `Before opening a pull request, run the local format and test check.
-
-Run: gofmt -l <changed Go files>
-The command must print nothing. If it prints a file, format that file and run it again.
-
-Run: go test <changed Go packages>
-The command must pass. If a test fails, fix it and run the command again.
-
-If gofmt -l still prints a file or a targeted test still fails, stop. Do not open a pull request. Report the exact command you ran and its full output, then stop.
-
-` + core.WeakMachineVerificationRule + `
-The gofmt -l and targeted go test checks are required on every machine.
-`
+// spawnVerification is the language-agnostic rule in the stock worker prompt.
+// The concrete format and test commands belong to config: beacon init writes
+// them for the detected stack, and the operator overrides them there. A stock
+// block that names Go commands tells a Node or Python worker to run another
+// stack's tools, so it must stay free of them.
+const spawnVerification = "Before opening a pull request, run the local format and targeted test checks for this stack. " + core.WeakMachineVerificationRule + "\n"
 
 func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
 	var b strings.Builder
 	// Reserve the fixed text plus the variable fields in one allocation. The
 	// stock prompt is a few kilobytes, so growing from zero reallocates several
 	// times for every dispatch.
-	b.Grow(len(prePRCheck) + len(core.OpenPRAndWatchInstruction) + len(instructions) +
+	b.Grow(len(spawnVerification) + len(core.OpenPRAndWatchInstruction) + len(instructions) +
 		len(id) + len(t.ID) + len(t.Title) + len(ws) +
 		len(t.BaseBranch) + len(t.WorkerPrompt) + 256)
 	prependWorkerInstructions(&b, instructions)
@@ -51,7 +39,7 @@ func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
 		b.WriteString(", not the default branch.\n")
 	}
 	b.WriteString("Implement the task, " + core.OpenPRAndWatchInstruction + "\n")
-	b.WriteString(prePRCheck)
+	b.WriteString(spawnVerification)
 	appendWorkerPrompt(&b, t)
 	return b.String()
 }
