@@ -578,7 +578,8 @@ func TestMarkdownBracketedTitleDropsCard(t *testing.T) {
 
 // TestTaskCardCorpusFrontmatter decodes every card shipped in docs/tasks. A
 // malformed header names the file and the YAML line so CI catches the next
-// hand-authored bad card before the daemon silently drops it.
+// hand-authored bad card before the daemon silently drops it. A conflict marker
+// anywhere in a card fails the same way and names its path and line.
 func TestTaskCardCorpusFrontmatter(t *testing.T) {
 	dir := filepath.Join("..", "..", "..", "docs", "tasks")
 	paths, err := (CardStore{Dir: dir}).cards()
@@ -587,6 +588,9 @@ func TestTaskCardCorpusFrontmatter(t *testing.T) {
 	}
 	if len(paths) == 0 {
 		t.Fatalf("no cards found under %s", dir)
+	}
+	if markerPath, markerLine, found := core.CheckCardMarkers(dir); found {
+		t.Fatalf("conflict marker at %s:%d in docs/tasks card", markerPath, markerLine)
 	}
 	for _, path := range paths {
 		b, err := os.ReadFile(path)
@@ -602,6 +606,40 @@ func TestTaskCardCorpusFrontmatter(t *testing.T) {
 		if err := yaml.Unmarshal([]byte(fm), &schema); err != nil {
 			t.Errorf("%s: malformed frontmatter: %v", path, err)
 		}
+	}
+}
+
+// TestTaskCardCorpusMarkersReportsPathAndLine feeds a marked card through the
+// helper the corpus test uses. Markers around status are the shape yaml.v3
+// rejects, so the card would otherwise vanish from SyncTasks and dispatch.
+func TestTaskCardCorpusMarkersReportsPathAndLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-MARKED.md")
+	content := strings.Join([]string{
+		"---",
+		"id: T-MARKED",
+		"title: Marked card",
+		"<<<<<<< Updated upstream",
+		"status: available",
+		"=======",
+		"status: done",
+		">>>>>>> Stashed changes",
+		"---",
+		"# T-MARKED. Card",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(path): %v", err)
+	}
+
+	gotPath, gotLine, found := core.CheckCardMarkers(dir)
+	if !found {
+		t.Fatal("CheckCardMarkers did not report a marker in the marked fixture")
+	}
+	if gotPath != path {
+		t.Fatalf("marker path = %q, want %q", gotPath, path)
+	}
+	if gotLine != 4 {
+		t.Fatalf("marker line = %d, want %d", gotLine, 4)
 	}
 }
 
