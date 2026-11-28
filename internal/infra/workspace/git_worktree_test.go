@@ -1229,11 +1229,11 @@ func TestGitWorktreeRemoveDirtyPathClassifiesWithOneProbe(t *testing.T) {
 	if core.CodeOf(err) != core.CodeConflict {
 		t.Fatalf("Remove() error = %v, want CodeConflict for a dirty worktree", err)
 	}
-	if len(calls) != 2 {
-		t.Fatalf("Remove() ran %d git commands on a dirty path, want 2: %v", len(calls), calls)
+	if len(calls) != 1 {
+		t.Fatalf("Remove() ran %d git commands on a dirty path, want only worktree remove: %v", len(calls), calls)
 	}
-	if calls[0][0] != "worktree" || calls[1][0] != "status" {
-		t.Fatalf("Remove() probe order = %v, want worktree remove then status", calls)
+	if calls[0][0] != "worktree" {
+		t.Fatalf("Remove() first call = %v, want worktree remove", calls[0])
 	}
 	if _, err := os.Stat(dirty); err != nil {
 		t.Fatalf("agent file removed by a rejected Remove(): %v", err)

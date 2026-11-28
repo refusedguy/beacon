@@ -696,6 +696,18 @@ func (g *GitWorktree) refresh(ctx context.Context) {
 	}
 }
 
+// isDirtyWorktreeError recognizes git's stable marker for a worktree it
+// refuses to remove because it holds uncommitted files. Both wordings appear
+// across supported git versions.
+func isDirtyWorktreeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "contains modified or untracked files") ||
+		strings.Contains(msg, "has modified or untracked files")
+}
+
 // Remove deletes a clean worktree and its local branch.
 func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	if ws.Path == "" {
@@ -722,14 +734,10 @@ func (g *GitWorktree) Remove(ctx context.Context, ws core.Workspace) error {
 	} else if err != nil {
 		return err
 	}
-	// A failed removal may mean dirt or a broken git registration. Ask git once
-	// to tell the cases apart so a dirty worktree keeps its old conflict error
-	// and every other failure keeps the original git error.
-	clean, cleanErr := g.Clean(ctx, ws)
-	if cleanErr != nil {
-		return core.JoinWith(removeErr, "check worktree before removal", cleanErr)
-	}
-	if !clean {
+	// Git names a dirty worktree in its own error. Classify from that text so
+	// the dirty path keeps its conflict error without a second status call;
+	// every other failure keeps the original git error.
+	if isDirtyWorktreeError(removeErr) {
 		return core.WorkspaceConflict(ws.Path)
 	}
 	return removeErr
