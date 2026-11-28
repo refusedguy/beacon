@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -545,6 +546,22 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 	sha := result.Data.UpdatePullRequestBranch.PullRequest.HeadRefOid
 	if sha == "" {
 		return "", core.Errorf(core.CodeUnavailable, "update branch returned no head SHA")
+	}
+	if sha == expectedSHA {
+		// The mutation echoed the pre-update headRefOid. Its validator is
+		// stale, so drop the cached PR and read it again with an unconditional
+		// GET. The caller records the real post-update head, and the next
+		// Observe starts from a fresh ETag instead of serving a 304.
+		g.prCache.invalidate(strconv.Itoa(pr))
+		fresh, err := g.getPR(ctx, pr)
+		if err != nil {
+			return "", redactErr(err)
+		}
+		sha = fresh.GetHead().GetSHA()
+		if sha == "" {
+			return "", core.Errorf(core.CodeUnavailable, "update branch returned no head SHA")
+		}
+		return sha, nil
 	}
 	g.writePRCache(pr, func(p *github.PullRequest) {
 		if head := p.GetHead(); head != nil {

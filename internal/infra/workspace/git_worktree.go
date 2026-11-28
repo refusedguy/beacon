@@ -212,25 +212,122 @@ func (g *GitWorktree) releaseWorkspace(ws core.Workspace) {
 	}
 }
 
-// clearStalePath removes a leftover worktree at path. A failed spawn can leave
-// only the card status marker behind, which belongs to Beacon and must not
-// block the next dispatch. Real agent code still stops the create with a
-// conflict. The stale path is removed quietly; the editor refresh belongs to
-// public removal, since Create re-adds this path immediately.
-func (g *GitWorktree) clearStalePath(ctx context.Context, path string) error {
-	if _, err := os.Stat(path); err == nil {
-		dirty, onlyCards, err := g.cardOnlyDirt(ctx, path)
+// reclaim returns a stale worktree to a state where the next add can reuse it.
+// A killed add leaves a worktree locked with the "initializing" reason, which
+// no prune clears, so the lock is released first. Beacon's own card marker is
+// discarded. Uncommitted agent code blocks a create but not a cancel cleanup:
+// protectCode keeps that conflict. Committed work is pushed to origin before
+// the branch is deleted, so no commit is lost.
+//
+// base names the branch whose origin ref marks pushed work. An empty base uses
+// the merge base recorded in ws, then the configured base branch.
+func (g *GitWorktree) reclaim(ctx context.Context, ws core.Workspace, base string, protectCode bool) error {
+	if ws.Path == "" {
+		return nil
+	}
+	if err := g.unlockInitializing(ctx, ws.Path); err != nil {
+		return err
+	}
+	if _, err := os.Stat(ws.Path); os.IsNotExist(err) {
+		if ws.Branch != "" {
+			return g.deleteBranch(ctx, ws.Branch, true)
+		}
+		return nil
+	} else if err != nil {
+		return err
+	}
+	dirty, onlyCards, err := g.cardOnlyDirt(ctx, ws.Path)
+	if err != nil {
+		return err
+	}
+	if dirty && !onlyCards && protectCode {
+		return core.WorkspaceConflict(ws.Path)
+	}
+	if err := g.preserveCommits(ctx, ws, base); err != nil {
+		return err
+	}
+	return g.removeForce(ctx, ws)
+}
+
+// unlockInitializing releases only a lock left by a killed worktree add. A
+// lock with another reason was set on purpose and must stay in place.
+func (g *GitWorktree) unlockInitializing(ctx context.Context, path string) error {
+	lock := filepath.Join(g.Root, ".git", "worktrees", filepath.Base(path), "locked")
+	data, err := os.ReadFile(lock)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(data)) != "initializing" {
+		return nil
+	}
+	_, err = g.run(ctx, "worktree", "unlock", path)
+	return err
+}
+
+// preserveCommits pushes commits that are not on origin so a later branch
+// delete cannot lose them. The push uses a bounded context detached from the
+// caller: once a cleanup is decided, a cancelled caller must not cut it short.
+func (g *GitWorktree) preserveCommits(ctx context.Context, ws core.Workspace, base string) error {
+	ref := "origin/" + base
+	if base == "" {
+		if ws.Base != "" {
+			ref = ws.Base
+		} else {
+			ref = "origin/" + g.baseBranch()
+		}
+	}
+	out, err := g.runInDir(ctx, ws.Path, "rev-list", "--count", ref+"..HEAD")
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	branch := ws.Branch
+	if branch == "" {
+		name, err := g.runInDir(ctx, ws.Path, "rev-parse", "--abbrev-ref", "HEAD")
 		if err != nil {
 			return err
 		}
-		if dirty && !onlyCards {
-			return core.WorkspaceConflict(path)
-		}
-		return g.removeForce(ctx, core.Workspace{Path: path})
-	} else if !os.IsNotExist(err) {
-		return err
+		branch = strings.TrimSpace(name)
+	}
+	if branch == "" || branch == "HEAD" {
+		return core.WorkspaceConflict(ws.Path)
+	}
+	pushCtx, cancel := detachedPushContext(ctx, g.Timeout)
+	defer cancel()
+	if _, err := g.runInDir(pushCtx, ws.Path, "push", "origin", branch); err != nil {
+		return fmt.Errorf("preserve unpushed commits: %w", err)
 	}
 	return nil
+}
+
+// baseBranch is the configured base, or main when none was set.
+func (g *GitWorktree) baseBranch() string {
+	if g.Base != "" {
+		return g.Base
+	}
+	return "main"
+}
+
+// Reclaim clears ws and its branch after a run is closed. It shares the
+// create-path helper: an initializing lock is released, unpushed commits are
+// pushed, and the worktree is removed even when it holds uncommitted edits.
+// The caller controls cancellation and refresh; Reclaim only reports failures.
+func (g *GitWorktree) Reclaim(ctx context.Context, ws core.Workspace, base string) error {
+	defer g.refresh(ctx)
+	err := g.reclaim(ctx, ws, base, false)
+	if err == nil {
+		g.releaseWorkspace(ws)
+	}
+	return err
 }
 
 // addWorktree checks branch out at path from origin/base. The branch name is
@@ -280,7 +377,9 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	if _, err := g.run(ctx, "fetch", "origin", t.base); err != nil {
 		return core.Workspace{}, err
 	}
-	if err := g.clearStalePath(ctx, t.path); err != nil {
+	// A closed run can leave a locked or dirty worktree behind. Reclaim it
+	// before adding so the next dispatch is not blocked by stale state.
+	if err := g.reclaim(ctx, core.Workspace{Path: t.path}, t.base, true); err != nil {
 		return core.Workspace{}, err
 	}
 	if err := g.addWorktree(ctx, t); err != nil {
@@ -533,9 +632,11 @@ func (g *GitWorktree) deleteBranch(ctx context.Context, branch string, force boo
 
 // ForceRemove deletes a worktree and its branch without a clean check. A
 // removal is the point where the editor's worktree registry must be refreshed.
+// Committed work is pushed before the branch goes away, so a forced cleanup
+// after a failed start cannot lose it.
 func (g *GitWorktree) ForceRemove(ctx context.Context, ws core.Workspace) error {
 	defer g.refresh(ctx)
-	err := g.removeForce(ctx, ws)
+	err := g.reclaim(ctx, ws, "", false)
 	if err == nil {
 		g.releaseWorkspace(ws)
 	}
