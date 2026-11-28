@@ -139,7 +139,11 @@ func TestChangeSubscribersDropsSlowClientWithoutBlockingOthers(t *testing.T) {
 	fast, unFast := subs.subscribe()
 	defer unFast()
 
-	go subs.run(ctx, src)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		subs.run(ctx, src)
+	}()
 
 	// Never drain slow. Broadcast more changes than its buffer holds.
 	total := subscriberBuffer + 1
@@ -154,6 +158,11 @@ func TestChangeSubscribersDropsSlowClientWithoutBlockingOthers(t *testing.T) {
 			t.Fatalf("fast subscriber stalled at change %d", i)
 		}
 	}
+
+	// Stop the broadcaster and wait for it to finish. The last change may still
+	// be in flight for slow after fast has received its frame.
+	cancel()
+	<-done
 
 	// slow kept the first subscriberBuffer changes and dropped the last one.
 	count := 0

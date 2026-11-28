@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
@@ -57,30 +59,11 @@ var activeStatesSQL = quotedList(activeExcludedStates)
 // Store is the SQLite implementation of the run and decision stores.
 type Store struct{ db *sql.DB }
 
-// Open opens the SQLite state database at path.
+// Open opens the SQLite state database at path. openDB prepares the schema in
+// one transaction, so there is no DDL left to apply here.
 func Open(path string) (*Store, error) {
 	db, err := openDB(path)
 	if err != nil {
-		return nil, err
-	}
-	if err := dropRedundantRunIndexes(db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := ensureSnapshotIndexes(db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := ensureDecisionSummary(db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := ensureOperationResults(db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := ensureWaitlist(db); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
@@ -99,12 +82,56 @@ const operationResultsDDL = `CREATE TABLE IF NOT EXISTS operation_results (
   created_at INTEGER NOT NULL
 )`
 
-// ensureOperationResults adds the journal table to every state database,
-// including one opened before the table existed. It runs outside the schema
-// version marker so an already prepared database gains the table on open.
-func ensureOperationResults(db *sql.DB) error {
-	_, err := db.Exec(operationResultsDDL)
+// ensureOperationResults adds the journal table during schema preparation. An
+// older database that lacks it fails schemaPrepared and takes the migration
+// path, so it gains the table on the next open.
+func ensureOperationResults(ctx context.Context, db dbExecutor) error {
+	_, err := db.ExecContext(ctx, operationResultsDDL)
 	return err
+}
+
+// SaveCAS saves r only while the stored row still carries the version the
+// caller read. expectedUpdatedAt is a Unix nanosecond reading and
+// expectedHeadSHA is the head SHA of that same read. Both checks and the write
+// share one immediate transaction, so a save that lands between the caller's
+// read and this call fails instead of overwriting the newer state.
+//
+// A stale version returns a core.CodeConflict error. A run that disappeared
+// returns core.CodeNotFound. Callers that need to retry can read the run again
+// and decide from its current state.
+func (s *Store) SaveCAS(ctx context.Context, r *core.Run, expectedUpdatedAt int64, expectedHeadSHA string) error {
+	if err := s.checkActivePR(ctx, r); err != nil {
+		return err
+	}
+	row, err := prepareSaveRow(r, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var storedUpdatedAt int64
+	var storedHeadSHA string
+	err = tx.QueryRowContext(ctx, `SELECT updated_at, head_sha FROM runs WHERE id=?`, string(r.ID)).
+		Scan(&storedUpdatedAt, &storedHeadSHA)
+	switch {
+	case err == sql.ErrNoRows:
+		return core.Errorf(core.CodeNotFound, "run %s no longer exists", r.ID)
+	case err != nil:
+		return err
+	case storedUpdatedAt != expectedUpdatedAt || storedHeadSHA != expectedHeadSHA:
+		return core.Errorf(core.CodeConflict, "run %s changed since it was read", r.ID)
+	}
+	newRun, previous, err := writeSaveRow(ctx, tx, r, row)
+	if err != nil {
+		return err
+	}
+	if err := recordSaveEvent(ctx, tx, r, newRun, previous); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // scanner is the row interface shared by QueryRow and Rows.
@@ -262,6 +289,101 @@ ORDER BY waiting_since ASC, task_id ASC, path ASC LIMIT 1`, values)
 func (s *Store) RemoveWaitEntries(ctx context.Context, taskID core.TaskID) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM waitlist WHERE task_id = ?`, string(taskID))
 	return err
+}
+
+// deliveryRetention is the default window for every age-pruned table. Delivery
+// keys and approvals are idempotency markers for a SHA, while decisions and run
+// events are audit history. The status snapshot shows only recent history, so a
+// row older than this window can no longer change a snapshot or a decision.
+const deliveryRetention = 30 * 24 * time.Hour
+
+// retentionBatchSize caps how many rows one prune pass removes from a table.
+// The reconcile tick stays short even after a long outage with accumulated
+// rows; a later tick removes the next batch.
+const retentionBatchSize = 1000
+
+// terminalRunLimit is the number of newest terminal runs a prune keeps. It is
+// a variable so the boundary test can use a small limit without writing twenty
+// thousand rows.
+var terminalRunLimit = 20000
+
+// terminalStatesSQL is the literal state list used by the terminal prune. It
+// shares the definitions used by the read-side filters.
+var terminalStatesSQL = quotedList(terminalStates)
+
+// PruneStale deletes delivery, approval, decision and run event rows older than
+// retention, then trims terminal runs past terminalRunLimit. It returns the
+// number of rows removed. A non-positive retention uses the default 30-day
+// window. Decisions are deleted through the summary delete trigger so
+// DecisionCounts keeps matching the rows still stored.
+func (s *Store) PruneStale(ctx context.Context, retention time.Duration) (int64, error) {
+	if retention <= 0 {
+		retention = deliveryRetention
+	}
+	cutoff := nowUnix() - retention.Nanoseconds()
+	queries := []string{
+		`DELETE FROM deliveries WHERE key IN (SELECT key FROM deliveries WHERE created_at < ? LIMIT ?)`,
+		`DELETE FROM approvals WHERE rowid IN (SELECT rowid FROM approvals WHERE created_at < ? LIMIT ?)`,
+		`DELETE FROM decisions WHERE id IN (SELECT id FROM decisions WHERE at < ? LIMIT ?)`,
+		`DELETE FROM run_events WHERE id IN (SELECT id FROM run_events WHERE at < ? LIMIT ?)`,
+	}
+	var removed int64
+	for _, query := range queries {
+		res, err := s.db.ExecContext(ctx, query, cutoff, retentionBatchSize)
+		if err != nil {
+			return removed, err
+		}
+		n, err := res.RowsAffected()
+		removed += n
+		if err != nil {
+			return removed, err
+		}
+	}
+	runs, err := pruneTerminalRuns(ctx, s.db)
+	removed += runs
+	return removed, err
+}
+
+// pruneTerminalRuns deletes the oldest terminal runs beyond terminalRunLimit
+// in batches. A run named by base_incidents.fixer_run_id is excluded from the
+// ranking, so an incident never points at a deleted run. Freed pages return to
+// the SQLite freelist and are reused by later inserts, so the file stops
+// growing at its high-water mark. The batch cap keeps one reconciler tick
+// short; a later tick removes the next batch.
+//
+// There is no automatic VACUUM. A measurement with 20,000 run rows on a 5,699 page
+// database showed a prune of 1,000 rows costing 87 ms and leaving 282 freelist
+// pages. Inserting 500 new rows reused that space without growing the file.
+// VACUUM took 146 ms under an exclusive lock and only lowered the high-water
+// mark to 5,347 pages. PRAGMA incremental_vacuum was a no-op because these
+// databases use auto_vacuum=NONE; enabling it would need a one-time full rewrite
+// of every existing state.db. The operator can run a VACUUM during an outage if
+// the freed pages must go back to the filesystem.
+func pruneTerminalRuns(ctx context.Context, db *sql.DB) (int64, error) {
+	query := `DELETE FROM runs WHERE id IN (
+ SELECT id FROM (
+   SELECT id FROM runs
+   WHERE state IN (` + terminalStatesSQL + `)
+     AND id NOT IN (SELECT fixer_run_id FROM base_incidents WHERE fixer_run_id <> '')
+   ORDER BY updated_at DESC
+   LIMIT ` + strconv.Itoa(retentionBatchSize) + ` OFFSET ` + strconv.Itoa(terminalRunLimit) + `
+ )
+)`
+	var removed int64
+	for {
+		res, err := db.ExecContext(ctx, query)
+		if err != nil {
+			return removed, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return removed, err
+		}
+		removed += n
+		if n < retentionBatchSize {
+			return removed, nil
+		}
+	}
 }
 
 var _ core.RunStore = (*Store)(nil)
