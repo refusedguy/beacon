@@ -15,6 +15,11 @@ on:
       - '!AGENTS.md'
   schedule:
     - cron: '0 3 * * *'
+    # A worker pushes before CI finishes, so the label step on synchronize
+    # sees pending checks. This pass labels open PRs whose required checks
+    # have since turned green, with no new push. mark-ready is the only job
+    # that runs on this schedule; the nightly gate stays at 03:00.
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -30,7 +35,8 @@ jobs:
   # One shared filter feeds every gate. Output names are pinned here so a typo
   # in a consumer cannot silently turn into a skipped job.
   changes:
-    if: github.event.action != 'closed'
+    # Scheduled runs have no diff to filter and no dependent gate to feed.
+    if: github.event.action != 'closed' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -100,13 +106,15 @@ jobs:
   mark-ready:
     # Ordinary PRs need no operator action to satisfy merge.labels.
     # Perf PRs are intentionally skipped: their worker sets the label after
-    # the last variant has been measured.
+    # the last variant has been measured. The periodic pass labels PRs whose
+    # checks turned green after the last push, with no new event from the PR.
     if: >-
-      github.event.action != 'closed' &&
-      github.event_name == 'pull_request' &&
-      !contains(github.event.pull_request.labels.*.name, 'perf')
+      (github.event_name == 'pull_request' &&
+       github.event.action != 'closed' &&
+       !contains(github.event.pull_request.labels.*.name, 'perf')) ||
+      github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     permissions:
       pull-requests: write
     steps:
@@ -114,12 +122,49 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.issues.addLabels({
+            const addReady = number => github.rest.issues.addLabels({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: number,
               labels: ['ready-to-merge'],
-            })
+            });
+            if (context.eventName === 'pull_request') {
+              await addReady(context.issue.number);
+            } else {
+              // mergeStateStatus CLEAN means every required check passed and
+              // no review or status blocks the merge. GraphQL reads it with
+              // the same token, so the job keeps only pull-requests: write.
+              // Perf PRs keep their measured-gain path.
+              const query = `query($owner: String!, $repo: String!, $cursor: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequests(states: OPEN, first: 100, after: $cursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      number
+                      mergeable
+                      mergeStateStatus
+                      labels(first: 100) { nodes { name } }
+                    }
+                  }
+                }
+              }`;
+              let cursor = null;
+              do {
+                const data = await github.graphql(query, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  cursor,
+                });
+                const conn = data.repository.pullRequests;
+                for (const pr of conn.nodes) {
+                  if (pr.mergeable !== 'MERGEABLE') continue;
+                  if (pr.mergeStateStatus !== 'CLEAN') continue;
+                  if (pr.labels.nodes.some(label => label.name === 'perf')) continue;
+                  await addReady(pr.number);
+                }
+                cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+              } while (cursor);
+            }
 
   verify:
     if: >-
@@ -1407,7 +1452,7 @@ jobs:
   # Both trees are the same SHA here, so every observed delta is machine noise.
   # The published floor lets PR comments reject a false regression.
   perf-noise-floor:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
@@ -1625,7 +1670,7 @@ jobs:
   # pinned CPU so a reader can tell which class produced a number. A manual
   # dispatch uses the nightly class to recover a broken baseline.
   perf-nightly:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *') || github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64, perf]
     timeout-minutes: 30
     permissions:

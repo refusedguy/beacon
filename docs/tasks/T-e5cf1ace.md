@@ -1,7 +1,7 @@
 ---
 id: T-e5cf1ace
 title: Add ready-to-merge when required checks turn green
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
 priority: 1
