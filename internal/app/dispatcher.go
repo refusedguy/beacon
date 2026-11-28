@@ -512,6 +512,7 @@ func (d *Dispatcher) withReserved(active []*core.Run) []*core.Run {
 		r.Scope = res.scope
 		if res.agent {
 			r.State = core.RunRunning
+			r.HoldAgent()
 		}
 		view = append(view, r)
 	}
@@ -838,6 +839,7 @@ func (d *Dispatcher) startOne(ctx context.Context, batch *dispatchBatch, run *co
 		return step("spawn", err)
 	}
 	run.SessionID = session.ID
+	run.HoldAgent()
 	if session.PR != 0 {
 		run.PRNumber = session.PR
 		d.Decisions.logTransitionWatchPR(ctx, run.ID, session.PR)
@@ -848,6 +850,9 @@ func (d *Dispatcher) startOne(ctx context.Context, batch *dispatchBatch, run *co
 	if err := d.timed(ctx, "Save", func() error {
 		return d.Store.Save(ctx, run)
 	}); err != nil {
+		// The session is live but no row records it. Stop the worker and drop
+		// its worktree so no live session is left without a run row.
+		d.stopUnsavedWorker(ctx, run, session.ID, ws)
 		return step("save", err)
 	}
 	d.Decisions.logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
@@ -858,6 +863,21 @@ func (d *Dispatcher) startOne(ctx context.Context, batch *dispatchBatch, run *co
 	return d.timed(ctx, "SetTaskStatus", func() error {
 		return d.Store.SetTaskStatus(ctx, task.ID, "claimed")
 	})
+}
+
+// stopUnsavedWorker cleans up a spawn whose final save failed. The run has no
+// row, so the session and worktree are the only trace left. Clearing the IDs
+// also keeps handleStartFailure from trying to save a live session again.
+func (d *Dispatcher) stopUnsavedWorker(ctx context.Context, run *core.Run, sessionID string, ws core.Workspace) {
+	bestEffort("stop unsaved worker", func() error {
+		return d.Harness.Stop(ctx, sessionID)
+	}, "run", run.ID, "task", run.TaskID)
+	bestEffort("force remove unsaved worktree", func() error {
+		return d.Workspace.ForceRemove(ctx, ws)
+	}, "run", run.ID, "task", run.TaskID)
+	run.ReleaseAgent()
+	run.SessionID = ""
+	run.WorkspacePath = ""
 }
 
 // handleStartFailure closes a run only after its worker is gone. A worker that
@@ -876,6 +896,8 @@ func (d *Dispatcher) handleStartFailure(ctx context.Context, run *core.Run, caus
 		run.UpdatedAt = time.Now().UTC()
 		if err := d.Store.Save(ctx, run); err != nil {
 			logStep("save live run", run, err)
+			// A live worker with no row would hold a slot no one can see.
+			d.stopUnsavedWorker(ctx, run, run.SessionID, core.Workspace{Path: run.WorkspacePath, Branch: run.Branch})
 		}
 		return
 	}
@@ -938,17 +960,72 @@ func (d *Dispatcher) Available(ctx context.Context) int {
 	return d.availableFrom(d.withReserved(active))
 }
 
+// AvailableFor reports the free slots visible to runID. The run being woken
+// already owns a live session, so counting its own slot would make a single
+// agent run unable to wake itself. Both the stored run and its wake reservation
+// are excluded by ID; every other holder still counts.
+func (d *Dispatcher) AvailableFor(ctx context.Context, runID core.RunID) int {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+	active, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return 0
+	}
+	return d.availableFromExcept(d.withReserved(active), runID)
+}
+
+// ReserveForWake checks and reserves one slot for runID inside a single
+// slotsMu section. Two concurrent wakes cannot both pass the same free-slot
+// check. The caller releases the reservation with ReleaseWake once the wake or
+// the injected spawn has landed a run row.
+func (d *Dispatcher) ReserveForWake(ctx context.Context, runID core.RunID) bool {
+	d.slotsMu.Lock()
+	defer d.slotsMu.Unlock()
+	active, err := d.Store.ListActive(ctx)
+	if err != nil {
+		return false
+	}
+	if d.availableFromExcept(d.withReserved(active), runID) <= 0 {
+		return false
+	}
+	if d.reserved == nil {
+		d.reserved = make(map[core.RunID]*slotReservation)
+	}
+	if _, held := d.reserved[runID]; !held {
+		d.reserved[runID] = &slotReservation{runID: runID, agent: true}
+	}
+	return true
+}
+
+// ReleaseWake frees a reservation taken by ReserveForWake. Dropping an ID that
+// was already released is a no-op, so a caller can defer it safely.
+func (d *Dispatcher) ReleaseWake(_ context.Context, runID core.RunID) {
+	d.dropReservation(runID)
+}
+
 // availableFrom applies the agent-slot rule to a list the caller already has.
 // Dispatch derives its budget from the same active view used for selection
 // instead of calling Available, which would read the store a second time.
 func (d *Dispatcher) availableFrom(active []*core.Run) int {
+	return d.availableFromExcept(active, "")
+}
+
+// availableFromExcept is availableFrom with one run omitted from the used
+// count. An empty except keeps the ordinary whole-view count.
+func (d *Dispatcher) availableFromExcept(active []*core.Run, except core.RunID) int {
 	limit := d.Concurrency.MaxActiveAgents
 	if limit <= 0 {
 		limit = d.inFlightLimit()
 	}
 	used := 0
 	for _, r := range active {
-		if r.State.ActiveAgent() {
+		if r == nil || (except != "" && r.ID == except) {
+			continue
+		}
+		// A persisted session flag keeps a woken run in waiting_ci counted
+		// while its worker is still alive. The state check covers rows written
+		// before the flag existed and in-flight reservations.
+		if r.HoldsAgent() || r.State.ActiveAgent() {
 			used++
 		}
 	}

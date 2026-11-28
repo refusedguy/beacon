@@ -155,12 +155,14 @@ func (r *Reconciler) bindOpenPR(ctx context.Context, run *core.Run) (bool, error
 	return true, nil
 }
 
-// reconcileOrphanRunning binds missing PRs and closes running runs whose
-// worker session is gone. A live session and a failed liveness check are both
-// left alone; only a confirmed dead session frees its slot.
+// reconcileOrphanRunning binds missing PRs and closes runs whose worker
+// session is gone. Every nonterminal run with a session is inspected: a
+// PR-bound run in waiting_ci can hold a slot just as a running run can. A live
+// session and a failed liveness check are both left alone; only a confirmed
+// dead session frees its slot.
 func (r *Reconciler) reconcileOrphanRunning(ctx context.Context, runs []*core.Run) {
 	for _, run := range runs {
-		if run.State != core.RunRunning || run.PRNumber != 0 {
+		if run == nil || run.State.Terminal() || run.SessionID == "" {
 			continue
 		}
 		r.reconcileOneOrphan(ctx, run)
@@ -188,6 +190,9 @@ func (r *Reconciler) reconcileOneOrphan(ctx context.Context, run *core.Run) {
 
 func (r *Reconciler) closeOrphan(ctx context.Context, run *core.Run) {
 	reason := "worker session exited without PR"
+	// The liveness check confirmed the session is gone, so it no longer holds
+	// an agent slot regardless of the state it leaves behind.
+	run.ReleaseAgent()
 	if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: reason}); err != nil {
 		slog.Error("orphan close", "run", run.ID, "error", err)
 		return
