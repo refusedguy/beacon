@@ -85,6 +85,13 @@ type WakeContext struct {
 	Action WakeAction
 }
 
+// Harness event kinds name the signal carried by HarnessEvent.Kind. A death
+// event lets the reconciler close a run without waiting for the orphan sweep.
+const (
+	HarnessEventIdle        = "idle"
+	HarnessEventSessionDead = "session_dead"
+)
+
 // HarnessEvent is an event emitted by an agent harness.
 type HarnessEvent struct {
 	RunID     RunID

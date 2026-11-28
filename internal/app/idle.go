@@ -47,11 +47,32 @@ func (r *Reconciler) releaseIdleNudge(ctx context.Context, run *core.Run) {
 	}
 }
 
-// HandleHarnessEvent attaches a PR by branch name when an agent finishes a turn.
+const sessionDeadReason = "harness session died"
+
+// HandleHarnessEvent reacts to harness signals. An idle turn attaches a PR or
+// nudges the worker. A dead session closes the run so it frees its slot at once.
 func (r *Reconciler) HandleHarnessEvent(ctx context.Context, ev core.HarnessEvent) {
-	if ev.Kind != "idle" || ev.RunID == "" {
+	if ev.RunID == "" {
 		return
 	}
+	switch ev.Kind {
+	case core.HarnessEventSessionDead:
+		run, err := r.Store.Get(ctx, ev.RunID)
+		if err != nil {
+			slog.Error("session dead run lookup", "error", err)
+			return
+		}
+		if run == nil || run.State.Terminal() {
+			return
+		}
+		r.closeOrphan(ctx, run, sessionDeadReason)
+	case core.HarnessEventIdle:
+		r.handleIdleEvent(ctx, ev)
+	}
+}
+
+// handleIdleEvent attaches a PR by branch name when an agent finishes a turn.
+func (r *Reconciler) handleIdleEvent(ctx context.Context, ev core.HarnessEvent) {
 	run, err := r.Store.Get(ctx, ev.RunID)
 	if err != nil {
 		slog.Error("idle run lookup", "error", err)
@@ -185,13 +206,13 @@ func (r *Reconciler) reconcileOneOrphan(ctx context.Context, run *core.Run) {
 	if err != nil || alive {
 		return
 	}
-	r.closeOrphan(ctx, run)
+	r.closeOrphan(ctx, run, orphanSweepReason)
 }
 
-func (r *Reconciler) closeOrphan(ctx context.Context, run *core.Run) {
-	reason := "worker session exited without PR"
-	// The liveness check confirmed the session is gone, so it no longer holds
-	// an agent slot regardless of the state it leaves behind.
+const orphanSweepReason = "worker session exited without PR"
+
+func (r *Reconciler) closeOrphan(ctx context.Context, run *core.Run, reason string) {
+	// A dead session holds no agent slot, whatever state the run leaves behind.
 	run.ReleaseAgent()
 	if err := run.Apply(core.Event{Kind: core.EvCancel, Reason: reason}); err != nil {
 		slog.Error("orphan close", "run", run.ID, "error", err)
