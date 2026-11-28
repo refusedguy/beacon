@@ -53,23 +53,33 @@ const DefaultModelTimeout = 3 * time.Second
 // language agnostic so no stack is told to run another stack's test command.
 const DefaultWorkerInstructions = core.WeakMachineVerificationRule + " Use the beacon_* MCP tools only. Never locate, build or execute the beacon binary or cmd/beacon source from a shell."
 
+// DefaultAutoDispatchBatchSize lets one tick fill every free agent slot. A
+// positive batch_size caps the number of runs dispatched per tick instead.
+const DefaultAutoDispatchBatchSize = 0
+
+// DefaultWatchdogAge is the age used for a watched state the operator does not
+// configure. No watchdog acts until watchdog.enabled is true.
+const DefaultWatchdogAge = 30 * time.Minute
+
 // Config holds every setting loaded from .beacon/config.yaml.
 type Config struct {
-	StateDB       string      `yaml:"state_db"`
-	WorkspaceDir  string      `yaml:"workspace_dir"`
-	BaseBranch    string      `yaml:"base_branch"`
-	PollInterval  string      `yaml:"poll_interval"`
-	OrphanTimeout string      `yaml:"orphan_timeout"`
-	ModelTimeout  string      `yaml:"model_timeout"`
-	StrictScope   bool        `yaml:"strict_scope"`
-	Concurrency   Concurrency `yaml:"concurrency"`
-	TaskSource    TaskSource  `yaml:"task_source"`
-	SCM           SCM         `yaml:"scm"`
-	Harness       Harness     `yaml:"harness"`
-	Merge         Merge       `yaml:"merge"`
-	OnBaseRed     OnBaseRed   `yaml:"on_base_red"`
-	Webhook       Webhook     `yaml:"webhook"`
-	Notify        Notify      `yaml:"notify"`
+	StateDB       string       `yaml:"state_db"`
+	WorkspaceDir  string       `yaml:"workspace_dir"`
+	BaseBranch    string       `yaml:"base_branch"`
+	PollInterval  string       `yaml:"poll_interval"`
+	OrphanTimeout string       `yaml:"orphan_timeout"`
+	ModelTimeout  string       `yaml:"model_timeout"`
+	StrictScope   bool         `yaml:"strict_scope"`
+	Concurrency   Concurrency  `yaml:"concurrency"`
+	AutoDispatch  AutoDispatch `yaml:"auto_dispatch"`
+	Watchdog      Watchdog     `yaml:"watchdog"`
+	TaskSource    TaskSource   `yaml:"task_source"`
+	SCM           SCM          `yaml:"scm"`
+	Harness       Harness      `yaml:"harness"`
+	Merge         Merge        `yaml:"merge"`
+	OnBaseRed     OnBaseRed    `yaml:"on_base_red"`
+	Webhook       Webhook      `yaml:"webhook"`
+	Notify        Notify       `yaml:"notify"`
 
 	// ProjectRoot is the repository root the config was loaded from. Load sets
 	// it so the composition root can resolve live workflow names from the same
@@ -86,6 +96,89 @@ type Config struct {
 type Concurrency struct {
 	MaxInFlight     int `yaml:"max_in_flight"`
 	MaxActiveAgents int `yaml:"max_active_agents"`
+}
+
+// AutoDispatch configures slot refilling on each daemon tick. DispatchOpen is
+// the intake brake: a false value freezes intake while agent slots stay free.
+type AutoDispatch struct {
+	Enabled      bool `yaml:"enabled"`
+	BatchSize    int  `yaml:"batch_size"`
+	DispatchOpen bool `yaml:"dispatch_open"`
+
+	// fromYAML records that Load decoded an auto_dispatch section. ApplyDefaults
+	// uses it to supply dispatch_open: true without overwriting an explicit
+	// false from the config file.
+	fromYAML bool `yaml:"-"`
+}
+
+// UnmarshalYAML seeds the true default before decoding so a config that omits
+// dispatch_open keeps intake open while an explicit false still takes effect.
+func (a *AutoDispatch) UnmarshalYAML(node *yaml.Node) error {
+	type plain AutoDispatch
+	var decoded plain
+	decoded.DispatchOpen = true
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	decoded.fromYAML = true
+	*a = AutoDispatch(decoded)
+	return nil
+}
+
+// BatchSizeFor returns how many runs one tick dispatches when freeSlots agent
+// slots are available. A zero BatchSize fills every free slot. A positive
+// BatchSize caps the batch, and never exceeds the number of free slots.
+func (a AutoDispatch) BatchSizeFor(freeSlots int) int {
+	if freeSlots <= 0 {
+		return 0
+	}
+	if a.BatchSize > 0 && a.BatchSize < freeSlots {
+		return a.BatchSize
+	}
+	return freeSlots
+}
+
+// Watchdog configures age alerts for states that observations keep fresh
+// without progress. The running-without-PR policy stays in the reconciler's
+// orphan timeout.
+type Watchdog struct {
+	Enabled       bool   `yaml:"enabled"`
+	WaitingCI     string `yaml:"waiting_ci"`
+	NeedsRebase   string `yaml:"needs_rebase"`
+	NeedsAgentFix string `yaml:"needs_agent_fix"`
+	Blocked       string `yaml:"blocked"`
+}
+
+// AgeFor returns the configured age for state. The four watched states are
+// waiting_ci, needs_rebase, needs_agent_fix and blocked. Other states return
+// zero with no error so a caller cannot alert on them by accident.
+func (w Watchdog) AgeFor(state core.RunState) (time.Duration, error) {
+	var value string
+	switch state {
+	case core.RunWaitingCI:
+		value = w.WaitingCI
+	case core.RunNeedsRebase:
+		value = w.NeedsRebase
+	case core.RunNeedsAgentFix:
+		value = w.NeedsAgentFix
+	case core.RunBlocked:
+		value = w.Blocked
+	default:
+		return 0, nil
+	}
+	return parseDuration(value, DefaultWatchdogAge)
+}
+
+// ValidateWatchdog rejects a malformed age before the daemon starts. A bad
+// duration would otherwise leave a state without an alert and no visible
+// reason.
+func ValidateWatchdog(w Watchdog) error {
+	for _, state := range []core.RunState{core.RunWaitingCI, core.RunNeedsRebase, core.RunNeedsAgentFix, core.RunBlocked} {
+		if _, err := w.AgeFor(state); err != nil {
+			return fmt.Errorf("watchdog.%s: %w", state, err)
+		}
+	}
+	return nil
 }
 
 // TaskSource selects where the daemon reads task cards.
@@ -273,6 +366,9 @@ func (c *Config) validate(interval time.Duration, intervalErr error) error {
 	if _, err := parseDuration(c.ModelTimeout, DefaultModelTimeout); err != nil {
 		return fmt.Errorf("invalid model_timeout %q: %w", c.ModelTimeout, err)
 	}
+	if err := ValidateWatchdog(c.Watchdog); err != nil {
+		return err
+	}
 	switch c.Merge.RequiredChecksMode {
 	case "", RequiredChecksManual, RequiredChecksWorkflow:
 	default:
@@ -383,6 +479,23 @@ func ApplyDefaults(c *Config) {
 	if c.ModelTimeout == "" {
 		c.ModelTimeout = DefaultModelTimeout.String()
 	}
+	if !c.AutoDispatch.fromYAML {
+		c.AutoDispatch.DispatchOpen = true
+	}
+	c.AutoDispatch.fromYAML = true
+	age := DefaultWatchdogAge.String()
+	if c.Watchdog.WaitingCI == "" {
+		c.Watchdog.WaitingCI = age
+	}
+	if c.Watchdog.NeedsRebase == "" {
+		c.Watchdog.NeedsRebase = age
+	}
+	if c.Watchdog.NeedsAgentFix == "" {
+		c.Watchdog.NeedsAgentFix = age
+	}
+	if c.Watchdog.Blocked == "" {
+		c.Watchdog.Blocked = age
+	}
 }
 
 // warnModelOverride makes an environment model override visible. BEACON_MODEL
@@ -475,11 +588,18 @@ func defaults() Config {
 		ModelTimeout:  DefaultModelTimeout.String(),
 		interval:      defaultPollInterval,
 		Concurrency:   Concurrency{MaxInFlight: DefaultMaxInFlight, MaxActiveAgents: DefaultMaxActiveAgents},
-		TaskSource:    TaskSource{Provider: "markdown", Dir: "docs/tasks"},
-		SCM:           SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
-		Harness:       Harness{WorkerInstructions: DefaultWorkerInstructions},
-		Merge:         Merge{MaxAttempts: 12, MaxAutoRebases: DefaultMaxAutoRebases, AutoRebase: true},
-		OnBaseRed:     OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
+		AutoDispatch:  AutoDispatch{BatchSize: DefaultAutoDispatchBatchSize, DispatchOpen: true, fromYAML: true},
+		Watchdog: Watchdog{
+			WaitingCI:     DefaultWatchdogAge.String(),
+			NeedsRebase:   DefaultWatchdogAge.String(),
+			NeedsAgentFix: DefaultWatchdogAge.String(),
+			Blocked:       DefaultWatchdogAge.String(),
+		},
+		TaskSource: TaskSource{Provider: "markdown", Dir: "docs/tasks"},
+		SCM:        SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
+		Harness:    Harness{WorkerInstructions: DefaultWorkerInstructions},
+		Merge:      Merge{MaxAttempts: 12, MaxAutoRebases: DefaultMaxAutoRebases, AutoRebase: true},
+		OnBaseRed:  OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
 }
 
@@ -523,6 +643,10 @@ func expandNonSecrets(c *Config) {
 		c.Merge.Labels[i] = expandEnv(c.Merge.Labels[i])
 	}
 	c.OnBaseRed.Mode = expandEnv(c.OnBaseRed.Mode)
+	c.Watchdog.WaitingCI = expandEnv(c.Watchdog.WaitingCI)
+	c.Watchdog.NeedsRebase = expandEnv(c.Watchdog.NeedsRebase)
+	c.Watchdog.NeedsAgentFix = expandEnv(c.Watchdog.NeedsAgentFix)
+	c.Watchdog.Blocked = expandEnv(c.Watchdog.Blocked)
 	c.Webhook.Addr = expandEnv(c.Webhook.Addr)
 	c.Webhook.SecretEnv = expandEnv(c.Webhook.SecretEnv)
 	c.Notify.TelegramTokenEnv = expandEnv(c.Notify.TelegramTokenEnv)
