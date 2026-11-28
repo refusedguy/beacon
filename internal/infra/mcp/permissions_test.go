@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,6 +73,112 @@ func TestGeneratedPermissionsUseRealActionNames(t *testing.T) {
 				t.Errorf("%s[%d] effect = %q, want %q", group.name, i, perm.Effect, group.effect)
 			}
 		}
+	}
+}
+
+// canonicalJSON decodes and re-encodes a document so two writers that emit
+// structs and maps in different field orders can be compared byte for byte.
+func canonicalJSON(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var value any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&value); err != nil {
+		t.Fatalf("decode JSON for comparison: %v", err)
+	}
+	out, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("encode JSON for comparison: %v", err)
+	}
+	return out
+}
+
+// TestGeneratorMatchesLibraryPermissions feeds one document through both
+// permission writers and diffs the bytes. The document carries a user
+// permission that both writers must keep and a stale beacon_beacon_task_create
+// entry that both must drop. A rule changed in one writer and not the other
+// fails here, so the owned-action rule cannot drift between them.
+func TestGeneratorMatchesLibraryPermissions(t *testing.T) {
+	const committed = "../../../opencode.json"
+	base, err := os.ReadFile(committed)
+	if err != nil {
+		t.Fatalf("read %s: %v", committed, err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(base, &doc); err != nil {
+		t.Fatalf("decode %s: %v", committed, err)
+	}
+
+	custom := map[string]any{"action": "custom", "effect": "allow", "resource": "*"}
+	legacy := map[string]any{"action": "beacon_beacon_task_create", "effect": "deny", "resource": "*"}
+	inject := func(value any) any {
+		list, _ := value.([]any)
+		return append([]any{custom, legacy}, list...)
+	}
+	if doc["permissions"] == nil {
+		doc["permissions"] = []any{}
+	}
+	doc["permissions"] = inject(doc["permissions"])
+	agents, _ := doc["agents"].(map[string]any)
+	for name := range agents {
+		agent, _ := agents[name].(map[string]any)
+		if agent == nil {
+			continue
+		}
+		if agent["permissions"] == nil {
+			agent["permissions"] = []any{}
+		}
+		agent["permissions"] = inject(agent["permissions"])
+	}
+	input, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatalf("encode input document: %v", err)
+	}
+	input = append(input, '\n')
+
+	// Library writer: apply the catalog-derived set with the role mapping
+	// cmd/beacon-gen uses.
+	set := GeneratedPermissions(ToolCatalog())
+	libDoc := map[string]any{}
+	if err := json.Unmarshal(input, &libDoc); err != nil {
+		t.Fatalf("decode input copy: %v", err)
+	}
+	libDoc["permissions"] = MergePermissions(libDoc["permissions"], set.Global)
+	libAgents, _ := libDoc["agents"].(map[string]any)
+	for name, want := range map[string][]Permission{
+		"orchestrator": set.Allow,
+		"build":        set.Allow,
+		"worker":       set.Deny,
+	} {
+		agent, ok := libAgents[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		agent["permissions"] = MergePermissions(agent["permissions"], want)
+	}
+	wantBytes, err := json.MarshalIndent(libDoc, "", "  ")
+	if err != nil {
+		t.Fatalf("encode library output: %v", err)
+	}
+
+	// Generator writer: run cmd/beacon-gen on the same document bytes.
+	tmp := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(tmp, input, 0o600); err != nil {
+		t.Fatalf("write temp document: %v", err)
+	}
+	cmd := exec.Command("go", "run", "../../../cmd/beacon-gen", "-out", tmp)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run beacon-gen: %v\n%s", err, stderr.String())
+	}
+	gotBytes, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read generated document: %v", err)
+	}
+
+	if !bytes.Equal(canonicalJSON(t, gotBytes), canonicalJSON(t, wantBytes)) {
+		t.Errorf("permission writers disagree\nlibrary:\n%s\ngenerator:\n%s", wantBytes, gotBytes)
 	}
 }
 
