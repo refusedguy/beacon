@@ -1,7 +1,7 @@
 ---
 id: T-5cda685b
 title: Persist per-path waitlist instead of dropping scope conflicts
-status: available
+status: dropped
 scope:
     - internal/app/planner.go
     - internal/infra/sqlite/schema.go
@@ -10,6 +10,7 @@ scope:
 priority: 1
 kind: task
 require_review: llm
+status_reason: Superseded by atomic split cards that satisfy the 3-2-1200 scope cap; intent preserved in the new cards.
 ---
 
 Goal: a card skipped for scope overlap must be queued and dispatched when the path owner finishes, not skipped forever in the same order.
