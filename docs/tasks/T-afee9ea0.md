@@ -1,7 +1,7 @@
 ---
 id: T-afee9ea0
 title: Fix task source consistency and dangling dependency resolution
-status: available
+status: done
 scope:
     - internal/infra/tasksource/cardindex.go
     - internal/infra/tasksource/parse.go
