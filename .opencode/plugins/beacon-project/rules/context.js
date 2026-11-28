@@ -5,14 +5,14 @@ import { ORCHESTRATOR_ROLE, WORKER_ROLE, agentRole, resolveAgent, sessionIDOf } 
 
 // BEGIN BEACON DOCS: context-tools
 const WORKER_TOOLS = [
-  "beacon_dispatch",
   "beacon_watch_pr",
-  "beacon_status",
-  "beacon_recent",
   "beacon_wait",
-  "beacon_control",
 ]
 const ORCHESTRATOR_TOOLS = [
+  "beacon_dispatch",
+  "beacon_status",
+  "beacon_recent",
+  "beacon_control",
   "beacon_task_create",
   "beacon_task_delete",
   "beacon_task_update",

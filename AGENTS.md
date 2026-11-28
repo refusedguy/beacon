@@ -36,16 +36,16 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 ## MCP tools
 
 <!-- BEGIN BEACON DOCS: agents-tools -->
-`beacon mcp` serves 12 tools over stdio: 6 worker tools and 6 orchestrator-only tools. `ToolCatalog()` in `internal/infra/mcp/registry.go` declares them.
+`beacon mcp` serves 12 tools over stdio: 2 worker tools and 10 orchestrator-only tools. `ToolCatalog()` in `internal/infra/mcp/registry.go` declares them.
 
 | Tool | Purpose | Agent |
 | --- | --- | --- |
-| `beacon_dispatch` | Pick up to N non-overlapping tasks and start agents. | worker |
+| `beacon_dispatch` | Pick up to N non-overlapping tasks and start agents. | orchestrator only |
 | `beacon_watch_pr` | Bind a pull request to a running task. | worker |
-| `beacon_status` | List active runs, PRs and blockers. | worker |
-| `beacon_recent` | List the most recently finished runs. | worker |
+| `beacon_status` | List active runs, PRs and blockers. | orchestrator only |
+| `beacon_recent` | List the most recently finished runs. | orchestrator only |
 | `beacon_wait` | Wait for a run to reach an active verdict or a terminal state. | worker |
-| `beacon_control` | Control a run: approve, unblock, cancel, retry, nudge or watch. | worker |
+| `beacon_control` | Control a run: approve, unblock, cancel, retry, nudge or watch. | orchestrator only |
 | `beacon_task_create` | Create and publish a task card. Orchestrator only. | orchestrator only |
 | `beacon_task_delete` | Delete task cards in one commit and push. Orchestrator only. | orchestrator only |
 | `beacon_task_update` | Update task cards in one commit and push. Orchestrator only. | orchestrator only |
@@ -57,13 +57,13 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 `opencode.json` tool permissions are generated, not hand-edited. `ToolCatalog()` in `internal/infra/mcp/registry.go` lists every tool and marks the orchestrator-only ones. Run `go generate ./...` after changing the catalog. `cmd/beacon-gen` rewrites only the permission entries it owns and keeps every other config key, agent description, mode and custom permission as they were. Generation happens at development time, never at binary startup. `TestPermissionsUpToDate` in `internal/infra/mcp/permissions_test.go` regenerates the file into a temp copy and fails when the committed `opencode.json` differs, so CI catches a stale permission list.
 
 No other `beacon_*` MCP tool exists. The MCP server runs as one pooled `beacon mcp` process started from the project `opencode.json`. The local plugin only resolves a command path: `BEACON_BIN` when it exists, then `.opencode/bin/beacon`, `bin/beacon`, a binary on `PATH`, and finally `go run ./cmd/beacon mcp` when `cmd/beacon/main.go` exists (`.opencode/plugins/beacon-project/mcp/mcp.js:86-107`). It never reads build inputs, never starts a build and never rebuilds a stale binary. There is no HEAD watcher and no automatic `ctx.mcp.reload()`. After Go code lands on `main`, run `bash scripts/build-beacon.sh` explicitly, then restart the MCP daemon and the OpenCode TUI; the plugin emits that reminder from `.opencode/plugins/beacon-project/rules/context.js:8`. A stale local binary keeps serving until that explicit rebuild. `beacon status --snapshot` bounds its decision history; `--recent-limit` and `--decisions-limit` tighten it further without a rebuild. `opencode.json` denies <!-- BEGIN BEACON DOCS: denied-actions -->
-`beacon_beacon_reconcile`, `beacon_beacon_task_close`, `beacon_beacon_task_create`, `beacon_beacon_task_delete`, `beacon_beacon_task_start`, `beacon_beacon_task_update`
+`beacon_beacon_control`, `beacon_beacon_dispatch`, `beacon_beacon_recent`, `beacon_beacon_reconcile`, `beacon_beacon_status`, `beacon_beacon_task_close`, `beacon_beacon_task_create`, `beacon_beacon_task_delete`, `beacon_beacon_task_start`, `beacon_beacon_task_update`
 <!-- END BEACON DOCS: denied-actions --> globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows. OpenCode checks namespaced actions, so every tool name carries the `beacon_beacon_` prefix. The control action <!-- BEGIN BEACON DOCS: control-action -->
-`beacon_beacon_control`
+
 <!-- END BEACON DOCS: control-action --> is allowed for `build`, `orchestrator` and `worker`.
 
 Spawn workers with `harness.command: worker` in `.beacon/config.yaml`. The OpenCode harness passes that value as the session agent, so each worker inherits the global deny rules for <!-- BEGIN BEACON DOCS: denied-actions -->
-`beacon_beacon_reconcile`, `beacon_beacon_task_close`, `beacon_beacon_task_create`, `beacon_beacon_task_delete`, `beacon_beacon_task_start`, `beacon_beacon_task_update`
+`beacon_beacon_control`, `beacon_beacon_dispatch`, `beacon_beacon_recent`, `beacon_beacon_reconcile`, `beacon_beacon_status`, `beacon_beacon_task_close`, `beacon_beacon_task_create`, `beacon_beacon_task_delete`, `beacon_beacon_task_start`, `beacon_beacon_task_update`
 <!-- END BEACON DOCS: denied-actions -->. A worker must never create, delete, update or close task cards, and must never force a reconcile. It reports new work to the orchestrator instead.
 
 ## Task cards

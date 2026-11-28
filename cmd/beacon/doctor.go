@@ -605,23 +605,22 @@ func doctorBinaryFreshnessCheck(root string) doctorCheck {
 	binary := filepath.Join(root, ".opencode", "bin", "beacon")
 	if _, err := os.Stat(binary); err != nil {
 		return doctorCheck{"preflight binary freshness", checkWarn,
-			"no local binary at " + binary + "; fix: run bash scripts/build-beacon.sh if the MCP command uses this path"}
+			"no local binary at " + binary + "; fix: " + rebuildCommand + " if the MCP command uses this path"}
 	}
 	recordedPath := binary + ".build-sha"
 	recorded, err := os.ReadFile(recordedPath)
 	if err != nil {
 		return doctorCheck{"preflight binary freshness", checkFail,
-			"no recorded source hash at " + recordedPath + "; fix: run bash scripts/build-beacon.sh, then restart the MCP daemon and the TUI"}
+			"no recorded source hash at " + recordedPath + "; fix: " + rebuildCommand}
 	}
 	current, err := doctorBuildHash(root)
 	if err != nil {
 		return doctorCheck{"preflight binary freshness", checkWarn,
-			"cannot compute the source hash: " + err.Error() + "; fix: run bash scripts/build-beacon.sh from the repository root"}
+			"cannot compute the source hash: " + err.Error() + "; fix: " + rebuildCommand}
 	}
 	if strings.TrimSpace(string(recorded)) != current {
-		return doctorCheck{"preflight binary freshness", checkFail, fmt.Sprintf(
-			"binary built from %s but sources hash to %s; fix: run bash scripts/build-beacon.sh, then restart the MCP daemon and the TUI",
-			doctorShortHash(string(recorded)), doctorShortHash(current))}
+		return doctorCheck{"preflight binary freshness", checkFail,
+			staleBuildMessage(string(recorded), current)}
 	}
 	return doctorCheck{"preflight binary freshness", checkOK, "binary matches recorded source hash " + doctorShortHash(current)}
 }

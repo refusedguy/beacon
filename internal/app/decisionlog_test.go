@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -434,6 +435,44 @@ func TestReconcileDecisionCacheWritesAfterChange(t *testing.T) {
 	}
 	if got := sink.decisions[1].Fields["head_sha"]; got != "sha2" {
 		t.Fatalf("second decision head_sha = %v, want sha2", got)
+	}
+}
+
+func TestDecisionCacheIsBounded(t *testing.T) {
+	c := &decisionCache{}
+	for i := 0; i < maxDecisionCacheEntries+10; i++ {
+		c.set(fmt.Sprintf("run-%d", i), "sig")
+	}
+	c.mu.Lock()
+	size, order, indexed := len(c.sigs), c.order.Len(), len(c.index)
+	c.mu.Unlock()
+	if size > maxDecisionCacheEntries || order > maxDecisionCacheEntries || indexed > maxDecisionCacheEntries {
+		t.Fatalf("cache grew to %d entries, %d order keys and %d indexed ids", size, order, indexed)
+	}
+	if _, ok := c.get("run-0"); ok {
+		t.Fatal("oldest signature was not evicted")
+	}
+	newest := fmt.Sprintf("run-%d", maxDecisionCacheEntries+9)
+	if sig, ok := c.get(newest); !ok || sig != "sig" {
+		t.Fatalf("get(%s) = %q, %v, want sig, true", newest, sig, ok)
+	}
+}
+
+func TestDecisionCacheEvictionOrder(t *testing.T) {
+	c := &decisionCache{}
+	for i := 0; i < maxDecisionCacheEntries; i++ {
+		c.set(fmt.Sprintf("run-%d", i), "sig")
+	}
+	// A hit refreshes run-0, leaving run-1 as the least recently used entry.
+	if sig, ok := c.get("run-0"); !ok || sig != "sig" {
+		t.Fatalf("get(run-0) = %q, %v, want sig, true", sig, ok)
+	}
+	c.set("run-new", "sig")
+	if _, ok := c.get("run-1"); ok {
+		t.Fatal("run-1 survived; expected the untouched oldest entry to be evicted")
+	}
+	if sig, ok := c.get("run-0"); !ok || sig != "sig" {
+		t.Fatalf("refreshed run-0 was evicted: get = %q, %v", sig, ok)
 	}
 }
 

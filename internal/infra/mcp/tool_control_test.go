@@ -296,6 +296,72 @@ func TestControlRemoteBatchCollectsOutcomesSequentially(t *testing.T) {
 	}
 }
 
+func TestControlSingleRefusalReturnsActionIDAndReason(t *testing.T) {
+	sv := Services{Remote: func(_ context.Context, action, runID string, _ int, _ string) error {
+		return errors.New("beacon API status 409: run is active")
+	}}
+	cs := controlClient(t, sv)
+
+	res := callControl(t, cs, map[string]any{"action": "unblock", "run_id": "r1"})
+	if !res.IsError {
+		t.Fatal("refused control reported success")
+	}
+	var refusal core.WireControlResult
+	if err := json.Unmarshal([]byte(controlText(t, res)), &refusal); err != nil {
+		t.Fatal(err)
+	}
+	if refusal.OK || refusal.Applied {
+		t.Fatalf("refusal = %+v, want ok=false applied=false", refusal)
+	}
+	if refusal.Action != "unblock" || refusal.RunID != "r1" {
+		t.Fatalf("refusal = %+v, want action unblock run r1", refusal)
+	}
+	if refusal.Reason != "run is active" {
+		t.Fatalf("reason = %q, want %q", refusal.Reason, "run is active")
+	}
+}
+
+func TestControlSingleBareStatusStaysPlainError(t *testing.T) {
+	sv := Services{Remote: func(_ context.Context, action, runID string, _ int, _ string) error {
+		return errors.New("beacon API status 409")
+	}}
+	cs := controlClient(t, sv)
+
+	res := callControl(t, cs, map[string]any{"action": "unblock", "run_id": "r1"})
+	if !res.IsError || !strings.Contains(controlText(t, res), "409") {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+}
+
+func TestControlBatchPartiallyFailingKeepsReasonPerID(t *testing.T) {
+	sv := Services{Remote: func(_ context.Context, action, runID string, _ int, _ string) error {
+		if runID == "bad" {
+			return errors.New("beacon API status 409: run is active")
+		}
+		return nil
+	}}
+	cs := controlClient(t, sv)
+
+	res := callControl(t, cs, map[string]any{
+		"action": "unblock", "run_ids": []any{"good", "bad"},
+	})
+	requireBatchError(t, res)
+	got := parseControlBatch(t, res)
+	if got.Action != "unblock" || len(got.Results) != 2 {
+		t.Fatalf("result = %+v", got)
+	}
+	if got.Results[0].ID != "good" || got.Results[0].Status != "ok" {
+		t.Fatalf("good result = %+v", got.Results[0])
+	}
+	bad := got.Results[1]
+	if bad.ID != "bad" || bad.Status != "error" || !strings.Contains(bad.Error, "409") {
+		t.Fatalf("bad result = %+v", bad)
+	}
+	if bad.Reason != "run is active" {
+		t.Fatalf("bad reason = %q, want %q", bad.Reason, "run is active")
+	}
+}
+
 func TestControlParallelCancelsAllSucceed(t *testing.T) {
 	store := newControlStore()
 	const n = 8
