@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -140,7 +141,7 @@ func (f *eventFrames) subscribe() (chan []byte, func()) {
 // always receives, which keeps the counts identical between runs. It returns
 // the frame bytes, the number of successful deliveries and the number of drops.
 func (f *eventFrames) deliver(ev core.HarnessEvent) ([]byte, int64, int64) {
-	b, err := f.marshal(core.NewWireEvent(ev))
+	b, err := f.marshal(core.NewWireEvent(ev, 1, time.Unix(0, 0).UTC()))
 	if err != nil {
 		return nil, 0, 0
 	}

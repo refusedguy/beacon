@@ -140,9 +140,9 @@ func refreshExec(cmds []tea.Cmd) []runsMsg {
 }
 
 // runRefreshCoalesce drives one burst, a ping and a reconnect through the
-// model, then checks the three error paths. The burst must cost one read, the
-// ping none and the reconnect one. Every accepted snapshot must render exactly
-// as viewBaseline does.
+// model, then checks the three error paths. The burst costs one read; the ping
+// and the reconnect each cost one, so a quiet connection still converges.
+// Every accepted snapshot must render exactly as viewBaseline does.
 func runRefreshCoalesce(f *refreshFixture) refreshCounts {
 	f.reset()
 	var c refreshCounts
@@ -175,9 +175,13 @@ func runRefreshCoalesce(f *refreshFixture) refreshCounts {
 
 	beforePing := f.counter.total()
 	_, pingCmd := m.onRefresh(Event{Type: pingEvent})
-	if pingCmd != nil {
+	pingMsg, ok := pingCmd().(runsMsg)
+	if !ok || pingMsg.stale || pingMsg.gen != m.refreshGen.Load() {
 		c.bad++
-		_ = pingCmd()
+	} else {
+		next, _ := m.Update(pingMsg)
+		m = next.(model)
+		c.work++
 	}
 	c.pingGets = int64(f.counter.total() - beforePing)
 
@@ -260,10 +264,10 @@ func TestRefreshCoalesceCountsStable(t *testing.T) {
 	if first != second {
 		t.Fatalf("refresh counts are not stable: first=%+v second=%+v", first, second)
 	}
-	if first.work != 2 || first.errs != 3 || first.gets != 2 ||
-		first.burstGets != 1 || first.pingGets != 0 || first.reconnGets != 1 ||
+	if first.work != 3 || first.errs != 3 || first.gets != 3 ||
+		first.burstGets != 1 || first.pingGets != 1 || first.reconnGets != 1 ||
 		first.stale != refreshBurstEvents-1 || first.bad != 0 {
-		t.Fatalf("refresh counts=%+v, want work=2 errs=3 gets=2 burst=1 ping=0 reconnect=1 stale=%d bad=0",
+		t.Fatalf("refresh counts=%+v, want work=3 errs=3 gets=3 burst=1 ping=1 reconnect=1 stale=%d bad=0",
 			first, refreshBurstEvents-1)
 	}
 }

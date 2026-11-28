@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -31,33 +32,62 @@ func bearerAuth(req *http.Request, token string) {
 // the other monitors or the broadcaster.
 const subscriberBuffer = 16
 
-// runsCache holds the serialized runs response for one change generation. A
-// generation ends when the harness or a pull request changes. Every runs GET
-// in a generation reads the same bytes, so eight monitors reacting to one
-// notification cause one status.Active call instead of eight.
-//
-// The mutex is held while the snapshot is built. That serializes concurrent
-// GETs and guarantees a single store read per generation.
-type runsCache struct {
-	mu   sync.Mutex
-	body []byte
+// streamID is the one id sequence for every loopback notification. An id is
+// assigned when a change is observed, before it enters any queue, so the id
+// line and the payload id of a frame are the same value. A monitor that sees
+// a gap can tell from the id alone that it missed notifications.
+type streamID struct {
+	next atomic.Uint64
 }
 
-// invalidate ends the current generation. The next runs GET rebuilds the
+func newStreamID() *streamID { return &streamID{} }
+
+// assign returns the next id. The zero value is usable, so a broadcaster built
+// without an explicit source still emits ordered ids.
+func (s *streamID) assign() int64 {
+	if s == nil {
+		return 0
+	}
+	return int64(s.next.Add(1))
+}
+
+// runsCache holds the serialized runs response for one store revision. A
+// revision advances when the harness or a pull request changes. Keying the
+// bytes by revision means a repeated or out-of-order invalidation cannot serve
+// a snapshot from the wrong generation, and every runs GET in one revision
+// reads the same bytes.
+//
+// The mutex is held while the snapshot is built. That serializes concurrent
+// GETs and guarantees a single store read per revision.
+type runsCache struct {
+	mu       sync.Mutex
+	body     []byte
+	revision uint64 // revision the body was built for
+	version  uint64 // revision advanced by invalidation
+}
+
+// invalidate advances the store revision. The next runs GET rebuilds the
 // snapshot from the store.
 func (c *runsCache) invalidate() {
 	c.mu.Lock()
-	c.body = nil
+	c.version++
 	c.mu.Unlock()
 }
 
-// snapshot returns the cached JSON for the current generation, building it
-// once when the cache is empty. The bytes match writeJSON exactly, including
-// the trailing newline from json.Encoder.
+// revision now reports the current store revision.
+func (c *runsCache) currentRevision() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.version
+}
+
+// snapshot returns the cached JSON for the current revision, building it once
+// when the cached bytes belong to an older revision. The bytes match writeJSON
+// exactly, including the trailing newline from json.Encoder.
 func (c *runsCache) snapshot(ctx context.Context, status apiStatus) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.body != nil {
+	if c.body != nil && c.revision == c.version {
 		return c.body, nil
 	}
 	runs, err := status.Active(ctx)
@@ -65,36 +95,104 @@ func (c *runsCache) snapshot(ctx context.Context, status apiStatus) ([]byte, err
 		return nil, err
 	}
 	// Marshal writes the same bytes as Encoder.Encode. Appending the newline
-	// here avoids an Encoder and a bytes.Buffer on every generation.
+	// here avoids an Encoder and a bytes.Buffer on every revision.
 	b, err := json.Marshal(core.NewWireRuns(runs))
 	if err != nil {
 		return nil, err
 	}
 	c.body = append(b, '\n')
+	c.revision = c.version
 	return c.body, nil
 }
 
-// changeSubscribers broadcasts PR change numbers to one channel per SSE
-// connection. Each connection owns its channel, so every monitor sees every
-// change. It also owns the runs snapshot, because it sees each PR change once
-// at the source and can end the generation before the monitors react.
+// The two notification names that tell a monitor to re-read runs. A gap says
+// a reconnect could not replay; a resync says a bounded queue dropped a frame.
+// Neither carries run state.
+const (
+	streamEventResync = "resync"
+	streamEventGap    = "gap"
+)
+
+// wireResync is the payload of both notifications. Reason says which gap the
+// monitor is recovering from.
+type wireResync struct {
+	Reason string `json:"reason"`
+}
+
+// appendSSEFrame appends an event and data pair to dst and returns it.
+func appendSSEFrame(dst []byte, event string, body []byte) []byte {
+	dst = append(dst, "event: "...)
+	dst = append(dst, event...)
+	dst = append(dst, "\ndata: "...)
+	dst = append(dst, body...)
+	return append(dst, "\n\n"...)
+}
+
+// notificationFrame builds one complete id-bearing frame with the given name.
+func notificationFrame(ids *streamID, event, reason string) []byte {
+	id := ids.assign()
+	body, _ := json.Marshal(wireResync{Reason: reason})
+	frame := make([]byte, 0, 24+len("event: ")+len(event)+len(body)+24)
+	frame = appendSSEID(frame, id)
+	return appendSSEFrame(frame, event, body)
+}
+
+// resyncFrame replaces a dropped frame so a monitor cannot stay stale without
+// seeing a notification.
+func resyncFrame(ids *streamID, reason string) []byte {
+	return notificationFrame(ids, streamEventResync, reason)
+}
+
+// gapFrame answers a reconnect that asked to resume. The daemon does not keep
+// a replay buffer, so it tells the monitor to read runs instead of claiming
+// that the Last-Event-ID was honoured.
+func gapFrame(ids *streamID) []byte {
+	return notificationFrame(ids, streamEventGap, "reconnect")
+}
+
+// broadcast queues one frame for every subscriber. When a channel is full the
+// oldest queued frame is replaced with a resync marker, so the monitor learns
+// that it missed a notification instead of silently staying stale.
+func broadcast(subs map[chan []byte]struct{}, frame []byte, newResync func() []byte) {
+	for ch := range subs {
+		select {
+		case ch <- frame:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- newResync():
+			default:
+			}
+		}
+	}
+}
+
+// changeSubscribers broadcasts complete PR change frames to one channel per
+// SSE connection. Each connection owns its channel, so every monitor sees
+// every change. It also owns the runs snapshot, because it sees each PR change
+// once at the source and can advance the revision before the monitors react.
 type changeSubscribers struct {
 	mu       sync.Mutex
-	subs     map[chan int]struct{}
+	subs     map[chan []byte]struct{}
 	snapshot *runsCache
+	ids      *streamID
 }
 
 func newChangeSubscribers() *changeSubscribers {
 	return &changeSubscribers{
-		subs:     make(map[chan int]struct{}),
+		subs:     make(map[chan []byte]struct{}),
 		snapshot: &runsCache{},
+		ids:      newStreamID(),
 	}
 }
 
 // subscribe adds a connection and returns its channel plus an unsubscribe
 // function. The caller must call unsubscribe when the connection closes.
-func (s *changeSubscribers) subscribe() (<-chan int, func()) {
-	ch := make(chan int, subscriberBuffer)
+func (s *changeSubscribers) subscribe() (<-chan []byte, func()) {
+	ch := make(chan []byte, subscriberBuffer)
 	s.mu.Lock()
 	s.subs[ch] = struct{}{}
 	s.mu.Unlock()
@@ -105,22 +203,26 @@ func (s *changeSubscribers) subscribe() (<-chan int, func()) {
 	}
 }
 
-// run copies each PR change to every subscriber. A full subscriber channel is
-// skipped so a slow monitor cannot stall the broadcast.
+// run copies each PR change to every subscriber. The id is assigned here, at
+// observation time, and travels in both the frame's id line and its payload.
+// A full subscriber channel receives a resync marker in place of an older
+// frame so a slow monitor cannot stall the broadcast or stay stale.
 func (s *changeSubscribers) run(ctx context.Context, src <-chan int) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case pr := <-src:
+			id := s.ids.assign()
 			s.snapshot.invalidate()
+			body := strconv.AppendInt(nil, int64(pr), 10)
+			frame := make([]byte, 0, 24+len("event: pr_changed\ndata: {\"pr\":")+len(body)+6)
+			frame = appendSSEID(frame, id)
+			frame = append(frame, "event: pr_changed\ndata: {\"pr\":"...)
+			frame = append(frame, body...)
+			frame = append(frame, "}\n\n"...)
 			s.mu.Lock()
-			for ch := range s.subs {
-				select {
-				case ch <- pr:
-				default:
-				}
-			}
+			broadcast(s.subs, frame, func() []byte { return resyncFrame(s.ids, "gap") })
 			s.mu.Unlock()
 		}
 	}
@@ -146,13 +248,16 @@ func appendHarnessFrame(dst, body []byte) []byte {
 
 // eventFrames encodes each harness event once and broadcasts the finished SSE
 // frame to one channel per monitor. Encoding at the source keeps one
-// json.Marshal per event no matter how many monitors are connected. Every
-// subscriber receives the same bytes.
+// json.Marshal per event no matter how many monitors are connected. The id is
+// assigned here, with the timestamp, before the payload is encoded. The
+// finished frame carries that id in its id line, so every subscriber receives
+// the same bytes and no monitor invents a competing sequence.
 type eventFrames struct {
 	mu      sync.Mutex
 	subs    map[chan []byte]struct{}
 	src     <-chan core.HarnessEvent
 	marshal func(any) ([]byte, error)
+	ids     *streamID
 }
 
 // newEventFrames builds a broadcaster that reads harness events from src.
@@ -162,6 +267,7 @@ func newEventFrames(src <-chan core.HarnessEvent, marshal func(any) ([]byte, err
 		subs:    make(map[chan []byte]struct{}),
 		src:     src,
 		marshal: marshal,
+		ids:     newStreamID(),
 	}
 }
 
@@ -179,9 +285,10 @@ func (f *eventFrames) subscribe() (<-chan []byte, func()) {
 	}
 }
 
-// run reads each harness event, builds one frame, and hands the same bytes to
-// every subscriber. A full subscriber channel is skipped so a slow monitor
-// cannot stall the broadcast or the other monitors.
+// run reads each harness event, builds one frame with its id, and hands the
+// same bytes to every subscriber. A full subscriber channel has an older frame
+// replaced with a resync marker, so a slow monitor cannot stall the broadcast
+// or stay stale without a notification.
 func (f *eventFrames) run(ctx context.Context) {
 	for {
 		select {
@@ -191,37 +298,37 @@ func (f *eventFrames) run(ctx context.Context) {
 			if !ok {
 				return
 			}
-			b, err := f.marshal(core.NewWireEvent(ev))
+			id := f.ids.assign()
+			b, err := f.marshal(core.NewWireEvent(ev, id, time.Now().UTC()))
 			if err != nil {
 				continue
 			}
-			size := len(harnessFramePrefix) + len(b) + len(harnessFrameSuffix)
-			frame := appendHarnessFrame(make([]byte, 0, size), b)
+			size := 24 + len(harnessFramePrefix) + len(b) + len(harnessFrameSuffix)
+			frame := appendSSEID(make([]byte, 0, size), id)
+			frame = appendHarnessFrame(frame, b)
 			f.mu.Lock()
-			for ch := range f.subs {
-				select {
-				case ch <- frame:
-				default:
-				}
-			}
+			broadcast(f.subs, frame, func() []byte { return resyncFrame(f.ids, "gap") })
 			f.mu.Unlock()
 		}
 	}
 }
 
 // pingBroadcaster owns the one keepalive ticker for every SSE connection. Each
-// tick builds a single payload and hands the same frame bytes to all subscribers,
-// so neither the timer nor the JSON work grows with the monitor count.
+// tick assigns one id and builds a single id-bearing frame, then hands the same
+// bytes to all subscribers. The ping reads runs in the monitor, so a connection
+// that fell behind converges on the next tick.
 type pingBroadcaster struct {
 	mu   sync.Mutex
 	subs map[chan []byte]struct{}
 	tick *time.Ticker
+	ids  *streamID
 }
 
 func newPingBroadcaster() *pingBroadcaster {
 	return &pingBroadcaster{
 		subs: make(map[chan []byte]struct{}),
 		tick: time.NewTicker(10 * time.Second),
+		ids:  newStreamID(),
 	}
 }
 
@@ -239,22 +346,21 @@ func (p *pingBroadcaster) subscribe() (<-chan []byte, func()) {
 	}
 }
 
-// pingFrame builds one keepalive frame per tick. Each monitor writes these same
-// bytes after its own SSE id line.
-func pingFrame(now time.Time) []byte {
-	// An RFC3339 UTC timestamp contains only digits, '-', 'T', ':', '.' and
-	// 'Z', so it needs no JSON escaping. Building the payload directly skips
-	// the json.Marshal allocation. The bytes match wirePing exactly.
+// pingFrame builds one complete keepalive frame. The id line carries the id
+// assigned at tick time. An RFC3339 UTC timestamp contains only digits, '-',
+// 'T', ':', '.' and 'Z', so its payload needs no JSON escaping.
+func pingFrame(id int64, now time.Time) []byte {
 	ts := now.UTC().Format(time.RFC3339)
-	frame := make([]byte, 0, len(ts)+32)
+	frame := make([]byte, 0, len(ts)+48)
+	frame = appendSSEID(frame, id)
 	frame = append(frame, "event: ping\ndata: {\"time\":\""...)
 	frame = append(frame, ts...)
 	frame = append(frame, "\"}\n\n"...)
 	return frame
 }
 
-// run broadcasts one ping per tick. A full subscriber channel is skipped so a
-// slow monitor cannot stall the other connections.
+// run broadcasts one ping per tick. A full subscriber channel receives a
+// resync marker in place of its older keepalive.
 func (p *pingBroadcaster) run(ctx context.Context) {
 	defer p.tick.Stop()
 	for {
@@ -262,14 +368,10 @@ func (p *pingBroadcaster) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-p.tick.C:
-			frame := pingFrame(now)
+			id := p.ids.assign()
+			frame := pingFrame(id, now)
 			p.mu.Lock()
-			for ch := range p.subs {
-				select {
-				case ch <- frame:
-				default:
-				}
-			}
+			broadcast(p.subs, frame, func() []byte { return resyncFrame(p.ids, "gap") })
 			p.mu.Unlock()
 		}
 	}
@@ -302,9 +404,28 @@ type apiServer struct {
 	// token holds the token bytes, converted once at construction so the auth
 	// check does not allocate a byte slice on every request.
 	token   []byte
+	ids     *streamID
 	frames  *eventFrames
 	changes *changeSubscribers
 	pings   *pingBroadcaster
+}
+
+// idSource returns the one id sequence shared by the three broadcasters. A
+// handler built with only one broadcaster still emits ordered resume markers.
+func (a *apiServer) idSource() *streamID {
+	if a.ids != nil {
+		return a.ids
+	}
+	if a.frames != nil {
+		return a.frames.ids
+	}
+	if a.changes != nil {
+		return a.changes.ids
+	}
+	if a.pings != nil {
+		return a.pings.ids
+	}
+	return nil
 }
 
 // stringBytes returns a read-only byte view of s without allocating. Callers
@@ -337,11 +458,15 @@ func startAPIServer(ctx context.Context, services apiServices, token string, eve
 	// event invalidates once no matter how many monitors are connected.
 	views := fanout(ctx, events, 2)
 	go invalidateOnHarness(ctx, views[1], changes.snapshot)
+	ids := newStreamID()
+	changes.ids = ids
 	frames := newEventFrames(views[0], json.Marshal)
+	frames.ids = ids
 	go frames.run(ctx)
 	pings := newPingBroadcaster()
+	pings.ids = ids
 	go pings.run(ctx)
-	api := &apiServer{services: services, token: []byte(token), frames: frames, changes: changes, pings: pings}
+	api := &apiServer{services: services, token: []byte(token), ids: ids, frames: frames, changes: changes, pings: pings}
 	runHTTP(ctx, errCh, addr, api.handler())
 }
 
@@ -461,23 +586,13 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 	rw.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Every frame carries a monotonic id so a monitor that reconnects can send
-	// Last-Event-ID and ask to resume. Seeding from that header keeps the id
-	// sequence increasing across reconnects. The event and data lines keep
-	// their documented shape; the id line is an SSE field before them.
-	nextID := int64(0)
-	if raw := r.Header.Get("Last-Event-ID"); raw != "" {
-		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
-			nextID = n
-		}
-	}
-	// The id buffer is reused across frames. A 24-byte array holds "id: "
-	// plus the 19 digits of the largest int64 plus the newline, so no frame
-	// write allocates.
-	var idBuf [24]byte
-	writeID := func() {
-		nextID++
-		_, _ = rw.Write(appendSSEID(idBuf[:0], nextID))
+	// Ids are assigned once at observation time and travel inside each frame.
+	// The server does not replay frames for Last-Event-ID, so it does not claim
+	// to resume. A reconnect instead gets one gap marker, which tells the
+	// monitor to read runs and converge on the next poll.
+	if r.Header.Get("Last-Event-ID") != "" {
+		_, _ = rw.Write(gapFrame(a.idSource()))
+		flusher.Flush()
 	}
 
 	for {
@@ -485,15 +600,12 @@ func (a *apiServer) events(rw http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case frame := <-frames:
-			writeID()
 			_, _ = rw.Write(frame)
 			flusher.Flush()
-		case pr := <-changes:
-			writeID()
-			writeSSE(rw, "pr_changed", wirePRChanged{PR: pr})
+		case frame := <-changes:
+			_, _ = rw.Write(frame)
 			flusher.Flush()
 		case frame := <-pings:
-			writeID()
 			_, _ = rw.Write(frame)
 			flusher.Flush()
 		}

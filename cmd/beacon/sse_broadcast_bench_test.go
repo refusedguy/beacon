@@ -60,7 +60,7 @@ func runPRChangedBroadcast() prBroadcastStats {
 	runDone := make(chan struct{})
 	go func() { subs.run(ctx, src); close(runDone) }()
 
-	chans := make([]<-chan int, prBroadcastViews)
+	chans := make([]<-chan []byte, prBroadcastViews)
 	unsubs := make([]func(), prBroadcastViews)
 	for i := range chans {
 		chans[i], unsubs[i] = subs.subscribe()
@@ -80,9 +80,9 @@ func runPRChangedBroadcast() prBroadcastStats {
 		defer close(fastDone)
 		for {
 			select {
-			case pr := <-chans[0]:
+			case frame := <-chans[0]:
 				rec := httptest.NewRecorder()
-				writeSSE(rec, "pr_changed", wirePRChanged{PR: pr})
+				writeSSE(rec, "pr_changed", wirePRChanged{PR: framePR(frame)})
 				stats.encoded++
 				stats.delivered++
 				if !bytes.Equal(rec.Body.Bytes(), want) {
