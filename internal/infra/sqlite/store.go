@@ -2,6 +2,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -75,6 +76,10 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	if err := ensureOperationResults(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := ensureWaitlist(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -186,6 +191,77 @@ func inQuery(template string, lists ...[]string) (string, []any) {
 		}
 	}
 	return fmt.Sprintf(template, holders...), args
+}
+
+// WaitEntry is one card waiting on one scope path. WaitingSince is a Unix
+// nanosecond reading: a smaller value waited longer.
+type WaitEntry struct {
+	Path         core.ScopePath
+	TaskID       core.TaskID
+	WaitingSince int64
+}
+
+// AddWaitEntry inserts or refreshes a wait entry for each path a candidate
+// lost on. waitingSince comes from the caller's clock so a caller can keep an
+// original wait time across repeated conflicts. A repeat call for the same
+// path and card refreshes the existing row instead of adding a second one.
+func (s *Store) AddWaitEntry(ctx context.Context, taskID core.TaskID, paths []core.ScopePath, waitingSince int64) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO waitlist (path, task_id, waiting_since) VALUES (?, ?, ?)
+ON CONFLICT (path, task_id) DO UPDATE SET waiting_since = excluded.waiting_since`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, p := range paths {
+		if _, err := stmt.ExecContext(ctx, string(p), string(taskID), waitingSince); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LongestWaiter returns the entry that has waited longest across paths, or nil
+// when none of them has a waiter. The age index bounds the lookup, so task
+// bodies are never read. Ties break on task ID then path for a stable answer.
+func (s *Store) LongestWaiter(ctx context.Context, paths []core.ScopePath) (*WaitEntry, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	values := make([]string, len(paths))
+	for i, p := range paths {
+		values[i] = string(p)
+	}
+	query, args := inQuery(`SELECT path, task_id, waiting_since FROM waitlist
+WHERE path IN (%s)
+ORDER BY waiting_since ASC, task_id ASC, path ASC LIMIT 1`, values)
+	var entry WaitEntry
+	var path, taskID string
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&path, &taskID, &entry.WaitingSince); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	entry.Path = core.ScopePath(path)
+	entry.TaskID = core.TaskID(taskID)
+	return &entry, nil
+}
+
+// RemoveWaitEntries clears every wait entry for a card once it runs. Entries
+// for other cards stay, so a path still held by a different owner keeps its
+// waiter.
+func (s *Store) RemoveWaitEntries(ctx context.Context, taskID core.TaskID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM waitlist WHERE task_id = ?`, string(taskID))
+	return err
 }
 
 var _ core.RunStore = (*Store)(nil)

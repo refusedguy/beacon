@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -27,15 +28,61 @@ const (
 	SkipBadStatus SkipCode = "bad_status"
 )
 
-// SkippedTask explains why a candidate was not dispatched. Overlap holds the
-// intersecting paths from the skipped task's own scope.
+// SkippedTask explains why a candidate was not dispatched and what the caller
+// can do next. Overlap holds the intersecting paths from the skipped task's own
+// scope.
 type SkippedTask struct {
 	TaskID       core.TaskID      `json:"task_id"`
 	Code         SkipCode         `json:"code"`
 	Reason       string           `json:"reason"`
+	Next         string           `json:"next"`
 	BlockedBy    core.TaskID      `json:"blocked_by,omitempty"`
 	BlockedByRun core.RunID       `json:"blocked_by_run,omitempty"`
 	Overlap      []core.ScopePath `json:"overlap,omitempty"`
+}
+
+// MarshalJSON fills in the next action for a skip built without one. Skips
+// reach callers through this encoding, so no wire response leaves a reason
+// without an instruction.
+func (s SkippedTask) MarshalJSON() ([]byte, error) {
+	type plain SkippedTask
+	out := plain(s)
+	if out.Next == "" {
+		out.Next = nextActionFor(out.Code)
+	}
+	return json.Marshal(out)
+}
+
+// setNextActions fills the next action for skips that do not carry one yet.
+// The planner builds skips by code, so one pass at the end keeps Select short
+// and gives every skip an instruction before it leaves Select.
+func setNextActions(skipped []SkippedTask) {
+	for i := range skipped {
+		if skipped[i].Next == "" {
+			skipped[i].Next = nextActionFor(skipped[i].Code)
+		}
+	}
+}
+
+// nextActionFor maps a skip code to the step that clears it. An unknown code
+// still gets an instruction so callers never have to invent one.
+func nextActionFor(code SkipCode) string {
+	switch code {
+	case SkipActiveRun:
+		return "wait for the active run to finish, then dispatch again"
+	case SkipActiveScopeOverlap:
+		return "wait for the overlapping run to finish, then dispatch again"
+	case SkipSelectedScopeOverlap:
+		return "wait for this dispatch cycle to finish, then dispatch again"
+	case SkipNoScope:
+		return "add a scope to the card, then dispatch again"
+	case SkipOversizedScope:
+		return "shrink the scope to fit the 3-2-1200 cap, then dispatch again"
+	case SkipBadStatus:
+		return "set the card status to available, then dispatch again"
+	default:
+		return "review the skip reason, then dispatch again"
+	}
 }
 
 // ConflictPlanner selects tasks that can run alongside active runs and each other.
@@ -146,6 +193,7 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 		}
 		selected = append(selected, t)
 	}
+	setNextActions(skipped)
 	return selected, skipped, nil
 }
 

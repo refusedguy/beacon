@@ -1,6 +1,6 @@
 # Perf status
 
-As of 2026-11-27, HEAD `857eab1a`. Operator-owned. Refresh date and HEAD with the last change of each session, in the same commit. The handoff at `/home/nbook/tmp/handoff-beacon-perf-full.md` is at `541a55ee` and behind; its pass-order and ci.yml-owner snapshots conflict. Live ci.yml, `beacon status`, `beacon_recent`, `gh pr view` and `git log` win: pass order `B A A B B A A B B A` (five per side), ci.yml owner T-4536fbaa in #2851, not T-b186b563. `cards.md` wave states are stale.
+As of 2026-11-28, HEAD `ea40bd1f`. Operator-owned. Refresh date and HEAD with the last change of each session, in the same commit. The handoff at `/home/nbook/tmp/handoff-beacon-perf-full.md` is at `541a55ee` and behind; its pass-order and ci.yml-owner snapshots conflict. Live ci.yml, `beacon status`, `beacon_recent`, `gh pr view` and `git log` win: pass order `B A A B B A A B B A` (five per side), ci.yml owner T-4536fbaa in #2851, not T-b186b563. `cards.md` wave states are stale.
 
 CI owns every number. Store pointers, not medians. `docs/perf/dossier.md` and local harness numbers are historical and invalid as evidence. Known: advisory green and non-gating, 15 keys, baseline unchanged, false `card-parse regression` gone. Unknown: current medians, five-pass spread rule, `json-control` usable, calibrated nightly floor.
 
@@ -29,6 +29,10 @@ The other perf2 PRs (#2726 to #2731) were reverted; their advisory comments carr
 | --- | --- | --- |
 | control drift fix | duplicate rows and cache block raw rows | after #2786 posts comparable rows |
 | ratios in nightly gate | floors tuned to absolute seconds | only with a required-check card |
+
+## Card scope ownership
+
+A new card may claim at most 4 scope paths, at most 2 hot files, and no path that another non-terminal card already claims. A hot file is a path named by two or more non-terminal cards. `internal/infra/tasksource/card_scope_test.go` walks `docs/tasks`, skips done and dropped cards, and keeps the explicit hot list. The test fails when the corpus disagrees with that list. A card with 5 paths or a shared hot file now fails CI before it can starve dispatch. Cards on the test's legacy list keep their existing scope until their owners split it.
 
 ## Constraints
 
