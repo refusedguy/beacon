@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -64,7 +65,9 @@ func (t *Telegram) Notify(ctx context.Context, n core.Notification) error {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.HTTP.Do(req)
 	if err != nil {
-		return err
+		// url.Error repeats the endpoint, which carries the bot token in its
+		// path. Return the redacted text so callers never store that URL.
+		return errors.New(redact.Redact(err.Error()))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {

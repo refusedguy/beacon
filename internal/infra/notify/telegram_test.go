@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -206,6 +207,29 @@ func TestTelegramEndpointBuiltOnce(t *testing.T) {
 	want := "/bot" + url.PathEscape(benchToken) + "/sendMessage"
 	if path != want {
 		t.Fatalf("request path = %q, want %q", path, want)
+	}
+}
+
+// failingTransport makes client.Do return a url.Error that repeats the
+// endpoint, which carries the bot token in its path.
+type failingTransport struct{ err error }
+
+func (f failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, f.err
+}
+
+func TestTelegramRedactsTransportError(t *testing.T) {
+	n := NewTelegram(benchToken, benchChatID)
+	n.HTTP = &http.Client{Transport: failingTransport{err: errors.New("dial failed")}}
+	err := n.Notify(context.Background(), benchNotification)
+	if err == nil {
+		t.Fatal("Notify with a failing transport returned nil, want an error")
+	}
+	if strings.Contains(err.Error(), benchToken) {
+		t.Fatalf("bot token leaked into error: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("error is not redacted: %q", err.Error())
 	}
 }
 

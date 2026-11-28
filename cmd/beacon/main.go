@@ -36,6 +36,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/tasksource"
 	"github.com/refusedguy/beacon/internal/infra/workspace"
 	"github.com/refusedguy/beacon/pkg/core"
+	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 type wiring struct {
@@ -278,6 +279,20 @@ func buildInfra(c infraConstructors) (*wiredInfra, error) {
 	}, nil
 }
 
+// redactingRunStore is the last boundary before a run is written. A caller
+// that still holds a raw reason cannot put it in the runs table or in the
+// state event recorded with the save.
+type redactingRunStore struct{ *sqlite.Store }
+
+func (s redactingRunStore) Save(ctx context.Context, run *core.Run) error {
+	if run == nil {
+		return s.Store.Save(ctx, run)
+	}
+	clean := *run
+	clean.Reason = redact.Redact(clean.Reason)
+	return s.Store.Save(ctx, &clean)
+}
+
 // wireServices builds the application services on top of the adapters. The
 // reloadable wrappers are injected here so no service is built with an
 // original adapter and patched afterwards.
@@ -285,6 +300,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 	// wire passes the resolved parent, but direct callers may supply only the
 	// environment value. Resolve once here so both services agree on it.
 	parentSession = coalesce(parentSession, cfg.Harness.ParentSessionID)
+	runStore := redactingRunStore{infra.store}
 	workspaceRoot := core.Workspace{Path: root, Branch: cfg.BaseBranch}
 	if infra.workspace != nil {
 		infra.workspace.Refresher = h
@@ -302,7 +318,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 	disp := &app.Dispatcher{
 		Source:    infra.source,
 		Planner:   planner.New(planner.Options{ByPath: true, ByDependency: true, Strict: cfg.StrictScope}),
-		Workspace: infra.workspace, Harness: h, Store: infra.store,
+		Workspace: infra.workspace, Harness: h, Store: runStore,
 		Concurrency:        core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
 		StrictScope:        cfg.StrictScope,
 		MaxAttempts:        cfg.Merge.MaxAttempts,
@@ -330,7 +346,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		OrphanTimeout:      cfg.OrphanTimeoutDuration(),
 		AutoRebase:         cfg.Merge.AutoRebase,
 		MaxAutoRebases:     cfg.Merge.MaxAutoRebases,
-	}, infra.store, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
+	}, runStore, infra.scm, h, p, infra.source, infra.workspace, disp, infra.changes)
 	recon.Decisions = infra.decisions
 	explain := app.ExplainService{Store: infra.store, SCM: infra.scm}
 	if traceable, ok := p.(app.ExplainPolicy); ok {
@@ -431,6 +447,56 @@ func loadTokens(cfg config.Config) (scmToken, sourceToken, harnessToken string) 
 	return
 }
 
+// redactingHarness cleans prompt text and errors for a harness that sends
+// them verbatim. OpenCode and the CLI adapter redact inside their own
+// adapters; ACP does not, so the composition root wraps it here.
+type redactingHarness struct{ core.AgentHarness }
+
+// redactHarnessErr keeps clean errors typed so callers can still inspect them.
+func redactHarnessErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	text := err.Error()
+	if clean := redact.Redact(text); clean != text {
+		return errors.New(clean)
+	}
+	return err
+}
+
+func (h redactingHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
+	req.Prompt = redact.Redact(req.Prompt)
+	s, err := h.AgentHarness.Spawn(ctx, req)
+	return s, redactHarnessErr(err)
+}
+
+func (h redactingHarness) Wake(ctx context.Context, session string, w core.WakeContext) error {
+	w.Reason = redact.Redact(w.Reason)
+	w.Excerpt = redact.Redact(w.Excerpt)
+	return redactHarnessErr(h.AgentHarness.Wake(ctx, session, w))
+}
+
+func (h redactingHarness) Stop(ctx context.Context, session string) error {
+	return redactHarnessErr(h.AgentHarness.Stop(ctx, session))
+}
+
+func (h redactingHarness) IsAlive(ctx context.Context, session string) (bool, error) {
+	alive, err := h.AgentHarness.IsAlive(ctx, session)
+	return alive, redactHarnessErr(err)
+}
+
+func (h redactingHarness) NotifyParent(ctx context.Context, session, text string) error {
+	return redactHarnessErr(h.AgentHarness.NotifyParent(ctx, session, redact.Redact(text)))
+}
+
+func (h redactingHarness) RefreshWorktrees(ctx context.Context) error {
+	refresher, ok := h.AgentHarness.(core.WorktreeRefresher)
+	if !ok {
+		return nil
+	}
+	return redactHarnessErr(refresher.RefreshWorktrees(ctx))
+}
+
 func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarness, error) {
 	switch strings.ToLower(cfg.Harness.Provider) {
 	case "opencode", "":
@@ -448,9 +514,7 @@ func newHarness(cfg config.Config, token, parent, root string) (core.AgentHarnes
 		if strings.TrimSpace(cfg.Harness.Command) == "" {
 			return nil, fmt.Errorf("acp harness requires command")
 		}
-		return acp.NewFromConfig(acp.Config{
-			Command: cfg.Harness.Command,
-		}), nil
+		return redactingHarness{acp.NewFromConfig(acp.Config{Command: cfg.Harness.Command})}, nil
 	default:
 		return harness.New(harness.Config{
 			Provider: cfg.Harness.Provider, Command: cfg.Harness.Command,
@@ -580,7 +644,7 @@ func main() {
 		if errors.As(err, &coder) {
 			os.Exit(coder.ExitCode())
 		}
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, redact.Redact(err.Error()))
 		os.Exit(1)
 	}
 }
