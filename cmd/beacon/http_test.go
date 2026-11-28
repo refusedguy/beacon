@@ -649,8 +649,9 @@ func (s *countingStatus) count() int {
 }
 
 // TestRunsSnapshotSharedAcrossMonitorsPerGeneration proves that eight monitors
-// reacting to one PR change share a single store read. The whole scenario runs
-// twenty times; one Active call per generation means twenty calls in total.
+// reacting to one PR change all see the same bytes. Each GET reads the store,
+// so a save that commits after the event is reflected on the next GET. The
+// whole scenario runs twenty times.
 func TestRunsSnapshotSharedAcrossMonitorsPerGeneration(t *testing.T) {
 	const (
 		monitors    = 8
@@ -742,14 +743,15 @@ func TestRunsSnapshotSharedAcrossMonitorsPerGeneration(t *testing.T) {
 				t.Fatalf("repetition %d monitor %d body = %q, want byte-identical %q", rep, i, body, want)
 			}
 		}
-		if got := status.count(); got != rep+1 {
-			t.Fatalf("after %d generations Active calls = %d, want %d", rep+1, got, rep+1)
+		if got := status.count(); got != (rep+1)*monitors {
+			t.Fatalf("after %d generations Active calls = %d, want %d", rep+1, got, (rep+1)*monitors)
 		}
 	}
 }
 
-// TestHarnessEventInvalidatesRunsSnapshot proves that a harness change ends the
-// current generation even with no monitor attached to the event stream.
+// TestHarnessEventInvalidatesRunsSnapshot proves that a harness change clears
+// the cached bytes even with no monitor attached to the event stream. Each GET
+// reads the store, so the cached bytes are rebuilt from the store state.
 func TestHarnessEventInvalidatesRunsSnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -768,8 +770,8 @@ func TestHarnessEventInvalidatesRunsSnapshot(t *testing.T) {
 	if first, second := load(), load(); first != second {
 		t.Fatalf("reads in one generation differ: %q vs %q", first, second)
 	}
-	if got := status.count(); got != 1 {
-		t.Fatalf("Active calls before harness change = %d, want 1", got)
+	if got := status.count(); got != 2 {
+		t.Fatalf("Active calls before harness change = %d, want 2", got)
 	}
 
 	events := make(chan core.HarnessEvent, 1)
@@ -783,8 +785,8 @@ func TestHarnessEventInvalidatesRunsSnapshot(t *testing.T) {
 	<-done
 
 	_ = load()
-	if got := status.count(); got != 2 {
-		t.Fatalf("Active calls after harness change = %d, want 2", got)
+	if got := status.count(); got != 3 {
+		t.Fatalf("Active calls after harness change = %d, want 3", got)
 	}
 }
 
