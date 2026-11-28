@@ -63,6 +63,11 @@ const (
 	statusCLIPathsLimiter    = "json-reflection-plus-sqlite-read"
 	configWatchReloadLimiter = "os.ReadFile + sha256 + loadConfig re-read + forwarder cancel and drain"
 	controlNoDaemonLimiter   = "two config loads + one Control.Apply per action"
+
+	// mcpDispatchEncodeLimiter names the resource that bounds one dispatch
+	// response encoding. The benchmark prints this string in its canonical
+	// row, so the registry and the benchmark share one owner.
+	mcpDispatchEncodeLimiter = "encoding/json reflection over dispatch runs, skipped and summary"
 )
 
 // prBenchLimiters are the canonical keys and limiter strings published by the
@@ -74,7 +79,8 @@ const (
 // the redact, marshal and POST chain on the notification send path. The four
 // CLI rows price the hot paths outside BenchmarkSQLiteSnapshot: the prepared
 // open, the three status read paths, a changed-config reload and the local
-// no-daemon control path.
+// no-daemon control path. The dispatch row prices one beacon_dispatch response
+// encoding with a compact summary beside the runs and skipped items.
 var prBenchLimiters = []struct{ key, limiter string }{
 	{"reconcile-tick-counts", reconcileTickLimiter},
 	{"base-red-check", baseRedCheckLimiter},
@@ -87,6 +93,7 @@ var prBenchLimiters = []struct{ key, limiter string }{
 	{"status-cli-paths", statusCLIPathsLimiter},
 	{"config-watch-reload", configWatchReloadLimiter},
 	{"control-no-daemon", controlNoDaemonLimiter},
+	{"mcp-dispatch-encode", mcpDispatchEncodeLimiter},
 }
 
 // The pure control benchmark owns no Beacon code, so its canonical name and

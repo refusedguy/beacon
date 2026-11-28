@@ -783,6 +783,7 @@ jobs:
             'status-cli-paths': 'StatusCLIPaths',
             'config-watch-reload': 'ConfigWatchReload',
             'control-no-daemon': 'ControlNoDaemon',
+            'mcp-dispatch-encode': 'MCPDispatchEncode',
           };
           // Deterministic call counters each key owns. The reconcile tick
           // counts guard the green-base path. The two base-red keys publish

@@ -104,6 +104,7 @@ func TestRegistryPRBenchSpecs(t *testing.T) {
 		{"status-cli-paths", statusCLIPathsLimiter},
 		{"config-watch-reload", configWatchReloadLimiter},
 		{"control-no-daemon", controlNoDaemonLimiter},
+		{"mcp-dispatch-encode", mcpDispatchEncodeLimiter},
 	} {
 		spec, ok := byKey[tc.key]
 		if !ok {

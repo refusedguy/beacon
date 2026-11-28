@@ -51,6 +51,18 @@ func (s *controlStore) Get(_ context.Context, id core.RunID) (*core.Run, error) 
 	return &copy, nil
 }
 
+func (s *controlStore) FindByPR(_ context.Context, pr int) (*core.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, run := range s.runs {
+		if run.PRNumber == pr {
+			copy := *run
+			return &copy, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *controlStore) Save(_ context.Context, run *core.Run) error {
 	s.mu.Lock()
 	failures := s.failures[run.ID]

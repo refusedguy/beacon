@@ -27,6 +27,18 @@ type dispatchOutcome struct {
 	Identity string `json:"agent_identity,omitempty"`
 }
 
+// dispatchResult is the wire shape of beacon_dispatch. The fields follow the
+// alphabetical key order json.Marshal gives a map, so encoding the struct emits
+// the same bytes without allocating a map or boxing four values into any. A
+// second slice of run pointers is also gone: RecordLaunch mutates each run in
+// place, so the dispatched slice is already the post-launch view.
+type dispatchResult struct {
+	Failures []app.DispatchFailure `json:"failures"`
+	Runs     []*core.Run           `json:"runs"`
+	Skipped  []app.SkippedTask     `json:"skipped"`
+	Summary  []dispatchOutcome     `json:"summary"`
+}
+
 func registerDispatch(s *msdk.Server, sv Services) {
 	msdk.AddTool(s, catalogTool("beacon_dispatch"), func(ctx context.Context, req *msdk.CallToolRequest, a DispatchArgs) (*msdk.CallToolResult, any, error) {
 		if a.N <= 0 {
@@ -44,10 +56,8 @@ func registerDispatch(s *msdk.Server, sv Services) {
 		}
 		source, agent := dispatchCaller(req)
 		summary := make([]dispatchOutcome, 0, len(res.Runs)+len(res.Failures)+len(res.Skipped))
-		runs := make([]*core.Run, 0, len(res.Runs))
 		for _, run := range res.Runs {
 			run.RecordLaunch(source, agent)
-			runs = append(runs, run)
 			summary = append(summary, outcomeForRun(run))
 		}
 		for _, failure := range res.Failures {
@@ -62,11 +72,11 @@ func registerDispatch(s *msdk.Server, sv Services) {
 				State: "skipped", Reason: skip.Reason,
 			})
 		}
-		return jsonResult(map[string]any{
-			"runs":     runs,
-			"skipped":  res.Skipped,
-			"failures": res.Failures,
-			"summary":  summary,
+		return jsonResult(dispatchResult{
+			Runs:     res.Runs,
+			Skipped:  res.Skipped,
+			Failures: res.Failures,
+			Summary:  summary,
 		}), nil, nil
 	})
 }

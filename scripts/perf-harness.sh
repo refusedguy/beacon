@@ -71,6 +71,9 @@ run_side() {
       -bench '^BenchmarkJSONControl$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
       || echo "abort $side" >> "$dir/$prefix-status"
     (cd "$tree" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
+      -bench '^BenchmarkMCPDispatchEncode$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
+      || echo "abort $side" >> "$dir/$prefix-status"
+    (cd "$tree" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \
       -bench '^BenchmarkOpenPreparedDB$' -benchtime=1x -count=1 -benchmem ./internal/bench/) \
       || echo "abort $side" >> "$dir/$prefix-status"
     (cd "$tree" && taskset -c "$cpu" env BEACON_BENCH_SMOKE=1 go test -vet=off -run '^$' \

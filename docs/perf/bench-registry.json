@@ -277,6 +277,15 @@
       "thresholdPct": 15
     },
     {
+      "key": "mcp-dispatch-encode",
+      "limiter": "encoding/json reflection over dispatch runs, skipped and summary",
+      "unit": "ns",
+      "workMetric": "work",
+      "errMetric": "errs",
+      "placement": "pr",
+      "thresholdPct": 15
+    },
+    {
       "key": "json-control",
       "limiter": "encoding/json reflection over a fixed struct",
       "unit": "ns",
