@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
@@ -26,6 +27,10 @@ type Telegram struct {
 // built once here because the token and its PathEscape cannot change on the
 // send path.
 func NewTelegram(token, chatID string) *Telegram {
+	if token == "" || chatID == "" {
+		slog.Warn("telegram notifications disabled: missing token or chat id",
+			"token_set", token != "", "chat_id_set", chatID != "")
+	}
 	return &Telegram{
 		Token:    token,
 		ChatID:   chatID,
