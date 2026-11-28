@@ -60,7 +60,7 @@ No other `beacon_*` MCP tool exists. The MCP server runs as one pooled `beacon m
 `beacon_beacon_control`, `beacon_beacon_dispatch`, `beacon_beacon_recent`, `beacon_beacon_reconcile`, `beacon_beacon_status`, `beacon_beacon_task_close`, `beacon_beacon_task_create`, `beacon_beacon_task_delete`, `beacon_beacon_task_start`, `beacon_beacon_task_update`
 <!-- END BEACON DOCS: denied-actions --> globally and allows them only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit those allows. OpenCode checks namespaced actions, so every tool name carries the `beacon_beacon_` prefix. The control action <!-- BEGIN BEACON DOCS: control-action -->
 
-<!-- END BEACON DOCS: control-action --> is allowed for `build`, `orchestrator` and `worker`.
+<!-- END BEACON DOCS: control-action --> is allowed for `build` and `orchestrator`; workers cannot call it.
 
 Spawn workers with `harness.command: worker` in `.beacon/config.yaml`. The OpenCode harness passes that value as the session agent, so each worker inherits the global deny rules for <!-- BEGIN BEACON DOCS: denied-actions -->
 `beacon_beacon_control`, `beacon_beacon_dispatch`, `beacon_beacon_recent`, `beacon_beacon_reconcile`, `beacon_beacon_status`, `beacon_beacon_task_close`, `beacon_beacon_task_create`, `beacon_beacon_task_delete`, `beacon_beacon_task_start`, `beacon_beacon_task_update`

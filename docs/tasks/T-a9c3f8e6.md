@@ -1,7 +1,7 @@
 ---
 id: T-a9c3f8e6
 title: Regenerate worker tool docs
-status: available
+status: in_progress
 scope:
     - AGENTS.md
     - README.md
