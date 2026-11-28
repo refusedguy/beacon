@@ -102,6 +102,18 @@ func liveDaemon(cfg config.Config) (*connectionInfo, bool) {
 	return info, true
 }
 
+// withWriteLock serializes a local write against the daemon. beacon serve owns
+// beacon.lock for its lifetime, so a CLI command that cannot delegate to the
+// daemon refuses to write instead of racing it.
+func withWriteLock(dir string, fn func() error) error {
+	lock, err := acquireLock(dir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	return fn()
+}
+
 func newDispatchCommand(configPath *string, fn wireFn) *cobra.Command {
 	return &cobra.Command{
 		Use:   "dispatch [n]",
@@ -123,8 +135,12 @@ The command prints one JSON result with the started runs.`,
 				return err
 			}
 			defer w.close()
-			res, err := w.dispatcher.Dispatch(cmd.Context(), n)
-			if err != nil {
+			var res app.DispatchResult
+			if err := withWriteLock(stateDir(w.cfg), func() error {
+				var dispatchErr error
+				res, dispatchErr = w.dispatcher.Dispatch(cmd.Context(), n)
+				return dispatchErr
+			}); err != nil {
 				return err
 			}
 			return printJSON(res)
@@ -289,12 +305,18 @@ func newReportCommand(configPath *string) *cobra.Command {
 	return cmd
 }
 
+// worktreeRemover is the write port gc needs. ForceRemove is the production
+// implementation; tests supply a failing remover to check the exit path.
+type worktreeRemover interface {
+	ForceRemove(ctx context.Context, ws core.Workspace) error
+}
+
 func newGCCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "gc",
 		Short: "Remove worktrees that no active run uses (silent on success)",
 		Long: `gc removes worktree directories under the configured workspace that no active run owns.
-It prints nothing on success and only writes removal errors to stderr.
+It prints nothing on success and returns an error with removed and failed counts when a removal fails.
 ForceRemove discards uncommitted work in an unused worktree, so inspect those directories first.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, store, wt, err := wireReadOnly(*configPath)
@@ -302,45 +324,97 @@ ForceRemove discards uncommitted work in an unused worktree, so inspect those di
 				return err
 			}
 			defer store.Close()
-			runs, err := store.ListActive(cmd.Context())
-			if err != nil {
-				return err
-			}
-			inUse := make(map[string]bool)
-			for _, r := range runs {
-				if r.WorkspacePath != "" {
-					inUse[filepath.Clean(r.WorkspacePath)] = true
-				}
-			}
-			entries, err := os.ReadDir(cfg.WorkspaceDir)
-			if err != nil {
-				if os.IsNotExist(err) {
-					return nil
-				}
-				return err
-			}
-			for _, e := range entries {
-				if !e.IsDir() {
-					continue
-				}
-				path := filepath.Join(cfg.WorkspaceDir, e.Name())
-				if inUse[filepath.Clean(path)] {
-					continue
-				}
-				if err := wt.ForceRemove(cmd.Context(), core.Workspace{Path: path}); err != nil {
-					fmt.Fprintln(os.Stderr, "gc:", err)
-				}
-			}
-			return nil
+			return withWriteLock(stateDir(cfg), func() error {
+				return gcWorktrees(cmd.Context(), cfg, store, wt)
+			})
 		},
 	}
 }
 
-// controlResult is the stable JSON contract printed by beacon control on success.
+// gcWorktrees removes unused worktrees and aggregates every failure. A clean
+// pass returns nil. A failed pass returns an error carrying the removed and
+// failed counts, so automation sees a nonzero exit instead of a clean cleanup.
+func gcWorktrees(ctx context.Context, cfg config.Config, store *sqlite.Store, remover worktreeRemover) error {
+	runs, err := store.ListActive(ctx)
+	if err != nil {
+		return err
+	}
+	inUse := make(map[string]bool)
+	for _, r := range runs {
+		if r.WorkspacePath != "" {
+			inUse[filepath.Clean(r.WorkspacePath)] = true
+		}
+	}
+	entries, err := os.ReadDir(cfg.WorkspaceDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	removed, failed := 0, 0
+	var errs []error
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path := filepath.Join(cfg.WorkspaceDir, e.Name())
+		if inUse[filepath.Clean(path)] {
+			continue
+		}
+		if err := remover.ForceRemove(ctx, core.Workspace{Path: path}); err != nil {
+			failed++
+			errs = append(errs, fmt.Errorf("remove %s: %w", path, err))
+			continue
+		}
+		removed++
+	}
+	if failed > 0 {
+		return fmt.Errorf("gc: removed %d, failed %d: %w", removed, failed, errors.Join(errs...))
+	}
+	return nil
+}
+
+// controlResult is the stable JSON contract printed by beacon control. A
+// refusal sets OK false and carries the reason so a caller can show it without
+// reading stderr.
 type controlResult struct {
 	OK     bool   `json:"ok"`
 	Action string `json:"action"`
 	RunID  string `json:"run_id"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// controlRefusal is the daemon's structured denial of a control request. Its
+// text keeps the "beacon API status" prefix so the MCP boundary can still read
+// the reason from the error string, while the CLI boundary reads the fields.
+type controlRefusal struct {
+	Status int
+	Reason string
+}
+
+func (r *controlRefusal) Error() string {
+	if r.Reason != "" {
+		return fmt.Sprintf("beacon API status %d: %s", r.Status, r.Reason)
+	}
+	return fmt.Sprintf("beacon API status %d", r.Status)
+}
+
+// refusalReason returns the reason in err when err is a structured refusal.
+// Infrastructure failures and validation errors stay plain errors.
+func refusalReason(err error) (string, bool) {
+	var refusal *controlRefusal
+	if errors.As(err, &refusal) {
+		return refusal.Reason, refusal.Reason != ""
+	}
+	var appErr *core.AppError
+	if errors.As(err, &appErr) {
+		switch appErr.Code {
+		case core.CodeConflict, core.CodeInvalidInput, core.CodeNotFound, core.CodePermissionDenied:
+			return appErr.Message, appErr.Message != ""
+		}
+	}
+	return "", false
 }
 
 type controlRequest struct {
@@ -390,7 +464,11 @@ func newControlCommand(configPath *string, fn wireFn) *cobra.Command {
 			if err := validateControl(f.action, f.runID, f.message); err != nil {
 				return err
 			}
-			if err := dispatchControlWithPR(cmd.Context(), fn, *configPath, f.action, f.runID, f.sha, f.pr, f.message); err != nil {
+			err := dispatchControlWithPR(cmd.Context(), fn, *configPath, f.action, f.runID, f.sha, f.pr, f.message)
+			if err != nil {
+				if reason, ok := refusalReason(err); ok {
+					return printJSON(controlResult{OK: false, Action: f.action, RunID: f.runID, Reason: reason})
+				}
 				return err
 			}
 			return printJSON(controlResult{OK: true, Action: f.action, RunID: f.runID})
@@ -434,7 +512,9 @@ func dispatchControlWithPR(ctx context.Context, fn wireFn, configPath, action, r
 		return err
 	}
 	defer w.close()
-	return applyControlWithPR(ctx, w.control, action, runID, sha, pr, message...)
+	return withWriteLock(stateDir(cfg), func() error {
+		return applyControlWithPR(ctx, w.control, action, runID, sha, pr, message...)
+	})
 }
 
 // controlPort is the single verb the command drives. Every action other than
@@ -495,10 +575,11 @@ func postControlJSON(ctx context.Context, info *connectionInfo, body []byte, cli
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 		var refusal core.WireControlResult
-		if json.Unmarshal(body, &refusal) == nil && refusal.Reason != "" {
-			return fmt.Errorf("beacon API status %d: %s", resp.StatusCode, refusal.Reason)
+		reason := ""
+		if json.Unmarshal(body, &refusal) == nil {
+			reason = refusal.Reason
 		}
-		return fmt.Errorf("beacon API status %d", resp.StatusCode)
+		return &controlRefusal{Status: resp.StatusCode, Reason: reason}
 	}
 	return nil
 }
