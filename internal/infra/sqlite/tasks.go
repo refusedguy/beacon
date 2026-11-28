@@ -5,10 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -41,59 +39,47 @@ func (s *Store) ensureTaskColumns(ctx context.Context) error {
 	return nil
 }
 
-// syncCache holds the fingerprint of the last successful SyncTasks for one
-// database file. Two handles on the same file share the entry, so a sync seen
-// by the daemon is also seen by a CLI process in the same process.
-type syncCache struct {
-	mu          sync.Mutex
-	fingerprint []byte
+// taskSyncStateDDL holds the fingerprint of the last successful SyncTasks in
+// the database itself. A process-local cache cannot serve two processes that
+// open one file: each keeps its own bytes and rewrites the same graph. Keeping
+// the fingerprint with the graph makes the store the single writer and gives
+// every opener the same answer. The one-row table is written inside the same
+// IMMEDIATE transaction as the graph, so a concurrent opener sees either the
+// whole sync or none of it.
+const taskSyncStateDDL = `CREATE TABLE IF NOT EXISTS task_sync_state (
+id INTEGER PRIMARY KEY CHECK (id = 1),
+fingerprint BLOB)`
+
+// ensureTaskSyncState creates the fingerprint holder inside tx. SQLite holds
+// the write lock for the whole IMMEDIATE transaction, so two openers cannot
+// both run the DDL.
+func ensureTaskSyncState(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, taskSyncStateDDL)
+	return err
 }
 
-var syncCaches sync.Map // map[string]*syncCache
-
-// dbPaths resolves the main file behind each handle once. Store is defined
-// outside this card's scope, so it cannot record the path it was opened with;
-// PRAGMA database_list is the only way to read it from an open handle.
-var dbPaths sync.Map // map[*sql.DB]string
-
-func pathForDB(ctx context.Context, db *sql.DB) (string, error) {
-	if v, ok := dbPaths.Load(db); ok {
-		return v.(string), nil
+// storedSyncFingerprint reads the persisted fingerprint. A missing row, or a
+// NULL left by SetTaskStatus, means no sync has described the current table.
+func storedSyncFingerprint(ctx context.Context, tx *sql.Tx) ([]byte, error) {
+	var fp []byte
+	err := tx.QueryRowContext(ctx, `SELECT fingerprint FROM task_sync_state WHERE id = 1`).Scan(&fp)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-	rows, err := db.QueryContext(ctx, `PRAGMA database_list`)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	path := ""
-	for rows.Next() {
-		var seq int
-		var name, file string
-		if err := rows.Scan(&seq, &name, &file); err != nil {
-			return "", err
-		}
-		if name == "main" {
-			path = file
-			break
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	if path == "" {
-		path = fmt.Sprintf("handle:%p", db)
-	}
-	actual, _ := dbPaths.LoadOrStore(db, path)
-	return actual.(string), nil
+	return fp, err
 }
 
-func cacheForDB(ctx context.Context, db *sql.DB) (*syncCache, error) {
-	path, err := pathForDB(ctx, db)
-	if err != nil {
-		return nil, err
+// writeSyncFingerprint records fp in the same transaction as the graph rows.
+// A nil fp stores SQL NULL, which tells the next sync in any process that the
+// table changed outside SyncTasks and must be rewritten.
+func writeSyncFingerprint(ctx context.Context, tx *sql.Tx, fp []byte) error {
+	var value any
+	if fp != nil {
+		value = fp
 	}
-	v, _ := syncCaches.LoadOrStore(path, &syncCache{})
-	return v.(*syncCache), nil
+	_, err := tx.ExecContext(ctx, `INSERT INTO task_sync_state(id, fingerprint) VALUES (1, ?)
+ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint`, value)
+	return err
 }
 
 // syncFingerprint encodes every field SyncTasks persists. core.Task exports
@@ -150,14 +136,21 @@ func (st *syncStatements) close() {
 	_ = st.deps.Close()
 }
 
+// sqlQueryer is satisfied by both *sql.DB and *sql.Tx. The store reads owned
+// statuses through its write transaction so the merge sees the same snapshot
+// it is about to replace.
+type sqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // beaconOwnedStatuses returns the status Beacon wrote for each stored card.
 // A claimed or done status in SQLite is authoritative over a stale working
 // tree: the worker changes the card in its own worktree, so main can still
 // report the older status while a run is in flight.
-func beaconOwnedStatuses(ctx context.Context, db *sql.DB) (map[string]string, error) {
+func beaconOwnedStatuses(ctx context.Context, q sqlQueryer) (map[string]string, error) {
 	query, args := inQuery(`SELECT id, status FROM tasks WHERE status IN (%s)`,
 		[]string{statusDone, string(core.TaskClaimed)})
-	rows, err := db.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -310,13 +303,15 @@ func pruneSyncRows(ctx context.Context, tx *sql.Tx, ids []string, owned map[stri
 	return err
 }
 
-// SyncTasks replaces the stored cards and dependencies with tasks. An
-// unchanged fingerprint skips the DELETE and INSERT pairs: the tables already
-// hold exactly these cards. SetTaskStatus clears the fingerprint because it
-// changes a stored status outside this function.
+// SyncTasks replaces the stored cards and dependencies with tasks. The
+// fingerprint lives in the database, so two processes opening one file read the
+// same bytes and only the first writer changes the graph. An unchanged
+// fingerprint skips the DELETE and INSERT pairs: the tables already hold
+// exactly these cards. SetTaskStatus clears the fingerprint because it changes
+// a stored status outside this function.
 func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
-	// Reject an impossible graph before touching the cache or the tables, so a
-	// failed sync leaves both the stored graph and the fingerprint unchanged.
+	// Reject an impossible graph before touching the tables, so a failed sync
+	// leaves both the stored graph and the fingerprint unchanged.
 	if err := core.ValidateTaskGraph(tasks); err != nil {
 		return err
 	}
@@ -327,31 +322,30 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err != nil {
 		return err
 	}
-	cache, err := cacheForDB(ctx, s.db)
-	if err != nil {
-		return err
-	}
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	if bytes.Equal(cache.fingerprint, fp) {
-		return nil
-	}
-	// A failed transaction leaves the cache cold so the next call rewrites the
-	// tables instead of trusting a half-applied sync.
-	cache.fingerprint = nil
-
 	if err := s.ensureTaskColumns(ctx); err != nil {
 		return err
 	}
-	owned, err := beaconOwnedStatuses(ctx, s.db)
-	if err != nil {
-		return err
-	}
+	// BEGIN IMMEDIATE takes the write lock before the fingerprint read, so two
+	// processes cannot both decide the graph is stale and both rewrite it.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err := ensureTaskSyncState(ctx, tx); err != nil {
+		return err
+	}
+	stored, err := storedSyncFingerprint(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(stored, fp) {
+		return nil
+	}
+	owned, err := beaconOwnedStatuses(ctx, tx)
+	if err != nil {
+		return err
+	}
 	stmts, err := prepareSyncStatements(ctx, tx)
 	if err != nil {
 		return err
@@ -360,11 +354,10 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 	if err := writeSyncRows(ctx, tx, stmts, tasks, owned); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := writeSyncFingerprint(ctx, tx, fp); err != nil {
 		return err
 	}
-	cache.fingerprint = fp
-	return nil
+	return tx.Commit()
 }
 
 // unresolvedDependencies is the one predicate that decides whether a
@@ -392,9 +385,16 @@ WHERE t.status IN (%s)
 ORDER BY priority DESC, id`, openTaskStatuses, resolvedTaskStatuses)
 
 // SetTaskStatus sets the status of taskID. A write that matched no row leaves
-// the table unchanged, so it keeps the last SyncTasks fingerprint.
+// the table unchanged, so it keeps the last SyncTasks fingerprint. A real write
+// clears the fingerprint in the same transaction, so a later sync in any
+// process rewrites the rows and merges the new status.
 func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE tasks SET status=?, updated_at=? WHERE id=?`, status, nowUnix(), string(taskID))
 	if err != nil {
 		return err
 	}
@@ -405,17 +405,13 @@ func (s *Store) SetTaskStatus(ctx context.Context, taskID core.TaskID, status st
 	if n == 0 {
 		return nil
 	}
-	path, err := pathForDB(ctx, s.db)
-	if err != nil {
+	if err := ensureTaskSyncState(ctx, tx); err != nil {
 		return err
 	}
-	if v, ok := syncCaches.Load(path); ok {
-		cache := v.(*syncCache)
-		cache.mu.Lock()
-		cache.fingerprint = nil
-		cache.mu.Unlock()
+	if err := writeSyncFingerprint(ctx, tx, nil); err != nil {
+		return err
 	}
-	return nil
+	return tx.Commit()
 }
 
 // ListReadyTasks returns the available tasks whose dependencies are resolved.

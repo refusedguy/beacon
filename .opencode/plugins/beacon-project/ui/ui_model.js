@@ -630,4 +630,38 @@ export function createStatusSource(ctx, { root, deps = {}, limits = {}, sessionI
   }
 }
 export const errorMessage = (error) => (error && typeof error.message === "string" ? error.message : String(error))
+// One dispatch can start some tasks, skip others and fail the rest. Read every
+// group so a partially failed batch never reaches the operator as clean success.
+export function dispatchToast(result) {
+  const group = (names) => {
+    for (const name of names) if (Array.isArray(result?.[name])) return result[name]
+    return []
+  }
+  const runs = group(["runs", "Runs", "startedRuns"])
+  const skipped = group(["skipped", "Skipped", "skips"])
+  const failures = group(["failures", "Failures"])
+  const declared = [result?.started, result?.dispatched].find((v) => v != null)
+  const started = declared == null ? runs.length : (num(declared) || runs.length)
+  const reasonOf = (entry) => {
+    for (const key of ["reason", "Reason", "Err", "err"]) {
+      const value = str(entry?.[key]).trim()
+      if (value) return value
+    }
+    return ""
+  }
+  const reason = [...failures, ...skipped].map(reasonOf).find(Boolean)
+    || str(result?.reason ?? result?.error).trim()
+  const parts = []
+  if (started > 0) parts.push(`Dispatched ${started} task${started === 1 ? "" : "s"}`)
+  else if (!skipped.length && !failures.length) parts.push("Nothing to dispatch right now · add a ready task card")
+  else parts.push("No tasks started")
+  if (skipped.length) parts.push(`${skipped.length} skipped`)
+  if (failures.length) parts.push(`${failures.length} failed`)
+  if (reason) parts.push(reason)
+  else if (result?.ok === false && failures.length === 0) parts.push("dispatch refused")
+  return {
+    message: parts.join(" · "),
+    variant: failures.length > 0 || result?.ok === false ? "error" : skipped.length > 0 ? "warning" : "success",
+  }
+}
 export { cleanErrorMessage } from "./ui_error.js"

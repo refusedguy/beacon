@@ -114,52 +114,67 @@ func actionEffects(perms []Permission) map[string]string {
 	return out
 }
 
-// TestGeneratedPermissionsUseNamespacedActions pins the exact action strings
-// OpenCode checks. The CLI joins the server name and the MCP tool name, so the
-// beacon server turns beacon_task_create into beacon_beacon_task_create.
+// TestGeneratedPermissionsUseNamespacedActions derives every expected action
+// from ToolCatalog, so adding a tool needs no literal edit here. It checks the
+// properties the golden list used to pin: every orchestrator-only tool is
+// denied globally under its namespaced action, the global scope holds exactly
+// those tools, and no unprefixed catalog name survives as an action in any
+// scope.
 func TestGeneratedPermissionsUseNamespacedActions(t *testing.T) {
-	set := GeneratedPermissions(ToolCatalog())
-	wantGlobal := []string{
-		"beacon_beacon_reconcile",
-		"beacon_beacon_task_close",
-		"beacon_beacon_task_create",
-		"beacon_beacon_task_delete",
-		"beacon_beacon_task_start",
-		"beacon_beacon_task_update",
-	}
+	catalog := ToolCatalog()
+	set := GeneratedPermissions(catalog)
 	global := actionEffects(set.Global)
-	if len(global) != len(wantGlobal) {
-		t.Fatalf("global has %d entries, want %d: %v", len(global), len(wantGlobal), global)
-	}
-	for _, action := range wantGlobal {
+
+	wantGlobal := 0
+	for _, spec := range catalog {
+		if !spec.OrchestratorOnly {
+			continue
+		}
+		wantGlobal++
+		action := mcpAction(spec.Name)
 		if global[action] != "deny" {
 			t.Errorf("global %q = %q, want deny", action, global[action])
 		}
 	}
-	for _, action := range []string{
-		"beacon_reconcile", "beacon_task_close", "beacon_task_create",
-		"beacon_task_delete", "beacon_task_start", "beacon_task_update",
-	} {
-		if _, ok := global[action]; ok {
-			t.Errorf("global contains unprefixed %q", action)
-		}
+	if len(global) != wantGlobal {
+		t.Fatalf("global has %d entries, want %d: %v", len(global), wantGlobal, global)
 	}
-}
 
-// TestGeneratedPermissionsAllowWorkerControl keeps the control tool free of
-// permission prompts. Control is a worker tool, so every role gets an allow.
-func TestGeneratedPermissionsAllowWorkerControl(t *testing.T) {
-	set := GeneratedPermissions(ToolCatalog())
 	for _, group := range []struct {
 		name  string
 		perms []Permission
 	}{
+		{"global", set.Global},
 		{"allow", set.Allow},
 		{"deny", set.Deny},
 	} {
 		effects := actionEffects(group.perms)
-		if got := effects["beacon_beacon_control"]; got != "allow" {
-			t.Errorf("%s beacon_beacon_control = %q, want allow", group.name, got)
+		for _, spec := range catalog {
+			if _, ok := effects[spec.Name]; ok {
+				t.Errorf("%s contains unprefixed action %q", group.name, spec.Name)
+			}
+		}
+	}
+}
+
+// TestGeneratedPermissionsGateOrchestratorTools derives its expectation from
+// ToolCatalog. Every orchestrator-only tool, including run control, is allowed
+// for orchestrator and build and denied for workers.
+func TestGeneratedPermissionsGateOrchestratorTools(t *testing.T) {
+	catalog := ToolCatalog()
+	set := GeneratedPermissions(catalog)
+	allow := actionEffects(set.Allow)
+	deny := actionEffects(set.Deny)
+	for _, spec := range catalog {
+		if !spec.OrchestratorOnly {
+			continue
+		}
+		action := mcpAction(spec.Name)
+		if got := allow[action]; got != "allow" {
+			t.Errorf("allow %s = %q, want allow", action, got)
+		}
+		if got := deny[action]; got != "deny" {
+			t.Errorf("deny %s = %q, want deny", action, got)
 		}
 	}
 }

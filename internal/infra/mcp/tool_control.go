@@ -103,6 +103,11 @@ func registerControl(s *msdk.Server, sv Services) {
 				if _, ok := noticeReason(err); ok {
 					return textResult("ok"), nil, nil
 				}
+				if refusal, ok := decodeControlRefusal(a.Action, a.RunID, err); ok {
+					result := jsonResult(refusal)
+					result.IsError = true
+					return result, nil, nil
+				}
 				return nil, nil, err
 			}
 			return textResult("ok"), nil, nil
@@ -119,6 +124,39 @@ func noticeReason(err error) (string, bool) {
 		return notice.Reason, true
 	}
 	return "", false
+}
+
+// controlRefusalReason recovers the daemon's reason from a refused control
+// call. The loopback adapter turns a 409 wire refusal into a formatted error,
+// so the reason lives in the error text. A refusal without a reason is not a
+// structured refusal and stays a plain error.
+func controlRefusalReason(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	const prefix = "beacon API status "
+	msg := err.Error()
+	if !strings.HasPrefix(msg, prefix) {
+		return "", false
+	}
+	rest := msg[len(prefix):]
+	i := strings.Index(rest, ": ")
+	if i < 0 {
+		return "", false
+	}
+	reason := strings.TrimSpace(rest[i+2:])
+	return reason, reason != ""
+}
+
+// decodeControlRefusal rebuilds the wire refusal from the action and id the
+// caller supplied plus the reason the daemon returned. The result carries all
+// three as fields instead of a prose error string.
+func decodeControlRefusal(action, id string, err error) (core.WireControlResult, bool) {
+	reason, ok := controlRefusalReason(err)
+	if !ok {
+		return core.WireControlResult{}, false
+	}
+	return core.NewWireControlRefusal(core.ParseControlAction(action), core.RunID(id), reason), true
 }
 
 // applyControl forwards one action either to the loopback API or to the local
@@ -154,6 +192,9 @@ func applyControlBatch(ctx context.Context, sv Services, a ControlArgs) (any, er
 			} else {
 				item.Status = "error"
 				item.Error = err.Error()
+				if refusal, ok := decodeControlRefusal(a.Action, id, err); ok {
+					item.Reason = refusal.Reason
+				}
 			}
 		}
 		results = append(results, item)

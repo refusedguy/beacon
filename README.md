@@ -113,16 +113,16 @@ beacon gc                           # remove unused worktrees; silent on success
 ## MCP tools
 
 <!-- BEGIN BEACON DOCS: readme-tools -->
-`beacon mcp` serves 12 tools over stdio. `ToolCatalog()` in `internal/infra/mcp/registry.go` declares them and marks the orchestrator-only ones. 6 tools handle runs and are available to every agent. 6 tools manage task cards or force reconciliation and are denied globally except for `orchestrator` and `build`.
+`beacon mcp` serves 12 tools over stdio. `ToolCatalog()` in `internal/infra/mcp/registry.go` declares them and marks the orchestrator-only ones. 2 tools handle runs and are available to every agent. 10 tools manage task cards or force reconciliation and are denied globally except for `orchestrator` and `build`.
 
 | Tool | Role | What it does |
 | --- | --- | --- |
-| `beacon_dispatch` | worker | Pick up to N non-overlapping tasks and start agents. |
+| `beacon_dispatch` | orchestrator only | Pick up to N non-overlapping tasks and start agents. |
 | `beacon_watch_pr` | worker | Bind a pull request to a running task. |
-| `beacon_status` | worker | List active runs, PRs and blockers. |
-| `beacon_recent` | worker | List the most recently finished runs. |
+| `beacon_status` | orchestrator only | List active runs, PRs and blockers. |
+| `beacon_recent` | orchestrator only | List the most recently finished runs. |
 | `beacon_wait` | worker | Wait for a run to reach an active verdict or a terminal state. |
-| `beacon_control` | worker | Control a run: approve, unblock, cancel, retry, nudge or watch. |
+| `beacon_control` | orchestrator only | Control a run: approve, unblock, cancel, retry, nudge or watch. |
 | `beacon_task_create` | orchestrator only | Create and publish a task card. Orchestrator only. |
 | `beacon_task_delete` | orchestrator only | Delete task cards in one commit and push. Orchestrator only. |
 | `beacon_task_update` | orchestrator only | Update task cards in one commit and push. Orchestrator only. |
