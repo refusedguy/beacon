@@ -198,6 +198,7 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 	if err := r.Store.Save(ctx, run); err != nil {
 		return err
 	}
+	r.releaseIdleNudge(ctx, run)
 	r.notifyParent(ctx, run, obs.PRNumber, string(run.State))
 	if !run.IsFixer {
 		if err := r.Source.Complete(ctx, run.TaskID); err != nil {
@@ -247,6 +248,13 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 }
 
 func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observation, reason string) error {
+	return r.wakeWithEvent(ctx, run, obs, reason, core.EvAgentFixed)
+}
+
+// wakeWithEvent applies the wake guards once and records the delivered wake
+// with kind. An idle nudge uses EvIdleNudge so the run stays in running state
+// while it spends the same bounded fix budget as a check failure.
+func (r *Reconciler) wakeWithEvent(ctx context.Context, run *core.Run, obs core.Observation, reason string, kind core.EventKind) error {
 	if !r.hasAgentSlot(ctx) {
 		return nil
 	}
@@ -269,9 +277,9 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 		return fmt.Errorf("wake: %w", err)
 	}
 	r.Decisions.logTransitionWake(ctx, run.ID, obs.PRNumber, "woke")
-	// The fix request has been delivered. The new waiting-ci run must not keep
-	// showing the old failure as its current reason.
-	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed}, obs)
+	// The wake has been delivered. The run must not keep showing the old
+	// failure as its current reason.
+	return r.applyAndSave(ctx, run, core.Event{Kind: kind}, obs)
 }
 
 // hasAgentSlot delegates the wake decision to the injected AgentSlots policy.

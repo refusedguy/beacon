@@ -95,6 +95,9 @@ const (
 	EvRebaseFailed EventKind = "rebase_failed"
 	// EvAgentFixed records that an agent fixed the run.
 	EvAgentFixed EventKind = "agent_fixed"
+	// EvIdleNudge records that an idle worker was asked to open a PR. It keeps
+	// the run in running state and spends one agent fix attempt.
+	EvIdleNudge EventKind = "idle_nudge"
 	// EvBlock records that an incident blocked the run.
 	EvBlock EventKind = "block"
 	// EvUnblock records that the blocking incident cleared.
@@ -117,7 +120,7 @@ type Event struct {
 
 var transitions = map[RunState]map[EventKind]RunState{
 	RunPending:       {EvStart: RunRunning, EvCancel: RunClosed},
-	RunRunning:       {EvPRRegistered: RunWaitingCI, EvChecksPending: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvChecksFailed: RunNeedsAgentFix, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
+	RunRunning:       {EvIdleNudge: RunRunning, EvPRRegistered: RunWaitingCI, EvChecksPending: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvChecksFailed: RunNeedsAgentFix, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
 	RunWaitingCI:     {EvChecksPending: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvChecksFailed: RunNeedsAgentFix, EvBehind: RunNeedsRebase, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
 	RunNeedsRebase:   {EvRebased: RunWaitingCI, EvRebaseFailed: RunNeedsAgentFix, EvBlock: RunBlocked, EvCancel: RunClosed},
 	RunNeedsAgentFix: {EvAgentFixed: RunWaitingCI, EvChecksPassed: RunWaitingCI, EvBlock: RunBlocked, EvCancel: RunClosed, EvMerged: RunMerged},
@@ -375,7 +378,7 @@ func (r *Run) Apply(e Event) error {
 			return &AppError{Code: CodeExhausted, Message: "rebase attempts exhausted"}
 		}
 		r.RebaseAttempts++
-	case EvAgentFixed:
+	case EvAgentFixed, EvIdleNudge:
 		if !r.CanWake() {
 			return &AppError{Code: CodeExhausted, Message: "agent fix attempts exhausted"}
 		}

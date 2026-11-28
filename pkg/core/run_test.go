@@ -13,6 +13,7 @@ func TestRunTransitions(t *testing.T) {
 		want  RunState
 	}{
 		{"start", RunPending, EvStart, RunRunning},
+		{"idle nudge", RunRunning, EvIdleNudge, RunRunning},
 		{"register pr", RunRunning, EvPRRegistered, RunWaitingCI},
 		{"checks pending after spawn", RunRunning, EvChecksPending, RunWaitingCI},
 		{"behind", RunWaitingCI, EvBehind, RunNeedsRebase},
@@ -34,6 +35,21 @@ func TestRunTransitions(t *testing.T) {
 				t.Fatalf("state = %s, want %s", r.State, tc.want)
 			}
 		})
+	}
+}
+
+func TestIdleNudgeSpendsBoundedFixAttempt(t *testing.T) {
+	r := &Run{ID: "r1", State: RunRunning, MaxAttempts: 2}
+	for i := 1; i <= 2; i++ {
+		if err := r.Apply(Event{Kind: EvIdleNudge}); err != nil {
+			t.Fatalf("Apply idle nudge %d: %v", i, err)
+		}
+		if r.FixAttempts != i || r.State != RunRunning {
+			t.Fatalf("after nudge %d: attempts=%d state=%s", i, r.FixAttempts, r.State)
+		}
+	}
+	if err := r.Apply(Event{Kind: EvIdleNudge}); err == nil {
+		t.Fatal("expected exhausted error after the last idle nudge")
 	}
 }
 
