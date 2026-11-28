@@ -5,6 +5,20 @@
     "minSamples": 5,
     "quantile": 0.95
   },
+  "aggregates": [
+    {
+      "key": "hot-paths-sec/op",
+      "metric": "sec/op",
+      "bench": "HotPaths",
+      "thresholdPct": 15
+    },
+    {
+      "key": "e2e-sec/op",
+      "metric": "sec/op",
+      "bench": "E2EOperatorPaths",
+      "thresholdPct": 20
+    }
+  ],
   "specs": [
     {
       "key": "sqlite-snapshot",

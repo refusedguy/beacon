@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Fail a nightly benchstat comparison when a timing median regresses.
+# Fail a nightly benchstat comparison when a median regresses past the noise
+# measured by the control row on that night.
+#
 # Input is the CSV from: benchstat -format csv <baseline.txt> <current.txt>
-# A baseline far above the current measurement is rejected as poisoned: a load
-# spike in one night must not become the reference for every later night.
-# Keys, thresholds and placement come from docs/perf/bench-registry.json.
+# Keys, per-key thresholds, aggregate sec/op limits and the noise floor come
+# from docs/perf/bench-registry.json. The emitters report -median-ns, so the
+# gate converts those values to seconds before comparing them with the control.
+#
+# A baseline far above the current measurement is poisoned. That night is
+# reported inconclusive and the script still exits zero, so CI publishes the
+# good current measurement as the next baseline instead of downloading the
+# poisoned artifact forever.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -24,8 +31,9 @@ if [[ ! -f "$registry" ]]; then
   exit 2
 fi
 
-# The nightly job has Go but not Node. Generate a small stdlib-only helper that
-# reads the registry and proves every key still resolves to an emitted metric.
+# The nightly job has Go but not Node. Generate a stdlib-only helper that reads
+# the registry and proves every key still resolves to an emitted metric. The
+# helper writes a tab-separated table the awk gate consumes.
 gate_dir="$(mktemp -d)"
 trap 'rm -rf "$gate_dir"' EXIT
 cat > "$gate_dir/registry_gate.go" <<'GO'
@@ -48,8 +56,19 @@ type spec struct {
 	ThresholdPct float64 `json:"thresholdPct"`
 }
 
+type aggregate struct {
+	Key          string  `json:"key"`
+	Metric       string  `json:"metric"`
+	Bench        string  `json:"bench"`
+	ThresholdPct float64 `json:"thresholdPct"`
+}
+
 type document struct {
-	Specs []spec `json:"specs"`
+	Noise struct {
+		DefaultFloorPct float64 `json:"defaultFloorPct"`
+	} `json:"noise"`
+	Aggregates []aggregate `json:"aggregates"`
+	Specs      []spec      `json:"specs"`
 }
 
 func fail(format string, args ...any) {
@@ -70,6 +89,20 @@ func main() {
 		fail("parse registry: %v", err)
 	}
 
+	// The 2 percent value is a noise floor, not a pass limit. The real sec/op
+	// limits are aggregate keys in the registry.
+	floor := doc.Noise.DefaultFloorPct
+	if floor <= 0 {
+		floor = 2
+	}
+	fmt.Printf("policy\t%g\n", floor)
+	for _, a := range doc.Aggregates {
+		if a.Key == "" || a.Metric == "" || a.Bench == "" || a.ThresholdPct <= 0 {
+			fail("invalid aggregate spec %+v", a)
+		}
+		fmt.Printf("aggregate\t%s\t%s\t%s\t%g\n", a.Key, a.Metric, a.Bench, a.ThresholdPct)
+	}
+
 	benchDir := filepath.Join(os.Args[2], "internal", "bench")
 	entries, err := os.ReadDir(benchDir)
 	if err != nil {
@@ -88,8 +121,15 @@ func main() {
 	}
 	src := source.String()
 
+	control := false
 	for _, s := range doc.Specs {
 		if s.Placement != "nightly" && s.Placement != "both" {
+			continue
+		}
+		if s.Key == "json-control" {
+			// The control publishes a canonical row, not a named Go metric.
+			fmt.Println("control\tJSONControl\tsec/op")
+			control = true
 			continue
 		}
 		if s.Key == "" || !strings.Contains(src, strconv.Quote(s.Key)) {
@@ -98,24 +138,30 @@ func main() {
 		if s.ThresholdPct <= 0 {
 			fail("registry key %q has non-positive threshold %g", s.Key, s.ThresholdPct)
 		}
-		for _, metric := range []string{s.WorkMetric, s.ErrMetric} {
-			if metric == "" {
-				continue
-			}
-			if strings.Contains(src, strconv.Quote(metric)) {
-				continue
-			}
+		metric := s.Key + "-median-ns"
+		if !strings.Contains(src, strconv.Quote(metric)) {
 			suffix := strings.TrimPrefix(metric, s.Key)
 			if suffix == metric || !strings.Contains(src, strconv.Quote(suffix)) {
 				fail("registry key %q has no emitted metric %q", s.Key, metric)
 			}
 		}
-		fmt.Printf("spec\t%s\t%s\t%g\n", s.Key, s.Key+"-median-sec", s.ThresholdPct)
+		for _, m := range []string{s.WorkMetric, s.ErrMetric} {
+			if m == "" {
+				continue
+			}
+			if strings.Contains(src, strconv.Quote(m)) {
+				continue
+			}
+			suffix := strings.TrimPrefix(m, s.Key)
+			if suffix == m || !strings.Contains(src, strconv.Quote(suffix)) {
+				fail("registry key %q has no emitted metric %q", s.Key, m)
+			}
+		}
+		fmt.Printf("spec\t%s\t%s\t%g\t%s\t%s\n", s.Key, metric, s.ThresholdPct, s.WorkMetric, s.ErrMetric)
 	}
-	// The registry has no aggregate sec/op key, so the micro and e2e limits
-	// stay policy defaults. Changing a limit here does not edit the registry.
-	fmt.Println("limit\tmicro\t-\t15")
-	fmt.Println("limit\te2e\t-\t20")
+	if !control {
+		fail("registry has no json-control spec")
+	}
 }
 GO
 
@@ -126,64 +172,153 @@ fi
 
 awk \
   -v specs="$gate_dir/specs.tsv" \
-  -v noise_floor=2 \
-  -v min_median_sec=0.0001 \
+  -v min_median_sec=1e-9 \
   -v sanity_factor="${BEACON_BASELINE_SANITY_FACTOR:-3}" '
+  function pct(s) { sub(/%$/, "", s); return s + 0 }
+  function max(a, b) { return a > b ? a : b }
+  function seconds(metric, value) {
+    if (metric ~ /-median-ns$/) return value / 1000000000
+    return value
+  }
+  function check(label, metric, old, new, ciold, cinew, limit,
+                 old_s, new_s, old_ratio, new_ratio, delta, spread, effective, ceiling) {
+    old_s = seconds(metric, old)
+    new_s = seconds(metric, new)
+    if (old_s <= 0 || old_s < min_median_sec || new_s < min_median_sec) return
+    ceiling = new_s * sanity_factor
+    if (old_s > ceiling) {
+      printf "INCONCLUSIVE: %s %s poisoned baseline old=%.6fs exceeds ceiling %.6fs\n", \
+        label, metric, old_s, ceiling > "/dev/stderr"
+      return
+    }
+    # Both sides carry the pure control row. Dividing by it removes the
+    # machine speed difference between the two nights.
+    old_ratio = old_s / ctrl_old
+    new_ratio = new_s / ctrl_new
+    delta = 100 * (new_ratio - old_ratio) / old_ratio
+    spread = max(ciold, cinew)
+    effective = max(floor, spread)
+    if (limit > 0 && effective > limit) effective = limit
+    printf "%-26s %-24s old=%.6fs new=%.6fs delta=%+.2f%% floor=%.1f%% spread=%.1f%% limit=%.1f%%\n", \
+      label, metric, old_s, new_s, delta, floor, spread, effective
+    if (delta > effective + 0.001) {
+      printf "REGRESSION: %s %s %+.2f%% exceeds %.1f%%\n", \
+        label, metric, delta, effective > "/dev/stderr"
+      failed = 1
+    }
+  }
+  function checkCounts(key,    wm, em, i, ow, nw, oe, ne) {
+    wm = work_metric[key]
+    em = err_metric[key]
+    for (i = 1; i <= rows; i++) {
+      if (wm != "" && r_metric[i] == wm) { ow = r_old[i]; nw = r_new[i] }
+      if (em != "" && r_metric[i] == em) { oe = r_old[i]; ne = r_new[i] }
+    }
+    if (wm != "" && ow != "" && nw != "" && ow != nw) {
+      printf "WORK MISMATCH: %s work old=%g new=%g\n", key, ow, nw > "/dev/stderr"
+      failed = 1
+    }
+    if (em != "" && oe != "" && ne != "" && oe != ne) {
+      printf "ERR MISMATCH: %s errs old=%g new=%g\n", key, oe, ne > "/dev/stderr"
+      failed = 1
+    }
+  }
   BEGIN {
-    FS = ","; failed = 0; micro_limit = 0; e2e_limit = 0
+    FS = ","; failed = 0; rows = 0; nspec = 0; nagg = 0
     while ((getline line < specs) > 0) {
-      if (split(line, f, "\t") < 4) continue
-      if (f[1] == "limit") {
-        if (f[2] == "micro") micro_limit = f[4] + 0
-        else if (f[2] == "e2e") e2e_limit = f[4] + 0
+      n = split(line, f, "\t")
+      if (n < 2) continue
+      if (f[1] == "policy") floor = f[2] + 0
+      else if (f[1] == "control") { ctrl_bench = f[2]; ctrl_metric = f[3] }
+      else if (f[1] == "aggregate") {
+        agg_limit[f[2]] = f[5] + 0
+        agg_metric[f[2]] = f[3]
+        agg_bench[f[2]] = f[4]
+        agg_keys[++nagg] = f[2]
       } else if (f[1] == "spec") {
-        threshold[f[3]] = f[4] + 0
+        spec_metric[f[2]] = f[3]
+        spec_limit[f[2]] = f[4] + 0
+        work_metric[f[2]] = f[5]
+        err_metric[f[2]] = f[6]
+        spec_keys[++nspec] = f[2]
       }
     }
     close(specs)
-    if (micro_limit <= 0 || e2e_limit <= 0) {
-      print "registry gate: no aggregate limits" > "/dev/stderr"
+    if (!(floor > 0) || ctrl_metric == "" || ctrl_bench == "" || nspec == 0 || nagg == 0) {
+      print "registry gate: incomplete registry" > "/dev/stderr"
       failed = 1
     }
   }
-  /^,/ {
-    metric = $2
-    next
-  }
+  /^,/ { metric = $2; next }
   {
     if ($1 == "" || $1 == "geomean" || $2 == "" || $4 == "") next
-    if (metric != "sec/op" && metric !~ /-median-sec$/) next
-
-    old = $2 + 0
-    new = $4 + 0
-    if (old <= 0 || old < min_median_sec || new < min_median_sec) next
-
-    # Reject a baseline far above the current measurement without a recorded
-    # median table. A spike on one night must not become the next reference.
-    ceiling = new * sanity_factor
-    if (old > ceiling) {
-      printf "POISONED BASELINE: %s %s old=%.6fs exceeds sanity ceiling %.6fs\n", \
-        $1, metric, old, ceiling > "/dev/stderr"
-      failed = 1
-      next
-    }
-
-    delta = 100 * (new - old) / old
-    if (delta < noise_floor) next
-
-    if (metric == "sec/op") {
-      limit = ($1 ~ /E2EOperatorPaths/) ? e2e_limit : micro_limit
-    } else {
-      limit = threshold[metric]
-      if (limit <= 0) limit = micro_limit
-    }
-    printf "%-22s %-30s old=%.6fs new=%.6fs delta=%+.2f%% limit=%.0f%%\n", \
-      $1, metric, old, new, delta, limit
-    if (delta + 0.001 > limit) {
-      printf "REGRESSION: %s %s %+.2f%% exceeds %.0f%%\n", \
-        $1, metric, delta, limit > "/dev/stderr"
-      failed = 1
-    }
+    rows++
+    r_metric[rows] = metric
+    r_bench[rows] = $1
+    r_old[rows] = $2 + 0
+    r_new[rows] = $4 + 0
+    r_ciold[rows] = pct($3)
+    r_cinew[rows] = pct($5)
   }
-  END { exit failed }
+  END {
+    if (failed) exit failed
+    for (i = 1; i <= rows; i++) {
+      if (r_metric[i] == ctrl_metric && r_bench[i] ~ ctrl_bench) {
+        ctrl_old = r_old[i]
+        ctrl_new = r_new[i]
+        ctrl_spread = max(r_ciold[i], r_cinew[i])
+      }
+    }
+    if (!(ctrl_old > 0) || !(ctrl_new > 0)) {
+      # Without a control the two nights cannot be aligned to the same machine
+      # speed. Still gate on raw deltas rather than passing by omission.
+      print "INCONCLUSIVE: no usable nightly control row, using raw deltas" > "/dev/stderr"
+      ctrl_old = 1
+      ctrl_new = 1
+    }
+    if (ctrl_old > ctrl_new * sanity_factor) {
+      print "INCONCLUSIVE: poisoned control row, using raw deltas" > "/dev/stderr"
+      ctrl_old = 1
+      ctrl_new = 1
+    }
+    # The control interval is the calibrated floor for this night.
+    if (ctrl_spread > floor) floor = ctrl_spread
+    for (a = 1; a <= nagg; a++) {
+      key = agg_keys[a]
+      count = 0
+      for (i = 1; i <= rows; i++) {
+        if (r_metric[i] == agg_metric[key] && r_bench[i] ~ agg_bench[key]) {
+          check(key, r_metric[i], r_old[i], r_new[i], r_ciold[i], r_cinew[i], agg_limit[key])
+          count++
+        }
+      }
+      if (count == 0) printf "INCONCLUSIVE: no %s aggregate row\n", key > "/dev/stderr"
+    }
+    for (s = 1; s <= nspec; s++) {
+      key = spec_keys[s]
+      count = 0
+      for (i = 1; i <= rows; i++) {
+        if (r_metric[i] == spec_metric[key]) {
+          check(key, r_metric[i], r_old[i], r_new[i], r_ciold[i], r_cinew[i], spec_limit[key])
+          count++
+        }
+      }
+      if (count == 0) {
+        # A key whose work metric is absent belongs to a benchmark the nightly
+        # command does not run. Only a vanished median on a benchmark that did
+        # run is worth reporting.
+        if (work_metric[key] != "") {
+          for (i = 1; i <= rows; i++) {
+            if (r_metric[i] == work_metric[key]) {
+              printf "INCONCLUSIVE: no %s row\n", spec_metric[key] > "/dev/stderr"
+              break
+            }
+          }
+        }
+        continue
+      }
+      checkCounts(key)
+    }
+    exit failed
+  }
 ' "$csv"

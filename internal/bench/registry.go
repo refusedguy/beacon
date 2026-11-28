@@ -120,12 +120,32 @@ func DefaultNoisePolicy() NoisePolicy {
 	}
 }
 
+// AggregateLimit is one nightly sec/op threshold. benchstat emits sec/op, so
+// an aggregate has no named Go metric for the key-to-metric cross-check.
+type AggregateLimit struct {
+	Key          string  `json:"key"`
+	Metric       string  `json:"metric"`
+	Bench        string  `json:"bench"`
+	ThresholdPct float64 `json:"thresholdPct"`
+}
+
+// AggregateLimits returns the aggregate sec/op limits the nightly gate
+// enforces. They moved out of the gate script into the registry so a review
+// sees the number beside every other threshold.
+func AggregateLimits() []AggregateLimit {
+	return []AggregateLimit{
+		{Key: "hot-paths-sec/op", Metric: "sec/op", Bench: "HotPaths", ThresholdPct: 15},
+		{Key: "e2e-sec/op", Metric: "sec/op", Bench: "E2EOperatorPaths", ThresholdPct: 20},
+	}
+}
+
 // registryDocument is the on-disk shape of the generated JSON. Keeping the
 // specs under a key lets a consumer add document metadata without changing the
 // array shape.
 type registryDocument struct {
-	Noise NoisePolicy `json:"noise"`
-	Specs []Spec      `json:"specs"`
+	Noise      NoisePolicy      `json:"noise"`
+	Aggregates []AggregateLimit `json:"aggregates"`
+	Specs      []Spec           `json:"specs"`
 }
 
 // Registry returns the typed benchmark registry in report order. The name
@@ -209,8 +229,9 @@ func Registry() []Spec {
 // generator and the drift test both call it, so the wire format has one owner.
 func EncodeRegistry() ([]byte, error) {
 	data, err := json.MarshalIndent(registryDocument{
-		Noise: DefaultNoisePolicy(),
-		Specs: Registry(),
+		Noise:      DefaultNoisePolicy(),
+		Aggregates: AggregateLimits(),
+		Specs:      Registry(),
 	}, "", "  ")
 	if err != nil {
 		return nil, err
