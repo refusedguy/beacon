@@ -1,6 +1,7 @@
 package app
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"log/slog"
@@ -12,7 +13,13 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-const maxLogReasonRunes = 160
+const (
+	maxLogReasonRunes = 160
+	// maxDecisionCacheEntries bounds reconcile signatures so a long-running
+	// daemon does not keep one entry per run forever. A few thousand entries
+	// cover the recently active runs while keeping memory flat.
+	maxDecisionCacheEntries = 4096
+)
 
 // Decision is one structured decision. The same shape is written to sqlite
 // and returned in the batched snapshot.
@@ -51,18 +58,24 @@ type DecisionLogger struct {
 	deferred *deferredDecisions
 }
 
-// decisionCache holds the last written reconcile signature for each run. A
-// hit lets Record skip both the store read and the write when an observation
-// has not changed.
+// decisionCache holds the last written reconcile signature for each recently
+// active run. A hit lets Record skip both the store read and the write when an
+// observation has not changed. Entries are bounded and evicted least recently
+// used first, so signature memory does not grow with the number of runs.
 type decisionCache struct {
-	mu   sync.Mutex
-	sigs map[string]string
+	mu    sync.Mutex
+	sigs  map[string]string
+	order *list.List // front is least recently used
+	index map[string]*list.Element
 }
 
 func (c *decisionCache) get(runID string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sig, ok := c.sigs[runID]
+	if ok {
+		c.touch(runID)
+	}
 	return sig, ok
 }
 
@@ -71,8 +84,31 @@ func (c *decisionCache) set(runID, sig string) {
 	defer c.mu.Unlock()
 	if c.sigs == nil {
 		c.sigs = make(map[string]string)
+		c.order = list.New()
+		c.index = make(map[string]*list.Element)
 	}
 	c.sigs[runID] = sig
+	c.touch(runID)
+	for len(c.sigs) > maxDecisionCacheEntries {
+		oldest := c.order.Front()
+		if oldest == nil {
+			break
+		}
+		key := oldest.Value.(string)
+		c.order.Remove(oldest)
+		delete(c.index, key)
+		delete(c.sigs, key)
+	}
+}
+
+// touch moves runID to the most-recent end of the LRU in constant time.
+// Callers hold mu.
+func (c *decisionCache) touch(runID string) {
+	if elem, ok := c.index[runID]; ok {
+		c.order.MoveToBack(elem)
+		return
+	}
+	c.index[runID] = c.order.PushBack(runID)
 }
 
 // decisionStateInitMu guards the lazy creation of cache and deferred on a
