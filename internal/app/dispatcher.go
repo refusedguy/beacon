@@ -84,9 +84,12 @@ type slotReservation struct {
 }
 
 // dispatchBatch holds the caches that live for one dispatch or promotion.
-// Batch-local state needs no lock and cannot leak into a concurrent batch.
+// mu guards ensured and modelRefs when the launcher starts several runs at
+// once. The other fields belong to the caller that planned the batch.
 type dispatchBatch struct {
+	mu        sync.Mutex
 	ensured   map[string]struct{}
+	ensuring  map[string]*branchEnsure
 	modelRefs map[string]core.ModelRef
 	planned   []plannedRun
 	reserved  []core.RunID
@@ -94,6 +97,16 @@ type dispatchBatch struct {
 	active    map[core.TaskID]*core.Run
 	limit     int
 	budget    int
+}
+
+// branchEnsure is one batch's publish of an epic base branch. The leader runs
+// ensureBranch; followers wait on done before their timed step begins, so a
+// follower's span does not include the leader's remote round trip.
+type branchEnsure struct {
+	branch string
+	done   chan struct{}
+	err    error
+	leader bool
 }
 
 // plannedRun pairs a created run with the card it will start. The run is
@@ -355,17 +368,54 @@ func (d *Dispatcher) claimSlots(ctx context.Context, batch *dispatchBatch, from 
 	}
 }
 
-// launch starts the reserved runs without holding slotsMu. Each run frees its
-// reservation when it lands in the store or fails.
+// launch starts the reserved runs without holding slotsMu. Runs holding an
+// agent slot start in one wave so their Create and Spawn calls overlap. Each
+// goroutine writes only its own result slot; the caller merges the slots in
+// planned order after the wave, which keeps the result deterministic without a
+// shared lock on out. A failed start frees its agent slot, so claimSlots runs
+// once after the wave rather than once per failure. Pending runs only persist
+// a row and stay on the caller, so a batch with one agent slot does not fan
+// out store writes.
 func (d *Dispatcher) launch(ctx context.Context, batch *dispatchBatch, out *DispatchResult) error {
+	type startResult struct {
+		out    DispatchResult
+		failed bool
+		err    error
+	}
+	results := make([]startResult, len(batch.planned))
+	var wg sync.WaitGroup
 	for i, p := range batch.planned {
-		failed, err := d.launchOne(ctx, batch, p, out)
-		if err != nil {
-			return err
+		if !d.hasAgent(p.run.ID) {
+			results[i].failed, results[i].err = d.launchOne(ctx, batch, p, &results[i].out)
+			continue
 		}
-		if failed {
-			d.claimSlots(ctx, batch, i+1)
+		wg.Add(1)
+		go func(i int, p plannedRun) {
+			defer wg.Done()
+			results[i].failed, results[i].err = d.launchOne(ctx, batch, p, &results[i].out)
+		}(i, p)
+	}
+	wg.Wait()
+
+	var firstErr error
+	anyFailed := false
+	for i := range results {
+		r := &results[i]
+		out.Skipped = append(out.Skipped, r.out.Skipped...)
+		out.Failures = append(out.Failures, r.out.Failures...)
+		out.Runs = append(out.Runs, r.out.Runs...)
+		if firstErr == nil && r.err != nil {
+			firstErr = r.err
 		}
+		if r.failed {
+			anyFailed = true
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if anyFailed {
+		d.claimSlots(ctx, batch, 0)
 	}
 	return nil
 }
@@ -499,35 +549,65 @@ func (d *Dispatcher) timed(ctx context.Context, name string, fn func() error) er
 	return err
 }
 
-// ensureOnce publishes an epic base branch at most once per batch. Children of
+// waitEnsure joins this batch's publish of an epic base branch. Children of
 // one epic share the branch, and ensureBranch starts with a remote round trip
 // even when the branch is already present, so repeating it for every child is
-// redundant git work. Only a successful publish is cached: a failure is retried
-// by the next child instead of being remembered for the rest of the batch.
-func (d *Dispatcher) ensureOnce(ctx context.Context, batch *dispatchBatch, branch string) error {
+// redundant git work. The leader runs the publish; followers wait here, before
+// their timed step starts, so a follower's span measures only the cache hit.
+func (d *Dispatcher) waitEnsure(batch *dispatchBatch, branch string) *branchEnsure {
 	branch = strings.TrimSpace(branch)
 	if !IsEpicBranch(branch) {
-		return nil
+		return &branchEnsure{}
 	}
+	batch.mu.Lock()
 	if _, ok := batch.ensured[branch]; ok {
-		return nil
+		batch.mu.Unlock()
+		return &branchEnsure{}
 	}
-	if err := ensureBranch(ctx, d.Workspace, branch, ""); err != nil {
-		return err
+	if tok, ok := batch.ensuring[branch]; ok {
+		batch.mu.Unlock()
+		<-tok.done
+		// The close publishes tok.err. Return a follower token so only the
+		// original leader can run and close the publish again.
+		return &branchEnsure{err: tok.err}
 	}
-	if batch.ensured == nil {
-		batch.ensured = make(map[string]struct{})
+	tok := &branchEnsure{branch: branch, done: make(chan struct{}), leader: true}
+	if batch.ensuring == nil {
+		batch.ensuring = make(map[string]*branchEnsure)
 	}
-	batch.ensured[branch] = struct{}{}
-	return nil
+	batch.ensuring[branch] = tok
+	batch.mu.Unlock()
+	return tok
+}
+
+// publish runs the leader's ensureBranch and wakes the followers. A failed
+// publish is not cached, so a later start retries it.
+func (d *Dispatcher) publish(ctx context.Context, batch *dispatchBatch, tok *branchEnsure) error {
+	if !tok.leader {
+		return tok.err
+	}
+	err := ensureBranch(ctx, d.Workspace, tok.branch, "")
+	batch.mu.Lock()
+	if err == nil {
+		if batch.ensured == nil {
+			batch.ensured = make(map[string]struct{})
+		}
+		batch.ensured[tok.branch] = struct{}{}
+	}
+	delete(batch.ensuring, tok.branch)
+	tok.err = err
+	close(tok.done)
+	batch.mu.Unlock()
+	return err
 }
 
 func (d *Dispatcher) startOne(ctx context.Context, batch *dispatchBatch, run *core.Run, task core.Task) error {
 	ctx = WithCycleID(ctx, string(run.ID))
 	// A child card may outlive the epic creation that was supposed to publish
 	// its base branch. Check again here so a missing branch never closes a run.
+	tok := d.waitEnsure(batch, task.BaseBranch)
 	if err := d.timed(ctx, "ensureBranch", func() error {
-		return d.ensureOnce(ctx, batch, task.BaseBranch)
+		return d.publish(ctx, batch, tok)
 	}); err != nil {
 		return step("base branch", err)
 	}
@@ -688,6 +768,8 @@ func (d *Dispatcher) modelRef(batch *dispatchBatch, parent string) core.ModelRef
 	if d.ResolveModel == nil || parent == "" {
 		return core.ModelRef{}
 	}
+	batch.mu.Lock()
+	defer batch.mu.Unlock()
 	if batch.modelRefs == nil {
 		batch.modelRefs = make(map[string]core.ModelRef)
 	}

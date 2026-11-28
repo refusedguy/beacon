@@ -28,11 +28,11 @@ func twentyTasks() []core.Task {
 }
 
 func TestTwoPoolConcurrency(t *testing.T) {
-	store := newFakeStore()
-	src := &fakeSource{tasks: twentyTasks()}
-	h := &fakeHarness{}
+	store := &slotStore{fakeStore: newFakeStore()}
+	src := &slotSource{fakeSource: &fakeSource{tasks: twentyTasks()}}
+	h := &lockedHarness{fakeHarness: &fakeHarness{}}
 	d := &Dispatcher{
-		Source: src, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
+		Source: src, Planner: NewPlanner(nil), Workspace: &slotWorkspace{fakeWorkspace: &fakeWorkspace{}},
 		Harness: h, Store: store,
 		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 3},
 	}
@@ -97,14 +97,14 @@ func TestDispatchMarksCardInWorkspace(t *testing.T) {
 }
 
 func TestDispatchTellsChildAgentTheBaseBranch(t *testing.T) {
-	store := newFakeStore()
+	store := &slotStore{fakeStore: newFakeStore()}
 	tasks := []core.Task{
 		{ID: "T-CHILD", Status: core.TaskAvailable, BaseBranch: "beacon/T-EPIC", Scope: []core.ScopePath{core.ScopeFile("child.go")}},
 		{ID: "T-PLAIN", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("plain.go")}},
 	}
-	h := &fakeHarness{}
+	h := &lockedHarness{fakeHarness: &fakeHarness{}}
 	d := &Dispatcher{
-		Source: &fakeSource{tasks: tasks}, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
+		Source: &slotSource{fakeSource: &fakeSource{tasks: tasks}}, Planner: NewPlanner(nil), Workspace: &slotWorkspace{fakeWorkspace: &fakeWorkspace{}},
 		Harness: h, Store: store,
 		Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
 	}
@@ -134,17 +134,17 @@ func TestDispatchTellsChildAgentTheBaseBranch(t *testing.T) {
 }
 
 func TestDispatchDoesNotRetryActiveTask(t *testing.T) {
-	store := newFakeStore()
+	store := &slotStore{fakeStore: newFakeStore()}
 	tasks := twentyTasks()
-	src := &fakeSource{tasks: tasks}
+	src := &slotSource{fakeSource: &fakeSource{tasks: tasks}}
 	active := core.NewRun("r-existing", tasks[0].ID, time.Now().UTC())
 	active.State = core.RunRunning
 	if err := store.Save(context.Background(), active); err != nil {
 		t.Fatalf(`store.Save(context.Background(), active): %v`, err)
 	}
 	d := &Dispatcher{
-		Source: src, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
-		Harness: &fakeHarness{}, Store: store,
+		Source: src, Planner: NewPlanner(nil), Workspace: &slotWorkspace{fakeWorkspace: &fakeWorkspace{}},
+		Harness: &lockedHarness{fakeHarness: &fakeHarness{}}, Store: store,
 		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 20},
 	}
 	res, err := d.Dispatch(context.Background(), 20)
@@ -169,7 +169,7 @@ func TestDispatchDoesNotRetryActiveTask(t *testing.T) {
 }
 
 func TestDispatchReportsStructuredConflicts(t *testing.T) {
-	store := newFakeStore()
+	store := &slotStore{fakeStore: newFakeStore()}
 	tasks := []core.Task{
 		{ID: "A", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("internal/infra/mcp/server.go")}},
 		{ID: "B", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("internal/infra/mcp/server.go")}},
@@ -182,8 +182,8 @@ func TestDispatchReportsStructuredConflicts(t *testing.T) {
 		t.Fatalf(`store.Save(context.Background(), active): %v`, err)
 	}
 	d := &Dispatcher{
-		Source: &fakeSource{tasks: tasks}, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
-		Harness: &fakeHarness{}, Store: store,
+		Source: &slotSource{fakeSource: &fakeSource{tasks: tasks}}, Planner: NewPlanner(nil), Workspace: &slotWorkspace{fakeWorkspace: &fakeWorkspace{}},
+		Harness: &lockedHarness{fakeHarness: &fakeHarness{}}, Store: store,
 		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 20},
 	}
 	res, err := d.Dispatch(context.Background(), 20)
@@ -625,10 +625,10 @@ func TestDispatchResolvesModelForTwoCards(t *testing.T) {
 		{ID: "T-MODEL-1", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("m1.go")}},
 		{ID: "T-MODEL-2", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("m2.go")}},
 	}
-	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	h := &lockedRequestHarness{requestCapturingHarness: &requestCapturingHarness{fakeHarness: &fakeHarness{}}}
 	d := &Dispatcher{
-		Source: &fakeSource{tasks: tasks}, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
-		Harness: h, Store: newFakeStore(),
+		Source: &slotSource{fakeSource: &fakeSource{tasks: tasks}}, Planner: NewPlanner(nil), Workspace: &slotWorkspace{fakeWorkspace: &fakeWorkspace{}},
+		Harness: h, Store: &slotStore{fakeStore: newFakeStore()},
 		Concurrency:     core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
 		ParentSessionID: "ses_parent",
 	}
@@ -876,6 +876,32 @@ func (s *slotStore) SetTaskStatus(ctx context.Context, id core.TaskID, status st
 	return s.fakeStore.SetTaskStatus(ctx, id, status)
 }
 
+// lockedHarness serializes the fake harness bookkeeping when several reserved
+// runs spawn in one wave. The production harness owns its own locking.
+type lockedHarness struct {
+	*fakeHarness
+	mu sync.Mutex
+}
+
+func (h *lockedHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.fakeHarness.Spawn(ctx, req)
+}
+
+// lockedRequestHarness guards the prompt capture used by the model tests when
+// two cards start together.
+type lockedRequestHarness struct {
+	*requestCapturingHarness
+	mu sync.Mutex
+}
+
+func (h *lockedRequestHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.requestCapturingHarness.Spawn(ctx, req)
+}
+
 // barrierHarness parks each Spawn until release is closed, so a test can prove
 // that two dispatch calls are inside Spawn at the same time.
 type barrierHarness struct {
@@ -1030,6 +1056,44 @@ func TestConcurrentDispatchOverlapsSpawn(t *testing.T) {
 	}
 }
 
+// TestDispatchOverlapsAgentSpawns checks the launch wave inside one dispatch.
+// The harness parks both spawns, so a sequential launcher cannot produce the
+// second arrival until the first is released.
+func TestDispatchOverlapsAgentSpawns(t *testing.T) {
+	ctx := context.Background()
+	store := &slotStore{fakeStore: newFakeStore()}
+	h := &barrierHarness{
+		fakeHarness: &fakeHarness{},
+		arrived:     make(chan core.RunID, 2),
+		release:     make(chan struct{}),
+	}
+	d := &Dispatcher{
+		Source: &slotSource{fakeSource: &fakeSource{tasks: twentyTasks()[:2]}}, Planner: NewPlanner(nil),
+		Workspace: &slotWorkspace{fakeWorkspace: &fakeWorkspace{}},
+		Harness:   h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := d.Dispatch(ctx, 2); err != nil {
+			t.Errorf("Dispatch: %v", err)
+		}
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-h.arrived:
+		case <-time.After(3 * time.Second):
+			t.Fatal("agent starts did not overlap inside one dispatch")
+		}
+	}
+	close(h.release)
+	<-done
+	if h.spawnCount() != 2 {
+		t.Fatalf("spawns = %d, want 2", h.spawnCount())
+	}
+}
+
 // TestConcurrentDispatchRespectsInFlightCap drives many dispatches at once and
 // checks the in-flight cap, not just the agent cap.
 func TestConcurrentDispatchRespectsInFlightCap(t *testing.T) {
@@ -1133,15 +1197,22 @@ const (
 	profileStatusDelay = 4 * time.Millisecond
 )
 
+// The profile doubles guard their counters and the embedded fakes once the
+// launcher can start several runs at once. The simulated delay stays outside
+// the lock so overlapping steps keep their own timing; only the short fake
+// bookkeeping is serialized.
 type timedWorkspace struct {
 	*fakeWorkspace
+	mu          sync.Mutex
 	ensureDelay time.Duration
 	createDelay time.Duration
 	ensures     int
 }
 
 func (w *timedWorkspace) EnsureBranch(ctx context.Context, branch, base string) error {
+	w.mu.Lock()
 	w.ensures++
+	w.mu.Unlock()
 	return benchDelay(ctx, w.ensureDelay)
 }
 
@@ -1149,11 +1220,14 @@ func (w *timedWorkspace) Create(ctx context.Context, task core.Task) (core.Works
 	if err := benchDelay(ctx, w.createDelay); err != nil {
 		return core.Workspace{}, err
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.fakeWorkspace.Create(ctx, task)
 }
 
 type timedSource struct {
 	*fakeSource
+	mu        sync.Mutex
 	markDelay time.Duration
 }
 
@@ -1161,11 +1235,14 @@ func (s *timedSource) MarkInWorkspace(ctx context.Context, id core.TaskID, path,
 	if err := benchDelay(ctx, s.markDelay); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.fakeSource.MarkInWorkspace(ctx, id, path, status)
 }
 
 type timedStore struct {
 	*fakeStore
+	mu          sync.Mutex
 	saveDelay   time.Duration
 	statusDelay time.Duration
 	saves       int
@@ -1173,23 +1250,28 @@ type timedStore struct {
 }
 
 func (s *timedStore) Save(ctx context.Context, run *core.Run) error {
-	s.saves++
 	if err := benchDelay(ctx, s.saveDelay); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saves++
 	return s.fakeStore.Save(ctx, run)
 }
 
 func (s *timedStore) SetTaskStatus(ctx context.Context, id core.TaskID, status string) error {
-	s.statuses++
 	if err := benchDelay(ctx, s.statusDelay); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statuses++
 	return s.fakeStore.SetTaskStatus(ctx, id, status)
 }
 
 type timedHarness struct {
 	*fakeHarness
+	mu         sync.Mutex
 	spawnDelay time.Duration
 }
 
@@ -1197,6 +1279,8 @@ func (h *timedHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.S
 	if err := benchDelay(ctx, h.spawnDelay); err != nil {
 		return core.Session{}, err
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return h.fakeHarness.Spawn(ctx, req)
 }
 
@@ -1591,16 +1675,33 @@ func TestSelectDispatchCandidatesPropagatesPlannerError(t *testing.T) {
 // the count.
 type countingActiveStore struct {
 	*fakeStore
+	mu         sync.Mutex
 	listActive int
 	findActive int
 }
 
+func (s *countingActiveStore) Save(ctx context.Context, r *core.Run) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.Save(ctx, r)
+}
+
+func (s *countingActiveStore) SetTaskStatus(ctx context.Context, id core.TaskID, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fakeStore.SetTaskStatus(ctx, id, status)
+}
+
 func (s *countingActiveStore) ListActive(ctx context.Context) ([]*core.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.listActive++
 	return s.fakeStore.ListActive(ctx)
 }
 
 func (s *countingActiveStore) FindActiveByTask(ctx context.Context, id core.TaskID) (*core.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.findActive++
 	return s.fakeStore.FindActiveByTask(ctx, id)
 }
@@ -1670,14 +1771,20 @@ func TestDispatchGuardUsesTheOneActiveList(t *testing.T) {
 
 type failFirstHarness struct {
 	*fakeHarness
+	mu    sync.Mutex
 	calls int
 }
 
 func (h *failFirstHarness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
+	h.mu.Lock()
 	h.calls++
-	if h.calls == 1 {
+	first := h.calls == 1
+	h.mu.Unlock()
+	if first {
 		return core.Session{}, errors.New("spawn exploded")
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return h.fakeHarness.Spawn(ctx, req)
 }
 
