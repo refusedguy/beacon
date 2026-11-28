@@ -10,14 +10,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sort"
 
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
 // generated holds the permission entries the generator owns, grouped by the
-// scope they belong to. The generator denies an orchestrator-only tool globally
-// and for workers, and allows it for the orchestrator and build agents.
+// scope they belong to. It denies an orchestrator-only tool globally and for
+// workers, allows it for the orchestrator and build agents, and allows worker
+// tools for every agent.
 type generated struct {
 	global  []any
 	allow   []any
@@ -83,30 +83,31 @@ func generate(data []byte) ([]byte, error) {
 }
 
 func buildGenerated(specs []mcp.ToolSpec) generated {
-	g := generated{actions: make(map[string]bool)}
-	sorted := append([]mcp.ToolSpec(nil), specs...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
-
-	for _, spec := range sorted {
-		if !spec.OrchestratorOnly {
-			continue
-		}
-		g.global = append(g.global, permission(spec.Name, "deny"))
-		g.allow = append(g.allow, permission(spec.Name, "allow"))
-		g.worker = append(g.worker, permission(spec.Name, "deny"))
+	// The catalog package owns the action names and the role mapping. Deriving
+	// every list from it keeps this writer in step with the library merge.
+	set := mcp.GeneratedPermissions(specs)
+	owned := make([]mcp.Permission, 0, len(set.Global)+len(set.Allow)+len(set.Deny))
+	owned = append(owned, set.Global...)
+	owned = append(owned, set.Allow...)
+	owned = append(owned, set.Deny...)
+	return generated{
+		global:  permissionMaps(set.Global),
+		allow:   permissionMaps(set.Allow),
+		worker:  permissionMaps(set.Deny),
+		actions: mcp.OwnedActions(owned),
 	}
-	// The owned-action rule, including the stale doubled prefix, belongs to
-	// the catalog package. This generator and the library merge now share it.
-	g.actions = mcp.OwnedActions(mcp.GeneratedPermissions(sorted).Global)
-	return g
 }
 
-func permission(action, effect string) map[string]any {
-	return map[string]any{
-		"action":   action,
-		"resource": "*",
-		"effect":   effect,
+func permissionMaps(perms []mcp.Permission) []any {
+	out := make([]any, 0, len(perms))
+	for _, p := range perms {
+		out = append(out, map[string]any{
+			"action":   p.Action,
+			"resource": p.Resource,
+			"effect":   p.Effect,
+		})
 	}
+	return out
 }
 
 // rewritePermissions drops every entry whose action is owned by the generator,

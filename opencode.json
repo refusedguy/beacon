@@ -5,27 +5,32 @@
       "description": "Default coding agent. Treated as the operator's orchestration session and allowed to manage Beacon tasks.",
       "permissions": [
         {
-          "action": "beacon_reconcile",
+          "action": "beacon_beacon_control",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_close",
+          "action": "beacon_beacon_reconcile",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_create",
+          "action": "beacon_beacon_task_close",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_delete",
+          "action": "beacon_beacon_task_create",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_update",
+          "action": "beacon_beacon_task_delete",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_task_update",
           "effect": "allow",
           "resource": "*"
         }
@@ -36,27 +41,32 @@
       "mode": "all",
       "permissions": [
         {
-          "action": "beacon_reconcile",
+          "action": "beacon_beacon_control",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_close",
+          "action": "beacon_beacon_reconcile",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_create",
+          "action": "beacon_beacon_task_close",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_delete",
+          "action": "beacon_beacon_task_create",
           "effect": "allow",
           "resource": "*"
         },
         {
-          "action": "beacon_task_update",
+          "action": "beacon_beacon_task_delete",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_task_update",
           "effect": "allow",
           "resource": "*"
         }
@@ -67,27 +77,32 @@
       "mode": "subagent",
       "permissions": [
         {
-          "action": "beacon_reconcile",
+          "action": "beacon_beacon_control",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_beacon_reconcile",
           "effect": "deny",
           "resource": "*"
         },
         {
-          "action": "beacon_task_close",
+          "action": "beacon_beacon_task_close",
           "effect": "deny",
           "resource": "*"
         },
         {
-          "action": "beacon_task_create",
+          "action": "beacon_beacon_task_create",
           "effect": "deny",
           "resource": "*"
         },
         {
-          "action": "beacon_task_delete",
+          "action": "beacon_beacon_task_delete",
           "effect": "deny",
           "resource": "*"
         },
         {
-          "action": "beacon_task_update",
+          "action": "beacon_beacon_task_update",
           "effect": "deny",
           "resource": "*"
         }
@@ -96,27 +111,27 @@
   },
   "permissions": [
     {
-      "action": "beacon_reconcile",
+      "action": "beacon_beacon_reconcile",
       "effect": "deny",
       "resource": "*"
     },
     {
-      "action": "beacon_task_close",
+      "action": "beacon_beacon_task_close",
       "effect": "deny",
       "resource": "*"
     },
     {
-      "action": "beacon_task_create",
+      "action": "beacon_beacon_task_create",
       "effect": "deny",
       "resource": "*"
     },
     {
-      "action": "beacon_task_delete",
+      "action": "beacon_beacon_task_delete",
       "effect": "deny",
       "resource": "*"
     },
     {
-      "action": "beacon_task_update",
+      "action": "beacon_beacon_task_update",
       "effect": "deny",
       "resource": "*"
     }
