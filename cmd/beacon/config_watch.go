@@ -181,12 +181,15 @@ func (cw *configWatcher) reload() bool {
 	if sum == cw.hash {
 		return false
 	}
-	cw.hash = sum
 	cfg, root, err := loadConfig(cw.path)
 	if err != nil || !cfg.Complete() {
 		slog.Warn("config watch: invalid config ignored", "path", cw.path)
 		return false
 	}
+	// Advance the hash only after the file parses and stays complete. An
+	// invalid edit leaves the previous hash in place so the next tick retries
+	// the file once the operator corrects it.
+	cw.hash = sum
 	previous := cw.live.Load()
 	if reflect.DeepEqual(previous.cfg, cfg) {
 		// Only workflow bytes changed, but resolution produced the same
