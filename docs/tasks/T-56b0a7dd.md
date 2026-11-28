@@ -1,7 +1,7 @@
 ---
 id: T-56b0a7dd
 title: Publish perf environment pins and floor age in artifacts
-status: available
+status: done
 scope:
     - .github/workflows/ci.yml
     - internal/bench/report.go
