@@ -1,7 +1,7 @@
 ---
 id: T-bd62e91b
 title: Add orchestrator beacon_task_close with audited status and reason
-status: available
+status: done
 scope:
     - internal/app/taskclose.go
     - internal/app/taskclose_test.go
