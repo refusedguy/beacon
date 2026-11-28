@@ -525,6 +525,36 @@ func TestGitWorktreeCardOnlyDirtUsesOneStatusCall(t *testing.T) {
 	}
 }
 
+// TestGitWorktreeCreateCalls is the deterministic create-calls counter. A
+// clean target makes reclaim a no-op, so a Create that reads the base ref from
+// disk issues exactly two git subcommands: fetch and worktree add. The old
+// merge-base subprocess made it three. The counter locks the fall at two
+// without a wall-clock measurement, so it stays stable on a noisy runner.
+func TestGitWorktreeCreateCalls(t *testing.T) {
+	ctx := context.Background()
+	for i := 1; i <= 5; i++ {
+		wt, _ := newTestGitWorktree(t)
+		var calls [][]string
+		wt.commandHook = func(_ string, args []string) error {
+			calls = append(calls, append([]string(nil), args...))
+			return nil
+		}
+		ws, err := wt.Create(ctx, core.Task{ID: core.TaskID(fmt.Sprintf("T-CRT-CALL-%d", i))})
+		if err != nil {
+			t.Fatalf("Create() pass %d: %v", i, err)
+		}
+		if ws.Path == "" {
+			t.Fatalf("Create() pass %d returned an empty path", i)
+		}
+		if len(calls) != 2 {
+			t.Fatalf("Create() pass %d ran %d git commands, want 2: %v", i, len(calls), calls)
+		}
+		if calls[0][0] != "fetch" || calls[1][0] != "worktree" {
+			t.Fatalf("Create() pass %d call order = %v, want fetch then worktree add", i, calls)
+		}
+	}
+}
+
 func TestGitWorktreeCommitPathOnlyStagesPathspec(t *testing.T) {
 	wt, _ := newTestGitWorktree(t)
 	ctx := context.Background()

@@ -1159,9 +1159,9 @@ jobs:
               !ea.length || !eb.length || median(ea) !== median(eb);
             const errsZero = ea.length > 0 && eb.length > 0 &&
               ea.every(v => v === 0) && eb.every(v => v === 0);
-            // Worktree removal drops one git status call by design: work 3 to 2.
-            // No other work or error change is forgiven for that key.
-            if (key === 'worktree-remove' && errsZero &&
+            // Worktree create and remove each drop one git subprocess by
+            // design: work 3 to 2. No other work or error change is forgiven.
+            if ((key === 'worktree-remove' || key === 'worktree-create') && errsZero &&
                 median(wa) === 3 && median(wb) === 2) workMismatch = false;
             const overlap = amax >= bmin && bmax >= amin;
             const relation = overlap ? 'overlap' : 'separate';
@@ -1193,8 +1193,8 @@ jobs:
             const allocGain = errsZero && noRise && equalWork &&
               ((Number.isFinite(allocDelta) && allocDelta <= -allocDropPct) ||
                (Number.isFinite(bytesDelta) && bytesDelta <= -allocDropPct));
-            const callsReduced = key === 'worktree-remove' && errsZero && noRise &&
-              median(wa) === 3 && median(wb) === 2;
+            const callsReduced = (key === 'worktree-remove' || key === 'worktree-create') &&
+              errsZero && noRise && median(wa) === 3 && median(wb) === 2;
             const ownCounters = counterFields[key];
             const counterFalls = ownCounters && errsZero && noRise &&
               equalWork && ownCounters.some(suffix => {
@@ -1275,7 +1275,7 @@ jobs:
             '',
             ...(notes.length ? ['Parser notes:', '', ...notes.map(n => `- ${n}`), ''] : []),
             `A timing verdict needs an absolute delta of at least ${floorPct}% and greater than the larger trimmed within-side spread; otherwise the row is flat.`,
-            `A flat row becomes 'gain (allocs/bytes)' when allocs/op or B/op falls at least ${allocDropPct}% with equal work, zero errors and no median rise beyond the row floor. Worktree removal with work 3 to 2 becomes 'gain (calls reduced)'. The green-base reconcile guard and the two red-base keys become 'gain (calls reduced)' when their own lists, observes, gets or saves counters fall under the same error and rise limits.`,
+            `A flat row becomes 'gain (allocs/bytes)' when allocs/op or B/op falls at least ${allocDropPct}% with equal work, zero errors and no median rise beyond the row floor. Worktree create and remove with work 3 to 2 become 'gain (calls reduced)'. The green-base reconcile guard and the two red-base keys become 'gain (calls reduced)' when their own lists, observes, gets or saves counters fall under the same error and rise limits.`,
             'Spread drops one extreme sample from either end of five medians per side, using min(s[3]-s[0], s[4]-s[1]), so a single spike does not force a false verdict. Range relation is supporting text only.',
             `Cache states recorded from canonical rows: ${cacheStates.join(', ') || '-'}.`,
             status.length ? `Aborted passes: ${status.join(', ')}.` : 'No aborted passes.',
