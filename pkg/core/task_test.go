@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestOverlap(t *testing.T) {
 	cases := []struct {
@@ -133,5 +136,79 @@ func TestSetParentStampsEveryChild(t *testing.T) {
 		if child.Parent != "T-EPIC" {
 			t.Fatalf("child %q parent = %q", child.ID, child.Parent)
 		}
+	}
+}
+
+func TestValidateTaskGraph(t *testing.T) {
+	cases := []struct {
+		name     string
+		tasks    []Task
+		wantCode ErrorCode
+		wantID   string
+	}{
+		{
+			name: "acyclic chain",
+			tasks: []Task{
+				{ID: "A"},
+				{ID: "B", DependsOn: []TaskID{"A"}},
+				{ID: "C", DependsOn: []TaskID{"B", "A"}},
+			},
+		},
+		{
+			name:  "dangling dependency is allowed",
+			tasks: []Task{{ID: "A", DependsOn: []TaskID{"EXT-1"}}},
+		},
+		{
+			name:     "self dependency",
+			tasks:    []Task{{ID: "A", DependsOn: []TaskID{"A"}}},
+			wantCode: CodeInvalidInput,
+			wantID:   "A",
+		},
+		{
+			name: "two node cycle",
+			tasks: []Task{
+				{ID: "A", DependsOn: []TaskID{"B"}},
+				{ID: "B", DependsOn: []TaskID{"A"}},
+			},
+			wantCode: CodeInvalidInput,
+			wantID:   "A",
+		},
+		{
+			name: "longer cycle",
+			tasks: []Task{
+				{ID: "A", DependsOn: []TaskID{"B"}},
+				{ID: "B", DependsOn: []TaskID{"C"}},
+				{ID: "C", DependsOn: []TaskID{"EXT-1", "A"}},
+			},
+			wantCode: CodeInvalidInput,
+			wantID:   "A",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateTaskGraph(tc.tasks)
+			if got := CodeOf(err); got != tc.wantCode {
+				t.Fatalf("code = %q, want %q (err = %v)", got, tc.wantCode, err)
+			}
+			if tc.wantCode != "" && !strings.Contains(err.Error(), tc.wantID) {
+				t.Fatalf("error %q does not name %q", err, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestChildKeyCoversDependenciesButNotOrder(t *testing.T) {
+	withDep := []ChildSpec{{Title: "Child", Depends: []TaskID{"A"}}}
+	otherDep := []ChildSpec{{Title: "Child", Depends: []TaskID{"B"}}}
+	if ChildKey(withDep) == ChildKey(otherDep) {
+		t.Fatal("child key ignores a changed dependency")
+	}
+	first := []ChildSpec{{Title: "B"}, {Title: "A"}}
+	second := []ChildSpec{{Title: "A"}, {Title: "B"}}
+	if ChildKey(first) != ChildKey(second) {
+		t.Fatal("child key changed with plan order")
+	}
+	if ChildKey([]ChildSpec{{Title: "Child"}}) == ChildKey(withDep) {
+		t.Fatal("child key ignores an added dependency")
 	}
 }
