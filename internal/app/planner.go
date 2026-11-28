@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 
@@ -19,6 +20,9 @@ const (
 	SkipSelectedScopeOverlap SkipCode = "selected_scope_overlap"
 	// SkipNoScope means the task has no scope while strict scope checking is enabled.
 	SkipNoScope SkipCode = "no_scope"
+	// SkipOversizedScope means the card breaks the 3-2-1200 scope cap. It is a
+	// dispatch-time backstop; creation is the authority that measures lines.
+	SkipOversizedScope SkipCode = "oversized_scope"
 	// SkipBadStatus means the task status is not available.
 	SkipBadStatus SkipCode = "bad_status"
 )
@@ -106,6 +110,15 @@ func (p GreedyPlanner) Select(candidates []core.Task, active []*core.Run, limit 
 				continue
 			}
 			t.Scope = []core.ScopePath{core.ScopeAll()}
+		}
+		if budget := declaredScopeBudget(t.Scope); !scopeWithinCap(budget) {
+			skipped = append(skipped, SkippedTask{
+				TaskID: t.ID,
+				Code:   SkipOversizedScope,
+				Reason: fmt.Sprintf("scope breaks the 3-2-1200 cap: %d paths, %d production files",
+					budget.paths, budget.files),
+			})
+			continue
 		}
 		if blocker, paths := p.activeConflict(t, index); blocker != nil {
 			skipped = append(skipped, SkippedTask{
