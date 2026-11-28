@@ -10,8 +10,9 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-// TestRequireOrchestrator pins the role gate for the three metadata shapes a
-// caller can send. A refusal must carry the permission code and name both the
+// TestRequireOrchestrator pins the role gate for the metadata shapes a caller
+// can send. The build agent is the operator session and passes alongside
+// orchestrator. A refusal must carry the permission code and name both the
 // role it saw and the role it needs, so the caller can diagnose the denial.
 func TestRequireOrchestrator(t *testing.T) {
 	tests := []struct {
@@ -35,6 +36,10 @@ func TestRequireOrchestrator(t *testing.T) {
 		{
 			name: "orchestrator",
 			meta: msdk.Meta{"ai.opencode/agent": "orchestrator"},
+		},
+		{
+			name: "build",
+			meta: msdk.Meta{"beacon/agent": "build"},
 		},
 	}
 	for _, tc := range tests {

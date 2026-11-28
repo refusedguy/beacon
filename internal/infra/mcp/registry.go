@@ -31,14 +31,15 @@ type ToolSpec struct {
 
 const (
 	roleAbsent       = "absent"
+	roleBuild        = "build"
 	roleOrchestrator = "orchestrator"
 )
 
-// requireOrchestrator refuses a tool call that does not name an orchestrator
-// agent. A worker identity and absent agent metadata are both refusals, each
-// with a coded error that names the observed role and the required role. A
-// caller can then diagnose the denial from the error alone instead of falling
-// through to an interactive permission prompt.
+// requireOrchestrator refuses a tool call that does not name an operator agent.
+// The build agent is the operator's default orchestration session, so it is
+// accepted alongside the orchestrator role. A worker identity and absent agent
+// metadata are both refusals, each with a coded error that names the observed
+// role and the required role.
 func requireOrchestrator(req *msdk.CallToolRequest) error {
 	agent := metaString(req, "beacon/agent", "ai.opencode/agent")
 	observed := strings.TrimSpace(agent)
@@ -46,6 +47,10 @@ func requireOrchestrator(req *msdk.CallToolRequest) error {
 		observed = roleAbsent
 	}
 	if observed == roleAbsent || isWorkerAgent(observed) {
+		return core.Errorf(core.CodePermissionDenied,
+			"tool is orchestrator only; observed role %q, required role %q", observed, roleOrchestrator)
+	}
+	if observed != roleBuild && observed != roleOrchestrator {
 		return core.Errorf(core.CodePermissionDenied,
 			"tool is orchestrator only; observed role %q, required role %q", observed, roleOrchestrator)
 	}
