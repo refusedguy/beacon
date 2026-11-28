@@ -69,6 +69,21 @@ func wireReadOnly(path string) (config.Config, *sqlite.Store, *workspace.GitWork
 	return cfg, store, wt, nil
 }
 
+// wireStatusReadOnly loads the config and opens the store without creating a
+// worktree. Status reads never use a worktree, so they skip the git rev-parse
+// that workspace.New runs. Commands that need a worktree keep wireReadOnly.
+func wireStatusReadOnly(path string) (config.Config, *sqlite.Store, error) {
+	cfg, _, err := loadConfig(path)
+	if err != nil {
+		return config.Config{}, nil, err
+	}
+	store, err := sqlite.Open(cfg.StateDB)
+	if err != nil {
+		return config.Config{}, nil, err
+	}
+	return cfg, store, nil
+}
+
 // daemonSnapshot converts the CLI's daemon liveness record into the app-level
 // snapshot type. The daemon files stay owned by the composition root.
 func daemonSnapshot(status daemonStatus) *app.DaemonSnapshot {
@@ -194,7 +209,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				fmt.Fprintln(cmd.OutOrStdout(), strings.TrimSuffix(text, "\n"))
 				return nil
 			}
-			cfg, store, _, err := wireReadOnly(*configPath)
+			cfg, store, err := wireStatusReadOnly(*configPath)
 			if err != nil {
 				return err
 			}
