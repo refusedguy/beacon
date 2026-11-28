@@ -93,19 +93,36 @@ type workflowJob struct {
 	body []string
 }
 
-// ParseWorkflowJobNames extracts job names from one workflow document. Only
+// ParseWorkflowJobNames extracts check names from one workflow document. Only
 // keys directly under jobs: are names; nested matrix and step keys sit deeper
-// and are ignored. A job with strategy.matrix is omitted because GitHub
-// reports only the expanded cell names. A job with a job-level
-// continue-on-error: true is omitted because it never gates merge. A step
-// with the same flag does not make the job advisory.
+// and are ignored. A job with strategy.matrix contributes the cell names
+// GitHub reports for its include entries instead of the unreportable parent
+// name. A job with a job-level continue-on-error: true is omitted because it
+// never gates merge. A step with the same flag does not make the job advisory.
 func ParseWorkflowJobNames(content string) []string {
 	var names []string
 	for _, job := range parseWorkflowJobs(content) {
-		if hasMatrix(job.body) || hasContinueOnError(job.body) {
+		if hasContinueOnError(job.body) {
+			continue
+		}
+		if hasMatrix(job.body) {
+			names = append(names, matrixCellNames(job.name, job.body)...)
 			continue
 		}
 		names = append(names, job.name)
+	}
+	return names
+}
+
+// ParseConditionalCellNames returns the matrix cell names of jobs that carry a
+// job-level if gate. GitHub skips or omits those cells when the condition is
+// false, so a required-check policy must treat them as conditional checks.
+func ParseConditionalCellNames(content string) []string {
+	var names []string
+	for _, job := range parseWorkflowJobs(content) {
+		if hasIfGate(job.body) {
+			names = append(names, matrixCellNames(job.name, job.body)...)
+		}
 	}
 	return names
 }
@@ -246,6 +263,165 @@ func hasMatrix(lines []string) bool {
 		}
 	}
 	return false
+}
+
+// hasIfGate reports whether the job body declares if at the job's own field
+// indentation. A step-level if sits deeper and does not gate the job.
+func hasIfGate(lines []string) bool {
+	field := fieldIndent(lines)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || leadingSpaces(line) != field {
+			continue
+		}
+		key, _, ok := strings.Cut(trimmed, ":")
+		if ok && strings.TrimSpace(key) == "if" {
+			return true
+		}
+	}
+	return false
+}
+
+// matrixCellNames renders each include entry the way GitHub names its check
+// run: "<job> (<value1>, <value2>, ...)". Values keep the key order of the
+// entry. A matrix without include entries yields no cells here; its parent is
+// unreportable and is collected by DetectUnreportableJobNames.
+func matrixCellNames(job string, lines []string) []string {
+	var names []string
+	for _, values := range matrixIncludeEntries(lines) {
+		names = append(names, job+" ("+strings.Join(values, ", ")+")")
+	}
+	return names
+}
+
+// matrixIncludeEntries reads strategy.matrix.include from a job body and
+// returns the scalar values of each entry in declaration order. Nested values
+// are skipped because GitHub renders them differently from scalars.
+func matrixIncludeEntries(lines []string) [][]string {
+	matrix := strategyMatrixBlock(lines)
+	if matrix == nil {
+		return nil
+	}
+	include := nestedYAMLBlock(matrix, "include")
+	if include == nil {
+		return nil
+	}
+	var entries [][]string
+	var entry []string
+	for _, line := range include {
+		value, listed := includeValueLine(strings.TrimSpace(line))
+		if listed {
+			entries = appendEntry(entries, entry)
+			entry = nil
+		}
+		if value != "" {
+			entry = append(entry, value)
+		}
+	}
+	return appendEntry(entries, entry)
+}
+
+// strategyMatrixBlock returns the lines nested under strategy.matrix in a job
+// body, or nil when the job has no matrix block.
+func strategyMatrixBlock(lines []string) []string {
+	field := fieldIndent(lines)
+	if field < 0 {
+		return nil
+	}
+	var strategy []string
+	indent := 0
+	found := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		level := leadingSpaces(line)
+		if found {
+			if level <= indent {
+				break
+			}
+			strategy = append(strategy, line)
+			continue
+		}
+		if level == field {
+			if key, _, ok := strings.Cut(trimmed, ":"); ok && key == "strategy" {
+				found = true
+				indent = level
+			}
+		}
+	}
+	if !found {
+		return nil
+	}
+	return nestedYAMLBlock(strategy, "matrix")
+}
+
+// nestedYAMLBlock returns the lines nested under key, stopping at the first
+// non-comment line at the key's own indentation or shallower.
+func nestedYAMLBlock(lines []string, key string) []string {
+	start := -1
+	indent := 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		name, _, ok := strings.Cut(trimmed, ":")
+		if ok && name == key {
+			start = i + 1
+			indent = leadingSpaces(line)
+			break
+		}
+	}
+	if start < 0 {
+		return nil
+	}
+	var out []string
+	for _, line := range lines[start:] {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if leadingSpaces(line) <= indent {
+			break
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// includeValueLine extracts a scalar include value. listed reports whether
+// the line starts a new entry with a leading dash.
+func includeValueLine(trimmed string) (value string, listed bool) {
+	item, hasDash := strings.CutPrefix(trimmed, "- ")
+	if !hasDash {
+		item = trimmed
+	}
+	value, ok := cellValue(item)
+	return value, ok && hasDash
+}
+
+// appendEntry appends a non-empty cell entry to entries.
+func appendEntry(entries [][]string, entry []string) [][]string {
+	if len(entry) == 0 {
+		return entries
+	}
+	return append(entries, entry)
+}
+
+// cellValue extracts a scalar YAML value used in a matrix include entry.
+func cellValue(line string) (string, bool) {
+	key, raw, ok := strings.Cut(line, ":")
+	if !ok || strings.TrimSpace(key) == "" {
+		return "", false
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.HasPrefix(value, "[") || strings.HasPrefix(value, "{") ||
+		strings.HasPrefix(value, "|") || strings.HasPrefix(value, ">") {
+		return "", false
+	}
+	return strings.Trim(value, "\"'"), true
 }
 
 // isReusableWorkflow reports whether the document declares a workflow_call
