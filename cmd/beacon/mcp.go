@@ -54,6 +54,9 @@ func newMCPCommand(configPath *string) *cobra.Command {
 					return fmt.Errorf("write daemon state: %w", stateErr)
 				}
 				defer tracker.Close()
+				if h, ok := w.harness.(*reloadableHarness); ok {
+					defer h.stop()
+				}
 				if watcher, ok := w.harness.(core.IdleWatcher); ok {
 					go watcher.WatchIdle(ctx)
 				}

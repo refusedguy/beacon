@@ -25,6 +25,9 @@ Clients read the current token from that file after each restart.`,
 				return err
 			}
 			defer w.close()
+			if h, ok := w.harness.(*reloadableHarness); ok {
+				defer h.stop()
+			}
 			if err := config.ValidateWebhook(w.cfg.Webhook); err != nil {
 				return err
 			}
