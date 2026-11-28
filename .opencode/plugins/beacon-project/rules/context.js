@@ -34,8 +34,8 @@ export const SURVIVAL_RULES = [
   '4) Use rg -n PATTERN <explicit-directory>. Do not grep -r the whole tree or find /.',
   `5) Worker tools: ${WORKER_TOOLS.join(", ")}. ${ORCHESTRATOR_TOOLS.join(", ")} are for the orchestrator only. No other Beacon tool exists.`,
   '6) After opening a pull request, call beacon_watch_pr with your real run ID and PR number.',
-  '7) Use beacon_wait to wait and beacon_status or beacon_recent to inspect. No gh pr checks --watch and no sleep loop.',
-  '8) Use beacon_control only for approve, unblock, cancel and retry on a run.',
+  '7) Use beacon_wait to wait for a verdict. The orchestrator inspects with beacon_status and beacon_recent. No gh pr checks --watch and no sleep loop.',
+  '8) Only the orchestrator may use beacon_control, for approve, unblock, cancel and retry on a run.',
   '9) Write prose with unslop: no em dashes, simple words, active voice, no filler.',
   '10) Fix a failed check when it is in your diff. Otherwise report the blocker in your final message.',
 ].join("\n")
