@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
-	"github.com/refusedguy/beacon/pkg/core/redact"
 )
 
 // telegramNotifyKey is the canonical advisory key. The registry owns the
@@ -132,10 +131,15 @@ func TestTelegramPayloadByteIdentical(t *testing.T) {
 	}
 }
 
+// wantRedactedText is the literal redaction of benchNotification. The test
+// compares the wire body with this fixed string instead of calling Redact to
+// build the expectation, so a leak in the redact chain fails the assertion.
+const wantRedactedText = "beacon [run-telegram-bench] notify: token [REDACTED] clone https://ci:[REDACTED]@example.com/beacon.git"
+
 func TestTelegramNotifyPayload(t *testing.T) {
 	expected, err := json.Marshal(map[string]string{
 		"chat_id": benchChatID,
-		"text":    redact.Redact(fmt.Sprintf("beacon [%s] %s: %s", benchNotification.RunID, benchNotification.Subject, benchNotification.Body)),
+		"text":    wantRedactedText,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -220,5 +224,99 @@ func TestTelegramStatusError(t *testing.T) {
 	n.HTTP.Transport = rewriteTransport{base: n.HTTP.Transport, target: target}
 	if err := n.Notify(context.Background(), benchNotification); err == nil {
 		t.Fatal("Notify on a 400 status returned nil, want an error")
+	}
+}
+
+// telegramRequest is what the fixture server observes. A test reads these
+// observations instead of asking Notify what it did.
+type telegramRequest struct {
+	method string
+	path   string
+	body   []byte
+}
+
+// TestTelegramNotify drives Notify through an httptest server. The expected
+// body is a literal, so a change to the redact rules fails this test instead
+// of moving the expected value with the implementation.
+func TestTelegramNotify(t *testing.T) {
+	wantBody, err := json.Marshal(map[string]string{"chat_id": benchChatID, "text": wantRedactedText})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const escapedToken = "tok/en:special"
+	escapedPath := "/bot" + url.PathEscape(escapedToken) + "/sendMessage"
+	benchPath := "/bot" + url.PathEscape(benchToken) + "/sendMessage"
+
+	cases := []struct {
+		name      string
+		token     string
+		chat      string
+		status    int
+		cancel    bool
+		wantPath  string
+		wantBody  []byte
+		wantCount int
+		wantErr   bool
+	}{
+		{name: "disabled sends nothing", token: "", chat: benchChatID, status: http.StatusOK},
+		{name: "escaped token path", token: escapedToken, chat: benchChatID,
+			status: http.StatusOK, wantPath: escapedPath, wantBody: wantBody, wantCount: 1},
+		{name: "redacted body", token: benchToken, chat: benchChatID,
+			status: http.StatusOK, wantPath: benchPath, wantBody: wantBody, wantCount: 1},
+		{name: "server error", token: benchToken, chat: benchChatID,
+			status: http.StatusInternalServerError, wantPath: benchPath, wantBody: wantBody,
+			wantCount: 1, wantErr: true},
+		{name: "cancelled context", token: benchToken, chat: benchChatID,
+			status: http.StatusOK, cancel: true, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := make(chan telegramRequest, 4)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				requests <- telegramRequest{method: r.Method, path: r.URL.EscapedPath(), body: body}
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+
+			target, err := url.Parse(srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := NewTelegram(tc.token, tc.chat)
+			n.HTTP = srv.Client()
+			n.HTTP.Transport = rewriteTransport{base: n.HTTP.Transport, target: target}
+			ctx := context.Background()
+			if tc.cancel {
+				cctx, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cctx
+			}
+
+			err = n.Notify(ctx, benchNotification)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Notify error = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if got := len(requests); got != tc.wantCount {
+				t.Fatalf("requests = %d, want %d", got, tc.wantCount)
+			}
+			if tc.wantCount == 0 {
+				return
+			}
+			got := <-requests
+			if got.method != http.MethodPost {
+				t.Fatalf("method = %q, want POST", got.method)
+			}
+			if got.path != tc.wantPath {
+				t.Fatalf("path = %q, want %q", got.path, tc.wantPath)
+			}
+			if strings.Count(got.path, "/") != 2 {
+				t.Fatalf("token slash was not escaped in path %q", got.path)
+			}
+			if !bytes.Equal(got.body, tc.wantBody) {
+				t.Fatalf("body = %s, want %s", got.body, tc.wantBody)
+			}
+		})
 	}
 }
