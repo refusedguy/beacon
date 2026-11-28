@@ -1,7 +1,7 @@
 ---
 id: T-c2c020fc
 title: 'P17: Wire CLI benchmarks into advisory'
-status: available
+status: done
 scope:
     - cmd/beacon/status_cli_bench_test.go
     - cmd/beacon/config_watch_bench_test.go

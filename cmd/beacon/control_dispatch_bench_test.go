@@ -190,8 +190,11 @@ func BenchmarkControlNoDaemon(b *testing.B) {
 	b.ResetTimer()
 
 	var sums controlPass
+	durations := make([]time.Duration, 0, b.N)
 	for i := 0; i < b.N; i++ {
+		start := time.Now()
 		r := f.pass(b)
+		durations = append(durations, time.Since(start))
 		sums.work += r.work
 		sums.errs += r.errs
 		sums.wires += r.wires
@@ -211,4 +214,5 @@ func BenchmarkControlNoDaemon(b *testing.B) {
 	b.ReportMetric(float64(sums.wires), controlBenchName+"-wire-calls")
 	b.ReportMetric(1, controlBenchLimiter)
 	printControlReport(os.Stdout, sums, b.N)
+	printPerfRow(os.Stdout, "control-no-daemon", durations, sums.work, sums.errs, controlBenchLimiter)
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +23,105 @@ import (
 const (
 	statusCLILimiter = "json-reflection-plus-sqlite-read"
 	statusCLIRuns    = 8
+
+	// cliPerfPrefix marks one canonical advisory row in a benchmark log.
+	cliPerfPrefix = "beacon-perf: "
 )
+
+// cliPerfRow is the fixed payload of a canonical row. The advisory comment
+// parser rejects a row with a different field set, so every CLI harness prints
+// exactly these eight fields.
+type cliPerfRow struct {
+	Key      string  `json:"key"`
+	MedianMS float64 `json:"median_ms"`
+	MinMS    float64 `json:"min_ms"`
+	MaxMS    float64 `json:"max_ms"`
+	Work     int64   `json:"work"`
+	Errs     int64   `json:"errs"`
+	Limiter  string  `json:"limiter"`
+	Cache    string  `json:"cache"`
+}
+
+// cliBenchCache mirrors the advisory cache stamp. CI exports
+// BEACON_BENCH_CACHE=warm for every measured pass, so two rows from different
+// cache policies can never be read as the same sample.
+func cliBenchCache() string {
+	if value := os.Getenv("BEACON_BENCH_CACHE"); value != "" {
+		return value
+	}
+	return "unset"
+}
+
+// printPerfRow writes one canonical row for a whole benchmark run. Durations
+// are the per-iteration timings the harness already collects, so the row and
+// the human-readable report describe the same measurement. This helper belongs
+// to package main; the bench package has its own of the same name.
+func printPerfRow(w io.Writer, key string, durations []time.Duration, work, errs int64, limiter string) {
+	if len(durations) == 0 {
+		return
+	}
+	min, max := durations[0], durations[0]
+	for _, d := range durations[1:] {
+		if d < min {
+			min = d
+		}
+		if d > max {
+			max = d
+		}
+	}
+	median := statusCLIMedian(durations)
+	data, err := json.Marshal(cliPerfRow{
+		Key:      key,
+		MedianMS: float64(median) / float64(time.Millisecond),
+		MinMS:    float64(min) / float64(time.Millisecond),
+		MaxMS:    float64(max) / float64(time.Millisecond),
+		Work:     work,
+		Errs:     errs,
+		Limiter:  limiter,
+		Cache:    cliBenchCache(),
+	})
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(w, cliPerfPrefix+string(data))
+}
+
+// TestCLICanonicalRow pins the eight-field payload every CLI benchmark prints.
+// The advisory parser rejects a row with a different field set, so a shape
+// change fails here instead of silently dropping the row in CI.
+func TestCLICanonicalRow(t *testing.T) {
+	t.Setenv("BEACON_BENCH_CACHE", "warm")
+	durations := []time.Duration{3 * time.Millisecond, time.Millisecond, 2 * time.Millisecond}
+	var out bytes.Buffer
+	printPerfRow(&out, "status-cli-paths", durations, 7, 0, statusCLILimiter)
+
+	line := strings.TrimSuffix(out.String(), "\n")
+	if !strings.HasPrefix(line, cliPerfPrefix) {
+		t.Fatalf("row has no canonical prefix: %q", line)
+	}
+	data := strings.TrimPrefix(line, cliPerfPrefix)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(data), &fields); err != nil {
+		t.Fatalf("row is not JSON: %v", err)
+	}
+	want := []string{"key", "median_ms", "min_ms", "max_ms", "work", "errs", "limiter", "cache"}
+	if len(fields) != len(want) {
+		t.Fatalf("row has %d fields, want %d: %s", len(fields), len(want), data)
+	}
+	for _, name := range want {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("row is missing %q: %s", name, data)
+		}
+	}
+	var row cliPerfRow
+	if err := json.Unmarshal([]byte(data), &row); err != nil {
+		t.Fatalf("row does not decode: %v", err)
+	}
+	if row.Key != "status-cli-paths" || row.MedianMS != 2 || row.MinMS != 1 || row.MaxMS != 3 ||
+		row.Work != 7 || row.Errs != 0 || row.Cache != "warm" || row.Limiter != statusCLILimiter {
+		t.Fatalf("row = %+v, want status-cli-paths 2/1/3 7/0 warm with the CLI limiter", row)
+	}
+}
 
 // statusCLICountWriter collects the bytes printJSON writes to stdout. The
 // status command prints through the package-level os.Stdout, so
@@ -155,7 +255,15 @@ func printStatusCLIReport(w io.Writer, name string, d time.Duration, work, errs 
 		name, d, work, errs, statusCLILimiter)
 }
 
-func runStatusCLIPathBench(b *testing.B, name string, args []string) {
+// statusCLIPass accumulates the three read paths of one benchmark invocation
+// into the single canonical row BenchmarkStatusCLIPaths publishes.
+type statusCLIPass struct {
+	durations []time.Duration
+	work      int64
+	errs      int64
+}
+
+func runStatusCLIPathBench(b *testing.B, pass *statusCLIPass, name string, args []string) {
 	b.Helper()
 	fx := newStatusCLIFixture(b)
 	b.Setenv("BEACON_PROJECT_ROOT", fx.root)
@@ -179,6 +287,9 @@ func runStatusCLIPathBench(b *testing.B, name string, args []string) {
 	if errs != 0 || work <= 0 {
 		b.Fatalf("%s: work=%d errs=%d, want positive work and no errors", name, work, errs)
 	}
+	pass.durations = append(pass.durations, durations...)
+	pass.work += work
+	pass.errs += errs
 	median := statusCLIMedian(durations)
 	printStatusCLIReport(os.Stdout, name, median, work, errs)
 	b.ReportMetric(float64(median.Nanoseconds()), name+"-median-ns")
@@ -204,9 +315,14 @@ func BenchmarkStatusCLIPaths(b *testing.B) {
 		{"status-cli-recent", []string{"--recent"}},
 		{"status-cli-snapshot", []string{"--snapshot"}},
 	}
+	pass := &statusCLIPass{}
 	for _, p := range paths {
 		b.Run(p.name, func(b *testing.B) {
-			runStatusCLIPathBench(b, p.name, p.args)
+			runStatusCLIPathBench(b, pass, p.name, p.args)
 		})
 	}
+	if pass.errs != 0 || pass.work <= 0 {
+		b.Fatalf("status-cli-paths: work=%d errs=%d, want positive work and no errors", pass.work, pass.errs)
+	}
+	printPerfRow(os.Stdout, "status-cli-paths", pass.durations, pass.work, pass.errs, statusCLILimiter)
 }
