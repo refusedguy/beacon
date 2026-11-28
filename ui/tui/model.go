@@ -83,6 +83,7 @@ type frameKey struct {
 	width    int
 	cursor   int
 	status   string
+	refusal  string
 	failed   bool
 	runCount int
 	visible  []runFrame
@@ -111,10 +112,10 @@ func newRunFrame(run Run) runFrame {
 // frameCurrent reports whether the cached frame matches the current inputs.
 // The visible rows are compared field by field on the values View actually
 // uses; changes to off-screen runs cannot change the frame.
-func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool, runs []Run) bool {
+func (c *renderCache) frameCurrent(width, cursor int, status, refusal string, failed bool, runs []Run) bool {
 	if !c.hasFrame || c.frameKey.width != width || c.frameKey.cursor != cursor ||
-		c.frameKey.status != status || c.frameKey.failed != failed ||
-		c.frameKey.runCount != len(runs) {
+		c.frameKey.status != status || c.frameKey.refusal != refusal ||
+		c.frameKey.failed != failed || c.frameKey.runCount != len(runs) {
 		return false
 	}
 	start, end := visibleWindow(cursor, len(runs))
@@ -137,7 +138,7 @@ func (c *renderCache) frameCurrent(width, cursor int, status string, failed bool
 // rememberFrame stores a rendered frame together with the inputs that made it.
 // The new visible window is built in the scratch slice, then swapped with the
 // cached key's slice so the next comparison reuses the old backing array.
-func (c *renderCache) rememberFrame(width, cursor int, status string, failed bool, runs []Run, frame string) {
+func (c *renderCache) rememberFrame(width, cursor int, status, refusal string, failed bool, runs []Run, frame string) {
 	start, end := visibleWindow(cursor, len(runs))
 	visible := c.keyRuns[:0]
 	for i := start; i < end; i++ {
@@ -145,7 +146,7 @@ func (c *renderCache) rememberFrame(width, cursor int, status string, failed boo
 	}
 	previous := c.frameKey.visible
 	c.frameKey = frameKey{
-		width: width, cursor: cursor, status: status, failed: failed,
+		width: width, cursor: cursor, status: status, refusal: refusal, failed: failed,
 		runCount: len(runs), visible: visible,
 	}
 	c.keyRuns = previous[:0]
@@ -155,10 +156,14 @@ func (c *renderCache) rememberFrame(width, cursor int, status string, failed boo
 
 // model is the Bubble Tea state for the run monitor.
 type model struct {
-	client       *Client
-	runs         []Run
-	cursor       int
-	status       string
+	client *Client
+	runs   []Run
+	cursor int
+	status string
+	// refusal holds the last refused control action. A refresh replaces status
+	// with the loaded count, so the refusal needs its own field to stay on
+	// screen until the operator issues the next action or a control succeeds.
+	refusal      string
 	failed       bool
 	width        int
 	debounce     time.Duration
@@ -355,16 +360,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case actionMsg:
 		m.failed = msg.err != nil
 		m.pending, m.pendingRunID = "", ""
+		// Any new control result replaces the previous refusal. A success or
+		// a transport error leaves the field empty; a refusal refills it.
+		m.refusal = ""
 		switch {
 		case msg.err != nil:
 			m.status = string(msg.action) + " " + msg.runID + ": " + withAction(msg.err.Error())
 		case !msg.result.OK:
 			m.failed = true
-			m.status = string(msg.action) + " " + msg.runID + ": refused"
+			refusal := string(msg.action) + " " + msg.runID + ": refused"
 			if msg.result.Reason != "" {
-				m.status += ": " + msg.result.Reason
+				refusal += ": " + msg.result.Reason
 			}
-			m.status += " · retry after the reason is cleared"
+			refusal += " · retry after the reason is cleared"
+			m.status = "control refused"
+			m.refusal = refusal
 		default:
 			m.status = string(msg.action) + " " + msg.runID + ": applied"
 			return m, m.reload()
@@ -391,13 +401,17 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a":
 		m.pending, m.pendingRunID = "", ""
+		m.refusal = ""
 		return m, m.apply(ActionApprove)
 	case "u":
 		m.pending, m.pendingRunID = "", ""
+		m.refusal = ""
 		return m, m.apply(ActionUnblock)
 	case "c", "x":
+		m.refusal = ""
 		return m.confirmArmed(ActionCancel, msg.String())
 	case "r":
+		m.refusal = ""
 		return m.confirmArmed(ActionRetry, "r")
 	}
 	return m, nil
@@ -411,7 +425,7 @@ func (m model) View() string {
 	if cache == nil {
 		cache = &renderCache{}
 	}
-	if cache.frameCurrent(m.width, m.cursor, m.status, m.failed, m.runs) {
+	if cache.frameCurrent(m.width, m.cursor, m.status, m.refusal, m.failed, m.runs) {
 		return cache.frame
 	}
 	var b strings.Builder
@@ -437,7 +451,7 @@ func (m model) View() string {
 	start, end := visibleWindow(m.cursor, len(m.runs))
 	// Grow once for the header, the visible rows and the footer so the
 	// builder does not reallocate while writing the frame.
-	b.Grow(len(styledHeader) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + 80)
+	b.Grow(len(styledHeader) + 1 + 8 + (end-start)*(visibleRowWidth*2+64) + len(m.status) + len(m.refusal) + 80)
 	row := cache.row[:0]
 	for i := start; i < end; i++ {
 		run := m.runs[i]
@@ -469,9 +483,13 @@ func (m model) View() string {
 		b.WriteString(m.status)
 	}
 	b.WriteString("\n")
+	if m.refusal != "" {
+		b.WriteString(errorStyle.Render(m.refusal))
+		b.WriteString("\n")
+	}
 	b.WriteString(helpLine)
 	frame := b.String()
-	cache.rememberFrame(m.width, m.cursor, m.status, m.failed, m.runs, frame)
+	cache.rememberFrame(m.width, m.cursor, m.status, m.refusal, m.failed, m.runs, frame)
 	return frame
 }
 

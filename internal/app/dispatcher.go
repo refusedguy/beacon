@@ -58,6 +58,11 @@ type Dispatcher struct {
 	ResolveModel       ModelResolver
 	Decisions          DecisionLogger
 
+	// StartCooldown is how long a task cancelled by the operator stays
+	// ineligible for a fresh start. A non-positive value uses
+	// defaultStartCooldown. An explicit retry is the way out before it expires.
+	StartCooldown time.Duration
+
 	// Spans records per-step timing when set. It never changes dispatch output.
 	Spans *DispatchSpans
 
@@ -218,8 +223,47 @@ const (
 	StartUnknownTask    StartOneCode = "unknown_task"
 	StartUnresolvedDeps StartOneCode = "unresolved_dependencies"
 	StartNoSlot         StartOneCode = "no_slot"
+	StartRecentlyClosed StartOneCode = "recently_closed"
 	StartFailed         StartOneCode = "start_failed"
 )
+
+// defaultStartCooldown is how long a task cancelled by the operator stays
+// ineligible for an automatic start. The operator can shorten the wait with
+// beacon_control retry on the cancelled run.
+const defaultStartCooldown = 15 * time.Minute
+
+// cooldownRecentLimit bounds the finished-run scan for the start cooldown. It
+// is deliberately larger than the status default so a busy tick cannot hide a
+// fresh cancel behind unrelated finished runs.
+const cooldownRecentLimit = 100
+
+// cancelledByOperator is the reason Control.Cancel stamps on a closed run. It
+// is the only close reason that triggers the start cooldown.
+const cancelledByOperator = "cancelled by operator"
+
+// recentlyCancelled returns the newest run of taskID that the operator
+// cancelled inside the cooldown window. Older cancels have expired and no
+// longer hold the task. A nil result means the task is free to start.
+func (d *Dispatcher) recentlyCancelled(recent []*core.Run, taskID core.TaskID, now time.Time) *core.Run {
+	cooldown := d.StartCooldown
+	if cooldown <= 0 {
+		cooldown = defaultStartCooldown
+	}
+	cutoff := now.Add(-cooldown)
+	var match *core.Run
+	for _, run := range recent {
+		if run == nil || run.TaskID != taskID || run.State != core.RunClosed {
+			continue
+		}
+		if run.Reason != cancelledByOperator || run.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		if match == nil || run.UpdatedAt.After(match.UpdatedAt) {
+			match = run
+		}
+	}
+	return match
+}
 
 // StartOne starts exactly one named task. Every refusal is decided before the
 // task sync or any run write, so a blocked call leaves every other card and run
@@ -255,6 +299,27 @@ func (d *Dispatcher) StartOne(ctx context.Context, taskID core.TaskID) (StartOne
 			})
 			return out, nil
 		}
+	}
+
+	// A closed run cancelled by the operator is invisible to ListActive. Read
+	// the finished runs and hold the card for the cooldown window so an
+	// automation tick cannot start it again behind the operator's back.
+	recent, err := d.Store.ListRecent(ctx, cooldownRecentLimit)
+	if err != nil {
+		d.slotsMu.Unlock()
+		return out, err
+	}
+	if cancelled := d.recentlyCancelled(recent, taskID, time.Now().UTC()); cancelled != nil {
+		d.slotsMu.Unlock()
+		out.Code = string(StartRecentlyClosed)
+		out.RunID = cancelled.ID
+		out.Reason = "task was cancelled by operator; retry run " + string(cancelled.ID) + " to start it again"
+		out.Blockers = []StartBlocker{{TaskID: taskID, Status: string(core.RunClosed)}}
+		d.Decisions.logDispatchSkip(ctx, SkippedTask{
+			TaskID: taskID, Code: SkipCode(StartRecentlyClosed),
+			BlockedByRun: cancelled.ID, Reason: out.Reason,
+		})
+		return out, nil
 	}
 
 	var task core.Task
